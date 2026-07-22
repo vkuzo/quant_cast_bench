@@ -42,6 +42,7 @@ from quant_cast_bench.quant_cast_gold.recipes import (
     QuantCastSingleKernelGold,
     RowwiseFp8Gold,
     RowwisePrecalcGold,
+    SrF32ToBf16,
 )
 
 
@@ -2215,6 +2216,148 @@ def rht_cute(x, rht, **kwargs):
 BF16_RHT = QuantCastCuteRecipe.from_gold(HadamardRht, cute_fn=rht_cute)
 
 
+# ---------------------------------------------------------------------------
+# Stochastic-rounding fp32 -> bf16 (mirrors sr_bf16_f). SR add-then-truncate: dither the 16 mantissa
+# bits fp32->bf16 drops with a uniform 16-bit value, then mask them off (& 0xFFFF0000); the low bits
+# are then zero so f32->bf16 is an exact truncation. bf16 shares fp32's 8-bit exponent, so this is
+# the simplest SR target -- no exponent rebias, no packing, no scale.
+#
+# RNG: the gold reference draws the dither from torch's Philox and the Triton kernel from its own
+# `tl.randint4x`, so neither bit-matches the other -- only the SR *property* is well-defined (unbiased,
+# every output lands on one of the two bracketing bf16 grid points), and that's all the test checks
+# for the `_sr` recipes. CuTeDSL exposes no counter-based PRNG intrinsic (unlike Triton's
+# `tl.randint4x`), so we implement Philox-4x32-10 by hand (`_philox_4x32`) out of the integer ops the
+# DSL does have -- the same generator Triton/PyTorch use. It's a stateless pure function
+# `(counter, key) -> 4 uniform uint32`, so every thread computes its own draws with no shared state.
+# We key it like Triton's global SR kernel: counter = (flat index // 4), and the four outputs feed the
+# four consecutive elements of that group (top 16 bits each = a uniform dither in [0, 2**16)). One
+# Philox call per 4 elements amortizes the 10-round mix. E[SR(x)] = x holds (mean error ~1e-5 vs the
+# 1e-3 tolerance on the 512x512 constant-input test).
+#
+# It's a pure elementwise streaming cast (read fp32, write bf16, no reduction), so it wants the same
+# DRAM-speed-of-light recipe as fp8_tensorwise: FLATTEN to 1-D, each thread owning a CONTIGUOUS run
+# loaded/stored via 128-bit VECTORIZED copy atoms (fp32 load 128b = 4 elems, bf16 store 128b = 8
+# elems; assumed_align=16). The seed is loaded from a device (1,) int32 (the first word of the Philox
+# key) so there's no host sync. numel % VPT == 0, so the single-coordinate predicate guards the tail.
+# ---------------------------------------------------------------------------
+_SR_THREADS = 256
+_SR_VPT = 8                             # elems/thread; 8 fp32 = 2x128b load, 8 bf16 = 1x128b store
+_SR_CHUNK = _SR_THREADS * _SR_VPT
+_SR_LD_BITS = min(128, _SR_VPT * 32)    # fp32 input  -> 128-bit vectorized load
+_SR_ST_BITS = min(128, _SR_VPT * 16)    # bf16 output -> 128-bit vectorized store
+
+# Philox-4x32 round constants (Salmon et al., "Parallel Random Numbers: As Easy as 1, 2, 3"); the
+# same values Random123 / Triton's tl.randint4x / PyTorch's _philox_uniform use. 10 rounds.
+_PHILOX_M0 = 0xD2511F53
+_PHILOX_M1 = 0xCD9E8D57
+_PHILOX_W0 = 0x9E3779B9                 # Weyl key bump, word 0
+_PHILOX_W1 = 0xBB67AE85                 # Weyl key bump, word 1
+_PHILOX_ROUNDS = 10
+
+
+@cute.jit
+def _philox_4x32(c0, c1, c2, c3, k0, k1):
+    """Philox-4x32-10: a stateless counter-based PRNG mapping a 128-bit counter (c0..c3) + 64-bit key
+    (k0,k1) to four uniform uint32 outputs.
+
+    We implement it by hand because CuTeDSL ships NO random-number generator -- there is no
+    counter-based (or any) PRNG intrinsic in the device API (unlike Triton's `tl.randint4x` or
+    PyTorch's `aten._philox_uniform`), so to draw the SR dither on-device we build the same standard
+    generator out of the integer ops the DSL does expose (XOR, add, shift, and a Uint64-widened
+    multiply for the mulhilo step).
+
+    Each round multiplies two counter words by the M constants, keeps the hi/lo halves of the 64-bit
+    products (mulhilo via the Uint64 widen), and mixes them with the other two counter words and the
+    key; the key is bumped by the Weyl constants between rounds. Bit-for-bit the standard Philox4x32
+    (verified against the Random123 reference)."""
+    for _ in cutlass.range_constexpr(_PHILOX_ROUNDS):
+        p0 = cutlass.Uint64(c0) * cutlass.Uint64(_PHILOX_M0)
+        p1 = cutlass.Uint64(c2) * cutlass.Uint64(_PHILOX_M1)
+        hi0 = cutlass.Uint32(p0 >> 32)
+        lo0 = cutlass.Uint32(p0 & cutlass.Uint64(0xFFFFFFFF))
+        hi1 = cutlass.Uint32(p1 >> 32)
+        lo1 = cutlass.Uint32(p1 & cutlass.Uint64(0xFFFFFFFF))
+        c0 = hi1 ^ c1 ^ k0
+        c1 = lo1
+        c2 = hi0 ^ c3 ^ k1
+        c3 = lo0
+        k0 = k0 + cutlass.Uint32(_PHILOX_W0)
+        k1 = k1 + cutlass.Uint32(_PHILOX_W1)
+    return c0, c1, c2, c3
+
+
+@cute.kernel
+def _sr_bf16_kernel(gX: cute.Tensor, gY: cute.Tensor, gSeed: cute.Tensor, cX: cute.Tensor,
+                    shape: cute.Shape, tv_layout: cute.Layout):
+    tidx, _, _ = cute.arch.thread_idx()
+    bidx, _, _ = cute.arch.block_idx()
+    coord = (None, bidx)
+    thrX = cute.composition(gX[coord], tv_layout)[(tidx, None)]
+    thrY = cute.composition(gY[coord], tv_layout)[(tidx, None)]
+    thrC = cute.composition(cX[coord], tv_layout)[(tidx, None)]
+
+    if cute.elem_less(thrC[0], shape):
+        ld_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gX.element_type,
+                                      num_bits_per_copy=_SR_LD_BITS)
+        st_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gY.element_type,
+                                      num_bits_per_copy=_SR_ST_BITS)
+        frgSeed = cute.make_rmem_tensor(cute.make_layout(1), gSeed.element_type)
+        cute.copy(cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gSeed.element_type), gSeed, frgSeed)
+        seed = cute.recast_tensor(frgSeed, dtype=cutlass.Uint32)[0]  # bitcast the int32 key word
+        frgX = cute.make_rmem_tensor(cute.get(tv_layout, mode=[1]), gX.element_type)
+        cute.copy(ld_atom, thrX, frgX)
+        p0 = thrC[0][0]                                   # flat index of this thread's first element
+        frgXi = cute.recast_tensor(frgX, dtype=cutlass.Int32)  # reinterpret the f32 bits in place
+        zero = cutlass.Uint32(0)
+        # p0 is a multiple of VPT (hence of 4), so the thread's run splits into VPT//4 aligned groups
+        # of 4 global-consecutive elements; one Philox call (counter = flat//4) dithers each group.
+        for g in cutlass.range_constexpr(_SR_VPT // 4):
+            ctr = cutlass.Uint32(p0 // 4) + cutlass.Uint32(g)
+            r0, r1, r2, r3 = _philox_4x32(ctr, zero, zero, zero, seed, zero)
+            b = g * 4
+            # add the top-16-bit dither, then truncate the low 16 mantissa bits (-65536 == 0xFFFF0000).
+            frgXi[b + 0] = (frgXi[b + 0] + cutlass.Int32(r0 >> 16)) & cutlass.Int32(-65536)
+            frgXi[b + 1] = (frgXi[b + 1] + cutlass.Int32(r1 >> 16)) & cutlass.Int32(-65536)
+            frgXi[b + 2] = (frgXi[b + 2] + cutlass.Int32(r2 >> 16)) & cutlass.Int32(-65536)
+            frgXi[b + 3] = (frgXi[b + 3] + cutlass.Int32(r3 >> 16)) & cutlass.Int32(-65536)
+        frgY = cute.make_rmem_tensor(cute.get(tv_layout, mode=[1]), gY.element_type)
+        frgY.store(frgX.load().to(cutlass.BFloat16))      # exact: low 16 bits are zero
+        cute.copy(st_atom, frgY, thrY)
+
+
+@cute.jit
+def _sr_bf16_jit(mX, mY, mSeed):
+    tv_layout = cute.make_layout((_SR_THREADS, _SR_VPT), stride=(_SR_VPT, 1))
+    tiler = (cute.size(tv_layout),)
+    gX = cute.zipped_divide(mX, tiler)
+    gY = cute.zipped_divide(mY, tiler)
+    cX = cute.zipped_divide(cute.make_identity_tensor(mX.shape), tiler)
+    _sr_bf16_kernel(gX, gY, mSeed, cX, mX.shape, tv_layout).launch(
+        grid=[cute.size(gX, mode=[1]), 1, 1], block=[cute.size(tv_layout, mode=[0]), 1, 1])
+
+
+def sr_bf16_cute(x, key, **kwargs):
+    """Matches sr_bf16_f: fp32 -> bf16 stochastic rounding. `key` is a Philox key tensor; its first
+    32-bit word seeds the in-kernel fmix32 dither (loaded on-device, no host sync). Returns `(out,)`."""
+    assert x.dtype == torch.float32, f"SR bf16 expects fp32 input, got {x.dtype}"
+    assert x.is_contiguous() and x.dim() == 2
+    assert _SR_VPT % 4 == 0, "SR Philox groups 4 elements per call, so VPT must be a multiple of 4"
+    M, N = x.shape
+    assert (M * N) % _SR_VPT == 0, f"sr_bf16 cute kernel needs numel % {_SR_VPT} == 0"
+    y = torch.empty(M, N, dtype=torch.bfloat16, device=x.device)
+    seed = key.reshape(-1)[:1].view(torch.int32).reshape(-1)[:1]  # first 32 bits of the key (device)
+    # assumed_align=16 enables the 128-bit vectorized copies (torch allocations are >=256B aligned).
+    mX = from_dlpack(x.reshape(-1), assumed_align=16).mark_layout_dynamic()  # flatten (elementwise)
+    mY = from_dlpack(y.reshape(-1), assumed_align=16).mark_layout_dynamic()
+    mSeed = from_dlpack(seed)
+    fn = _compiled(("sr_bf16", M, N), _sr_bf16_jit, mX, mY, mSeed)
+    fn(mX, mY, mSeed)
+    return (y,)
+
+
+SR_F32_TO_BF16 = QuantCastCuteRecipe.from_gold(SrF32ToBf16, cute_fn=sr_bf16_cute)
+
+
 ALL_RECIPES = [
     # elementwise
     ("fp8_tensorwise_precalc_scale", FP8_TENSORWISE_PRECALC_SCALE),
@@ -2240,4 +2383,6 @@ ALL_RECIPES = [
     ("nvfp4_blocked_outer", NVFP4_BLOCKED_OUTER),
     # RHT
     ("bf16_rht", BF16_RHT),
+    # stochastic rounding
+    ("fp32_to_bf16_sr", SR_F32_TO_BF16),
 ]
