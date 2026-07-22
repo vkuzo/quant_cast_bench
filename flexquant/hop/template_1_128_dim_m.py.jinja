@@ -1,0 +1,57 @@
+{# Triton template for FlexQuantHOP, 1x128 deepseek dim_m case.
+   Adapted from triton_kernels.py:triton_fp8_blockwise_act_quant_transposed_lhs_kernel.
+
+   Tile shape: (BLOCK_SIZE, NUM_GROUPS) — BLOCK_SIZE rows along M, NUM_GROUPS
+   columns along K. Amax reduces column-wise so each K element gets its own
+   scale. Output qdata is in transposed (K, M) layout.
+
+   Inductor input/output convention for this template:
+     input_nodes = [x, scale]   (scale is the mutated secondary output)
+     primary output = qdata     (allocated by maybe_append_choice via layout,
+                                  layout is (K, M) row-major)
+#}
+{{def_kernel("X", "S")}}
+    pid_m = tl.program_id(0)
+    pid_k = tl.program_id(1)
+
+    stride_xm, stride_xk = {{stride("X")}}
+    stride_sk, stride_sm = {{stride("S")}}
+
+    M = {{size("X", 0)}}
+    K = {{size("X", 1)}}
+
+    m_offs = pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    k_offs = pid_k * NUM_GROUPS + tl.arange(0, NUM_GROUPS)
+    x_offs = m_offs[:, None] * stride_xm + k_offs[None, :] * stride_xk
+    x_mask = (m_offs[:, None] < M) & (k_offs[None, :] < K)
+    x_var = tl.load(X + x_offs, mask=x_mask)
+
+    # Column-wise amax (one scale per K element in the tile), shape (NUM_GROUPS,).
+    amax_var = tl.max(tl.abs(x_var), axis=0)
+
+    {{ modification(
+        subgraph_number=0,
+        output_name="scale_var",
+        amax="amax_var",
+    ) | indent_except_first(1) }}
+
+    # Broadcast scale over the BLOCK_SIZE rows for the cast callback.
+    scale_broadcast = scale_var[None, :]
+
+    {{ modification(
+        subgraph_number=1,
+        output_name="qdata_var",
+        tile="x_var",
+        scale="scale_broadcast",
+    ) | indent_except_first(1) }}
+
+    # Scale store: shape (K, M // BLOCK_SIZE) row-major.
+    scale_offs = k_offs * stride_sk + pid_m * stride_sm
+    tl.store(S + scale_offs, scale_var, mask=k_offs < K)
+
+    # Primary output: (K, M) row-major. Transpose tile before store_output.
+    qdata_t = qdata_var.trans(1, 0)
+    idx_k = k_offs[:, None]
+    idx_m = m_offs[None, :]
+    out_mask = (idx_k < K) & (idx_m < M)
+    {{ store_output(("idx_k", "idx_m"), "qdata_t", "out_mask", val_shape=("NUM_GROUPS", "BLOCK_SIZE")) }}

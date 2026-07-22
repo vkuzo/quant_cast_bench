@@ -1,0 +1,49 @@
+{# Triton template for FlexQuantHOP, 128x128 deepseek case.
+   Adapted from triton_kernels.py:triton_fp8_blockwise_weight_quant_rhs_kernel.
+   The two callbacks (amax_to_scale_fn, cast_to_dtype_fn) are inlined at the
+   {{ modification(...) }} holes by Inductor.
+
+   Inductor input/output convention for this template:
+     input_nodes = [x, scale]   (scale is the mutated secondary output)
+     primary output = qdata     (allocated by maybe_append_choice via layout)
+#}
+{{def_kernel("X", "S")}}
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    stride_xm, stride_xn = {{stride("X")}}
+    stride_sm, stride_sn = {{stride("S")}}
+
+    M = {{size("X", 0)}}
+    N = {{size("X", 1)}}
+
+    offs_m = pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    offs_n = pid_n * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    x_offs = offs_m[:, None] * stride_xm + offs_n[None, :] * stride_xn
+    x_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    x_var = tl.load(X + x_offs, mask=x_mask)
+
+    amax_var = tl.max(tl.abs(x_var))
+
+    {{ modification(
+        subgraph_number=0,
+        output_name="scale_var",
+        amax="amax_var",
+    ) | indent_except_first(1) }}
+
+    {{ modification(
+        subgraph_number=1,
+        output_name="qdata_var",
+        tile="x_var",
+        scale="scale_var",
+    ) | indent_except_first(1) }}
+
+    # scale_var is a [1]-shaped block; align pointer rank for the store.
+    s_off = pid_m * stride_sm + pid_n * stride_sn + tl.arange(0, 1)
+    tl.store(S + s_off, scale_var)
+
+    # Primary output: qdata, layout (M, N) row-major.
+    idx_m = offs_m[:, None]
+    idx_n = offs_n[None, :]
+    out_mask = (idx_m < M) & (idx_n < N)
+    {{ store_output(("idx_m", "idx_n"), "qdata_var", "out_mask", val_shape=("BLOCK_SIZE", "BLOCK_SIZE")) }}
