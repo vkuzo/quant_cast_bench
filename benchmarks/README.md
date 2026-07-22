@@ -49,9 +49,9 @@ Default shape is `(M, K) = (16384, 16384)`. Assumes a B200 (peak 8 TB/s).
 
 ![Memory bandwidth by mode](mem_bw.png)
 
-*Achieved memory bandwidth (% of the B200 8 TB/s peak) per kernel, one bar per implementation
-(`compile` / `triton` / `cute`); the dashed line is the eager-`relu` bandwidth ceiling. The
-compile-only kernels (`bf16_rht`, `fp32_to_bf16_sr`, ...) have no triton/cute bar. Data lives in
+*Achieved memory bandwidth (% of the B200 8 TB/s peak) per kernel, one marker per implementation
+(`compile` ●, `triton` ■, `cute` ▲). Kernels benchmarked in only some modes (e.g. the compile-only
+`bf16_rht`) simply show fewer points. Data lives in
 [`bench_results.csv`](bench_results.csv); regenerate the chart with `python benchmarks/plot_bench.py`.
 Refresh the data by re-running the sweeps with the
 `--csv` flag — `rm benchmarks/bench_results.csv` then
@@ -64,43 +64,45 @@ fresh sweep can differ ±1–2 pts from the tables below (run-to-run variance).*
 shape: (16384, 16384)  mode: compile
 recipe                            gpu_time_ms    gbps    pct_peak  perf_description
 ------------------------------  -------------  ------  ----------  -------------------------------------------------
-relu (baseline)                        0.1792  5993.2       74.9%
-fp8_tensorwise_precalc_scale            0.143  5632.1       70.4%  elementwise
-mxfp8_floor_swizzle                    0.1301  6256.2       78.2%  (1,32) block, swizzle
-mxfp8_floor_dim_m                      0.5811  1400.3       17.5%  (32,1) block, t-contig
-mxfp8_floor_dim_km                     0.7127  1530.1       19.1%  (1,32) dim-k + (32,1) dim-m, one pass, t-contig
-mxfp8_32x32_floor                      0.3793  2123.7       26.5%  (32,32) block
-fp8_deepseek_1x128                     0.1318  6171.9       77.1%  (1,128) block
-fp8_deepseek_1x128_dim_m               0.2498  3257.7       40.7%  (128,1) block, t-contig
-fp8_deepseek_1x128_dim_km              0.3808  2863.4       35.8%  (1,128) dim-k + (128,1) dim-m, one pass, t-contig
-fp8_deepseek_128x128                    0.227    3548       44.4%  (128,128) block
-fp8_rowwise                            0.1224  6577.4       82.2%  (1,-1) block
-fp8_colwise                            0.3928  2050.4       25.6%  (-1,1) block, t-contig
-nvfp4_swizzle                          0.3658  1880.2       23.5%  (1,16) block, fp4 qdata, swizzle
-bf16_rht                               0.4596  2336.1       29.2%  elementwise RHT
-fp32_to_bf16_sr                        0.6822    2361       29.5%
-fp32_to_bf16_sr_global_offsets         2.8956   556.2        7.0%  elementwise SR with stateless RNG
+relu (baseline)                        0.1791  5995.1       74.9%
+fp8_tensorwise_precalc_scale            0.144  5592.6       69.9%  elementwise
+mxfp8_floor_swizzle                    0.1338  6079.9       76.0%  (1,32) block, swizzle
+mxfp8_floor_dim_m                      0.5798  1403.4       17.5%  (32,1) block, t-contig
+mxfp8_floor_dim_km                     0.7148  1525.6       19.1%  (1,32) dim-k + (32,1) dim-m, one pass, t-contig
+mxfp8_32x32_floor                      0.3788  2126.9       26.6%  (32,32) block
+fp8_deepseek_1x128                     0.1328  6128.5       76.6%  (1,128) block
+fp8_deepseek_1x128_dim_m               0.2636    3087       38.6%  (128,1) block, t-contig
+fp8_deepseek_1x128_dim_km              0.3937  2769.6       34.6%  (1,128) dim-k + (128,1) dim-m, one pass, t-contig
+fp8_deepseek_128x128                   0.2294  3510.1       43.9%  (128,128) block
+fp8_rowwise                            0.1257  6404.8       80.1%  (1,-1) block
+fp8_colwise                            0.3927  2050.9       25.6%  (-1,1) block, t-contig
+nvfp4_swizzle                          0.3651  1883.8       23.5%  (1,16) block, fp4 qdata, swizzle
+bf16_rht                                0.458  2344.7       29.3%  elementwise RHT
+fp32_to_bf16_sr                        0.6879  2341.3       29.3%
+fp32_to_bf16_sr_global_offsets         2.8902   557.3        7.0%  elementwise SR with stateless RNG
 ```
 
 ### `--mode triton`
 
 ```
 shape: (16384, 16384)  mode: triton
-recipe                          gpu_time_ms    gbps    pct_peak  perf_description
-----------------------------  -------------  ------  ----------  -------------------------------------------------
-relu (baseline)                      0.1792  5992.8       74.9%
-fp8_tensorwise_precalc_scale         0.1422    5663       70.8%  elementwise
-mxfp8_floor_swizzle                  0.1248  6518.6       81.5%  (1,32) block, swizzle
-mxfp8_floor_dim_m                    0.1692  4810.2       60.1%  (32,1) block, t-contig
-mxfp8_floor_dim_km                   0.2893  3769.3       47.1%  (1,32) dim-k + (32,1) dim-m, one pass, t-contig
-mxfp8_32x32_floor                    0.1287  6257.8       78.2%  (32,32) block
-fp8_deepseek_1x128                   0.1341    6068       75.9%  (1,128) block
-fp8_deepseek_1x128_dim_m             0.1506  5404.2       67.6%  (128,1) block, t-contig
-fp8_deepseek_1x128_dim_km            0.2358  4625.7       57.8%  (1,128) dim-k + (128,1) dim-m, one pass, t-contig
-fp8_deepseek_128x128                 0.1306  6166.2       77.1%  (128,128) block
-fp8_rowwise                          0.1291  6238.8       78.0%  (1,-1) block
-fp8_colwise                          0.2259  3564.8       44.6%  (-1,1) block, t-contig
-nvfp4_swizzle                        0.1371  5017.3       62.7%  (1,16) block, fp4 qdata, swizzle
+recipe                            gpu_time_ms    gbps    pct_peak  perf_description
+------------------------------  -------------  ------  ----------  -------------------------------------------------
+relu (baseline)                        0.1791  5994.5       74.9%
+fp8_tensorwise_precalc_scale           0.1431  5625.7       70.3%  elementwise
+mxfp8_floor_swizzle                    0.1301  6254.8       78.2%  (1,32) block, swizzle
+mxfp8_floor_dim_m                      0.1788  4551.5       56.9%  (32,1) block, t-contig
+mxfp8_floor_dim_km                     0.2976  3664.7       45.8%  (1,32) dim-k + (32,1) dim-m, one pass, t-contig
+mxfp8_32x32_floor                      0.1299  6201.5       77.5%  (32,32) block
+fp8_deepseek_1x128                     0.1345  6051.8       75.6%  (1,128) block
+fp8_deepseek_1x128_dim_m               0.1592  5110.3       63.9%  (128,1) block, t-contig
+fp8_deepseek_1x128_dim_km              0.2534  4302.9       53.8%  (1,128) dim-k + (128,1) dim-m, one pass, t-contig
+fp8_deepseek_128x128                    0.131  6147.9       76.8%  (128,128) block
+fp8_rowwise                            0.1396  5767.6       72.1%  (1,-1) block
+fp8_colwise                            0.2324  3466.1       43.3%  (-1,1) block, t-contig
+nvfp4_swizzle                          0.1391  4944.8       61.8%  (1,16) block, fp4 qdata, swizzle
+fp32_to_bf16_sr                        0.2784  5786.2       72.3%  elementwise SR, tl.randint4x (tile-local)
+fp32_to_bf16_sr_global_offsets         0.2615  6158.4       77.0%  tile-invariant SR, global-index key
 ```
 
 ### `--mode cute`
@@ -238,33 +240,35 @@ compile/triton numbers above:
 shape: (16384, 16384)  mode: cute
 recipe                          gpu_time_ms    gbps    pct_peak  perf_description
 ----------------------------  -------------  ------  ----------  --------------------------------
-relu (baseline)                      0.1791  5995.5       74.9%
-fp8_tensorwise_precalc_scale         0.1173  6866.5       85.8%  elementwise
-mxfp8_floor_swizzle                  0.1504  5409.0       67.6%  (1,32) block, swizzle
-mxfp8_floor_dim_m                    0.1687  4824.1       60.3%  (32,1) block, t-contig
-mxfp8_floor_dim_km                   0.2373  4595.1       57.4%  (1,32) dim-k + (32,1) dim-m, one pass, t-contig
-mxfp8_32x32_floor                    0.1423  5662.4       70.8%  (32,32) block
-fp8_deepseek_1x128                   0.1381  5891.7       73.6%  (1,128) block
-fp8_deepseek_1x128_dim_m             0.1649  4935.6       61.7%  (128,1) block, t-contig
-fp8_deepseek_1x128_dim_km            0.3308  3296.7       41.2%  (1,128) dim-k + (128,1) dim-m, one pass, t-contig
-fp8_deepseek_128x128                 0.1436  5608.5       70.1%  (128,128) block
-fp8_rowwise                          0.1262  6380.5       79.8%  (1,-1) block
-fp8_colwise                          0.2187  3683.1       46.0%  (-1,1) block, t-contig
-nvfp4_swizzle                        0.1395  4931.9       61.6%  (1,16) block, fp4 qdata, swizzle
+relu (baseline)                       0.179  5996.9       75.0%
+fp8_tensorwise_precalc_scale         0.1172  6871.2       85.9%  elementwise
+mxfp8_floor_swizzle                  0.1528  5323.8       66.5%  (1,32) block, swizzle
+mxfp8_floor_dim_m                    0.1677  4852.2       60.7%  (32,1) block, t-contig
+mxfp8_floor_dim_km                   0.2492  4375.5       54.7%  (1,32) dim-k + (32,1) dim-m, one pass, t-contig
+mxfp8_32x32_floor                    0.1425  5654.1       70.7%  (32,32) block
+fp8_deepseek_1x128                   0.1417  5742.4       71.8%  (1,128) block
+fp8_deepseek_1x128_dim_m             0.1648  4936.7       61.7%  (128,1) block, t-contig
+fp8_deepseek_1x128_dim_km             0.331  3295.1       41.2%  (1,128) dim-k + (128,1) dim-m, one pass, t-contig
+fp8_deepseek_128x128                 0.1435  5611.1       70.1%  (128,128) block
+fp8_rowwise                          0.1305  6173.1       77.2%  (1,-1) block
+fp8_colwise                          0.2179  3696.6       46.2%  (-1,1) block, t-contig
+nvfp4_swizzle                        0.1442  4771.6       59.6%  (1,16) block, fp4 qdata, swizzle
 ```
 
 ## Known issues
 
-* `fp32_to_bf16_sr` (compile) reports only ~19.6% peak, but this understates the real bandwidth.
+* `fp32_to_bf16_sr` (compile) reports only ~29.3% peak, but this understates the real bandwidth.
   The stochastic-rounding uniform is drawn via `torch.func._random.uniform` → `aten._philox_uniform`,
   which inductor treats as an opaque extern op rather than a fusible in-kernel RNG. So it runs as
   two DRAM passes: kernel 1 materializes a full-size fp32 random tensor (~1.07 GB write, ~63% of
   the runtime), kernel 2 reads it back alongside `x` to dither+truncate. Real traffic is ~3.76 GB
   (write u + read x + read u + write out) ≈ 46% of peak; the benchmark only counts input+output
-  (~1.61 GB), so the wasted RNG round-trip shows up as the low 19.6%. Fix: fuse the Philox RNG into
+  (~1.61 GB), so the wasted RNG round-trip shows up as the low 29.3%. Fix: fuse the Philox RNG into
   the dither kernel (generate uniforms in-register, never materialize) — as inductor already does
   for `torch.rand`/dropout — which would cut traffic to ~1.61 GB and approach the relu ceiling
-  (~2–3× speedup).
+  (~2–3× speedup). **The hand-written Triton kernel does exactly this and confirms the prediction:
+  `tl.randint4x` generates the Philox uniforms in-register (never materializing `u`), so it moves
+  ~1.61 GB in one pass and hits 72.2% — ~2.5× the compile mode's 29.3% and near the relu ceiling.**
 
 * `bf16_rht` (compile) runs at only ~29% peak, and here the traffic is not wasted (the whole 1.07 GB
   is useful read x + write out) — it's GEMM-kernel inefficiency. The 16×16 RHT `x.reshape(..., 16) @ rht`
@@ -321,8 +325,8 @@ nvfp4_swizzle                        0.1395  4931.9       61.6%  (1,16) block, f
   granularity means 4× as many e8m0 scales (M/32 vs M/128) plus the per-scale e8m0 bit-math, and the
   transposed dim-M store remains the binding cost.
 
-* `fp32_to_bf16_sr_global_offsets` (compile) runs at only ~6.2% peak — ~3.2× slower than
-  `fp32_to_bf16_sr` (19.6%) for identical dithering math. The difference is how the Philox draw is
+* `fp32_to_bf16_sr_global_offsets` (compile) runs at only ~7.0% peak — ~4.2× slower (wall-clock) than
+  `fp32_to_bf16_sr` (29.3%) for identical dithering math. The difference is how the Philox draw is
   keyed. Both use `torch.func._random.uniform` (experimental stateless Philox → unfused
   `aten._philox_uniform`, so both share the same materialized-`u` ~46%-real-BW ceiling). The plain
   variant keys on tile-LOCAL position (one shared key, counter = flat index within the call), which
@@ -331,7 +335,7 @@ nvfp4_swizzle                        0.1395  4931.9       61.6%  (1,16) block, f
   `(seed, offset)` key pair, fine for 1D/full-width tiles but not 2D sub-blocks) — forces
   materializing a per-element `(numel, 2)` uint64 key tensor = **4.29 GB** (16 B/element, 8× the
   0.54 GB bf16 output), written then read back by a batched Philox. That ~8.5 GB key round-trip
-  triples total traffic (~12.3 GB vs ~3.76 GB), matching the 3.2× slowdown.
+  roughly triples total traffic (~12.3 GB vs ~3.76 GB), the bulk of the slowdown.
 
 ### Fix direction: key by global index without materializing keys
 
@@ -381,6 +385,18 @@ rand16 = (u * 65536).to(int32)
 
 </td></tr>
 </table>
+
+**The hand-written Triton kernel realizes this "ideal" and hits 77.0% — the fastest SR variant in the
+suite (vs the 7.0% compile mode, ~11×).** It's even simpler than the sketch above: because a standalone
+Triton kernel is handed the *whole* tensor and owns its own blocking (rather than a flex_tile_map
+sub-tile), an element's global index is just its flat position `f` in `x` — so there's no
+`global_row`/`global_col`/`num_col` to thread through, and no `base`/`strides` needed. It keys Philox on
+`counter = f >> 2` (via `tl.randint4x`, so one counter's 4 streams serve 4 consecutive elements),
+computed in-register from `f` alone. This makes the result **invariant to the internal block size**
+(the meaningful sense of "tile-invariant" for a standalone kernel — change `BLOCK` and every element
+still draws the same dither; the tile-*local* `fp32_to_bf16_sr` kernel, keyed on `pid*BLOCK+lane`, is
+not), with zero materialized key/uniform tensors — exactly the fused, never-materialize path the
+compile mode can't generate.
 
 ## Why `mxfp8_floor_dim_m` (59.9%) is slower than `fp8_deepseek_1x128_dim_m` (71.2%)
 
