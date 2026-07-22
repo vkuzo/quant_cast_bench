@@ -21,6 +21,9 @@ Coverage so far:
 * input orientation: x, x.t(), both
 * scale swizzles: none, blackwell_32_4_4
 
+Note: these are all **single kernel**.  For recipes such as nvfp4 with global outer scale, we assume that
+the outer scale is computed elsewhere and the user is responsible for composing the pieces together.
+
 ## tile invariance and quantization
 
 **tile invariance** of a function `f` is desireable as it gives a backend maximium
