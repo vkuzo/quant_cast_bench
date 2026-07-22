@@ -30,17 +30,17 @@ for the shape.
 ## Repro
 
 ```bash
-cd /home/dev/pytorch_scripts
+cd /home/dev/quant_cast_bench
 
 # torch.compile the gold reference fns (default mode)
-python quant_cast_bench/benchmark.py --mode compile
+python benchmarks/benchmark.py --mode compile
 
 # hand-written Triton kernels
-python quant_cast_bench/benchmark.py --mode triton
+python benchmarks/benchmark.py --mode triton
 
 # optional: single shape / single recipe
-python quant_cast_bench/benchmark.py --mode triton --M 16384 --K 16384
-python quant_cast_bench/benchmark.py --mode triton --recipe_name_filter mxfp8_floor_dim_m
+python benchmarks/benchmark.py --mode triton --M 16384 --K 16384
+python benchmarks/benchmark.py --mode triton --recipe_name_filter mxfp8_floor_dim_m
 ```
 
 Default shape is `(M, K) = (16384, 16384)`. Assumes a B200 (peak 8 TB/s).
