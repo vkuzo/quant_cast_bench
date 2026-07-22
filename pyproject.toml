@@ -9,7 +9,7 @@ description = "Reference recipes and benchmarks for single-kernel quantization c
 requires-python = ">=3.10"
 # torch / triton / nvidia-cutlass-dsl are environment-provided (CUDA nightly), so they are not
 # pinned here; only the light pure-Python deps used by the benchmark/flexquant are declared.
-dependencies = ["fire", "tabulate", "jinja2"]
+dependencies = ["fire", "tabulate", "jinja2", "matplotlib"]
 
 [tool.setuptools.packages.find]
 include = ["quant_cast_bench*"]
