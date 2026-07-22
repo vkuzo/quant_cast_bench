@@ -1,7 +1,25 @@
 # quant_cast_gold
 
-Golden **plain-PyTorch reference** recipes for single-kernel quant-casts (fp8 / mxfp8 / nvfp4 /
-stochastic-rounding / RHT), written in a near-tile-invariant way.
+LLM-friendly gold **plain-PyTorch reference** recipes for single-kernel quant-casts (fp8 / mxfp8 / nvfp4 /
+stochastic-rounding / RHT), written in a tile-invariant-friendly way.  The signature:
+
+```python
+@dataclass(frozen=True)
+class QuantCastSingleKernelGold:
+    # Callable[*inputs] -> *outputs - PyTorch native definition of a quant cast recipe
+    pt_ref_fn: Callable
+    # Callable[inputs, computed_outputs] - A function to test correctness of the outputs, throws on error
+    correctness_fn: Callable
+    # Convenience function to generate valid inputs
+    example_input_fn: Callable[[int, int], Tuple[torch.Tensor, ...]]
+    # String for humans to reason about performance considerations
+    perf_description: str
+```
+
+Coverage so far:
+* quant recipes: fp8 (deepseek, tensorwise, rowwise), mxfp8, nvfp4, RHT, RS
+* input orientation: x, x.t(), both
+* swizzles: none, blackwell_32_4_4
 
 ## tile invariance and quantization
 
