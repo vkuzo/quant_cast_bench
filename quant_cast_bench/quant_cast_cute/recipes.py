@@ -43,6 +43,7 @@ from quant_cast_bench.quant_cast_gold.recipes import (
     RowwiseFp8Gold,
     RowwisePrecalcGold,
     SrF32ToBf16,
+    SrF32ToBf16Global,
 )
 
 
@@ -2358,6 +2359,33 @@ def sr_bf16_cute(x, key, **kwargs):
 SR_F32_TO_BF16 = QuantCastCuteRecipe.from_gold(SrF32ToBf16, cute_fn=sr_bf16_cute)
 
 
+# ---------------------------------------------------------------------------
+# Tiling-INVARIANT fp32 -> bf16 stochastic rounding (mirrors sr_bf16_global_f). The gold SR pair
+# differs ONLY in RNG keying: sr_bf16_f keys the dither on the TILE-LOCAL element order (so tiling
+# changes the rounding -- the deliberate counterexample), while sr_bf16_global_f keys on each
+# element's GLOBAL flat index (tile-invariant). The Triton pair writes two distinct kernels: its plain
+# kernel keys on `pid*BLOCK + lane` (tile-local) and its global kernel on `f>>2` (global).
+#
+# The CuTeDSL SR kernel above is built on cute.make_identity_tensor global coordinates, so it ALREADY
+# keys Philox on each element's global flat index f (counter = f>>2, stream = f&3 -- see `p0 =
+# thrC[0][0]` and `ctr = p0//4 + g`), independent of _SR_THREADS/_SR_VPT. That is exactly the
+# tile-invariant "global offsets" scheme, so the global recipe reuses the same kernel: there is no
+# separate tile-local cute kernel to contrast against (the plain cute recipe is already global-keyed),
+# and duplicating the code would add nothing. `global_row`/`global_col`/`num_col` are flex_tile_map
+# artifacts a standalone kernel that owns its own tiling doesn't need.
+# ---------------------------------------------------------------------------
+def sr_bf16_global_cute(x, key, **kwargs):
+    """Tiling-invariant fp32 -> bf16 stochastic rounding (mirrors sr_bf16_global_f). The cute SR kernel
+    keys Philox on each element's global flat index (counter = f>>2, stream = f&3), which is already
+    tile-invariant, so this shares `sr_bf16_cute`'s kernel. Returns `(out,)`."""
+    return sr_bf16_cute(x, key, **kwargs)
+
+
+SR_F32_TO_BF16_GLOBAL = QuantCastCuteRecipe.from_gold(
+    SrF32ToBf16Global, cute_fn=sr_bf16_global_cute
+)
+
+
 ALL_RECIPES = [
     # elementwise
     ("fp8_tensorwise_precalc_scale", FP8_TENSORWISE_PRECALC_SCALE),
@@ -2385,4 +2413,5 @@ ALL_RECIPES = [
     ("bf16_rht", BF16_RHT),
     # stochastic rounding
     ("fp32_to_bf16_sr", SR_F32_TO_BF16),
+    ("fp32_to_bf16_sr_global_offsets", SR_F32_TO_BF16_GLOBAL),
 ]

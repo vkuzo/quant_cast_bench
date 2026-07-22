@@ -52,8 +52,8 @@ Default shape is `(M, K) = (16384, 16384)`. Assumes a B200 (peak 8 TB/s).
 ![Memory bandwidth by mode](mem_bw.png)
 
 *Achieved memory bandwidth (% of the B200 8 TB/s peak) per kernel, one marker per implementation
-(`compile` ●, `triton` ■, `cute` ▲). Kernels benchmarked in only some modes (e.g.
-`fp32_to_bf16_sr_global_offsets` has no cute impl) simply show fewer points. Data lives in
+(`compile` ●, `triton` ■, `cute` ▲). Every kernel is now implemented in all three modes (the
+`relu (baseline)` reference is the dashed ceiling line). Data lives in
 [`bench_results.csv`](bench_results.csv); regenerate the chart with `python benchmarks/plot_bench.py`.
 Refresh the data by re-running the sweeps with the
 `--csv` flag — `rm benchmarks/bench_results.csv` then
@@ -110,7 +110,7 @@ fp32_to_bf16_sr_global_offsets         0.2595  6206.6       77.6%  tile-invarian
 
 ### `--mode cute`
 
-The CuTeDSL (`cutlass.cute`) kernels are **correctness-first (naive tiling), with fourteen tuned
+The CuTeDSL (`cutlass.cute`) kernels are **correctness-first (naive tiling), with fifteen tuned
 exceptions** — treat the untuned rows as a functional baseline, not a fair comparison to the
 compile/triton numbers above:
 
@@ -269,6 +269,16 @@ compile/triton numbers above:
   also passes — the extra ALU of a full Philox is the price of matching the standard generator.
   fp32-in/bf16-out is 6 bytes/element, so the 83.5% isn't directly comparable to the bf16 relu ceiling.
 
+* `fp32_to_bf16_sr_global_offsets` (82.9%) — the tiling-invariant SR counterpart. In the gold/triton
+  pair the two SR recipes differ in RNG keying: the plain one keys the dither on the *tile-local*
+  element order (so tiling changes the rounding — the deliberate counterexample), the global one keys
+  on each element's *global* flat index (tile-invariant). But the CuTeDSL SR kernel is built on
+  `cute.make_identity_tensor` global coordinates, so it **already** keys Philox on the global flat
+  index (counter = flat index // 4, stream = flat index % 4), independent of the tile shape. That is
+  exactly the "global offsets" scheme, so this recipe reuses the same kernel — there is no separate
+  tile-local cute kernel to contrast against, and the ±0.6-pt gap from `fp32_to_bf16_sr` is run-to-run
+  variance on identical code.
+
 ```
 shape: (16384, 16384)  mode: cute
 recipe                          gpu_time_ms    gbps    pct_peak  perf_description
@@ -287,7 +297,8 @@ fp8_rowwise                           0.1328  6066.8       75.8%  (1,-1) block
 fp8_colwise                           0.2183  3688.8       46.1%  (-1,1) block, t-contig
 nvfp4_swizzle                         0.1422    4838       60.5%  (1,16) block, fp4 qdata, swizzle
 bf16_rht                              0.1968  5456.1       68.2%  16x16 RHT, warp mma.sync (4x2 tiles)
-fp32_to_bf16_sr                       0.2411    6679       83.5%  elementwise SR, hand-written Philox-4x32
+fp32_to_bf16_sr                       0.2407  6691.8       83.6%  elementwise SR, hand-written Philox-4x32
+fp32_to_bf16_sr_global_offsets        0.2429  6629.7       82.9%  tile-invariant SR, same global-keyed kernel
 ```
 
 ## Known issues
@@ -443,6 +454,12 @@ computed in-register from `f` alone. This makes the result **invariant to the in
 still draws the same dither; the tile-*local* `fp32_to_bf16_sr` kernel, keyed on `pid*BLOCK+lane`, is
 not), with zero materialized key/uniform tensors — exactly the fused, never-materialize path the
 compile mode can't generate.
+
+The CuTeDSL kernel reaches the same 82.9% as its plain SR sibling because it is *literally the same
+kernel*: the cute SR kernel is built on `cute.make_identity_tensor` global coordinates, so it already
+keys its hand-written Philox on each element's global flat index (`counter = f >> 2`) regardless of
+the tile shape — it was tile-invariant from the start, so the "global offsets" recipe just reuses it
+(there is no separate tile-local cute kernel to contrast against, unlike the Triton pair).
 
 ## Why `mxfp8_floor_dim_m` (59.9%) is slower than `fp8_deepseek_1x128_dim_m` (71.2%)
 
