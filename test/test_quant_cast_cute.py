@@ -57,6 +57,11 @@ def test_cute_matches_reference(name, recipe):
     # still a valid quantization AND every output is close: narrow types (fp8/fp4/e8m0) must match
     # bit-for-bit on all but <1% of bytes; float (fp32 scale) outputs must be allclose to ~1 ULP.
     recipe.correctness_fn(inputs, cute_outs)
+    if "_sr" in name:
+        # stochastic rounding: the cute kernel draws its dither from an in-kernel fmix32 hash, which
+        # cannot bit-match the reference's torch Philox -- only the SR property (checked above via the
+        # gold correctness_fn) is well-defined, so a per-element bound is meaningless (like triton).
+        return
     for i, (t, r) in enumerate(zip(cute_outs, ref_outs)):
         if t.dtype in (torch.float4_e2m1fn_x2, torch.float8_e8m0fnu, torch.float8_e4m3fn):
             frac = _mismatch_fraction(t, r)

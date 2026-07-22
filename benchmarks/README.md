@@ -52,8 +52,8 @@ Default shape is `(M, K) = (16384, 16384)`. Assumes a B200 (peak 8 TB/s).
 ![Memory bandwidth by mode](mem_bw.png)
 
 *Achieved memory bandwidth (% of the B200 8 TB/s peak) per kernel, one marker per implementation
-(`compile` ●, `triton` ■, `cute` ▲). Kernels benchmarked in only some modes (e.g. the two SR kernels
-have no cute impl) simply show fewer points. Data lives in
+(`compile` ●, `triton` ■, `cute` ▲). Kernels benchmarked in only some modes (e.g.
+`fp32_to_bf16_sr_global_offsets` has no cute impl) simply show fewer points. Data lives in
 [`bench_results.csv`](bench_results.csv); regenerate the chart with `python benchmarks/plot_bench.py`.
 Refresh the data by re-running the sweeps with the
 `--csv` flag — `rm benchmarks/bench_results.csv` then
@@ -110,7 +110,7 @@ fp32_to_bf16_sr_global_offsets         0.2595  6206.6       77.6%  tile-invarian
 
 ### `--mode cute`
 
-The CuTeDSL (`cutlass.cute`) kernels are **correctness-first (naive tiling), with thirteen tuned
+The CuTeDSL (`cutlass.cute`) kernels are **correctness-first (naive tiling), with fourteen tuned
 exceptions** — treat the untuned rows as a functional baseline, not a fair comparison to the
 compile/triton numbers above:
 
@@ -253,6 +253,22 @@ compile/triton numbers above:
   vs the torch reference: bf16×bf16 is exact in fp32, so the tensor-core fp32 accumulation reproduces
   torch's bf16 matmul (the cute test compares bf16 outputs to ~1 ULP, i.e. demands exactness).
 
+* `fp32_to_bf16_sr` (83.5%) — stochastic-rounding fp32→bf16, a pure elementwise streaming cast (read
+  fp32, write bf16), so it takes the same DRAM-speed-of-light recipe as `fp8_tensorwise`: flatten to
+  1-D, 256 threads/CTA, VPT=8 with 128-bit vectorized load/store (8 fp32 = 2×128b in, 8 bf16 = 1×128b
+  out; VPT=4 drops to 70.5% — the 64-bit store loses the vectorization). CuTeDSL exposes no
+  counter-based PRNG intrinsic (unlike Triton's `tl.randint4x`), so the dither comes from a
+  **hand-written Philox-4×32-10** (`_philox_4x32`) — the same generator torch/triton use, built out of
+  the DSL's integer ops (the mulhilo step widens to `Uint64`; verified bit-exact vs the Random123
+  reference). It's keyed like the global SR kernel (counter = flat index // 4, one call dithers 4
+  consecutive elements from its 4 outputs' top 16 bits). The test only checks the SR *property*
+  (unbiased, lands on the two bracketing bf16 grid points — mean error ~1e-5 vs the 1e-3 tolerance),
+  not a bit-match. This is the **fastest SR path** — beats triton (72.3%, `tl.randint4x` in-register)
+  and is ~2.8× compile (29.3%, which wastes a DRAM round-trip materializing the uniforms; see Known
+  issues). The 10-round Philox mix costs ~5 pts vs a cheap MurmurHash3 fmix32 dither (88.0%), which
+  also passes — the extra ALU of a full Philox is the price of matching the standard generator.
+  fp32-in/bf16-out is 6 bytes/element, so the 83.5% isn't directly comparable to the bf16 relu ceiling.
+
 ```
 shape: (16384, 16384)  mode: cute
 recipe                          gpu_time_ms    gbps    pct_peak  perf_description
@@ -271,6 +287,7 @@ fp8_rowwise                           0.1328  6066.8       75.8%  (1,-1) block
 fp8_colwise                           0.2183  3688.8       46.1%  (-1,1) block, t-contig
 nvfp4_swizzle                         0.1422    4838       60.5%  (1,16) block, fp4 qdata, swizzle
 bf16_rht                              0.1968  5456.1       68.2%  16x16 RHT, warp mma.sync (4x2 tiles)
+fp32_to_bf16_sr                       0.2411    6679       83.5%  elementwise SR, hand-written Philox-4x32
 ```
 
 ## Known issues
@@ -287,6 +304,9 @@ bf16_rht                              0.1968  5456.1       68.2%  16x16 RHT, war
   (~2–3× speedup). **The hand-written Triton kernel does exactly this and confirms the prediction:
   `tl.randint4x` generates the Philox uniforms in-register (never materializing `u`), so it moves
   ~1.61 GB in one pass and hits 72.2% — ~2.5× the compile mode's 29.3% and near the relu ceiling.**
+  The CuTeDSL kernel goes further (83.5%): the same one-pass, in-register dither with 128-bit
+  vectorized fp32-load/bf16-store, using a hand-written Philox-4×32-10 (CuTeDSL has no PRNG intrinsic,
+  so it's built from the DSL's integer ops — bit-exact vs the Random123 reference).
 
 * `bf16_rht` (compile) runs at only ~29% peak, and here the traffic is not wasted (the whole 1.07 GB
   is useful read x + write out) — it's GEMM-kernel inefficiency. The 16×16 RHT `x.reshape(..., 16) @ rht`
