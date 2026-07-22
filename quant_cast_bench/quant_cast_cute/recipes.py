@@ -2391,22 +2391,23 @@ ALL_RECIPES = [
     ("fp8_tensorwise_precalc_scale", FP8_TENSORWISE_PRECALC_SCALE),
     ("fp8_rowwise_precalc_scale", FP8_ROWWISE_PRECALC_SCALE),
     ("fp8_colwise_precalc_scale", FP8_COLWISE_PRECALC_SCALE),
-    # 1x32, 8-bit
+    # 8-bit 1D, dim-k reduction
     ("mxfp8_floor", MXFP8_FLOOR),
     ("mxfp8_floor_swizzle", MXFP8_FLOOR_SWIZZLE),
-    ("mxfp8_floor_dim_m", MXFP8_FLOOR_DIM_M),
-    ("mxfp8_floor_dim_km", MXFP8_FLOOR_DIM_KM),
-    ("mxfp8_32x32_floor", MXFP8_32X32_FLOOR),
-    # 1x128, 8-bit
     ("fp8_deepseek_1x128", FP8_DEEPSEEK_1X128),
+    # 8-bit 1D, dim-m reduction
+    ("mxfp8_floor_dim_m", MXFP8_FLOOR_DIM_M),
     ("fp8_deepseek_1x128_dim_m", FP8_DEEPSEEK_1X128_DIM_M),
+    # 8-bit 1D, dim-km reduction
+    ("mxfp8_floor_dim_km", MXFP8_FLOOR_DIM_KM),
     ("fp8_deepseek_1x128_dim_km", FP8_DEEPSEEK_1X128_DIM_KM),
-    # 128x128, 8-bit
+    # 8-bit 2D
+    ("mxfp8_32x32_floor", MXFP8_32X32_FLOOR),
     ("fp8_deepseek_128x128", FP8_DEEPSEEK_128X128),
-    # rowwise/colwise, 8-bit
+    # 8-bit rowwise/colwise
     ("fp8_rowwise", FP8_ROWWISE),
     ("fp8_colwise", FP8_COLWISE),
-    # 1x16, 4-bit
+    # 4 bit 1D
     ("nvfp4_swizzle", NVFP4_SWIZZLE),
     ("nvfp4_blocked_outer", NVFP4_BLOCKED_OUTER),
     # RHT
