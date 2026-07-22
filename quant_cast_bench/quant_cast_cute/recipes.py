@@ -845,53 +845,134 @@ MXFP8_FLOOR_SWIZZLE = QuantCastCuteRecipe.from_gold(
 
 
 # ---------------------------------------------------------------------------
-# deepseek fp8 128x128: one fp32 scale per 128x128 block (amax over the whole block). One warp per
-# block; thread r owns 4 chunks of 128 cols across 4 of the 128 rows... simpler: 32 threads each own
-# 512 vals (128*128/32 = 512) via a (32, 512) tv-layout over the flattened block, intra-thread reduce
-# then warp_reduction over the 32 threads. Mirrors deepseek_128x128_f. Grid = (M//128, N//128).
+# deepseek fp8 128x128: one fp32 scale per 128x128 block (amax over the whole block). The block is a
+# strided 2D region (128 rows N apart), so the old 32-thread/warp kernel with a (32,512) tv-layout had
+# uncoalesced loads across the warp (~4.5% peak). Like `..._dim_m`, the fix is TMA -- but this cast is
+# NON-transposing (y is (M,N) like x), so it's simpler: no register->smem transpose, both tiles
+# row-major (128,128). One CTA per block:
+#   - TMA G2S loads the (128,128) tile into smem (sIN);
+#   - each thread reduces its VPT contiguous elements to a local amax (32-wide vector reduce), then a
+#     warp-reduce + smem block-reduce yields the whole-block amax; scale = max(amax,1e-12)/448;
+#   - each thread re-reads its chunk (cheap smem), quantizes (vectorized f32->fp8), writes to sOUT;
+#   - TMA S2G stores sOUT into the (128,128) tile of the row-major output.
+# The fp32 scale is written once per block by thread 0. Mirrors deepseek_128x128_f.
 # ---------------------------------------------------------------------------
+_D128_TILE = 128
+_D128_THREADS = 128                                      # tuned on B200 @ 16384 (128 best: 256->45%, 64->56%)
+_D128_VPT = (_D128_TILE * _D128_TILE) // _D128_THREADS   # elems/thread (strided, coalesced)
+_D128_WARPS = _D128_THREADS // 32
+_D128_CHUNKS = _D128_VPT // 32                            # 32-wide chunks per thread (vectorize)
+_D128_BYTES = _D128_TILE * _D128_TILE * 2                # bf16 tile bytes for the TMA expect-tx
+
+
+@cute.struct
+class _Deepseek128Smem:
+    bar: cute.struct.MemRange[cutlass.Int64, 1]
+    red: cute.struct.MemRange[cutlass.Float32, _D128_WARPS]     # per-warp amax scratch
+    sin: cute.struct.Align[cute.struct.MemRange[cutlass.BFloat16, _D128_TILE * _D128_TILE], 1024]
+    sout: cute.struct.Align[cute.struct.MemRange[cutlass.Float8E4M3FN, _D128_TILE * _D128_TILE], 1024]
+
+
 @cute.kernel
-def _deepseek_128x128_kernel(gX: cute.Tensor, gY: cute.Tensor, gScale: cute.Tensor, tv_layout: cute.Layout):
+def _deepseek_128x128_kernel(atom_in: cute.CopyAtom, ten_in: cute.Tensor, atom_out: cute.CopyAtom,
+                             ten_out: cute.Tensor, scales: cute.Tensor, sil: cute.Layout,
+                             sol: cute.Layout, ncb: cutlass.Constexpr):
     tidx, _, _ = cute.arch.thread_idx()
-    bidx, _, _ = cute.arch.block_idx()
-    thrX = cute.composition(gX[(None, bidx)], tv_layout)[(tidx, None)]
-    thrY = cute.composition(gY[(None, bidx)], tv_layout)[(tidx, None)]
-    frgX = cute.make_rmem_tensor(cute.get(tv_layout, mode=[1]), gX.element_type)
-    cute.copy(cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gX.element_type), thrX, frgX)
-    v = frgX.load().to(cutlass.Float32)
-    local = cutlass.max(v, -v).reduce(cute.ReductionOp.MAX, cutlass.Float32(0.0), 0)
-    amax = cutlass.max(cute.arch.warp_reduction_max(local), cutlass.Float32(1e-12))
-    scale = amax / 448.0
-    frgY = cute.make_rmem_tensor(cute.get(tv_layout, mode=[1]), gY.element_type)
-    frgY.store((v * (1.0 / scale)).to(gY.element_type))
-    cute.copy(cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gY.element_type), frgY, thrY)
+    bidx, bidy, _ = cute.arch.block_idx()   # bidx = m_tile, bidy = n_tile
+    warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+    smem = utils.SmemAllocator()
+    st = smem.allocate(_Deepseek128Smem)
+    bar = st.bar.data_ptr()
     if tidx == 0:
-        gScale[(None, bidx)][0] = scale
+        cute.arch.mbarrier_init(bar, 1)
+    cute.arch.mbarrier_init_fence()
+    cute.arch.sync_threads()
+    sIN = st.sin.get_tensor(sil)
+    sOUT = st.sout.get_tensor(sol)
+    red = st.red.get_tensor(cute.make_layout(_D128_WARPS))
+    gIN = cute.local_tile(ten_in, (_D128_TILE, _D128_TILE), (None, None))
+    gOUT = cute.local_tile(ten_out, (_D128_TILE, _D128_TILE), (None, None))
+    tAsA, tAgA = cpasync.tma_partition(atom_in, 0, cute.make_layout(1),
+                                       cute.group_modes(sIN, 0, 2), cute.group_modes(gIN, 0, 2))
+    tOsO, tBgB = cpasync.tma_partition(atom_out, 0, cute.make_layout(1),
+                                       cute.group_modes(sOUT, 0, 2), cute.group_modes(gOUT, 0, 2))
+    if warp == 0:
+        with cute.arch.elect_one():
+            cute.arch.mbarrier_arrive_and_expect_tx(bar, _D128_BYTES)
+        cute.copy(atom_in, tAgA[(None, bidx, bidy)], tAsA, tma_bar_ptr=bar)
+    cute.arch.mbarrier_wait(bar, 0)
+
+    # Thread t owns the strided (coalesced) positions {t + i*THREADS}: at each step lanes 0..31 hit
+    # consecutive smem addresses -> conflict-free. (Contiguous VPT-runs put all 32 lanes on one bank.)
+    # pass 1: per-thread amax over its VPT elems (32-wide chunks), then block-reduce.
+    local = cutlass.Float32(0.0)
+    for c in cutlass.range_constexpr(_D128_CHUNKS):
+        frg = cute.make_rmem_tensor(cute.make_layout(32), cutlass.Float32)
+        for r in cutlass.range_constexpr(32):
+            fp = tidx + (c * 32 + r) * _D128_THREADS
+            frg[r] = sIN[fp // 128, fp % 128].to(cutlass.Float32)
+        v = frg.load()
+        local = cutlass.max(local, cute.where(v < 0, -v, v).reduce(
+            cute.ReductionOp.MAX, cutlass.Float32(0.0), 0))
+    wmax = cute.arch.warp_reduction_max(local)
+    if tidx % 32 == 0:
+        red[warp] = wmax
+    cute.arch.sync_threads()
+    bmax = red[0]
+    for w in cutlass.range_constexpr(1, _D128_WARPS):
+        bmax = cutlass.max(bmax, red[w])
+    scale = cutlass.max(bmax, cutlass.Float32(1e-12)) / 448.0
+    inv = 1.0 / scale                                         # reciprocal-mul, not per-element divs
+    if tidx == 0:
+        scales[bidx * ncb + bidy] = scale.to(scales.element_type)
+    # pass 2: re-read (cheap smem), quantize (vectorized f32->fp8), write to sOUT.
+    for c in cutlass.range_constexpr(_D128_CHUNKS):
+        frg = cute.make_rmem_tensor(cute.make_layout(32), cutlass.Float32)
+        for r in cutlass.range_constexpr(32):
+            fp = tidx + (c * 32 + r) * _D128_THREADS
+            frg[r] = sIN[fp // 128, fp % 128].to(cutlass.Float32)
+        frgOut = cute.make_rmem_tensor(cute.make_layout(32), cutlass.Float8E4M3FN)
+        frgOut.store((frg.load() * inv).to(cutlass.Float8E4M3FN))
+        for r in cutlass.range_constexpr(32):
+            fp = tidx + (c * 32 + r) * _D128_THREADS
+            sOUT[fp // 128, fp % 128] = frgOut[r]
+
+    cute.arch.fence_proxy("async.shared", space="cta")
+    cute.arch.sync_threads()
+    if warp == 0:
+        cute.copy(atom_out, tOsO, tBgB[(None, bidx, bidy)])
 
 
 @cute.jit
-def _deepseek_128x128_jit(mX, mY, mScale):
-    # 32 threads x 512 vals cover the 128x128 = 16384-element block; thread t owns rows where
-    # (row*128 + col) falls in its stripe. Layout the block row-major (128,128) and tile with a
-    # (32, 512) TV mapping over the 16384 linear positions.
-    tv_layout = cute.make_layout((32, 512), stride=(512, 1))
-    gX = cute.zipped_divide(mX, (128, 128))
-    gY = cute.zipped_divide(mY, (128, 128))
-    gScale = cute.zipped_divide(mScale, (1, 1))
-    _deepseek_128x128_kernel(gX, gY, gScale, tv_layout).launch(
-        grid=[cute.size(gX, mode=[1]), 1, 1], block=[32, 1, 1])
+def _deepseek_128x128_jit(mIN, mOUT, scales, ncb: cutlass.Constexpr):
+    sil = cute.make_layout((_D128_TILE, _D128_TILE), stride=(_D128_TILE, 1))
+    sol = cute.make_layout((_D128_TILE, _D128_TILE), stride=(_D128_TILE, 1))
+    atom_in, ten_in = cpasync.make_tiled_tma_atom(
+        cpasync.CopyBulkTensorTileG2SOp(), mIN, sil, (_D128_TILE, _D128_TILE))
+    atom_out, ten_out = cpasync.make_tiled_tma_atom(
+        cpasync.CopyBulkTensorTileS2GOp(), mOUT, sol, (_D128_TILE, _D128_TILE))
+    M2, N2 = mIN.shape
+    grid = ((M2 + _D128_TILE - 1) // _D128_TILE, (N2 + _D128_TILE - 1) // _D128_TILE, 1)
+    _deepseek_128x128_kernel(atom_in, ten_in, atom_out, ten_out, scales, sil, sol,
+                             ncb).launch(grid=grid, block=(_D128_THREADS, 1, 1), cluster=(1, 1, 1))
 
 
 def fp8_deepseek_128x128_cute(x, **kwargs):
     assert x.is_contiguous() and x.dim() == 2
     M, N = x.shape
+    assert M % _D128_TILE == 0 and N % _D128_TILE == 0, \
+        f"deepseek_128x128 cute kernel needs M%{_D128_TILE}==0 and N%{_D128_TILE}==0"
     y = torch.empty(M, N, dtype=torch.float8_e4m3fn, device=x.device)
-    s = torch.empty(M // 128, N // 128, dtype=torch.float32, device=x.device)
-    mX = from_dlpack(x).mark_layout_dynamic()
-    mY = from_dlpack(y).mark_layout_dynamic()
-    mS = from_dlpack(s).mark_layout_dynamic()
-    fn = _compiled(("deepseek_128x128", M, N), _deepseek_128x128_jit, mX, mY, mS)
-    fn(mX, mY, mS)
+    ncb = N // 128
+    s = torch.empty(M // 128, ncb, dtype=torch.float32, device=x.device)
+    # TMA needs full layout/divisibility marking (leading dim contiguous, 16-elem aligned).
+    mIN = (from_dlpack(x, assumed_align=16).mark_layout_dynamic(leading_dim=1)
+           .mark_compact_shape_dynamic(mode=1, divisibility=16))
+    mOUT = (from_dlpack(y, assumed_align=16).mark_layout_dynamic(leading_dim=1)
+            .mark_compact_shape_dynamic(mode=1, divisibility=16))
+    scales = from_dlpack(s.reshape(-1)).mark_layout_dynamic()
+    fn = _compiled(("deepseek_128x128", M, N), _deepseek_128x128_jit, mIN, mOUT, scales, ncb)
+    fn(mIN, mOUT, scales)
     return y, s
 
 
