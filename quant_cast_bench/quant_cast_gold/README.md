@@ -44,6 +44,8 @@ Findings:
    - (acceptable) flex_tile_map with a dummy backend, to enable fusion of gemm + f to flex_gemm(..., f)
      - Note: a reason for this to exist with today's tooling is line up torch.autograd.Function boundaries for CODA flex_gemm
      - to get good performance with flex_tile_map + general case of quant, we need a compiler that outputs cuteDSL
+     - TODO talk about new input broadcasting cases
+     - TODO talk about example flex_tile_map API
 3. options for quant cast API backend
    - (acceptable) per-recipe human written gold reference + LLM kernel gen
    - lowering target
