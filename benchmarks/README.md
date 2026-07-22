@@ -90,22 +90,22 @@ fp32_to_bf16_sr_global_offsets         2.8898   557.3        7.0%  elementwise S
 shape: (16384, 16384)  mode: triton
 recipe                            gpu_time_ms    gbps    pct_peak  perf_description
 ------------------------------  -------------  ------  ----------  -------------------------------------------------
-relu (baseline)                        0.1791  5995.4       74.9%
-fp8_tensorwise_precalc_scale           0.1423    5658       70.7%  elementwise
-mxfp8_floor_swizzle                     0.133    6119       76.5%  (1,32) block, swizzle
-fp8_deepseek_1x128                     0.1343  6060.3       75.8%  (1,128) block
-mxfp8_floor_dim_m                      0.1832  4441.6       55.5%  (32,1) block, t-contig
-fp8_deepseek_1x128_dim_m                0.162    5024       62.8%  (128,1) block, t-contig
-mxfp8_floor_dim_km                     0.3022    3608       45.1%  (1,32) dim-k + (32,1) dim-m, one pass, t-contig
-fp8_deepseek_1x128_dim_km               0.253    4310       53.9%  (1,128) dim-k + (128,1) dim-m, one pass, t-contig
-mxfp8_32x32_floor                      0.1319  6108.5       76.4%  (32,32) block
-fp8_deepseek_128x128                   0.1309  6153.1       76.9%  (128,128) block
-fp8_rowwise                            0.1378  5845.4       73.1%  (1,-1) block
-fp8_colwise                            0.2439  3301.7       41.3%  (-1,1) block, t-contig
-nvfp4_swizzle                          0.1391  4944.3       61.8%  (1,16) block, fp4 qdata, swizzle
-bf16_rht                               0.1982  5418.6       67.7%  16x16 RHT, tl.dot (BLOCK_G=512)
-fp32_to_bf16_sr                        0.2781  5790.7       72.4%  elementwise SR, tl.randint4x (tile-local)
-fp32_to_bf16_sr_global_offsets         0.2611  6167.6       77.1%  tile-invariant SR, global-index key
+relu (baseline)                        0.1791  5994.5       74.9%
+fp8_tensorwise_precalc_scale            0.143  5629.6       70.4%  elementwise
+mxfp8_floor_swizzle                    0.1314  6191.7       77.4%  (1,32) block, swizzle
+fp8_deepseek_1x128                     0.1344  6052.4       75.7%  (1,128) block
+mxfp8_floor_dim_m                      0.1788  4551.6       56.9%  (32,1) block, t-contig
+fp8_deepseek_1x128_dim_m               0.1468    5543       69.3%  (128,1) block, t-contig
+mxfp8_floor_dim_km                     0.3106  3511.4       43.9%  (1,32) dim-k + (32,1) dim-m, one pass, t-contig
+fp8_deepseek_1x128_dim_km              0.2555  4267.5       53.3%  (1,128) dim-k + (128,1) dim-m, one pass, t-contig
+mxfp8_32x32_floor                      0.1322  6095.4       76.2%  (32,32) block
+fp8_deepseek_128x128                   0.1308  6156.4       77.0%  (128,128) block
+fp8_rowwise                            0.1382  5829.3       72.9%  (1,-1) block
+fp8_colwise                            0.2413    3338       41.7%  (-1,1) block, t-contig
+nvfp4_swizzle                          0.1386  4962.1       62.0%  (1,16) block, fp4 qdata, swizzle
+bf16_rht                               0.1984  5411.1       67.6%  16x16 RHT, tl.dot (BLOCK_G=512)
+fp32_to_bf16_sr                        0.2773  5807.7       72.6%  elementwise SR, tl.randint4x (tile-local)
+fp32_to_bf16_sr_global_offsets         0.2612  6165.2       77.1%  tile-invariant SR, global-index key
 ```
 
 ### `--mode cute`
