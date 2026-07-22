@@ -15,6 +15,8 @@ for the shape.
   - For example, on mxfp8_floor_dim_m, inductor 17.5% peak mem -> triton 59.9% peak mem
 * fp4
   - nvfp4_swizzle: inductor 23.3% peak mem -> triton 62.6% peak mem
+* skinny (small-K/N) matmuls that are really memory-bound (inductor lowers to a cuBLAS GEMM)
+  - bf16_rht (16x16 RHT): inductor 29.3% peak mem -> triton 67.7% peak mem
 
 ## triton gaps vs SOL (CUDA / CUTLASS / cute)
 
@@ -50,8 +52,8 @@ Default shape is `(M, K) = (16384, 16384)`. Assumes a B200 (peak 8 TB/s).
 ![Memory bandwidth by mode](mem_bw.png)
 
 *Achieved memory bandwidth (% of the B200 8 TB/s peak) per kernel, one marker per implementation
-(`compile` ●, `triton` ■, `cute` ▲). Kernels benchmarked in only some modes (e.g. the compile-only
-`bf16_rht`) simply show fewer points. Data lives in
+(`compile` ●, `triton` ■, `cute` ▲). Kernels benchmarked in only some modes (e.g. `bf16_rht` and the
+two SR kernels have no cute impl) simply show fewer points. Data lives in
 [`bench_results.csv`](bench_results.csv); regenerate the chart with `python benchmarks/plot_bench.py`.
 Refresh the data by re-running the sweeps with the
 `--csv` flag — `rm benchmarks/bench_results.csv` then
@@ -88,21 +90,22 @@ fp32_to_bf16_sr_global_offsets         2.8902   557.3        7.0%  elementwise S
 shape: (16384, 16384)  mode: triton
 recipe                            gpu_time_ms    gbps    pct_peak  perf_description
 ------------------------------  -------------  ------  ----------  -------------------------------------------------
-relu (baseline)                        0.1791  5994.5       74.9%
-fp8_tensorwise_precalc_scale           0.1431  5625.7       70.3%  elementwise
-mxfp8_floor_swizzle                    0.1301  6254.8       78.2%  (1,32) block, swizzle
-mxfp8_floor_dim_m                      0.1788  4551.5       56.9%  (32,1) block, t-contig
-mxfp8_floor_dim_km                     0.2976  3664.7       45.8%  (1,32) dim-k + (32,1) dim-m, one pass, t-contig
-mxfp8_32x32_floor                      0.1299  6201.5       77.5%  (32,32) block
-fp8_deepseek_1x128                     0.1345  6051.8       75.6%  (1,128) block
-fp8_deepseek_1x128_dim_m               0.1592  5110.3       63.9%  (128,1) block, t-contig
-fp8_deepseek_1x128_dim_km              0.2534  4302.9       53.8%  (1,128) dim-k + (128,1) dim-m, one pass, t-contig
-fp8_deepseek_128x128                    0.131  6147.9       76.8%  (128,128) block
-fp8_rowwise                            0.1396  5767.6       72.1%  (1,-1) block
-fp8_colwise                            0.2324  3466.1       43.3%  (-1,1) block, t-contig
-nvfp4_swizzle                          0.1391  4944.8       61.8%  (1,16) block, fp4 qdata, swizzle
-fp32_to_bf16_sr                        0.2784  5786.2       72.3%  elementwise SR, tl.randint4x (tile-local)
-fp32_to_bf16_sr_global_offsets         0.2615  6158.4       77.0%  tile-invariant SR, global-index key
+relu (baseline)                        0.1791  5995.3       74.9%
+fp8_tensorwise_precalc_scale            0.143  5630.3       70.4%  elementwise
+mxfp8_floor_swizzle                    0.1278  6365.3       79.6%  (1,32) block, swizzle
+mxfp8_floor_dim_m                      0.1838  4426.2       55.3%  (32,1) block, t-contig
+mxfp8_floor_dim_km                     0.3083  3537.5       44.2%  (1,32) dim-k + (32,1) dim-m, one pass, t-contig
+mxfp8_32x32_floor                      0.1324  6084.4       76.1%  (32,32) block
+fp8_deepseek_1x128                     0.1346    6044       75.6%  (1,128) block
+fp8_deepseek_1x128_dim_m               0.1618  5028.3       62.9%  (128,1) block, t-contig
+fp8_deepseek_1x128_dim_km              0.2561    4258       53.2%  (1,128) dim-k + (128,1) dim-m, one pass, t-contig
+fp8_deepseek_128x128                   0.1308  6158.1       77.0%  (128,128) block
+fp8_rowwise                            0.1385  5812.9       72.7%  (1,-1) block
+fp8_colwise                            0.2342    3439       43.0%  (-1,1) block, t-contig
+nvfp4_swizzle                          0.1381  4980.5       62.3%  (1,16) block, fp4 qdata, swizzle
+bf16_rht                               0.1982    5417       67.7%  16x16 RHT, tl.dot (BLOCK_G=512)
+fp32_to_bf16_sr                        0.2786    5781       72.3%  elementwise SR, tl.randint4x (tile-local)
+fp32_to_bf16_sr_global_offsets         0.2595  6206.6       77.6%  tile-invariant SR, global-index key
 ```
 
 ### `--mode cute`
@@ -278,7 +281,11 @@ nvfp4_swizzle                        0.1442  4771.6       59.6%  (1,16) block, f
   wasted, no K-reuse to amortize), so it fails to saturate DRAM — 29% vs the ~75% relu ceiling for the
   same 1.07 GB (~2.6× slower than bandwidth-bound). Fix direction: a fused kernel that loads a 16-vector,
   applies the transform in registers, and writes 16 (or a Triton matmul template tuned for the skinny
-  shape) would approach the relu ceiling.
+  shape) would approach the relu ceiling. **The hand-written Triton kernel confirms this and hits 67.7%**
+  (~2.3× the compile 29.3%, near the 74.9% relu ceiling): it flattens `x` to `(n_groups, 16)` and runs a
+  batch of `(BLOCK_G, 16) @ (16, 16)` `tl.dot`s (fp32 accum → bf16) in one pass. The win comes from a
+  large `BLOCK_G=512` — each program does a `512×16` tile, amortizing the tiny `K=16` dot that cuBLAS
+  can't tile well and turning the load/store into big coalesced runs.
 
 * `nvfp4_swizzle` (compile) runs at only ~23% peak (vs the Triton kernel's 62.6%), because inductor
   splits it into **3 separate kernels** instead of one fused pass:
