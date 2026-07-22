@@ -94,7 +94,7 @@ nvfp4_swizzle                        0.1371  5017.3       62.7%  (1,16) block, f
 
 ### `--mode cute`
 
-The CuTeDSL (`cutlass.cute`) kernels are **correctness-first (naive tiling), with seven tuned
+The CuTeDSL (`cutlass.cute`) kernels are **correctness-first (naive tiling), with eight tuned
 exceptions** — treat the untuned rows as a functional baseline, not a fair comparison to the
 compile/triton numbers above:
 
@@ -145,12 +145,23 @@ compile/triton numbers above:
   `evict_last`/`evict_first` hints — to quantize and store. Registers drop to 32, occupancy to 90%,
   DRAM to 82.6%. Beats triton (76.7%) and matches compile (79.0%); the extra L2 read pass costs
   little at this occupancy. (Replaces the old one-warp-per-row scalar kernel at 3.0%.)
+* `fp8_colwise` (46.0%) — one fp32 scale per column, amax over all rows, transposed (N,M) output.
+  The reduction is *down* a column (the strided axis of row-major x), so a naive kernel is forced
+  into uncoalesced reads (1.6%). Mirror triton's two coalesced passes but drive both with **TMA**:
+  pass 1 TMA-loads (128,256) tiles, each thread reduces its column's rows in smem to a partial amax,
+  then `atomic_max_float32` into a (N,) scratch (combining across the M-grid); pass 2 TMA-loads
+  (64,256) tiles, quantizes each column with the precomputed `amax/448` scale, transposes in the
+  register→smem write (like `mxfp8_floor_dim_m`), and TMA-stores the (256,64) tile. The TMA engine
+  streams the strided tiles at DRAM speed — a hand-rolled strided row-segment read of x caps the amax
+  pass at ~42% (152 µs) vs TMA's ~67% (93 µs). Beats triton (43.8%) and compile (25.6%). The ~51%
+  ceiling is structural: a full-column amax forces reading x *twice* and, unlike rowwise, the quant
+  re-read misses L2 (a full column is 32 KB·M, far larger than L2; the whole 512 MB streams between
+  the two kernels). L2-panel tiling doesn't help — separate TMA kernels don't retain the panel, and
+  per-CTA reuse needs <6 concurrent CTAs. (Replaces the old scalar `x.t()` path at 1.6%.)
 
 Everything else is a single naive kernel: `nvfp4_swizzle` does serial per-thread reductions with
-tiny transfers, and `fp8_colwise` uses one warp per column feeding `x.t()`, so every load is
-uncoalesced (it reuses rowwise's old scalar kernel on the transposed view — the vectorized loop
-kernel can't drive its strided reads). Their percentages are far below the compile/triton
-equivalents and aren't meaningful yet — tuning them is future work.
+tiny transfers, so its percentage is far below the compile/triton equivalents and isn't meaningful
+yet — tuning it is future work.
 
 ```
 shape: (16384, 16384)  mode: cute
@@ -165,7 +176,7 @@ fp8_deepseek_1x128                   0.1381  5891.7       73.6%  (1,128) block
 fp8_deepseek_1x128_dim_m             0.1649  4935.6       61.7%  (128,1) block, t-contig
 fp8_deepseek_128x128                 0.1436  5608.5       70.1%  (128,128) block
 fp8_rowwise                          0.1262  6380.5       79.8%  (1,-1) block
-fp8_colwise                          6.4013   125.8        1.6%  (-1,1) block, t-contig
+fp8_colwise                          0.2187  3683.1       46.0%  (-1,1) block, t-contig
 nvfp4_swizzle                        1.0879   632.3        7.9%  (1,16) block, fp4 qdata, swizzle
 ```
 
