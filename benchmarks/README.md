@@ -94,7 +94,7 @@ nvfp4_swizzle                        0.1371  5017.3       62.7%  (1,16) block, f
 
 ### `--mode cute`
 
-The CuTeDSL (`cutlass.cute`) kernels are **correctness-first (naive tiling), with eight tuned
+The CuTeDSL (`cutlass.cute`) kernels are **correctness-first (naive tiling), with ten tuned
 exceptions** — treat the untuned rows as a functional baseline, not a fair comparison to the
 compile/triton numbers above:
 
@@ -136,6 +136,17 @@ compile/triton numbers above:
   conflict → 4.3%, worse than the old kernel); switching to a *strided* assignment (thread `t` owns
   `{t + i·THREADS}`) so consecutive lanes hit consecutive banks lifts it to 70.1%. 128 threads/CTA
   beat 256/512 (higher VPT → more memory-level parallelism per thread).
+* `mxfp8_32x32_floor` (70.8%) — one e8m0-floor scale per 32×32 block; non-transposing, so the same
+  TMA path as `fp8_deepseek_128x128`. A 32×32 block = 1024 elems = a full warp (32 lanes × 32 rows),
+  so **one warp owns one block** and the block amax is a single `warp_reduction_max` — no cross-warp
+  scratch. A 128×128 TMA tile holds 16 blocks; 8 warps each loop over 2 of them (lane `l` owns
+  column `l` → consecutive lanes hit consecutive smem banks). Two findings each moved it ~38%→70%:
+  (1) `v / sfp` on the 32-wide vector emits 32 per-element **divisions** (168M insts, 38%) — since
+  the e8m0 scale is a power of two, `inv = 1/sfp; v * inv` is bit-exact and cuts to 95M insts (matches
+  deepseek); (2) using 8 warps/CTA (not 4) doubles resident warps at the same smem-capped 4 CTAs/SM,
+  hiding the TMA-load latency the kernel is bound on. A direct coalesced fp8 *global* store (drop the
+  sOUT smem to raise occupancy) was tried but is worse (50.5%) — the whole-tile TMA store beats
+  scattered 32-byte fp8 sectors. Matches the deepseek_128x128 sibling's ~70% ceiling (triton 76.5%).
 * `fp8_rowwise` (79.7%) — one fp32 scale per row, amax over the whole row. The naive kernel held the
   whole row live (one 512-thread CTA/row), which pinned it at 58 reg/thread → 43% occupancy → 60%
   DRAM (3.0% of peak here since it was also unvectorized). The fix mirrors triton/inductor: a small
@@ -159,9 +170,25 @@ compile/triton numbers above:
   the two kernels). L2-panel tiling doesn't help — separate TMA kernels don't retain the panel, and
   per-CTA reuse needs <6 concurrent CTAs. (Replaces the old scalar `x.t()` path at 1.6%.)
 
-Everything else is a single naive kernel: `nvfp4_swizzle` does serial per-thread reductions with
-tiny transfers, so its percentage is far below the compile/triton equivalents and isn't meaningful
-yet — tuning it is future work.
+* `nvfp4_swizzle` (~62%) — the two-level nvfp4 cast (per-tensor outer scale × per-16-block e4m3
+  inner scale, fp4-packed qdata, e4m3 scale scattered to the swizzled 4D grid), modeled on the
+  human-optimized torchao fp4 CuTeDSL cast (pytorch/ao#4517). The unit of work is a "group" of 32
+  elems = two 1×16 blocks = one 128-bit fp4 store. The old naive kernel (8 thr/CTA, scalar
+  per-element loads) was 7.9%. ncu shows it's **ALU-pipe bound** (~73%), not DRAM bound, and three
+  fixes lifted it: (1) hardware inline-PTX cvts — `cvt.rn.satfinite.e2m1x2.f32` packs 8 f32 → 4 fp4
+  bytes/call (one `mov.b32`, no per-byte masking) and `cvt e4m3x2` / `f16x2.e4m3x2` do the two-level
+  scale as single instructions, vs the 4-lane-broadcast e4m3 fragments + `_maybe_recast_from_f4`;
+  (2) hoisting the swizzle offset — the 4D flatten factors as `row_base + (col//4)*512 + (col%4)`
+  (the per-row div/mod chain was the dominant ALU term); (3) a **warp-per-row** mapping (ao#4517's
+  "wpr") — warp `w` owns row `bidy*WARPS+w`; its 32 lanes + a `grid.x` column split + ILP stripe
+  that row's groups, all loads issued first for MLP. Because the row is fixed per warp, `row_base`
+  is computed *once* and amortized over every group the lane visits (vs 2 in a 1-D-flatten mapping),
+  and a whole row's scale bytes land in one 128-row swizzle atom. This beat a 1-D striped mapping
+  (~58%, long-scoreboard-bound at 44% occ). Tuned WARPS=2, XSPLIT=4, ILP=4. Beats compile (23.5%)
+  and edges the repo's triton (62.7%) at peak; the identical ao#4517 kernel on this same swizzle
+  layout measures 58.5% (its striped mapping) / 63.1% (its wpr) here. (The swizzle scale-scatter is
+  the ceiling: the *linear* scale layout hits ~70% on the same kernel, but our recipe needs the
+  blocked swizzle.) (`nvfp4_blocked_outer` keeps the naive kernel — it wasn't the target.)
 
 ```
 shape: (16384, 16384)  mode: cute
@@ -171,13 +198,13 @@ relu (baseline)                      0.1791  5995.5       74.9%
 fp8_tensorwise_precalc_scale         0.1173  6866.5       85.8%  elementwise
 mxfp8_floor_swizzle                  0.1504  5409.0       67.6%  (1,32) block, swizzle
 mxfp8_floor_dim_m                    0.1687  4824.1       60.3%  (32,1) block, t-contig
-mxfp8_32x32_floor                    0.2768  2910.5       36.4%  (32,32) block
+mxfp8_32x32_floor                    0.1423  5662.4       70.8%  (32,32) block
 fp8_deepseek_1x128                   0.1381  5891.7       73.6%  (1,128) block
 fp8_deepseek_1x128_dim_m             0.1649  4935.6       61.7%  (128,1) block, t-contig
 fp8_deepseek_128x128                 0.1436  5608.5       70.1%  (128,128) block
 fp8_rowwise                          0.1262  6380.5       79.8%  (1,-1) block
 fp8_colwise                          0.2187  3683.1       46.0%  (-1,1) block, t-contig
-nvfp4_swizzle                        1.0879   632.3        7.9%  (1,16) block, fp4 qdata, swizzle
+nvfp4_swizzle                        0.1395  4931.9       61.6%  (1,16) block, fp4 qdata, swizzle
 ```
 
 ## Known issues
