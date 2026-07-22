@@ -1,0 +1,43 @@
+kernel,mode,gpu_time_ms,gbps,mem_bw_pct
+relu (baseline),compile,0.1791,5996.1,74.95
+fp8_tensorwise_precalc_scale,compile,0.1433,5619.0,70.24
+mxfp8_floor_swizzle,compile,0.1368,5947.3,74.34
+mxfp8_floor_dim_m,compile,0.5798,1403.5,17.54
+mxfp8_floor_dim_km,compile,0.7153,1524.6,19.06
+mxfp8_32x32_floor,compile,0.3787,2127.0,26.59
+fp8_deepseek_1x128,compile,0.1329,6120.4,76.50
+fp8_deepseek_1x128_dim_m,compile,0.2684,3031.4,37.89
+fp8_deepseek_1x128_dim_km,compile,0.3977,2742.4,34.28
+fp8_deepseek_128x128,compile,0.2344,3436.4,42.96
+fp8_rowwise,compile,0.1250,6442.9,80.54
+fp8_colwise,compile,0.3928,2050.2,25.63
+nvfp4_swizzle,compile,0.3650,1884.3,23.55
+bf16_rht,compile,0.4579,2344.8,29.31
+fp32_to_bf16_sr,compile,0.6850,2351.3,29.39
+fp32_to_bf16_sr_global_offsets,compile,2.8903,557.3,6.97
+relu (baseline),triton,0.1791,5995.5,74.94
+fp8_tensorwise_precalc_scale,triton,0.1424,5654.5,70.68
+mxfp8_floor_swizzle,triton,0.1312,6202.5,77.53
+mxfp8_floor_dim_m,triton,0.1787,4554.0,56.92
+mxfp8_floor_dim_km,triton,0.3109,3508.0,43.85
+mxfp8_32x32_floor,triton,0.1333,6044.3,75.55
+fp8_deepseek_1x128,triton,0.1348,6036.2,75.45
+fp8_deepseek_1x128_dim_m,triton,0.1566,5197.1,64.96
+fp8_deepseek_1x128_dim_km,triton,0.2555,4268.4,53.36
+fp8_deepseek_128x128,triton,0.1310,6149.6,76.87
+fp8_rowwise,triton,0.1382,5828.5,72.86
+fp8_colwise,triton,0.2372,3394.6,42.43
+nvfp4_swizzle,triton,0.1396,4926.5,61.58
+relu (baseline),cute,0.1791,5995.6,74.95
+fp8_tensorwise_precalc_scale,cute,0.1172,6872.8,85.91
+mxfp8_floor_swizzle,cute,0.1509,5392.2,67.40
+mxfp8_floor_dim_m,cute,0.1714,4747.0,59.34
+mxfp8_floor_dim_km,cute,0.2475,4406.2,55.08
+mxfp8_32x32_floor,cute,0.1423,5661.2,70.77
+fp8_deepseek_1x128,cute,0.1402,5804.4,72.55
+fp8_deepseek_1x128_dim_m,cute,0.1651,4929.9,61.62
+fp8_deepseek_1x128_dim_km,cute,0.3309,3295.4,41.19
+fp8_deepseek_128x128,cute,0.1457,5527.2,69.09
+fp8_rowwise,cute,0.1356,5937.9,74.22
+fp8_colwise,cute,0.2180,3694.0,46.17
+nvfp4_swizzle,cute,0.1359,5060.6,63.26

@@ -7,6 +7,7 @@ fn ("compile", the default) or run its hand-written Triton kernel ("triton"), ti
 flexquant/benchmark.py.
 """
 
+import csv as _csv
 import os
 import sys
 
@@ -99,7 +100,16 @@ def main(
     K: int = 16384,
     recipe_name_filter: str | None = None,
     mode: str | None = None,
+    csv: str | None = None,
 ):
+    """Benchmark the quant-cast recipes for one `mode` and print a table.
+
+    Pass `--csv PATH` to also MERGE the numeric results (long format:
+    kernel,mode,gpu_time_ms,gbps,mem_bw_pct) into PATH, treated as a small database: existing rows
+    are read, the (kernel, mode) keys computed this run are upserted, and the file is rewritten.
+    Run once per mode to build the file the chart script (plot_bench.py) reads; re-running a mode
+    just updates its rows in place (idempotent, no duplicates).
+    """
     device_name = torch.cuda.get_device_name(0)
     assert "B200" in device_name, f"this benchmark assumes B200, got {device_name!r}"
 
@@ -130,11 +140,13 @@ def main(
         )
 
     rows = []  # (recipe, gpu_time_ms, gbps, pct_peak, perf_description)
+    csv_rows = []  # (kernel, mode, gpu_time_ms, gbps, mem_bw_pct) numeric, successes only
 
     # relu baseline anchors the bandwidth ceiling; shown on a full sweep (no filter).
     if recipe_name_filter is None:
         ms, gbps, pct = _bench_relu(M, K)
         rows.append(("relu (baseline)", f"{ms:.4f}", f"{gbps:.1f}", f"{pct:.1f}%", ""))
+        csv_rows.append(("relu (baseline)", mode, ms, gbps, pct))
 
     for name, recipe in recipes:
         # TODO: some recipes don't benchmark cleanly yet (e.g. fp4-packed byte accounting under
@@ -147,6 +159,7 @@ def main(
             rows.append((name, reason, "", "", recipe.perf_description))
             continue
         rows.append((name, f"{ms:.4f}", f"{gbps:.1f}", f"{pct:.1f}%", recipe.perf_description))
+        csv_rows.append((name, mode, ms, gbps, pct))
 
     print(f"shape: ({M}, {K})  mode: {mode}")
     print(
@@ -156,6 +169,36 @@ def main(
             colalign=("left", "right", "right", "right", "left"),
         )
     )
+
+    # Optionally merge numeric results (long format) into the CSV, treated as a small database:
+    # read existing rows, UPSERT the (kernel, mode) keys computed this run, keep everything else,
+    # and rewrite the file. Re-running a mode is idempotent (updates in place, no duplicate rows).
+    if csv is not None:
+        header = ["kernel", "mode", "gpu_time_ms", "gbps", "mem_bw_pct"]
+        merged = []           # rows in first-seen order (stable across re-runs)
+        index = {}            # (kernel, mode) -> position in `merged`
+        if os.path.exists(csv):
+            with open(csv, newline="") as f:
+                reader = _csv.reader(f)
+                next(reader, None)  # skip header
+                for r in reader:
+                    if len(r) < len(header):
+                        continue
+                    index[(r[0], r[1])] = len(merged)
+                    merged.append(r[: len(header)])
+        for kernel, md, ms, gbps, pct in csv_rows:
+            row = [kernel, md, f"{ms:.4f}", f"{gbps:.1f}", f"{pct:.2f}"]
+            key = (kernel, md)
+            if key in index:
+                merged[index[key]] = row       # update
+            else:
+                index[key] = len(merged)        # insert
+                merged.append(row)
+        with open(csv, "w", newline="") as f:
+            w = _csv.writer(f)
+            w.writerow(header)
+            w.writerows(merged)
+        print(f"wrote {len(merged)} rows to {csv} ({len(csv_rows)} upserted for mode {mode!r})")
 
 
 if __name__ == "__main__":

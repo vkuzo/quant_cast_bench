@@ -47,6 +47,17 @@ Default shape is `(M, K) = (16384, 16384)`. Assumes a B200 (peak 8 TB/s).
 
 ## Output
 
+![Memory bandwidth by mode](mem_bw.png)
+
+*Achieved memory bandwidth (% of the B200 8 TB/s peak) per kernel, one bar per implementation
+(`compile` / `triton` / `cute`); the dashed line is the eager-`relu` bandwidth ceiling. The
+compile-only kernels (`bf16_rht`, `fp32_to_bf16_sr`, ...) have no triton/cute bar. Data lives in
+[`bench_results.csv`](bench_results.csv); regenerate the chart with `python benchmarks/plot_bench.py`.
+Refresh the data by re-running the sweeps with the
+`--csv` flag — `rm benchmarks/bench_results.csv` then
+`benchmark.py --mode {compile,triton,cute} --csv benchmarks/bench_results.csv` (once per mode). A
+fresh sweep can differ ±1–2 pts from the tables below (run-to-run variance).*
+
 ### `--mode compile`
 
 ```
