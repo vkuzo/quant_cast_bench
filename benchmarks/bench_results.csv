@@ -15,22 +15,22 @@ nvfp4_swizzle,compile,0.3651,1884.2,23.55
 bf16_rht,compile,0.4576,2346.6,29.33
 fp32_to_bf16_sr,compile,0.6850,2351.2,29.39
 fp32_to_bf16_sr_global_offsets,compile,2.8898,557.3,6.97
-relu (baseline),triton,0.1791,5995.4,74.94
-fp8_tensorwise_precalc_scale,triton,0.1423,5658.0,70.72
-mxfp8_floor_swizzle,triton,0.1330,6119.0,76.49
-fp8_deepseek_1x128,triton,0.1343,6060.3,75.75
-mxfp8_floor_dim_m,triton,0.1832,4441.6,55.52
-fp8_deepseek_1x128_dim_m,triton,0.1620,5024.0,62.80
-mxfp8_floor_dim_km,triton,0.3022,3608.0,45.10
-fp8_deepseek_1x128_dim_km,triton,0.2530,4310.0,53.88
-mxfp8_32x32_floor,triton,0.1319,6108.5,76.36
-fp8_deepseek_128x128,triton,0.1309,6153.1,76.91
-fp8_rowwise,triton,0.1378,5845.4,73.07
-fp8_colwise,triton,0.2439,3301.7,41.27
-nvfp4_swizzle,triton,0.1391,4944.3,61.80
-bf16_rht,triton,0.1982,5418.6,67.73
-fp32_to_bf16_sr,triton,0.2781,5790.7,72.38
-fp32_to_bf16_sr_global_offsets,triton,0.2611,6167.6,77.10
+relu (baseline),triton,0.1791,5994.5,74.93
+fp8_tensorwise_precalc_scale,triton,0.1430,5629.6,70.37
+mxfp8_floor_swizzle,triton,0.1314,6191.7,77.40
+fp8_deepseek_1x128,triton,0.1344,6052.4,75.66
+mxfp8_floor_dim_m,triton,0.1788,4551.6,56.89
+fp8_deepseek_1x128_dim_m,triton,0.1468,5543.0,69.29
+mxfp8_floor_dim_km,triton,0.3106,3511.4,43.89
+fp8_deepseek_1x128_dim_km,triton,0.2555,4267.5,53.34
+mxfp8_32x32_floor,triton,0.1322,6095.4,76.19
+fp8_deepseek_128x128,triton,0.1308,6156.4,76.96
+fp8_rowwise,triton,0.1382,5829.3,72.87
+fp8_colwise,triton,0.2413,3338.0,41.73
+nvfp4_swizzle,triton,0.1386,4962.1,62.03
+bf16_rht,triton,0.1984,5411.1,67.64
+fp32_to_bf16_sr,triton,0.2773,5807.7,72.60
+fp32_to_bf16_sr_global_offsets,triton,0.2612,6165.2,77.07
 relu (baseline),cute,0.1791,5996.6,74.96
 fp8_tensorwise_precalc_scale,cute,0.1172,6873.2,85.92
 mxfp8_floor_swizzle,cute,0.1518,5360.2,67.00

@@ -267,10 +267,14 @@ def _fp8_deepseek_1x128_dim_m_kernel(
     offs_m = pid_rb * 128 + tl.arange(0, 128)
     offs_n = pid_n * BN + tl.arange(0, BN)
     n_mask = offs_n < N
-    x = tl.load(x_ptr + offs_m[:, None] * sxm + offs_n[None, :] * sxn, mask=n_mask[None, :]).to(tl.float32)
-    amax = tl.maximum(tl.max(tl.abs(x), axis=0), 1e-12)  # (BN,) per column
+    # Keep the loaded tile in bf16; the amax reduction is exact in bf16 (abs just clears the sign
+    # bit, max is a comparison), so we only promote to fp32 for the short-lived reduction accumulator
+    # and for the final quantize. This halves the tile's register footprint versus promoting the
+    # whole (128, BN) tile up front, which lifts occupancy on these tiny 1-warp CTAs.
+    x = tl.load(x_ptr + offs_m[:, None] * sxm + offs_n[None, :] * sxn, mask=n_mask[None, :])
+    amax = tl.maximum(tl.max(tl.abs(x).to(tl.float32), axis=0), 1e-12)  # (BN,) per column
     scale = amax / 448.0
-    y = (x * (1.0 / scale)[None, :]).to(tl.float8e4nv)  # (128, BN)
+    y = (x.to(tl.float32) * (1.0 / scale)[None, :]).to(tl.float8e4nv)  # (128, BN)
     # transposed store into (N, M): out[n, m] = y[row_in_block, n]
     out_off = offs_n[:, None] * sym + offs_m[None, :] * syn
     tl.store(y_ptr + out_off, tl.trans(y), mask=n_mask[:, None])
@@ -283,10 +287,12 @@ def fp8_deepseek_1x128_dim_m_triton(x, **kwargs):
     M, N = x.shape
     y = torch.empty((N, M), dtype=torch.float8_e4m3fn, device=x.device)
     s = torch.empty((N, M // 128), dtype=torch.float32, device=x.device)
-    grid = (M // 128, triton.cdiv(N, 64))
+    # BN=32, single warp: the transposed fp8 store is bottlenecked by the tl.trans smem roundtrip, so
+    # small high-occupancy CTAs (many resident, 128B contiguous store rows) beat larger tiles here.
+    grid = (M // 128, triton.cdiv(N, 32))
     _fp8_deepseek_1x128_dim_m_kernel[grid](
         x, y, s, M, N, x.stride(0), x.stride(1), y.stride(0), y.stride(1),
-        s.stride(0), s.stride(1), BN=64,
+        s.stride(0), s.stride(1), BN=32, num_warps=1,
     )
     return y, s
 
