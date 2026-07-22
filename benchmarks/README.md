@@ -92,6 +92,42 @@ fp8_colwise                          0.2259  3564.8       44.6%  (-1,1) block, t
 nvfp4_swizzle                        0.1371  5017.3       62.7%  (1,16) block, fp4 qdata, swizzle
 ```
 
+### `--mode cute`
+
+The CuTeDSL (`cutlass.cute`) kernels are **correctness-first (naive tiling), with two tuned
+exceptions** — treat the untuned rows as a functional baseline, not a fair comparison to the
+compile/triton numbers above:
+
+* `fp8_tensorwise_precalc_scale` (85.9%) — vectorized 128-bit copy atoms (`num_bits_per_copy` +
+  `assumed_align=16`) hit DRAM speed-of-light.
+* `mxfp8_floor_dim_m` (62.1%) — warp-specialized **TMA**: TMA-load a (64,256) tile, reduce 32-row
+  blocks per column to the e8m0-floor scale, quantize, transpose in the register→smem write, and
+  TMA-store the (256,64) tile to the row-major (N,M) output. Beats the triton kernel (60.1%) and
+  approaches the CUDA SOL (67.7%). See [`quant_cast_cute/recipes.py`](../quant_cast_bench/quant_cast_cute/recipes.py).
+
+Everything else is a single naive kernel: the 1×N block kernels (`mxfp8_floor_swizzle`,
+`fp8_deepseek_*`, `nvfp4_swizzle`) do serial per-thread reductions with tiny transfers, and
+`fp8_rowwise`/`fp8_colwise` use one warp per row/column with a full-width `N//32` fragment (colwise
+additionally feeds `x.t()`, so every load is uncoalesced). Their percentages are far below the
+compile/triton equivalents and aren't meaningful yet — tuning them is future work.
+
+```
+shape: (16384, 16384)  mode: cute
+recipe                          gpu_time_ms    gbps    pct_peak  perf_description
+----------------------------  -------------  ------  ----------  --------------------------------
+relu (baseline)                      0.1791  5996.1       75.0%
+fp8_tensorwise_precalc_scale         0.1172  6873.5       85.9%  elementwise
+mxfp8_floor_swizzle                  1.0913   745.6        9.3%  (1,32) block, swizzle
+mxfp8_floor_dim_m                    0.1637  4969.8       62.1%  (32,1) block, t-contig
+mxfp8_32x32_floor                    0.2741  2938.5       36.7%  (32,32) block
+fp8_deepseek_1x128                    1.082   752.1        9.4%  (1,128) block
+fp8_deepseek_1x128_dim_m             1.4114   576.5        7.2%  (128,1) block, t-contig
+fp8_deepseek_128x128                 2.2377   359.9        4.5%  (128,128) block
+fp8_rowwise                          3.3308   241.8        3.0%  (1,-1) block
+fp8_colwise                          6.3901     126        1.6%  (-1,1) block, t-contig
+nvfp4_swizzle                        1.0879   632.3        7.9%  (1,16) block, fp4 qdata, swizzle
+```
+
 ## Known issues
 
 * `fp32_to_bf16_sr` (compile) reports only ~19.6% peak, but this understates the real bandwidth.
