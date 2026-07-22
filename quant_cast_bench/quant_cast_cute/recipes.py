@@ -1065,41 +1065,6 @@ def _rowwise_opt_jit(mX, mY, sflat, threads: cutlass.Constexpr, warps: cutlass.C
         grid=[cute.size(gX, mode=[1]) // nbpr, 1, 1], block=[threads, 1, 1])
 
 
-# ---------------------------------------------------------------------------
-# Scalar one-warp-per-row fallback (used by fp8_colwise on the transposed, strided x.t() view where
-# the vectorized 128-bit copy above is invalid). Thread t owns a contiguous N//32 chunk, intra-thread
-# abs-max then warp_reduction over 32 threads -> row amax, quantize + store. Requires N % 32 == 0.
-# ---------------------------------------------------------------------------
-@cute.kernel
-def _fp8_rowwise_kernel(gX: cute.Tensor, gY: cute.Tensor, gScale: cute.Tensor, tv_layout: cute.Layout):
-    tidx, _, _ = cute.arch.thread_idx()
-    bidx, _, _ = cute.arch.block_idx()
-    thrX = cute.composition(gX[(None, bidx)], tv_layout)[(tidx, None)]
-    thrY = cute.composition(gY[(None, bidx)], tv_layout)[(tidx, None)]
-    frgX = cute.make_rmem_tensor(cute.get(tv_layout, mode=[1]), gX.element_type)
-    cute.copy(cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gX.element_type), thrX, frgX)
-    v = frgX.load().to(cutlass.Float32)
-    local = cutlass.max(v, -v).reduce(cute.ReductionOp.MAX, cutlass.Float32(0.0), 0)
-    amax = cutlass.max(cute.arch.warp_reduction_max(local), cutlass.Float32(1e-12))
-    scale = amax / 448.0
-    frgY = cute.make_rmem_tensor(cute.get(tv_layout, mode=[1]), gY.element_type)
-    frgY.store((v * (1.0 / scale)).to(gY.element_type))
-    cute.copy(cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gY.element_type), frgY, thrY)
-    if tidx == 0:
-        gScale[(None, bidx)][0] = scale
-
-
-@cute.jit
-def _fp8_rowwise_jit(mX, mY, mScale, vpt: cutlass.Constexpr):
-    tv_layout = cute.make_layout((32, vpt), stride=(vpt, 1))  # 32 threads x N//32 vals = one row
-    n = cute.size(mX, mode=[1])
-    gX = cute.zipped_divide(mX, (1, n))
-    gY = cute.zipped_divide(mY, (1, n))
-    gScale = cute.zipped_divide(mScale, (1, 1))
-    _fp8_rowwise_kernel(gX, gY, gScale, tv_layout).launch(
-        grid=[cute.size(gX, mode=[1]), 1, 1], block=[32, 1, 1])
-
-
 def fp8_rowwise_cute(x, **kwargs):
     assert x.is_contiguous() and x.dim() == 2
     M, N = x.shape
@@ -1131,20 +1096,182 @@ FP8_ROWWISE = QuantCastCuteRecipe.from_gold(RowwiseFp8Gold, cute_fn=fp8_rowwise_
 
 # ---------------------------------------------------------------------------
 # fp8 colwise (full-span): one fp32 scale per column, amax over ALL rows; transposed outputs
-# (N, M) / (N, 1). Exactly fp8_rowwise on the transposed view x.t() (reduce its last dim = all rows
-# of x; the (N, M)-contiguous output view is the transpose). Reuse the rowwise kernel. Needs M%32==0.
+# (N, M) / (N, 1). The reduction is down a column (the strided axis of row-major x) and the output is
+# transposed, so a single naive kernel is forced into uncoalesced reads (~1.6%). Mirror triton's
+# split into two coalesced passes (see quant_cast_triton):
+#   pass 1 (amax): TMA-load (TM, TN) row-major tiles of x (the TMA engine streams these strided tiles
+#     at DRAM speed -- a hand-rolled strided row-segment read caps at ~42%); each thread owns a column,
+#     reduces its TM rows in smem to a partial abs-max, then one atomic_max per column into a (N,) fp32
+#     scratch -- combines the per-column amax across the M-grid.
+#   pass 2 (quant): TMA-load a (TM, TN) row-major tile of x, quantize each column with the precomputed
+#     scale (amax/448), transpose in the register->smem write (like mxfp8_floor_dim_m -- the DSL can't
+#     drive a col-major TMA store), and TMA-store the (TN, TM) tile into the row-major (N, M) output;
+#     the (N, 1) scale is written once (from the m_tile=0 row of blocks). Both DRAM passes ride the TMA
+#     engine and the transpose happens in the register->smem write.
+# ~1.6% -> 46.0% of B200 peak (beats triton 43.8%, compile 25.6%). The ceiling is ~51%: a full-column
+# amax forces reading x TWICE (amax then quant) and, unlike rowwise, the quant re-read MISSES L2 (the
+# whole 512 MB of x streams between the two kernels; a full column is 32 KB * M, far larger than L2, so
+# nothing stays warm). L2-panel tiling (amax+quant per column-panel that fits in L2) does NOT help --
+# separate TMA kernels don't retain the panel, and per-CTA reuse needs <6 concurrent CTAs (occupancy).
 # ---------------------------------------------------------------------------
+_CWA_TM, _CWA_TN, _CWA_WARPS = 128, 256, 8     # amax tile (tuned on B200; needs M%TM==0, N%TN==0)
+_CWA_THREADS = _CWA_WARPS * 32
+_CWA_ITERS = (_CWA_TN + _CWA_THREADS - 1) // _CWA_THREADS
+_CWA_IN_BYTES = _CWA_TM * _CWA_TN * 2          # bf16 tile bytes for the TMA expect-tx
+
+
+@cute.struct
+class _ColwiseAmaxSmem:
+    bar: cute.struct.MemRange[cutlass.Int64, 1]
+    sin: cute.struct.Align[cute.struct.MemRange[cutlass.BFloat16, _CWA_TM * _CWA_TN], 1024]
+
+
+@cute.kernel
+def _colwise_amax_kernel(atom_in: cute.CopyAtom, ten_in: cute.Tensor, mA: cute.Tensor,
+                         sil: cute.Layout):
+    tidx, _, _ = cute.arch.thread_idx()
+    bidx, bidy, _ = cute.arch.block_idx()   # bidx = m_tile, bidy = n_tile
+    warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+    smem = utils.SmemAllocator()
+    st = smem.allocate(_ColwiseAmaxSmem)
+    bar = st.bar.data_ptr()
+    if tidx == 0:
+        cute.arch.mbarrier_init(bar, 1)
+    cute.arch.mbarrier_init_fence()
+    cute.arch.sync_threads()
+    sIN = st.sin.get_tensor(sil)                             # (TM, TN) row-major
+    gIN = cute.local_tile(ten_in, (_CWA_TM, _CWA_TN), (None, None))
+    tAsA, tAgA = cpasync.tma_partition(atom_in, 0, cute.make_layout(1),
+                                       cute.group_modes(sIN, 0, 2), cute.group_modes(gIN, 0, 2))
+    if warp == 0:
+        with cute.arch.elect_one():
+            cute.arch.mbarrier_arrive_and_expect_tx(bar, _CWA_IN_BYTES)
+        cute.copy(atom_in, tAgA[(None, bidx, bidy)], tAsA, tma_bar_ptr=bar)
+    cute.arch.mbarrier_wait(bar, 0)
+
+    n0 = bidy * _CWA_TN
+    for it in cutlass.range_constexpr(_CWA_ITERS):
+        col = tidx + it * _CWA_THREADS
+        if col < _CWA_TN:
+            frg = cute.make_rmem_tensor(cute.make_layout(_CWA_TM), cutlass.Float32)
+            for r in cutlass.range_constexpr(_CWA_TM):
+                frg[r] = sIN[r, col].to(cutlass.Float32)     # column read (warp-coalesced)
+            v = frg.load()
+            amax = cutlass.Float32(
+                cute.where(v < 0, -v, v).reduce(cute.ReductionOp.MAX, cutlass.Float32(0.0), 0))
+            cute.arch.atomic_max_float32(ptr=(mA.iterator + (n0 + col)).llvm_ptr, value=amax)
+
+
+@cute.jit
+def _colwise_amax_jit(mX, mA):
+    sil = cute.make_layout((_CWA_TM, _CWA_TN), stride=(_CWA_TN, 1))
+    atom_in, ten_in = cpasync.make_tiled_tma_atom(
+        cpasync.CopyBulkTensorTileG2SOp(), mX, sil, (_CWA_TM, _CWA_TN))
+    M2, N2 = mX.shape
+    grid = ((M2 + _CWA_TM - 1) // _CWA_TM, (N2 + _CWA_TN - 1) // _CWA_TN, 1)
+    _colwise_amax_kernel(atom_in, ten_in, mA, sil).launch(
+        grid=grid, block=(_CWA_THREADS, 1, 1), cluster=(1, 1, 1))
+
+
+_CWQ_TM, _CWQ_TN, _CWQ_WARPS = 64, 256, 8      # tuned on B200 (needs M%TM==0, N%TN==0)
+_CWQ_THREADS = _CWQ_WARPS * 32
+_CWQ_ITERS = (_CWQ_TN + _CWQ_THREADS - 1) // _CWQ_THREADS
+_CWQ_IN_BYTES = _CWQ_TM * _CWQ_TN * 2          # bf16 tile bytes for the TMA expect-tx
+
+
+@cute.struct
+class _ColwiseQuantSmem:
+    bar: cute.struct.MemRange[cutlass.Int64, 1]
+    sin: cute.struct.Align[cute.struct.MemRange[cutlass.BFloat16, _CWQ_TM * _CWQ_TN], 1024]
+    sout: cute.struct.Align[cute.struct.MemRange[cutlass.Float8E4M3FN, _CWQ_TM * _CWQ_TN], 1024]
+
+
+@cute.kernel
+def _colwise_quant_kernel(atom_in: cute.CopyAtom, ten_in: cute.Tensor, atom_out: cute.CopyAtom,
+                          ten_out: cute.Tensor, mA: cute.Tensor, sflat: cute.Tensor,
+                          sil: cute.Layout, sol: cute.Layout):
+    tidx, _, _ = cute.arch.thread_idx()
+    bidx, bidy, _ = cute.arch.block_idx()   # bidx = m_tile, bidy = n_tile
+    warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+    smem = utils.SmemAllocator()
+    st = smem.allocate(_ColwiseQuantSmem)
+    bar = st.bar.data_ptr()
+    if tidx == 0:
+        cute.arch.mbarrier_init(bar, 1)
+    cute.arch.mbarrier_init_fence()
+    cute.arch.sync_threads()
+    sIN = st.sin.get_tensor(sil)                             # (TM, TN) row-major
+    sOUT = st.sout.get_tensor(sol)                           # (TN, TM) row-major (transposed)
+    gIN = cute.local_tile(ten_in, (_CWQ_TM, _CWQ_TN), (None, None))
+    gOUT = cute.local_tile(ten_out, (_CWQ_TN, _CWQ_TM), (None, None))
+    tAsA, tAgA = cpasync.tma_partition(atom_in, 0, cute.make_layout(1),
+                                       cute.group_modes(sIN, 0, 2), cute.group_modes(gIN, 0, 2))
+    tOsO, tBgB = cpasync.tma_partition(atom_out, 0, cute.make_layout(1),
+                                       cute.group_modes(sOUT, 0, 2), cute.group_modes(gOUT, 0, 2))
+    if warp == 0:
+        with cute.arch.elect_one():
+            cute.arch.mbarrier_arrive_and_expect_tx(bar, _CWQ_IN_BYTES)
+        cute.copy(atom_in, tAgA[(None, bidx, bidy)], tAsA, tma_bar_ptr=bar)
+    cute.arch.mbarrier_wait(bar, 0)
+
+    n0 = bidy * _CWQ_TN
+    for it in cutlass.range_constexpr(_CWQ_ITERS):
+        col = tidx + it * _CWQ_THREADS
+        if col < _CWQ_TN:
+            amax = cutlass.max(mA[n0 + col], cutlass.Float32(1e-12))
+            scale = amax / 448.0
+            inv = 1.0 / scale                                # reciprocal-mul, not TM divs
+            frgIn = cute.make_rmem_tensor(cute.make_layout(_CWQ_TM), cutlass.Float32)
+            for r in cutlass.range_constexpr(_CWQ_TM):
+                frgIn[r] = sIN[r, col].to(cutlass.Float32)   # column read (warp-coalesced)
+            frgOut = cute.make_rmem_tensor(cute.make_layout(_CWQ_TM), cutlass.Float8E4M3FN)
+            frgOut.store((frgIn.load() * inv).to(cutlass.Float8E4M3FN))
+            for r in cutlass.range_constexpr(_CWQ_TM):
+                sOUT[col, r] = frgOut[r]                      # contiguous run = the transpose
+            if bidx == 0:
+                sflat[n0 + col] = scale.to(sflat.element_type)
+
+    cute.arch.fence_proxy("async.shared", space="cta")
+    cute.arch.sync_threads()
+    if warp == 0:
+        cute.copy(atom_out, tOsO, tBgB[(None, bidy, bidx)])   # y tile (n_tile, m_tile)
+
+
+@cute.jit
+def _colwise_quant_jit(mX, mY, mA, sflat):
+    sil = cute.make_layout((_CWQ_TM, _CWQ_TN), stride=(_CWQ_TN, 1))
+    sol = cute.make_layout((_CWQ_TN, _CWQ_TM), stride=(_CWQ_TM, 1))
+    atom_in, ten_in = cpasync.make_tiled_tma_atom(
+        cpasync.CopyBulkTensorTileG2SOp(), mX, sil, (_CWQ_TM, _CWQ_TN))
+    atom_out, ten_out = cpasync.make_tiled_tma_atom(
+        cpasync.CopyBulkTensorTileS2GOp(), mY, sol, (_CWQ_TN, _CWQ_TM))
+    M2, N2 = mX.shape
+    grid = ((M2 + _CWQ_TM - 1) // _CWQ_TM, (N2 + _CWQ_TN - 1) // _CWQ_TN, 1)
+    _colwise_quant_kernel(atom_in, ten_in, atom_out, ten_out, mA, sflat, sil, sol).launch(
+        grid=grid, block=(_CWQ_THREADS, 1, 1), cluster=(1, 1, 1))
+
+
 def fp8_colwise_cute(x, **kwargs):
     assert x.is_contiguous() and x.dim() == 2
     M, N = x.shape
-    assert M % 32 == 0, "fp8_colwise cute kernel needs M % 32 == 0"
-    y = torch.empty(N, M, dtype=torch.float8_e4m3fn, device=x.device)  # transposed output
+    assert M % _CWA_TM == 0 and M % _CWQ_TM == 0 and N % _CWA_TN == 0 and N % _CWQ_TN == 0, \
+        f"fp8_colwise cute kernel needs M%{_CWQ_TM}==0 and N%{_CWQ_TN}==0"
+    y = torch.empty(N, M, dtype=torch.float8_e4m3fn, device=x.device)  # transposed row-major output
     s = torch.empty(N, 1, dtype=torch.float32, device=x.device)
-    mX = from_dlpack(x.t()).mark_layout_dynamic()  # (N, M) strided view; reduce its last dim
-    mY = from_dlpack(y).mark_layout_dynamic()
-    mS = from_dlpack(s)  # (N, 1) stride (1,1): keep static (ambiguous leading dim otherwise)
-    fn = _compiled(("fp8_colwise", M, N), _fp8_rowwise_jit, mX, mY, mS, M // 32)
-    fn(mX, mY, mS)
+    a = torch.zeros(N, dtype=torch.float32, device=x.device)           # per-column amax scratch (>=0)
+    mA = from_dlpack(a).mark_layout_dynamic()
+    # TMA needs full layout/divisibility marking (leading dim contiguous, 16-elem aligned).
+    mX = (from_dlpack(x, assumed_align=16).mark_layout_dynamic(leading_dim=1)
+          .mark_compact_shape_dynamic(mode=1, divisibility=16))
+    mY = (from_dlpack(y, assumed_align=16).mark_layout_dynamic(leading_dim=1)
+          .mark_compact_shape_dynamic(mode=1, divisibility=16))
+    sflat = from_dlpack(s.reshape(-1)).mark_layout_dynamic()
+    # --- pass 1: TMA-tile per-column amax via atomic_max ---
+    amax_fn = _compiled(("fp8_colwise_amax", M, N), _colwise_amax_jit, mX, mA)
+    amax_fn(mX, mA)
+    # --- pass 2: TMA-tile quant + transposed store (reads the precomputed per-column amax) ---
+    quant_fn = _compiled(("fp8_colwise_quant", M, N), _colwise_quant_jit, mX, mY, mA, sflat)
+    quant_fn(mX, mY, mA, sflat)
     return y, s
 
 
