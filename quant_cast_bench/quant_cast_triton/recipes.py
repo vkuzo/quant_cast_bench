@@ -7,8 +7,6 @@ cast. Mirrors flexquant_v3's `RecipeV2` (inherit-from-gold + `from_gold`). test.
 `triton_fn` against its gold `pt_ref_fn`.
 """
 
-import os
-import sys
 from dataclasses import dataclass
 from typing import Callable
 
@@ -16,8 +14,7 @@ import torch
 import triton
 import triton.language as tl
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from quant_cast_gold.recipes import (
+from quant_cast_bench.quant_cast_gold.recipes import (
     ColwiseFp8Gold,
     ColwisePrecalcGold,
     Deepseek1x128DimKmGold,

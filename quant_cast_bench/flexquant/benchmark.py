@@ -3,14 +3,14 @@ import torch
 import torch.profiler
 from torch._inductor.utils import do_bench_using_profiling
 
-from api import _HopMode, flex_cast_quant_dense
-from api_triton_for_debugging import flex_cast_quant_dense_triton
-from recipe_debug_triton import (
+from .api import _HopMode, flex_cast_quant_dense
+from .api_triton_for_debugging import flex_cast_quant_dense_triton
+from .recipe_debug_triton import (
     RecipeTriton,
     deepseek_fp8_128_128_triton,
     deepseek_fp8_1_128_dim_m_triton,
 )
-from recipes import (
+from .recipes import (
     Recipe,
     deepseek_fp8_1_128,
     deepseek_fp8_1_128_dim_m,

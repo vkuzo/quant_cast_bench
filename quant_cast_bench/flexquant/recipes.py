@@ -4,13 +4,13 @@ from typing import Callable
 import torch
 from torch.nn.functional import SwizzleType
 
-from nvfp4_utils import (
+from .nvfp4_utils import (
     F4_E2M1_MAX,
     f32_to_f4_unpacked,
     f32_to_f4_unpacked_lut,
     pack_uint4,
 )
-from swizzle import to_blocked_2d
+from .swizzle import to_blocked_2d
 
 FP8_MAX = torch.finfo(torch.float8_e4m3fn).max  # 448.0
 EPS = 1e-12

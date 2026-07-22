@@ -6,15 +6,12 @@ table registers them (plus per-recipe test metadata) for the tests in test.py. M
 mirrors flexquant v1 recipes.py.
 """
 
-import os
-import sys
 from dataclasses import dataclass
 from typing import Any, Callable, Tuple
 
-from api import AuxKind, OutputKind
+from .api import AuxKind, OutputKind
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from quant_cast_gold.recipes import (
+from quant_cast_bench.quant_cast_gold.recipes import (
     ColwiseFp8Gold,
     ColwisePrecalcGold,
     Deepseek1x128DimMGold,
