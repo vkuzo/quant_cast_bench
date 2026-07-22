@@ -94,37 +94,47 @@ nvfp4_swizzle                        0.1371  5017.3       62.7%  (1,16) block, f
 
 ### `--mode cute`
 
-The CuTeDSL (`cutlass.cute`) kernels are **correctness-first (naive tiling), with two tuned
+The CuTeDSL (`cutlass.cute`) kernels are **correctness-first (naive tiling), with three tuned
 exceptions** — treat the untuned rows as a functional baseline, not a fair comparison to the
 compile/triton numbers above:
 
-* `fp8_tensorwise_precalc_scale` (85.9%) — vectorized 128-bit copy atoms (`num_bits_per_copy` +
+* `fp8_tensorwise_precalc_scale` (85.8%) — vectorized 128-bit copy atoms (`num_bits_per_copy` +
   `assumed_align=16`) hit DRAM speed-of-light.
-* `mxfp8_floor_dim_m` (62.1%) — warp-specialized **TMA**: TMA-load a (64,256) tile, reduce 32-row
+* `mxfp8_floor_swizzle` (67.6%) — same vectorized-copy recipe as tensorwise: flatten to 1-D, 128
+  threads/CTA, each thread owns one contiguous 1×32 block, 128-bit vectorized load/store. The
+  e8m0 scale is scattered to the swizzled 4D grid. ncu shows the ~68% ceiling is structural: the
+  per-block reduction forces the full 32-wide f32 vector live (48 reg/thread → 48% occupancy, vs
+  the 29 reg / 80% occ of the pure-elementwise tensorwise), and the scattered scale-byte write
+  costs ~5 pts (a 1-D CTA covers part of one row, so the swizzled positions don't coalesce). A
+  paired-lane VPT=16 variant restored occupancy (32 reg / 83%) but was *slower* (61.6%) — reducing
+  from a smaller register fragment loses memory-level parallelism. Reaching the triton 81.5% would
+  need a TMA + 128×128 swizzle-atom kernel (reduce from smem to avoid the register spike; write the
+  512 scale bytes contiguously) — future work.
+* `mxfp8_floor_dim_m` (60.3%) — warp-specialized **TMA**: TMA-load a (64,256) tile, reduce 32-row
   blocks per column to the e8m0-floor scale, quantize, transpose in the register→smem write, and
   TMA-store the (256,64) tile to the row-major (N,M) output. Beats the triton kernel (60.1%) and
   approaches the CUDA SOL (67.7%). See [`quant_cast_cute/recipes.py`](../quant_cast_bench/quant_cast_cute/recipes.py).
 
-Everything else is a single naive kernel: the 1×N block kernels (`mxfp8_floor_swizzle`,
-`fp8_deepseek_*`, `nvfp4_swizzle`) do serial per-thread reductions with tiny transfers, and
-`fp8_rowwise`/`fp8_colwise` use one warp per row/column with a full-width `N//32` fragment (colwise
-additionally feeds `x.t()`, so every load is uncoalesced). Their percentages are far below the
-compile/triton equivalents and aren't meaningful yet — tuning them is future work.
+Everything else is a single naive kernel: the 1×N block kernels (`fp8_deepseek_*`, `nvfp4_swizzle`)
+do serial per-thread reductions with tiny transfers, and `fp8_rowwise`/`fp8_colwise` use one warp
+per row/column with a full-width `N//32` fragment (colwise additionally feeds `x.t()`, so every load
+is uncoalesced). Their percentages are far below the compile/triton equivalents and aren't
+meaningful yet — tuning them is future work.
 
 ```
 shape: (16384, 16384)  mode: cute
 recipe                          gpu_time_ms    gbps    pct_peak  perf_description
 ----------------------------  -------------  ------  ----------  --------------------------------
-relu (baseline)                      0.1791  5996.1       75.0%
-fp8_tensorwise_precalc_scale         0.1172  6873.5       85.9%  elementwise
-mxfp8_floor_swizzle                  1.0913   745.6        9.3%  (1,32) block, swizzle
-mxfp8_floor_dim_m                    0.1637  4969.8       62.1%  (32,1) block, t-contig
-mxfp8_32x32_floor                    0.2741  2938.5       36.7%  (32,32) block
-fp8_deepseek_1x128                    1.082   752.1        9.4%  (1,128) block
-fp8_deepseek_1x128_dim_m             1.4114   576.5        7.2%  (128,1) block, t-contig
-fp8_deepseek_128x128                 2.2377   359.9        4.5%  (128,128) block
-fp8_rowwise                          3.3308   241.8        3.0%  (1,-1) block
-fp8_colwise                          6.3901     126        1.6%  (-1,1) block, t-contig
+relu (baseline)                      0.1791  5995.5       74.9%
+fp8_tensorwise_precalc_scale         0.1173  6866.5       85.8%  elementwise
+mxfp8_floor_swizzle                  0.1504  5409.0       67.6%  (1,32) block, swizzle
+mxfp8_floor_dim_m                    0.1687  4824.1       60.3%  (32,1) block, t-contig
+mxfp8_32x32_floor                    0.2768  2910.5       36.4%  (32,32) block
+fp8_deepseek_1x128                    1.082   752.0        9.4%  (1,128) block
+fp8_deepseek_1x128_dim_m             1.4108   576.8        7.2%  (128,1) block, t-contig
+fp8_deepseek_128x128                 2.2384   359.8        4.5%  (128,128) block
+fp8_rowwise                          3.3297   241.9        3.0%  (1,-1) block
+fp8_colwise                          6.4013   125.8        1.6%  (-1,1) block, t-contig
 nvfp4_swizzle                        1.0879   632.3        7.9%  (1,16) block, fp4 qdata, swizzle
 ```
 
@@ -287,3 +297,45 @@ freed ~6 registers (127→121) and moved the number 57.9% → 59.9% — the bulk
 fp32 working tile plus the `(RB,32,BN)` reshape and `tl.trans` transpose staging, plus holding 4×
 the per-column scale state. Closing the gap to deepseek would require cutting *that* (e.g. a
 shared-memory transpose to decouple store coalescing from tile height), not cheaper scale math.
+
+## cuteDSL notes
+
+### Optimizing `mxfp8_floor_swizzle` further (67.6% → target ~triton 81.5%)
+
+The current cute kernel uses the tensorwise vectorized-copy recipe (1-D flatten, 128 thr/CTA, each
+thread owns one contiguous 1×32 block, 128-bit ld/st). ncu shows the ~68% ceiling is structural, and
+splits into two independent costs — an **occupancy** cost (~12 pts) and a **scatter** cost (~5 pts):
+
+| variant | reg/thread | occupancy | DRAM % | note |
+|---|---|---|---|---|
+| elementwise ceiling (no reduce/scatter) | 29 | 80% | 85.7% | same as tensorwise |
+| VPT=32, one block/thread (shipped) | 48 | 48.7% | 73.5% | reduction forces 32-wide f32 live |
+| VPT=32, contiguous scale store | 47 | 47.4% | 78.1% | isolates the scatter cost (~5 pts) |
+| VPT=16 paired lanes (2 lanes/block) | 32 | 83.4% | 64.1% | higher occ, **lower** BW — rejected |
+
+Two dead ends already ruled out (don't repeat):
+
+* **Reduce in bf16** to shrink the live vector — the compiler CSEs the store's f32 back, regs stay 48.
+* **Paired-lane VPT=16** (two lanes share the block amax via `warp_reduction_max(threads_in_group=2)`)
+  — cuts regs to 32 and lifts occupancy to 83%, but DRAM *drops* to 64%: reducing from a smaller
+  register fragment loses memory-level parallelism. For a reduction kernel, **bigger VPT wins** even
+  at lower occupancy.
+
+Suggested next step — a **TMA + 128×128 swizzle-atom kernel** (mirrors `mxfp8_floor_dim_m`, minus the
+transpose since qdata here is *not* transposed). This attacks both costs at once:
+
+1. **CTA = one swizzle atom** = 128 rows × 4 col-blocks (128×128 = 512 mxfp8 blocks). The atom's 512
+   e8m0 bytes are **contiguous** in the `(nrb, ncb, 32, 16)` grid at offset `(br*ncb+bc)*512`, so the
+   scale write becomes one coalesced store instead of a byte scatter → recovers the ~5 pts. (This is
+   exactly how the nvfp4 triton kernel lays out its scale store — see `_nvfp4_swizzle_kernel`.)
+2. **TMA-load the (128,128) bf16 tile into smem**, then do the per-block abs-max **reductions from
+   smem**, not from a register fragment. This is the key occupancy fix: the 32 values a block reduces
+   live in smem, so no thread holds a 32-wide f32 vector → registers stay near the 29-reg elementwise
+   profile → occupancy back to ~80% (recovers the ~12 pts). Quantize, write fp8 to an smem out-tile,
+   TMA-store row-major→row-major (no transpose gotcha, unlike dim_m).
+3. Reuse the multi-warp TMA barrier pattern and `_e8m0_floor` helper already in `recipes.py`; the
+   `mxfp8_floor_dim_m` kernel is the working template for the TMA load/store + barrier plumbing.
+
+Expected: ~80%+ (elementwise ceiling 85.7% minus a small reduction/coalescing tax), matching triton.
+The trade-off is complexity — it's roughly the effort of the dim_m TMA kernel, which is why the
+simpler 67.6% vectorized-copy version was shipped first.
