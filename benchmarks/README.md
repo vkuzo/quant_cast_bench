@@ -94,7 +94,7 @@ nvfp4_swizzle                        0.1371  5017.3       62.7%  (1,16) block, f
 
 ### `--mode cute`
 
-The CuTeDSL (`cutlass.cute`) kernels are **correctness-first (naive tiling), with six tuned
+The CuTeDSL (`cutlass.cute`) kernels are **correctness-first (naive tiling), with seven tuned
 exceptions** — treat the untuned rows as a functional baseline, not a fair comparison to the
 compile/triton numbers above:
 
@@ -136,12 +136,21 @@ compile/triton numbers above:
   conflict → 4.3%, worse than the old kernel); switching to a *strided* assignment (thread `t` owns
   `{t + i·THREADS}`) so consecutive lanes hit consecutive banks lifts it to 70.1%. 128 threads/CTA
   beat 256/512 (higher VPT → more memory-level parallelism per thread).
+* `fp8_rowwise` (79.7%) — one fp32 scale per row, amax over the whole row. The naive kernel held the
+  whole row live (one 512-thread CTA/row), which pinned it at 58 reg/thread → 43% occupancy → 60%
+  DRAM (3.0% of peak here since it was also unvectorized). The fix mirrors triton/inductor: a small
+  256-thread CTA per row that **loops over the row in BN=4096 blocks** (VPT=16, 128-bit vectorized
+  ld/st) accumulating a per-thread abs-max (only 16 elems live/iter), warp+smem block-reduce for the
+  row amax, then a second loop re-reads each block — warm in L2 from pass 1, like triton's
+  `evict_last`/`evict_first` hints — to quantize and store. Registers drop to 32, occupancy to 90%,
+  DRAM to 82.6%. Beats triton (76.7%) and matches compile (79.0%); the extra L2 read pass costs
+  little at this occupancy. (Replaces the old one-warp-per-row scalar kernel at 3.0%.)
 
 Everything else is a single naive kernel: `nvfp4_swizzle` does serial per-thread reductions with
-tiny transfers, and `fp8_rowwise`/`fp8_colwise` use one warp per row/column with a full-width
-`N//32` fragment (colwise additionally feeds `x.t()`, so every load is uncoalesced). Their
-percentages are far below the compile/triton equivalents and aren't meaningful yet — tuning them is
-future work.
+tiny transfers, and `fp8_colwise` uses one warp per column feeding `x.t()`, so every load is
+uncoalesced (it reuses rowwise's old scalar kernel on the transposed view — the vectorized loop
+kernel can't drive its strided reads). Their percentages are far below the compile/triton
+equivalents and aren't meaningful yet — tuning them is future work.
 
 ```
 shape: (16384, 16384)  mode: cute
@@ -155,7 +164,7 @@ mxfp8_32x32_floor                    0.2768  2910.5       36.4%  (32,32) block
 fp8_deepseek_1x128                   0.1381  5891.7       73.6%  (1,128) block
 fp8_deepseek_1x128_dim_m             0.1649  4935.6       61.7%  (128,1) block, t-contig
 fp8_deepseek_128x128                 0.1436  5608.5       70.1%  (128,128) block
-fp8_rowwise                          3.3297   241.9        3.0%  (1,-1) block
+fp8_rowwise                          0.1262  6380.5       79.8%  (1,-1) block
 fp8_colwise                          6.4013   125.8        1.6%  (-1,1) block, t-contig
 nvfp4_swizzle                        1.0879   632.3        7.9%  (1,16) block, fp4 qdata, swizzle
 ```

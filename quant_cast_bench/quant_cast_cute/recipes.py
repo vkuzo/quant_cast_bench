@@ -982,10 +982,93 @@ FP8_DEEPSEEK_128X128 = QuantCastCuteRecipe.from_gold(
 
 
 # ---------------------------------------------------------------------------
-# fp8 rowwise (full-span): one fp32 scale per row, amax over ALL columns. One warp per row: thread t
-# owns a contiguous N//32 chunk of the row, intra-thread abs-max then warp_reduction over 32 threads
-# -> row amax; then quantize its chunk and store. Mirrors rowwise_fp8_f. Requires N % 32 == 0.
-# (Correctness-first: one warp/row and a single-pass N//32 fragment; large-N perf is a later pass.)
+# fp8 rowwise (full-span), optimized: one fp32 scale per row, amax over ALL columns. One CTA per row,
+# but it LOOPS over the row in BN-wide blocks (small, few-warp CTA) instead of holding the whole row
+# live -- the register-resident variant was capped at 50% occupancy by 58 regs/thr. Pass 1 streams the
+# row's blocks accumulating a per-thread abs-max (only VPT elems live/iter), then a warp-reduce (row in
+# one warp) or warp+smem block-reduce (wide row) gives the row amax = one fp32 scale; pass 2 re-reads
+# each block (hits L2, warm from pass 1 -- like triton's evict_last/evict_first hints), quantizes and
+# stores. Two DRAM->L2 read passes trade a small extra read for high occupancy. Mirrors rowwise_fp8_f.
+# Needs N % BN == 0 with BN = THREADS*VPT, and THREADS <= 32 (one warp) or a multiple of 32.
+# ---------------------------------------------------------------------------
+_RW_VPT = 16                               # vals/thread (128-bit bf16 load, 128-bit fp8 store)
+_RW_THREADS = 256                          # target CTA width (BN = THREADS*VPT = 4096), tuned on B200
+_RW_LD_BITS = min(128, _RW_VPT * 16)       # bf16 in  -> 128-bit vectorized load
+_RW_ST_BITS = min(128, _RW_VPT * 8)        # fp8 out  -> 128-bit vectorized store
+_RW_MAXWARPS = 32                          # smem scratch upper bound
+
+
+@cute.struct
+class _RowwiseSmem:
+    red: cute.struct.MemRange[cutlass.Float32, _RW_MAXWARPS]   # per-warp amax scratch
+
+
+@cute.kernel
+def _rowwise_opt_kernel(gX: cute.Tensor, gY: cute.Tensor, sflat: cute.Tensor, tv_layout: cute.Layout,
+                        threads: cutlass.Constexpr, warps: cutlass.Constexpr, nbpr: cutlass.Constexpr):
+    tidx, _, _ = cute.arch.thread_idx()
+    bidx, _, _ = cute.arch.block_idx()                       # bidx = row
+    warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+    ld_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gX.element_type,
+                                  num_bits_per_copy=_RW_LD_BITS)
+    st_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gY.element_type,
+                                  num_bits_per_copy=_RW_ST_BITS)
+    # pass 1: stream the row's blocks, accumulating a per-thread abs-max (only VPT elems live per iter)
+    local = cutlass.Float32(0.0)
+    for j in cutlass.range_constexpr(nbpr):
+        thrX = cute.composition(gX[(None, bidx * nbpr + j)], tv_layout)[(tidx, None)]
+        frg = cute.make_rmem_tensor(cute.get(tv_layout, mode=[1]), gX.element_type)
+        cute.copy(ld_atom, thrX, frg)
+        v = frg.load().to(cutlass.Float32)
+        local = cutlass.max(local, cutlass.max(v, -v).reduce(
+            cute.ReductionOp.MAX, cutlass.Float32(0.0), 0))
+    if cutlass.const_expr(warps == 1):
+        # row fits one (possibly partial) warp: single butterfly reduce broadcasts amax to all threads
+        amax = cutlass.max(cute.arch.warp_reduction_max(local, threads_in_group=threads),
+                           cutlass.Float32(1e-12))
+    else:
+        # wide row: warp-reduce, lane0 -> smem scratch, then every thread maxes the WARPS entries
+        smem = utils.SmemAllocator()
+        st = smem.allocate(_RowwiseSmem)
+        red = st.red.get_tensor(cute.make_layout(warps))
+        wmax = cute.arch.warp_reduction_max(local)
+        if tidx % 32 == 0:
+            red[warp] = wmax
+        cute.arch.sync_threads()
+        bmax = red[0]
+        for w in cutlass.range_constexpr(1, warps):
+            bmax = cutlass.max(bmax, red[w])
+        amax = cutlass.max(bmax, cutlass.Float32(1e-12))
+    scale = amax / 448.0
+    inv = 1.0 / scale                                        # reciprocal-mul, not per-element divs
+    # pass 2: re-read each block (warm in L2), quantize (vectorized f32->fp8), store.
+    for j in cutlass.range_constexpr(nbpr):
+        thrX = cute.composition(gX[(None, bidx * nbpr + j)], tv_layout)[(tidx, None)]
+        thrY = cute.composition(gY[(None, bidx * nbpr + j)], tv_layout)[(tidx, None)]
+        frg = cute.make_rmem_tensor(cute.get(tv_layout, mode=[1]), gX.element_type)
+        cute.copy(ld_atom, thrX, frg)
+        frgY = cute.make_rmem_tensor(cute.get(tv_layout, mode=[1]), gY.element_type)
+        frgY.store((frg.load().to(cutlass.Float32) * inv).to(gY.element_type))
+        cute.copy(st_atom, frgY, thrY)
+    if tidx == 0:
+        sflat[bidx] = scale.to(sflat.element_type)
+
+
+@cute.jit
+def _rowwise_opt_jit(mX, mY, sflat, threads: cutlass.Constexpr, warps: cutlass.Constexpr,
+                     nbpr: cutlass.Constexpr):
+    tv_layout = cute.make_layout((threads, _RW_VPT), stride=(_RW_VPT, 1))
+    tiler = (threads * _RW_VPT,)                              # one BN-wide block per tile; nbpr per row
+    gX = cute.zipped_divide(mX, tiler)
+    gY = cute.zipped_divide(mY, tiler)
+    _rowwise_opt_kernel(gX, gY, sflat, tv_layout, threads, warps, nbpr).launch(
+        grid=[cute.size(gX, mode=[1]) // nbpr, 1, 1], block=[threads, 1, 1])
+
+
+# ---------------------------------------------------------------------------
+# Scalar one-warp-per-row fallback (used by fp8_colwise on the transposed, strided x.t() view where
+# the vectorized 128-bit copy above is invalid). Thread t owns a contiguous N//32 chunk, intra-thread
+# abs-max then warp_reduction over 32 threads -> row amax, quantize + store. Requires N % 32 == 0.
 # ---------------------------------------------------------------------------
 @cute.kernel
 def _fp8_rowwise_kernel(gX: cute.Tensor, gY: cute.Tensor, gScale: cute.Tensor, tv_layout: cute.Layout):
@@ -1020,14 +1103,26 @@ def _fp8_rowwise_jit(mX, mY, mScale, vpt: cutlass.Constexpr):
 def fp8_rowwise_cute(x, **kwargs):
     assert x.is_contiguous() and x.dim() == 2
     M, N = x.shape
-    assert N % 32 == 0, "fp8_rowwise cute kernel needs N % 32 == 0"
+    assert N % _RW_VPT == 0, f"fp8_rowwise cute kernel needs N % {_RW_VPT} == 0"
+    # BN-wide blocks (BN = THREADS*VPT); the CTA loops nbpr = N//BN blocks over its row. Use the target
+    # CTA width when it divides N, else fall back to one block spanning the whole (short) row.
+    bn = _RW_THREADS * _RW_VPT
+    if N % bn == 0:
+        threads, nbpr = _RW_THREADS, N // bn
+    else:
+        threads, nbpr = N // _RW_VPT, 1
+    assert threads <= 1024 and (threads <= 32 or threads % 32 == 0), \
+        f"fp8_rowwise cute kernel needs a valid block width for N={N} (got threads={threads})"
+    warps = (threads + 31) // 32
     y = torch.empty(M, N, dtype=torch.float8_e4m3fn, device=x.device)
     s = torch.empty(M, 1, dtype=torch.float32, device=x.device)
-    mX = from_dlpack(x).mark_layout_dynamic()
-    mY = from_dlpack(y).mark_layout_dynamic()
-    mS = from_dlpack(s)  # (M, 1) stride (1,1): keep static (ambiguous leading dim otherwise)
-    fn = _compiled(("fp8_rowwise", M, N), _fp8_rowwise_jit, mX, mY, mS, N // 32)
-    fn(mX, mY, mS)
+    # flatten to 1-D (blocks are contiguous BN-runs); assumed_align=16 enables the vectorized copies
+    # (torch allocations are >=256B aligned).
+    mX = from_dlpack(x.reshape(-1), assumed_align=16).mark_layout_dynamic()
+    mY = from_dlpack(y.reshape(-1), assumed_align=16).mark_layout_dynamic()
+    sflat = from_dlpack(s.reshape(-1)).mark_layout_dynamic()
+    fn = _compiled(("fp8_rowwise", M, N), _rowwise_opt_jit, mX, mY, sflat, threads, warps, nbpr)
+    fn(mX, mY, sflat)
     return y, s
 
 
