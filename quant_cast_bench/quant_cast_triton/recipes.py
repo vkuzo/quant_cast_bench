@@ -22,6 +22,7 @@ from quant_cast_bench.quant_cast_gold.recipes import (
     Deepseek1x128Gold,
     Deepseek128x128Gold,
     Float8TensorwiseGold,
+    HadamardRht,
     Mxfp832x32FloorGold,
     Mxfp8FloorDimKmGold,
     Mxfp8FloorDimMGold,
@@ -1063,6 +1064,47 @@ SR_F32_TO_BF16 = QuantCastTritonRecipe.from_gold(SrF32ToBf16, triton_fn=sr_bf16_
 
 
 # ---------------------------------------------------------------------------
+# 16x16 randomized Hadamard transform (bf16 in, bf16 out, no scale). Mirrors hadamard_rht_f:
+# reshape the last dim into groups of 16 and right-multiply each group by the 16x16 RHT matrix
+# (`out = x.reshape(..., 16) @ rht`). The RHT matrix is an explicit input (built once on the host);
+# the kernel just reads it. We flatten x to (n_groups, 16) -- every 16 contiguous elements along the
+# last dim form one group -- and give each program a BLOCK_G x 16 tile, so the whole thing is a batch
+# of (BLOCK_G, 16) @ (16, 16) matmuls via tl.dot with fp32 accumulation (matching torch's bf16 matmul,
+# which accumulates in fp32 on tensor cores), cast back to bf16 on store. Memory-bound: 4 bytes moved
+# per element (bf16 in + bf16 out), the 16x16 matrix is a negligible one-time read.
+# ---------------------------------------------------------------------------
+@triton.jit
+def _rht_kernel(x_ptr, rht_ptr, y_ptr, n_groups, BLOCK_G: tl.constexpr):
+    pid = tl.program_id(0)
+    g = pid * BLOCK_G + tl.arange(0, BLOCK_G)  # (BLOCK_G,) group index along the flattened last dim
+    gmask = g < n_groups
+    cols = tl.arange(0, 16)
+    xoff = g[:, None] * 16 + cols[None, :]  # (BLOCK_G, 16): 16 contiguous elements per group
+    x = tl.load(x_ptr + xoff, mask=gmask[:, None], other=0.0)  # bf16
+    r = tl.load(rht_ptr + cols[:, None] * 16 + cols[None, :])  # (16, 16) RHT matrix, row-major bf16
+    out = tl.dot(x, r, out_dtype=tl.float32).to(tl.bfloat16)  # (BLOCK_G, 16), fp32 accum then bf16
+    tl.store(y_ptr + xoff, out, mask=gmask[:, None])
+
+
+def rht_triton(x, rht, **kwargs):
+    """16x16 randomized Hadamard transform along the last dim (mirrors `hadamard_rht_f`). `rht` is the
+    precomputed 16x16 RHT matrix (an explicit input). Returns a 1-tuple `(out,)` -- no scale."""
+    assert x.dtype == torch.bfloat16, f"RHT expects bf16 input, got {x.dtype}"
+    assert x.is_contiguous()
+    assert x.shape[-1] % 16 == 0, f"last dim {x.shape[-1]} not divisible by 16"
+    out = torch.empty_like(x)
+    n_groups = x.numel() // 16
+    BLOCK_G = 512  # rows per program; big tiles amortize the tiny K=16 dot (swept best on B200)
+    def grid(meta):
+        return (triton.cdiv(n_groups, meta["BLOCK_G"]),)
+    _rht_kernel[grid](x, rht, out, n_groups, BLOCK_G=BLOCK_G)
+    return (out,)
+
+
+BF16_RHT = QuantCastTritonRecipe.from_gold(HadamardRht, triton_fn=rht_triton)
+
+
+# ---------------------------------------------------------------------------
 # Tiling-INVARIANT stochastic-rounding fp32 -> bf16 (the tile-invariant counterpart of the kernel
 # above, mirroring sr_bf16_global_f). The gold recipe keys the dither on each element's GLOBAL index
 # so the draws don't shift with tiling; under flex_tile_map it's told the tile's origin/stride
@@ -1123,7 +1165,7 @@ SR_F32_TO_BF16_GLOBAL = QuantCastTritonRecipe.from_gold(
 
 
 # Order mirrors quant_cast_gold.ALL_RECIPES (skipping the gold entries with no Triton impl:
-# bf16_rht, mxfp8_bias).
+# mxfp8_bias).
 ALL_RECIPES = [
     # elementwise
     ("fp8_tensorwise_precalc_scale", FP8_TENSORWISE_PRECALC_SCALE),
@@ -1147,6 +1189,8 @@ ALL_RECIPES = [
     # 1x16, 4 bit
     ("nvfp4_swizzle", NVFP4_SWIZZLE),
     ("nvfp4_blocked_outer", NVFP4_BLOCKED_OUTER),
+    # RHT
+    ("bf16_rht", BF16_RHT),
     # stochastic rounding
     ("fp32_to_bf16_sr", SR_F32_TO_BF16),
     ("fp32_to_bf16_sr_global_offsets", SR_F32_TO_BF16_GLOBAL),
