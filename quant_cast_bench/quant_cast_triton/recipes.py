@@ -413,49 +413,69 @@ FP8_ROWWISE = QuantCastTritonRecipe.from_gold(RowwiseFp8Gold, triton_fn=fp8_roww
 
 # ---------------------------------------------------------------------------
 # fp8 colwise (full-span): one fp32 scale per column, amax over ALL rows; transposed-contiguous
-# output (N, M) and scale (N, 1). Two passes over M. Mirrors colwise_fp8_f. Grid: (cdiv(N, BN),).
-# Perf: like rowwise, eviction hints keep the amax pass resident (evict_last) for the quant pass
-# (evict_first); autotune (BM, BN). The (BM, BN) tile is transposed in registers (tl.trans) so the
-# store to the (N, M) output is a coalesced BM-wide run per output row.
+# output (N, M) and scale (N, 1). Mirrors colwise_fp8_f.
+#
+# Perf: the scale is a full-column (dim-M) reduction, so the cast is inherently reduce-then-quantize
+# and reads x twice from DRAM (the reload misses L2 -- unlike rowwise, many concurrent full-column
+# strips thrash the cache). A single kernel is forced into narrow, *strided* reads (the reduction
+# axis M is the strided one in row-major x), which caps DRAM utilization ~50% -> ~37% of peak.
+# Splitting into two kernels lets BOTH reads be *coalesced* (row-major), lifting DRAM utilization:
+#   (A) `_fp8_colwise_amax_kernel`: coalesced wide (BM, BN) tiles, partial per-column amax, combined
+#       across the M-grid with `tl.atomic_max` into a per-column scratch buffer.
+#   (B) `_fp8_colwise_quant_kernel`: reads x once (coalesced), quantizes with the precomputed amax,
+#       and writes the transposed (N, M) output + the (N, 1) scale.
+# ~37% -> ~46% of peak. (True read-once needs staging the column in SMEM, which Triton can't express
+# -- that's a CuTeDSL/CUDA optimization.)
 # ---------------------------------------------------------------------------
-_COLWISE_CONFIGS = [
+_COLWISE_AMAX_CONFIGS = [
     triton.Config({"BM": bm, "BN": bn}, num_warps=w)
-    for bm in (256, 512, 1024)
-    for bn in (16, 32, 64)
-    for w in (4, 8)
+    for bm in (128, 256) for bn in (128, 256) for w in (4, 8)
+]
+_COLWISE_QUANT_CONFIGS = [
+    triton.Config({"BM": bm, "BN": bn}, num_warps=w)
+    for bm in (256, 512) for bn in (32, 64) for w in (4, 8)
 ]
 
 
-@triton.autotune(configs=_COLWISE_CONFIGS, key=["M", "N"])
+@triton.autotune(configs=_COLWISE_AMAX_CONFIGS, key=["M", "N"])
 @triton.jit
-def _fp8_colwise_kernel(x_ptr, y_ptr, s_ptr, M, N, sxm, sxn, sym, syn, BM: tl.constexpr, BN: tl.constexpr):
-    pid_n = tl.program_id(0)
+def _fp8_colwise_amax_kernel(x_ptr, a_ptr, M, N, sxm, sxn, BM: tl.constexpr, BN: tl.constexpr):
+    # coalesced (BM, BN) row-major tile -> partial per-column amax -> atomic_max into a_ptr[N].
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_m = pid_m * BM + tl.arange(0, BM)
     offs_n = pid_n * BN + tl.arange(0, BN)
+    m_mask = offs_m < M
     n_mask = offs_n < N
-    amax = tl.zeros((BN,), dtype=tl.float32)
-    for i in range(0, tl.cdiv(M, BM)):
-        offs_m = i * BM + tl.arange(0, BM)
-        m_mask = offs_m < M
-        x = tl.load(
-            x_ptr + offs_m[:, None] * sxm + offs_n[None, :] * sxn,
-            mask=m_mask[:, None] & n_mask[None, :], other=0.0, eviction_policy="evict_last",
-        ).to(tl.float32)
-        amax = tl.maximum(amax, tl.max(tl.abs(x), axis=0))
-    amax = tl.maximum(amax, 1e-12)
+    x = tl.load(
+        x_ptr + offs_m[:, None] * sxm + offs_n[None, :] * sxn,
+        mask=m_mask[:, None] & n_mask[None, :], other=0.0,
+    ).to(tl.float32)
+    tl.atomic_max(a_ptr + offs_n, tl.max(tl.abs(x), axis=0), mask=n_mask)
+
+
+@triton.autotune(configs=_COLWISE_QUANT_CONFIGS, key=["M", "N"])
+@triton.jit
+def _fp8_colwise_quant_kernel(
+    x_ptr, a_ptr, y_ptr, s_ptr, M, N, sxm, sxn, sym, syn, BM: tl.constexpr, BN: tl.constexpr
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_m = pid_m * BM + tl.arange(0, BM)
+    offs_n = pid_n * BN + tl.arange(0, BN)
+    m_mask = offs_m < M
+    n_mask = offs_n < N
+    amax = tl.maximum(tl.load(a_ptr + offs_n, mask=n_mask, other=1e-12), 1e-12)
     scale = amax / 448.0  # (BN,); mirror gold: scale then 1/scale
     inv = 1.0 / scale
-    for i in range(0, tl.cdiv(M, BM)):
-        offs_m = i * BM + tl.arange(0, BM)
-        m_mask = offs_m < M
-        mask = m_mask[:, None] & n_mask[None, :]
-        x = tl.load(
-            x_ptr + offs_m[:, None] * sxm + offs_n[None, :] * sxn, mask=mask,
-            eviction_policy="evict_first",
-        ).to(tl.float32)
-        y = (x * inv[None, :]).to(tl.float8e4nv)  # (BM, BN)
-        out_off = offs_n[:, None] * sym + offs_m[None, :] * syn  # transposed (N, M)
-        tl.store(y_ptr + out_off, tl.trans(y), mask=n_mask[:, None] & m_mask[None, :])
-    tl.store(s_ptr + offs_n, scale, mask=n_mask)  # scale (N, 1) contiguous
+    x = tl.load(
+        x_ptr + offs_m[:, None] * sxm + offs_n[None, :] * sxn, mask=m_mask[:, None] & n_mask[None, :]
+    ).to(tl.float32)
+    y = (x * inv[None, :]).to(tl.float8e4nv)  # (BM, BN)
+    out_off = offs_n[:, None] * sym + offs_m[None, :] * syn  # transposed (N, M)
+    tl.store(y_ptr + out_off, tl.trans(y), mask=n_mask[:, None] & m_mask[None, :])
+    if pid_m == 0:
+        tl.store(s_ptr + offs_n, scale, mask=n_mask)  # scale (N, 1), written once per column
 
 
 def fp8_colwise_triton(x, **kwargs):
@@ -463,9 +483,12 @@ def fp8_colwise_triton(x, **kwargs):
     M, N = x.shape
     y = torch.empty((N, M), dtype=torch.float8_e4m3fn, device=x.device)
     s = torch.empty(N, 1, dtype=torch.float32, device=x.device)
-    grid = lambda meta: (triton.cdiv(N, meta["BN"]),)  # noqa: E731
-    _fp8_colwise_kernel[grid](
-        x, y, s, M, N, x.stride(0), x.stride(1), y.stride(0), y.stride(1)
+    a = torch.zeros(N, dtype=torch.float32, device=x.device)  # per-column amax scratch (>=0)
+    grid_a = lambda meta: (triton.cdiv(M, meta["BM"]), triton.cdiv(N, meta["BN"]))  # noqa: E731
+    grid_q = lambda meta: (triton.cdiv(M, meta["BM"]), triton.cdiv(N, meta["BN"]))  # noqa: E731
+    _fp8_colwise_amax_kernel[grid_a](x, a, M, N, x.stride(0), x.stride(1))
+    _fp8_colwise_quant_kernel[grid_q](
+        x, a, y, s, M, N, x.stride(0), x.stride(1), y.stride(0), y.stride(1)
     )
     return y, s
 
