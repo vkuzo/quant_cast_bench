@@ -51,9 +51,9 @@ Default shape is `(M, K) = (16384, 16384)`. Assumes a B200 (peak 8 TB/s).
 
 ![Memory bandwidth by mode](mem_bw.png)
 
-*Achieved memory bandwidth (% of the B200 8 TB/s peak) per kernel, one marker per implementation
-(`compile` ●, `triton` ■, `cute` ▲). Every kernel is now implemented in all three modes (the
-`relu (baseline)` reference is the dashed ceiling line). Data lives in
+*Achieved memory bandwidth (% of the B200 8 TB/s peak) on the x-axis, one kernel per row, with a
+marker per implementation (`compile` ●, `triton` ■, `cute` ▲). Every kernel is implemented in all
+three modes. Data lives in
 [`bench_results.csv`](bench_results.csv); regenerate the chart with `python benchmarks/plot_bench.py`.
 Refresh the data by re-running the sweeps with the
 `--csv` flag — `rm benchmarks/bench_results.csv` then
