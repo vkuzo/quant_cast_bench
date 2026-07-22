@@ -92,7 +92,7 @@ x_q_nvfp4, [x_inner_scale, x_outer_scale] = flex_cast_quant_dense_c(
 api.py - the public API, and the logic when to use inductor vs templates
 example.py - one e2e example of just doing the casts
 recipes.py - deepseek recipes (for testing and benchmarking)
-test.py - smoke tests
+../../test/test_flexquant.py - smoke tests
 benchmark.py - bench all the deepseek casts (assumes B200)
 hop/* - out of tree lowering to templates (100% clauded, didn't look much)
 ```
@@ -129,7 +129,8 @@ hop/* - out of tree lowering to templates (100% clauded, didn't look much)
 # the _triton rows are just for debugging (manual triton kernels)
 # cpu overhead of _hop is slightly higher than _triton but acceptable
 
-> python benchmark.py
+# run from the repo root (relative imports -> module form)
+> python -m quant_cast_bench.flexquant.benchmark
 
 shape: (16384, 16384) bfloat16
 recipe                           gpu_time_ms   gpu_gbps  gpu_pct_peak  cpu_time_ms

@@ -183,12 +183,12 @@ Notes:
   - `perf_description` — free-form note surfaced in the benchmark.
 
   All recipes are collected in **`ALL_RECIPES`** (list of `(name, gold)`), consumed by the tests and
-  by `quant_cast_bench` (`--mode compile` `torch.compile`s each `pt_ref_fn`).
+  by the benchmark (`benchmarks/benchmark.py --mode compile` `torch.compile`s each `pt_ref_fn`).
 - **`utils.py`** — fp4 (e2m1) helpers: `f32_to_f4_unpacked` / `f4_unpacked_to_f32`, `pack_uint4` /
   `unpack_uint4`.
-- **`test.py`** — parametrizes `ALL_RECIPES`, runs `pt_ref_fn` on a fixed shape, and asserts
-  `correctness_fn`. Makes no assumption about the number of outputs (recipes return 1-, 2-, or
-  4-tuples).
+- **`test/test_quant_cast_gold.py`** — parametrizes `ALL_RECIPES`, runs `pt_ref_fn` on a fixed shape,
+  and asserts `correctness_fn`. Makes no assumption about the number of outputs (recipes return 1-,
+  2-, or 4-tuples).
 
 ## Recipe families
 
@@ -200,6 +200,6 @@ Hadamard transform, and fp32→bf16 stochastic rounding. See `ALL_RECIPES` for t
 ## Test
 
 ```bash
-cd /home/dev/pytorch_scripts
-pytest quant_cast_gold/test.py -s
+cd /home/dev/quant_cast_bench
+pytest test/test_quant_cast_gold.py -s
 ```
