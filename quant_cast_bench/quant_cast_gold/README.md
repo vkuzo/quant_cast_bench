@@ -19,19 +19,17 @@ class QuantCastSingleKernelGold:
 Coverage so far:
 * quant recipes: fp8 (deepseek, tensorwise, rowwise), mxfp8, nvfp4, RHT, RS
 * input orientation: x, x.t(), both
-* swizzles: none, blackwell_32_4_4
+* scale swizzles: none, blackwell_32_4_4
 
 ## tile invariance and quantization
 
 **tile invariance** of a function `f` is desireable as it gives a backend maximium
-flexibility in tiling and fusing the calculation.
+flexibility in tiling and fusing the calculation.  **Some but not all** quantization
+casts are expressible by a fully tile invariant `f`:
 
-**Some but not all** quantization casts are expressible by a fully tile invariant `f`:
-
-* **input_orientation**: `input -> f` can be tile-invariant, but `input.t() -> f` is not
-* **quantization_block_size**: can be tile invariant with a constraint on the tiling.
-* **tile-local output transform**: can be tile invariant with a constraint on the tiling.
-* **global offset** for RS is not tile invariant
+* **input orientation**: quantizing `input` can be tile invariant, but quantizing `input.t()` is not
+* **quantization block_size** and **local output transform**: can be tile invariant with a constraint on the tiling
+* **global element offset** for RS is not tile invariant
 
 At a high level:
 * inference (no `input.t() quant, no SR) - tile-invariant, with tiling constraints
@@ -59,12 +57,11 @@ Quantizing both `input` and `input.t()` is commonly needed for quantized trainin
 to supply the backward quantized gemms with the operands in the right orientation. 
 There are two considerations here:
 
-1. `input.t() -> f` is not tile invariant, as it is a global axis flip. Note that we **can**
-   express an equivalent transform with a transpose inside a tile invariant `f` coupled
-   with transposing the tile positions in the output tensor.
+1. the `input.t()` operation is not tile invariant, as it is a global axis flip. Note that we **can**
+   express an equivalent transform with a composition of an (a) in-tile transpose and (b)
+   transposing the tile positions in the output tensor.
 
-   Example: producing `input.t()` of a 4x4 matrix (numbers are source positions), tiled into 2x2
-   tiles, with a pointwise `f` (shown as identity, so only the transpose bookkeeping matters).
+   Example: `input.t()` of a 4x4 matrix (numbers are source positions), tiled into 2x2 tiles.
 
    ```text
    input:              goal (input.t()):
@@ -73,32 +70,21 @@ There are two considerations here:
     8  9 10 11           2  6 10 14
    12 13 14 15           3  7 11 15
 
-   (a) transpose the WHOLE tensor -> correct (matches goal).
-
-   (b) transpose each 2x2 tile, tiles left in place -> WRONG
-       (off-diagonal tiles sit in the wrong quadrant):
-        0  4 | 2  6
-        1  5 | 3  7
-       ------+------
-        8 12 |10 14
-        9 13 |11 15
-
-   (c) transpose each 2x2 tile AND transpose the tile positions
-       (swap the two off-diagonal tiles) -> correct:
-        0  4 | 8 12
-        1  5 | 9 13
-       ------+------
-        2  6 |10 14
-        3  7 |11 15
+    input 2x2         transpose tiles    transpose tile positions
+    0  1 |  2  3      0  4 | 2  6        0  4 |  8 12
+    4  5 |  6  7      1  5 | 3  7        1  5 |  9 13
+    -----+------  =>  -----+-----    =>  -----+------
+    8  9 | 10 11      8 12 |10 14        2  6 | 10 14
+   12 13 | 14 15      9 13 |11 15        3  7 | 11 15
    ```
 
    So the global transpose factors into a tile-invariant `f` (the local per-tile transpose) plus a
-   grid-level swap of tile positions. The grid-level swap of tile positions must be handles by
+   grid-level swap of tile positions. The grid-level swap of tile positions must be handled by
    a backend that consumes a tile invariant `f`, and it requires extra information (for example,
    `OutputKinds.GRID_SWAP`, or a more general version of it).
 
 
-2. performant kernels to quantize `input.t()` are not currently at SOL performance in triton
+3. performant kernels to quantize `input.t()` are not currently at SOL performance in triton
    due to limitations of triton itself (TODO link to details). We need a lower level 
    DSL (for example, cuteDSL) to reach near-SOL.
 
