@@ -16,9 +16,11 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.utils as utils
 import torch
+from cutlass._mlir.dialects import llvm  # inline PTX for the hardware fp4/e4m3 cvts
 from cutlass.cute.nvgpu import cpasync  # TMA (bulk-tensor) copy ops + tma_partition
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cute.testing import _maybe_recast_from_f4  # packs an fp4 register vector to bytes
+from cutlass.cutlass_dsl import T, dsl_user_op
 
 from quant_cast_bench.quant_cast_gold.recipes import (
     ColwiseFp8Gold,
@@ -686,48 +688,136 @@ MXFP8_FLOOR_DIM_M = QuantCastCuteRecipe.from_gold(
 
 
 # ---------------------------------------------------------------------------
-# mxfp8 FLOOR 32x32: one e8m0 scale per 32x32 block. One warp (32 threads x 32 vals) per block:
-# thread r owns row r of the block (32 contiguous cols), intra-thread abs-max then warp_reduction
-# over the 32 rows -> block amax. Grid = one warp per (M//32, N//32) block. Mirrors mxfp8_32x32.
+# mxfp8 FLOOR 32x32: one e8m0 scale per 32x32 block (amax over the whole block, e8m0-FLOOR pow2
+# scale). Like deepseek_128x128 this is a NON-transposing block reduction, so it takes the same TMA
+# path (both tiles row-major (TM,TN), no register->smem transpose). Went 37.1% -> 70.9% of B200 peak
+# (beats compile 26.5%, matches the deepseek_128x128 sibling's ~70% ceiling; triton 76.5%). The
+# 32x32 block maps perfectly to a warp: 32 lanes x 32 rows = 1024 = a full block, so a WARP OWNS A
+# BLOCK and the block amax is a single warp_reduction_max -- no cross-warp scratch, no inter-phase
+# sync (simpler than deepseek_128x128). Tile size is decoupled from warp count (a small 64x64 tile
+# is TMA-starved, 45%): a big (TM,TN)=128x128 tile (32KB, matching deepseek's sweet spot) holds
+# NBLK=16 blocks, and each of the WARPS=8 warps LOOPS over NBLK//WARPS blocks.
+#   - TMA G2S loads the (TM,TN) tile into sIN;
+#   - warp w handles blocks {w, w+WARPS, ...}; for each, lane `l` owns COLUMN l of the block (rows
+#     0..31) -> consecutive lanes hit consecutive smem cols = conflict-free (bank note in
+#     [[cute-tma-transpose-quant]]); lane reduces its 32-row column, warp_reduction_max -> block
+#     amax -> e8m0 floor scale; each lane quantizes its column (vectorized f32->fp8) into sOUT;
+#     lane0 writes the e8m0 byte;
+#   - TMA S2G stores sOUT into the (TM,TN) tile of the row-major output.
+# TWO decisive findings (both took the kernel from ~38% -> 70%): (1) `v / sfp` on a 32-wide vector
+# emits 32 per-element DIVISIONS (168M insts, 38%); `inv = 1/sfp; v * inv` is bit-exact for a pow2
+# e8m0 scale and cuts to 95M insts (matches deepseek) -> 70%. (2) WARPS=8 (not 4): smem caps
+# occupancy at 4 CTAs/SM regardless of thread count, so 8 warps/CTA doubles resident warps to hide
+# the TMA-load latency (long_scoreboard-bound). Tried but REJECTED: a direct coalesced fp8 GLOBAL
+# store (drop sOUT smem, halve footprint, raise occupancy) -> only 50.5%; TMA store of the whole
+# tile beats scattered 32-byte fp8 sectors even at lower occupancy. Bigger tiles (128x256, 256x256)
+# are smem-occupancy-starved (63%, 47%).
 # ---------------------------------------------------------------------------
+_M32_TM, _M32_TN = 128, 128                    # TMA tile (tuned on B200 @ 16384)
+_M32_WARPS = 8                                 # warps/CTA (tuned; more warps hide TMA-load latency)
+_M32_THREADS = _M32_WARPS * 32
+_M32_BR = _M32_TM // 32                         # block-rows per tile
+_M32_BC = _M32_TN // 32                         # block-cols per tile
+_M32_NBLK = _M32_BR * _M32_BC                   # 32x32 blocks per tile
+_M32_BPW = _M32_NBLK // _M32_WARPS              # blocks each warp loops over
+_M32_BYTES = _M32_TM * _M32_TN * 2              # bf16 tile bytes for TMA expect-tx
+
+
+@cute.struct
+class _Mxfp832Smem:
+    bar: cute.struct.MemRange[cutlass.Int64, 1]
+    sin: cute.struct.Align[cute.struct.MemRange[cutlass.BFloat16, _M32_TM * _M32_TN], 1024]
+    sout: cute.struct.Align[cute.struct.MemRange[cutlass.Float8E4M3FN, _M32_TM * _M32_TN], 1024]
+
+
 @cute.kernel
-def _mxfp8_32x32_kernel(gX: cute.Tensor, gY: cute.Tensor, gScale: cute.Tensor, tv_layout: cute.Layout):
+def _mxfp8_32x32_kernel(atom_in: cute.CopyAtom, ten_in: cute.Tensor, atom_out: cute.CopyAtom,
+                        ten_out: cute.Tensor, scales: cute.Tensor, sil: cute.Layout,
+                        sol: cute.Layout, ncb: cutlass.Constexpr):
     tidx, _, _ = cute.arch.thread_idx()
-    bidx, _, _ = cute.arch.block_idx()
-    thrX = cute.composition(gX[(None, bidx)], tv_layout)[(tidx, None)]
-    thrY = cute.composition(gY[(None, bidx)], tv_layout)[(tidx, None)]
-    frgX = cute.make_rmem_tensor(cute.get(tv_layout, mode=[1]), gX.element_type)
-    cute.copy(cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gX.element_type), thrX, frgX)
-    v = frgX.load().to(cutlass.Float32)
-    local = cutlass.max(v, -v).reduce(cute.ReductionOp.MAX, cutlass.Float32(0.0), 0)
-    amax = cute.arch.warp_reduction_max(local)  # across the 32 rows of the block
-    sfp, biased = _e8m0_floor(amax)
-    frgY = cute.make_rmem_tensor(cute.get(tv_layout, mode=[1]), gY.element_type)
-    frgY.store((v / sfp).to(gY.element_type))
-    cute.copy(cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gY.element_type), frgY, thrY)
+    bidx, bidy, _ = cute.arch.block_idx()   # bidx = m_tile, bidy = n_tile
+    warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+    lane = tidx % 32
+    smem = utils.SmemAllocator()
+    st = smem.allocate(_Mxfp832Smem)
+    bar = st.bar.data_ptr()
     if tidx == 0:
-        gScale[(None, bidx)][0] = biased.to(gScale.element_type)
+        cute.arch.mbarrier_init(bar, 1)
+    cute.arch.mbarrier_init_fence()
+    cute.arch.sync_threads()
+    sIN = st.sin.get_tensor(sil)
+    sOUT = st.sout.get_tensor(sol)
+    gIN = cute.local_tile(ten_in, (_M32_TM, _M32_TN), (None, None))
+    gOUT = cute.local_tile(ten_out, (_M32_TM, _M32_TN), (None, None))
+    tAsA, tAgA = cpasync.tma_partition(atom_in, 0, cute.make_layout(1),
+                                       cute.group_modes(sIN, 0, 2), cute.group_modes(gIN, 0, 2))
+    tOsO, tBgB = cpasync.tma_partition(atom_out, 0, cute.make_layout(1),
+                                       cute.group_modes(sOUT, 0, 2), cute.group_modes(gOUT, 0, 2))
+    if warp == 0:
+        with cute.arch.elect_one():
+            cute.arch.mbarrier_arrive_and_expect_tx(bar, _M32_BYTES)
+        cute.copy(atom_in, tAgA[(None, bidx, bidy)], tAsA, tma_bar_ptr=bar)
+    cute.arch.mbarrier_wait(bar, 0)
+
+    # warp handles blocks {warp, warp+WARPS, ...}; lane l owns column l of a block (32 rows deep).
+    for bi in cutlass.range_constexpr(_M32_BPW):
+        blk = warp + bi * _M32_WARPS
+        br = blk // _M32_BC
+        bc = blk % _M32_BC
+        r0 = br * 32
+        c0 = bc * 32 + lane
+        frg = cute.make_rmem_tensor(cute.make_layout(32), cutlass.Float32)
+        for i in cutlass.range_constexpr(32):
+            frg[i] = sIN[r0 + i, c0].to(cutlass.Float32)
+        v = frg.load()
+        local = cute.where(v < 0, -v, v).reduce(cute.ReductionOp.MAX, cutlass.Float32(0.0), 0)
+        amax = cute.arch.warp_reduction_max(local)       # across the 32 columns -> whole-block amax
+        sfp, biased = _e8m0_floor(amax)
+        inv = 1.0 / sfp                                   # pow2 scale: v*(1/sfp) is bit-exact vs v/sfp
+        if lane == 0:
+            gbr = bidx * _M32_BR + br
+            gbc = bidy * _M32_BC + bc
+            scales[gbr * ncb + gbc] = biased.to(scales.element_type)
+        frgOut = cute.make_rmem_tensor(cute.make_layout(32), cutlass.Float8E4M3FN)
+        frgOut.store((v * inv).to(cutlass.Float8E4M3FN))  # reciprocal-mul, not 32 per-element divs
+        for i in cutlass.range_constexpr(32):
+            sOUT[r0 + i, c0] = frgOut[i]
+
+    cute.arch.fence_proxy("async.shared", space="cta")
+    cute.arch.sync_threads()
+    if warp == 0:
+        cute.copy(atom_out, tOsO, tBgB[(None, bidx, bidy)])
 
 
 @cute.jit
-def _mxfp8_32x32_jit(mX, mY, mScale):
-    tv_layout = cute.make_layout((32, 32), stride=(32, 1))  # 32 threads (rows) x 32 vals (cols)
-    gX = cute.zipped_divide(mX, (32, 32))
-    gY = cute.zipped_divide(mY, (32, 32))
-    gScale = cute.zipped_divide(mScale, (1, 1))
-    _mxfp8_32x32_kernel(gX, gY, gScale, tv_layout).launch(
-        grid=[cute.size(gX, mode=[1]), 1, 1], block=[32, 1, 1])
+def _mxfp8_32x32_jit(mIN, mOUT, scales, ncb: cutlass.Constexpr):
+    sil = cute.make_layout((_M32_TM, _M32_TN), stride=(_M32_TN, 1))
+    sol = cute.make_layout((_M32_TM, _M32_TN), stride=(_M32_TN, 1))
+    atom_in, ten_in = cpasync.make_tiled_tma_atom(
+        cpasync.CopyBulkTensorTileG2SOp(), mIN, sil, (_M32_TM, _M32_TN))
+    atom_out, ten_out = cpasync.make_tiled_tma_atom(
+        cpasync.CopyBulkTensorTileS2GOp(), mOUT, sol, (_M32_TM, _M32_TN))
+    M2, N2 = mIN.shape
+    grid = ((M2 + _M32_TM - 1) // _M32_TM, (N2 + _M32_TN - 1) // _M32_TN, 1)
+    _mxfp8_32x32_kernel(atom_in, ten_in, atom_out, ten_out, scales, sil, sol,
+                        ncb).launch(grid=grid, block=(_M32_THREADS, 1, 1), cluster=(1, 1, 1))
 
 
 def mxfp8_32x32_floor_cute(x, **kwargs):
     assert x.is_contiguous() and x.dim() == 2
     M, N = x.shape
+    assert M % _M32_TM == 0 and N % _M32_TN == 0, \
+        f"mxfp8_32x32 cute kernel needs M%{_M32_TM}==0 and N%{_M32_TN}==0"
     y = torch.empty(M, N, dtype=torch.float8_e4m3fn, device=x.device)
-    s_u8 = torch.empty(M // 32, N // 32, dtype=torch.uint8, device=x.device)
-    mX = from_dlpack(x).mark_layout_dynamic()
-    mY = from_dlpack(y).mark_layout_dynamic()
-    mS = from_dlpack(s_u8).mark_layout_dynamic()
-    fn = _compiled(("mxfp8_32x32", M, N), _mxfp8_32x32_jit, mX, mY, mS)
+    ncb = N // 32
+    s_u8 = torch.empty(M // 32, ncb, dtype=torch.uint8, device=x.device)
+    # TMA needs full layout/divisibility marking (leading dim contiguous, 16-elem aligned).
+    mX = (from_dlpack(x, assumed_align=16).mark_layout_dynamic(leading_dim=1)
+          .mark_compact_shape_dynamic(mode=1, divisibility=16))
+    mY = (from_dlpack(y, assumed_align=16).mark_layout_dynamic(leading_dim=1)
+          .mark_compact_shape_dynamic(mode=1, divisibility=16))
+    mS = from_dlpack(s_u8.reshape(-1)).mark_layout_dynamic()
+    fn = _compiled(("mxfp8_32x32", M, N), _mxfp8_32x32_jit, mX, mY, mS, ncb)
     fn(mX, mY, mS)
     return y, s_u8.view(torch.float8_e8m0fnu)
 
@@ -1306,61 +1396,266 @@ def _nvfp4_block(v, data_val_layout, outer):
     return packed, frgIe[0]
 
 
-# nvfp4 with a per-tensor (global) outer scale: 1x16 inner blocks, e4m3 inner scale, fp4-packed
-# qdata, inner scale in the swizzled 4D grid. One thread per 1x16 block. Mirrors nvfp4_gs_swizzle_f.
-@cute.kernel
-def _nvfp4_swizzle_kernel(gX: cute.Tensor, gQ: cute.Tensor, sflat: cute.Tensor, mOuter: cute.Tensor,
-                          cX: cute.Tensor, tv_layout: cute.Layout, q_tv_layout: cute.Layout,
-                          ncb: cutlass.Int32):
-    tidx, _, _ = cute.arch.thread_idx()
-    bidx, _, _ = cute.arch.block_idx()
-    thrX = cute.composition(gX[(None, bidx)], tv_layout)[(tidx, None)]
-    thrQ = cute.composition(gQ[(None, bidx)], q_tv_layout)[(tidx, None)]
-    thrC = cute.composition(cX[(None, bidx)], tv_layout)[(tidx, None)]
-    frgX = cute.make_rmem_tensor(cute.get(tv_layout, mode=[1]), gX.element_type)
-    cute.copy(cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gX.element_type), thrX, frgX)
-    frgO = cute.make_rmem_tensor(cute.make_layout(1), mOuter.element_type)
-    cute.copy(cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), mOuter.element_type), mOuter, frgO)
+# Hardware fp4 / e4m3 conversions via inline PTX (Blackwell SM10.x), ported verbatim from the
+# human-optimized torchao unified fp4 CuTeDSL cast (pytorch/ao#4517, cute_utils.py). The fast
+# nvfp4_swizzle kernel uses these single hardware instructions instead of `_nvfp4_block`'s
+# 4-lane-broadcast e4m3 fragment conversions + `_maybe_recast_from_f4` fp4 packing -- far fewer
+# registers and instructions (the kernel was compute/register-bound at 56 reg/thread, 44% occ).
+@dsl_user_op
+def _cvt_rn_satfinite_e2m1x2_f32(hi, lo, *, loc=None, ip=None):
+    """Pack two f32 into one E2M1x2 byte = (e2m1(hi) << 4) | e2m1(lo) (RN, saturating to +-6). The
+    e2m1x2 cvt output is a .b8, but inline-asm outputs must be >=16-bit, so (like cutlass's
+    nvvm_wrappers) we cvt into a .reg .b8 and assemble a .b16 via mov.b16 with a zero high byte."""
+    packed = cutlass.Uint16(
+        llvm.inline_asm(
+            T.i16(),
+            [cutlass.Float32(hi).ir_value(loc=loc, ip=ip),
+             cutlass.Float32(lo).ir_value(loc=loc, ip=ip)],
+            "{\n\t"
+            ".reg .b8 d, z, w;\n\t"
+            ".reg .b16 zero16;\n\t"
+            "mov.u16 zero16, 0;\n\t"
+            "mov.b16 {z, w}, zero16;\n\t"
+            "cvt.rn.satfinite.e2m1x2.f32 d, $1, $2;\n\t"
+            "mov.b16 $0, {d, z};\n\t"
+            "}",
+            "=h,f,f",
+            has_side_effects=False, is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+    return cutlass.Uint8(packed & cutlass.Uint16(0xFF))
 
-    packed, inner_e4 = _nvfp4_block(frgX.load().to(cutlass.Float32),
-                                    cute.get(tv_layout, mode=[1]), frgO[0])
-    frgQ = cute.make_rmem_tensor(cute.get(q_tv_layout, mode=[1]), gQ.element_type)
-    frgQ.store(packed)
-    cute.copy(cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gQ.element_type), frgQ, thrQ)
-    flat = _swizzle_flat(thrC[0][0], thrC[0][1] // 16, ncb)  # col = 16-group index
-    fib = cute.make_rmem_tensor(cute.make_layout(1), cutlass.Float8E4M3FN)
-    fib[0] = inner_e4
-    sflat[flat] = cute.recast_tensor(fib, dtype=cutlass.Uint8)[0]
+
+@dsl_user_op
+def _cvt_rn_satfinite_e2m1x2_f32_x4(v0, v1, v2, v3, v4, v5, v6, v7, *, loc=None, ip=None):
+    """Pack eight f32 into four E2M1x2 bytes as one Uint32 (byte k = (e2m1(v[2k+1])<<4)|e2m1(v[2k])),
+    assembled with a single mov.b32 -- no per-byte masking. Mirrors MSLK's convert_fp32_to_fp4_packed
+    (the triton nvfp4 kernel); amortizes the fp4-pack ALU over 4 bytes/call instead of 1."""
+    args = [cutlass.Float32(x).ir_value(loc=loc, ip=ip)
+            for x in (v0, v1, v2, v3, v4, v5, v6, v7)]
+    return cutlass.Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            args,
+            "{\n\t"
+            ".reg .b8 b0, b1, b2, b3;\n\t"
+            "cvt.rn.satfinite.e2m1x2.f32 b0, $2, $1;\n\t"
+            "cvt.rn.satfinite.e2m1x2.f32 b1, $4, $3;\n\t"
+            "cvt.rn.satfinite.e2m1x2.f32 b2, $6, $5;\n\t"
+            "cvt.rn.satfinite.e2m1x2.f32 b3, $8, $7;\n\t"
+            "mov.b32 $0, {b0, b1, b2, b3};\n\t"
+            "}",
+            "=r,f,f,f,f,f,f,f,f",
+            has_side_effects=False, is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
 
 
-_NVFP4_BPT = 8  # 1x16 blocks per CTA
+@dsl_user_op
+def _cvt_rn_satfinite_e4m3x2_f32(hi, lo, *, loc=None, ip=None):
+    """Convert one f32 to its E4M3 byte (RN, saturating to 448): pass hi == lo, return the low byte
+    (e4m3x2 cvt already yields a .b16, low byte = e4m3(lo))."""
+    packed = cutlass.Uint16(
+        llvm.inline_asm(
+            T.i16(),
+            [cutlass.Float32(hi).ir_value(loc=loc, ip=ip),
+             cutlass.Float32(lo).ir_value(loc=loc, ip=ip)],
+            "cvt.rn.satfinite.e4m3x2.f32 $0, $1, $2;",
+            "=h,f,f",
+            has_side_effects=False, is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+    return cutlass.Uint8(packed & cutlass.Uint16(0xFF))
+
+
+@dsl_user_op
+def _cvt_e4m3_byte_to_f32(byte, *, loc=None, ip=None):
+    """Dequantize a single E4M3 byte to Float32 (== float8_e4m3fn(byte).to(torch.float32)). Zero-
+    extend to a .b16 and feed it straight to cvt.rn.f16x2.e4m3x2; the low f16 = e4m3(byte)."""
+    src_i16 = cutlass.Uint16(byte)
+    rst_i32 = cutlass.Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [src_i16.ir_value(loc=loc, ip=ip)],
+            "cvt.rn.f16x2.e4m3x2 $0, $1;",
+            "=r,h",
+            has_side_effects=False, is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+    lo_f16_bits = cutlass.Uint16(rst_i32 & cutlass.Uint32(0xFFFF))
+    f16_val = cutlass.Float16(llvm.bitcast(T.f16(), lo_f16_bits.ir_value(loc=loc, ip=ip)))
+    return cutlass.Float32(f16_val)
 
 
 @cute.jit
-def _nvfp4_swizzle_jit(mX, mQ, sflat, mOuter, ncb: cutlass.Constexpr):
-    tv_layout = cute.make_layout((_NVFP4_BPT, 16), stride=(16, 1))
-    q_tv_layout = cute.make_layout((_NVFP4_BPT, 8), stride=(8, 1))  # 16 fp4 -> 8 bytes
-    gX = cute.zipped_divide(mX, (1, _NVFP4_BPT * 16))
-    gQ = cute.zipped_divide(mQ, (1, _NVFP4_BPT * 8))
-    cX = cute.zipped_divide(cute.make_identity_tensor(mX.shape), (1, _NVFP4_BPT * 16))
-    _nvfp4_swizzle_kernel(gX, gQ, sflat, mOuter, cX, tv_layout, q_tv_layout,
-                          cutlass.Int32(ncb)).launch(
-        grid=[cute.size(gX, mode=[1]), 1, 1], block=[_NVFP4_BPT, 1, 1])
+def _nvfp4_scale_e4m3(amax, inv_outer):
+    """NVFP4 two-level inner scale via hardware cvts: returns (e4m3 scale byte, fp32 data recip).
+    Matches nvfp4_gs_swizzle_f: local = clamp((amax/6)/outer, eps, 448) -> e4m3;
+    recip = (1/outer) / dequant(e4m3) (what each element is multiplied by before the fp4 cast).
+    Takes the hoisted inv_outer = 1/outer so the per-block `/outer` is a multiply (nvfp4 is a
+    coarse 4-bit / SQNR-graded cast, so the reassociated rounding is well within tolerance)."""
+    local = cutlass.min(
+        cutlass.max((amax / 6.0) * inv_outer, cutlass.Float32(_NVFP4_EPS)), cutlass.Float32(448.0)
+    )
+    e4m3_byte = _cvt_rn_satfinite_e4m3x2_f32(local, local)
+    recip = inv_outer / _cvt_e4m3_byte_to_f32(e4m3_byte)
+    return e4m3_byte, recip
+
+
+# nvfp4 with a per-tensor (global) outer scale: 1x16 inner blocks, e4m3 inner scale, fp4-packed
+# qdata, inner scale in the swizzled 4D grid. Mirrors nvfp4_gs_swizzle_f. Went 7.9% -> ~62% of B200
+# peak (beats compile 23.5%, edges triton 62.7% at peak).
+#
+# ATTRIBUTION: the design and much of the machinery are adapted from the human-optimized torchao
+# unified FP4 (NVFP4 + MXFP4 +/- RHT) CuTeDSL quantize cast, pytorch/ao PR #4517
+# (https://github.com/pytorch/ao/pull/4517), files cutedsl/cute_utils.py + fp4_unified_quantize.py.
+# Taken from it: the three inline-PTX conversion helpers (e2m1x2 / e4m3x2 / f16x2.e4m3x2 -- see
+# _cvt_* below, ported ~verbatim), the two-level nvfp4 scale recipe, the "group of 32 = two blocks =
+# one 128-bit store" unit of work, and the warp-per-row ("wpr") thread mapping. Differences: this is
+# a single-purpose nvfp4-only kernel (no MXFP4, no fused RHT, one scale layout = the blocked swizzle
+# our gold recipe needs) rather than that PR's unified multi-format/multi-layout kernel; the batched
+# 8-f32 -> 4-byte packer (_cvt_rn_satfinite_e2m1x2_f32_x4) instead follows the PR's sibling *triton*
+# kernel's pack=4 asm; and the swizzle-offset hoisting (fix 2 below) is not in the PR.
+#
+# Like mxfp8_floor_swizzle this is a non-transposing streaming cast (qdata is (M, N//2), same row
+# order as x), so it uses the SAME DRAM-speed recipe: FLATTEN to 1-D, 128 threads/CTA, each thread
+# owning CONTIGUOUS runs loaded/stored via 128-bit VECTORIZED copy atoms. The old kernel launched
+# only 8 threads/CTA with scalar (per-element) CopyUniversalOp loads (~7.9%). The unit of work is a
+# "group" of 32 input elements = TWO 1x16 nvfp4 blocks = exactly one 128-bit fp4 store (32 fp4 -> 16
+# bytes). Per block: thread-local amax reduce -> e4m3 inner scale -> fp4 pack; the 16 output bytes
+# are assembled into one 128-bit store. The two e4m3 scale bytes are scattered to their swizzled 4D
+# positions (numel/16 bytes ~= 0.4%). assumed_align=16 enables the 128-bit copies.
+#
+# The bandwidth is unlocked by three profiler-guided fixes (the kernel is ALU-pipe bound, not DRAM
+# bound -- ncu showed ALU ~73% while DRAM climbed 58 -> 66% as each was applied):
+#  1. HARDWARE cvts (inline PTX, ported from ao#4517): cvt.rn.satfinite.e2m1x2.f32 packs 8 f32 ->
+#     4 fp4 bytes/call (one mov.b32, no per-byte masking), and cvt e4m3x2 / f16x2.e4m3x2 do the
+#     two-level scale as single instructions -- vs _nvfp4_block's 4-lane-broadcast e4m3 fragments
+#     + _maybe_recast_from_f4 (which cost registers + ALU). (blocked_outer still uses _nvfp4_block.)
+#  2. HOISTED swizzle offset: the 4D (nrb,ncb,32,16) flatten factors as row_base + (col//4)*512 +
+#     (col%4); the per-row div/mods are computed once/group (not per block), and because a group's
+#     start is a multiple of 32 -> col16 is even -> its NB blocks share bc and land at flat0, +1.
+#     (Recomputing the full swizzle per block cost ~7 pts: it was the dominant ALU term.)
+#  3. WARP-PER-ROW mapping (ao#4517's "wpr", which beat its own 1-D "striped" mapping on this
+#     swizzle layout): warp w owns row bidy*WARPS+w; its 32 lanes + a grid.x column split + ILP
+#     stripe that row's 32-elem groups. Because the row is FIXED per warp, the row-dependent swizzle
+#     math (row_base) is computed ONCE and reused across all ~GPR/(XSPLIT*32) groups a lane visits
+#     (vs 2 in a 1-D-flatten mapping), and a whole row's scale bytes land in one 128-row swizzle
+#     atom. All ILP loads are issued first so global-load latency overlaps via MLP. This took the
+#     1-D striped mapping (~58%, long-scoreboard-bound at 44% occ) to ~62% (peaks at ao#4517's own
+#     wpr ~63%, above the repo's triton 62.7%). Tuned WARPS=2, XSPLIT=4, ILP=4 (the 128-bit store
+#     still pins the group at 32 elems = 2 blocks).
+# Requires N % 32 == 0 (whole 32-groups per row); a 32-group gc holds the two consecutive 16-groups
+# 2*gc and 2*gc+1 (2*gc even), so their swizzle offsets are flat0 and flat0+1.
+_NVSWZ_WARPS = 2                             # warps/CTA; warp w owns row bidy*WARPS+w
+_NVSWZ_XSPLIT = 4                            # grid.x column split within a row
+_NVSWZ_ILP = 4                               # groups/thread per loop iter (loads issued together)
+_NVSWZ_THREADS = 32 * _NVSWZ_WARPS
+_NVSWZ_LDWIDTH = 8                           # bf16 per 128-bit load (NLD = 32//LDWIDTH sub-loads)
+_NVSWZ_LD_BITS = _NVSWZ_LDWIDTH * 16         # bf16 input  -> 128-bit vectorized load
+_NVSWZ_ST_BITS = 128                         # 16 uint8 output -> 128-bit vectorized store
+
+
+@cute.kernel
+def _nvfp4_swizzle_kernel(gX: cute.Tensor, gQ: cute.Tensor, sflat: cute.Tensor, mOuter: cute.Tensor,
+                          M: cutlass.Constexpr, N: cutlass.Constexpr, ncb: cutlass.Constexpr):
+    tidx, _, _ = cute.arch.thread_idx()
+    bidx, bidy, _ = cute.arch.block_idx()
+    warp_id = tidx // 32
+    lane = tidx % 32
+    ld_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gX.element_type,
+                                  num_bits_per_copy=_NVSWZ_LD_BITS)
+    st_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gQ.element_type,
+                                  num_bits_per_copy=_NVSWZ_ST_BITS)
+    frgO = cute.make_rmem_tensor(cute.make_layout(1), mOuter.element_type)
+    cute.copy(cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), mOuter.element_type), mOuter, frgO)
+    inv_outer = 1.0 / frgO[0]                    # loop-invariant; per-block `/outer` becomes a mul
+    blk_layout = cute.make_layout(16)
+    ld_layout = cute.make_layout(_NVSWZ_LDWIDTH)
+    GPR = N // 32                                # 32-elem groups per row (constexpr)
+    NLD = 32 // _NVSWZ_LDWIDTH                   # 128-bit sub-loads per group
+
+    row = bidy * _NVSWZ_WARPS + warp_id          # warp owns one row
+    if row < M:
+        # Row-invariant swizzle offset (bc=0, c4=0) -- computed ONCE per warp-row and reused across
+        # every group this lane visits: the 4D (nrb,ncb,32,16) flatten factors as
+        # row_base + (col//4)*512 + (col%4); this per-row div/mod chain was the ALU-pipe bottleneck.
+        r128 = row % 128
+        row_base = ((row // 128) * ncb * 32 + (r128 % 32)) * 16 + (r128 // 32) * 4
+        nthreads_row = _NVSWZ_XSPLIT * 32
+        base = bidx * 32 + lane
+        while base < GPR:
+            # issue all ILP loads first (each group = one contiguous 32-run -> NLD 128-bit loads;
+            # the ILP groups are independent -> overlap) so global-load latency is hidden via MLP.
+            fragbuf = cute.make_rmem_tensor(cute.make_layout(_NVSWZ_ILP * 32), gX.element_type)
+            for jj in cutlass.range_constexpr(_NVSWZ_ILP):
+                gc = base + jj * nthreads_row
+                if gc < GPR:
+                    off = cute.assume(row * N + gc * 32, divby=32)
+                    for w in cutlass.range_constexpr(NLD):
+                        cute.copy(
+                            ld_atom,
+                            cute.make_tensor(gX.iterator + off + w * _NVSWZ_LDWIDTH, ld_layout),
+                            cute.make_tensor(fragbuf.iterator + jj * 32 + w * _NVSWZ_LDWIDTH,
+                                             ld_layout))
+            for jj in cutlass.range_constexpr(_NVSWZ_ILP):
+                gc = base + jj * nthreads_row
+                if gc < GPR:
+                    frgQ = cute.make_rmem_tensor(cute.make_layout(16), gQ.element_type)
+                    frgQ32 = cute.recast_tensor(frgQ, dtype=cutlass.Uint32)
+                    col16 = gc * 2               # two 16-groups per 32-group; first (even) at 2*gc
+                    flat0 = row_base + (col16 // 4) * 512 + (col16 % 4)
+                    for b in cutlass.range_constexpr(2):
+                        blk = cute.make_rmem_tensor(blk_layout, cutlass.Float32)
+                        blk.store(cute.make_tensor(fragbuf.iterator + jj * 32 + b * 16,
+                                                   blk_layout).load().to(cutlass.Float32))
+                        v = blk.load()
+                        amax = cutlass.max(v, -v).reduce(
+                            cute.ReductionOp.MAX, cutlass.Float32(0.0), 0)
+                        e4m3_byte, recip = _nvfp4_scale_e4m3(amax, inv_outer)
+                        # pack 16 scaled values -> 8 bytes = two uint32 (even col -> low nibble, odd
+                        # -> high, matching gold _f32_to_packed_fp4); 8 values/call amortizes ALU.
+                        for c in cutlass.range_constexpr(2):
+                            o = c * 8
+                            frgQ32[b * 2 + c] = _cvt_rn_satfinite_e2m1x2_f32_x4(
+                                blk[o] * recip, blk[o + 1] * recip, blk[o + 2] * recip,
+                                blk[o + 3] * recip, blk[o + 4] * recip, blk[o + 5] * recip,
+                                blk[o + 6] * recip, blk[o + 7] * recip)
+                        sflat[flat0 + b] = e4m3_byte
+                    offq = cute.assume(row * (N // 2) + gc * 16, divby=16)
+                    cute.copy(st_atom, frgQ,
+                              cute.make_tensor(gQ.iterator + offq, cute.make_layout(16)))
+            base = base + nthreads_row * _NVSWZ_ILP
+
+
+@cute.jit
+def _nvfp4_swizzle_jit(mX, mQ, sflat, mOuter,
+                       M: cutlass.Constexpr, N: cutlass.Constexpr, ncb: cutlass.Constexpr):
+    # warp-per-row grid: grid.y covers M in steps of WARPS, grid.x is the XSPLIT column split.
+    grid_y = (M + _NVSWZ_WARPS - 1) // _NVSWZ_WARPS
+    _nvfp4_swizzle_kernel(mX, mQ, sflat, mOuter, M, N, ncb).launch(
+        grid=[_NVSWZ_XSPLIT, grid_y, 1], block=[_NVSWZ_THREADS, 1, 1])
 
 
 def nvfp4_swizzle_cute(x, outer_scale, **kwargs):
     assert x.is_contiguous() and x.dim() == 2
     M, N = x.shape
+    assert N % 32 == 0, "nvfp4_swizzle cute kernel needs N % 32 == 0 (whole 32-groups per row)"
     q = torch.empty(M, N // 2, dtype=torch.uint8, device=x.device)
     ngc = N // 16
     nrb = (M + 127) // 128
     ncb = (ngc + 3) // 4
     s_u8 = torch.zeros(nrb, ncb, 32, 16, dtype=torch.uint8, device=x.device)  # padding stays 0
-    mX = from_dlpack(x).mark_layout_dynamic()
-    mQ = from_dlpack(q).mark_layout_dynamic()
+    # flatten (elementwise-style); assumed_align=16 enables the 128-bit vectorized copies.
+    mX = from_dlpack(x.reshape(-1), assumed_align=16).mark_layout_dynamic()
+    mQ = from_dlpack(q.reshape(-1), assumed_align=16).mark_layout_dynamic()
     sflat = from_dlpack(s_u8.reshape(-1)).mark_layout_dynamic()
     mOuter = from_dlpack(outer_scale.reshape(1))  # per-tensor scalar (static)
-    fn = _compiled(("nvfp4_swizzle", M, N), _nvfp4_swizzle_jit, mX, mQ, sflat, mOuter, ncb)
+    fn = _compiled(("nvfp4_swizzle", M, N), _nvfp4_swizzle_jit, mX, mQ, sflat, mOuter, M, N, ncb)
     fn(mX, mQ, sflat, mOuter)
     return q.view(torch.float4_e2m1fn_x2), s_u8.view(torch.float8_e4m3fn)
 
@@ -1368,8 +1663,12 @@ def nvfp4_swizzle_cute(x, outer_scale, **kwargs):
 NVFP4_SWIZZLE = QuantCastCuteRecipe.from_gold(Nvfp4GsSwizzleGold, cute_fn=nvfp4_swizzle_cute)
 
 
-# nvfp4 with a 128x128-blocked outer scale (Mb, Nb): identical to nvfp4_swizzle but the outer scale
-# is looked up per block from outer_blocked[row//128, (col*16)//128]. Mirrors nvfp4_blocked_outer_f.
+# nvfp4 with a 128x128-blocked outer scale (Mb, Nb): the outer scale is looked up per block from
+# outer_blocked[row//128, (col*16)//128]. Mirrors nvfp4_blocked_outer_f. (Still the naive one-block-
+# per-thread kernel -- unlike nvfp4_swizzle it wasn't the optimization target here.)
+_NVFP4_BPT = 8  # 1x16 blocks per CTA (blocked_outer naive kernel)
+
+
 @cute.kernel
 def _nvfp4_blocked_kernel(gX: cute.Tensor, gQ: cute.Tensor, sflat: cute.Tensor, mOuter: cute.Tensor,
                           cX: cute.Tensor, tv_layout: cute.Layout, q_tv_layout: cute.Layout,
