@@ -52,8 +52,8 @@ Default shape is `(M, K) = (16384, 16384)`. Assumes a B200 (peak 8 TB/s).
 ![Memory bandwidth by mode](mem_bw.png)
 
 *Achieved memory bandwidth (% of the B200 8 TB/s peak) per kernel, one marker per implementation
-(`compile` ●, `triton` ■, `cute` ▲). Kernels benchmarked in only some modes (e.g. `bf16_rht` and the
-two SR kernels have no cute impl) simply show fewer points. Data lives in
+(`compile` ●, `triton` ■, `cute` ▲). Kernels benchmarked in only some modes (e.g. the two SR kernels
+have no cute impl) simply show fewer points. Data lives in
 [`bench_results.csv`](bench_results.csv); regenerate the chart with `python benchmarks/plot_bench.py`.
 Refresh the data by re-running the sweeps with the
 `--csv` flag — `rm benchmarks/bench_results.csv` then
@@ -110,7 +110,7 @@ fp32_to_bf16_sr_global_offsets         0.2595  6206.6       77.6%  tile-invarian
 
 ### `--mode cute`
 
-The CuTeDSL (`cutlass.cute`) kernels are **correctness-first (naive tiling), with twelve tuned
+The CuTeDSL (`cutlass.cute`) kernels are **correctness-first (naive tiling), with thirteen tuned
 exceptions** — treat the untuned rows as a functional baseline, not a fair comparison to the
 compile/triton numbers above:
 
@@ -239,23 +239,38 @@ compile/triton numbers above:
   tile (XOR swizzle, as CUTLASS GEMM uses) that *also* keeps the dim-M column reads conflict-free —
   the real next step, left as future work.
 
+* `bf16_rht` (68.2%) — the 16×16 randomized Hadamard transform, run on **tensor cores**. A scalar
+  fp32 dot-product cute kernel is *compute*-bound at ~36% (256 fp32 MACs/group saturate the CUDA
+  cores before DRAM), and torch.compile's cuBLAS GEMM stalls at 29.3% (a skinny K=N=16 GEMM tiles
+  terribly). The fix is the SM80 warp-level bf16 `mma.sync` atom (m16n8k16): flatten `x` to groups
+  of 16 and run the transform as a batched `D[m,n] = Σ_k A[m,k]·B[n,k]` with A = a 16-group×16 tile
+  and B = `rht`ᵀ, so K=16 is a single k-step — the CuTeDSL analog of the Triton `tl.dot` kernel.
+  Global↔smem transfers are coalesced 128-bit vectorized copies; smem↔MMA-register fragments go
+  through the tiled-MMA partition; `rht` is staged in smem once per block (transposed on the fly, so
+  the wrapper passes it row-major with no runtime transpose). Tuned WARPS=4 × 2 tiles/warp (the
+  per-warp tile loop gives the memory-level parallelism that lifts a 1-tile/warp version 56% → 68%).
+  Beats compile (29.3%) and matches the triton kernel (67.7%), near the ~75% relu ceiling. Bit-exact
+  vs the torch reference: bf16×bf16 is exact in fp32, so the tensor-core fp32 accumulation reproduces
+  torch's bf16 matmul (the cute test compares bf16 outputs to ~1 ULP, i.e. demands exactness).
+
 ```
 shape: (16384, 16384)  mode: cute
 recipe                          gpu_time_ms    gbps    pct_peak  perf_description
 ----------------------------  -------------  ------  ----------  --------------------------------
-relu (baseline)                       0.179  5996.9       75.0%
-fp8_tensorwise_precalc_scale         0.1172  6871.2       85.9%  elementwise
-mxfp8_floor_swizzle                  0.1528  5323.8       66.5%  (1,32) block, swizzle
-mxfp8_floor_dim_m                    0.1677  4852.2       60.7%  (32,1) block, t-contig
-mxfp8_floor_dim_km                   0.2492  4375.5       54.7%  (1,32) dim-k + (32,1) dim-m, one pass, t-contig
-mxfp8_32x32_floor                    0.1425  5654.1       70.7%  (32,32) block
-fp8_deepseek_1x128                   0.1417  5742.4       71.8%  (1,128) block
-fp8_deepseek_1x128_dim_m             0.1648  4936.7       61.7%  (128,1) block, t-contig
-fp8_deepseek_1x128_dim_km             0.331  3295.1       41.2%  (1,128) dim-k + (128,1) dim-m, one pass, t-contig
-fp8_deepseek_128x128                 0.1435  5611.1       70.1%  (128,128) block
-fp8_rowwise                          0.1305  6173.1       77.2%  (1,-1) block
-fp8_colwise                          0.2179  3696.6       46.2%  (-1,1) block, t-contig
-nvfp4_swizzle                        0.1442  4771.6       59.6%  (1,16) block, fp4 qdata, swizzle
+relu (baseline)                        0.179  5997.1       75.0%
+fp8_tensorwise_precalc_scale           0.117  6882.3       86.0%  elementwise
+mxfp8_floor_swizzle                   0.1523  5342.6       66.8%  (1,32) block, swizzle
+mxfp8_floor_dim_m                     0.1667  4881.2       61.0%  (32,1) block, t-contig
+mxfp8_floor_dim_km                    0.2465  4423.7       55.3%  (1,32) dim-k + (32,1) dim-m, one pass, t-contig
+mxfp8_32x32_floor                     0.1417  5685.3       71.1%  (32,32) block
+fp8_deepseek_1x128                    0.1391  5848.9       73.1%  (1,128) block
+fp8_deepseek_1x128_dim_m              0.1654  4918.2       61.5%  (128,1) block, t-contig
+fp8_deepseek_1x128_dim_km             0.3309  3295.1       41.2%  (1,128) dim-k + (128,1) dim-m, one pass, t-contig
+fp8_deepseek_128x128                  0.1455    5536       69.2%  (128,128) block
+fp8_rowwise                           0.1328  6066.8       75.8%  (1,-1) block
+fp8_colwise                           0.2183  3688.8       46.1%  (-1,1) block, t-contig
+nvfp4_swizzle                         0.1422    4838       60.5%  (1,16) block, fp4 qdata, swizzle
+bf16_rht                              0.1968  5456.1       68.2%  16x16 RHT, warp mma.sync (4x2 tiles)
 ```
 
 ## Known issues
@@ -285,7 +300,11 @@ nvfp4_swizzle                        0.1442  4771.6       59.6%  (1,16) block, f
   (~2.3× the compile 29.3%, near the 74.9% relu ceiling): it flattens `x` to `(n_groups, 16)` and runs a
   batch of `(BLOCK_G, 16) @ (16, 16)` `tl.dot`s (fp32 accum → bf16) in one pass. The win comes from a
   large `BLOCK_G=512` — each program does a `512×16` tile, amortizing the tiny `K=16` dot that cuBLAS
-  can't tile well and turning the load/store into big coalesced runs.
+  can't tile well and turning the load/store into big coalesced runs. **The CuTeDSL kernel matches it
+  at 68.2%** on the SM80 warp `mma.sync` atom (m16n8k16, K=16 in one step); notably a *scalar* fp32
+  cute kernel is only ~36% (compute-bound on the CUDA cores) — the tensor cores are what make this
+  memory-bound. Both `tl.dot` and `mma.sync` are bit-exact vs the reference (bf16×bf16 is exact in
+  fp32, so the fp32 accumulation reproduces torch's bf16 matmul).
 
 * `nvfp4_swizzle` (compile) runs at only ~23% peak (vs the Triton kernel's 62.6%), because inductor
   splits it into **3 separate kernels** instead of one fused pass:

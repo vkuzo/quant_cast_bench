@@ -18,6 +18,7 @@ import cutlass.utils as utils
 import torch
 from cutlass._mlir.dialects import llvm  # inline PTX for the hardware fp4/e4m3 cvts
 from cutlass.cute.nvgpu import cpasync  # TMA (bulk-tensor) copy ops + tma_partition
+from cutlass.cute.nvgpu import warp as warp_mma  # SM80 warp-level mma.sync atoms (m16n8k16)
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cute.testing import _maybe_recast_from_f4  # packs an fp4 register vector to bytes
 from cutlass.cutlass_dsl import T, dsl_user_op
@@ -30,6 +31,7 @@ from quant_cast_bench.quant_cast_gold.recipes import (
     Deepseek1x128Gold,
     Deepseek128x128Gold,
     Float8TensorwiseGold,
+    HadamardRht,
     Mxfp832x32FloorGold,
     Mxfp8FloorDimKmGold,
     Mxfp8FloorDimMGold,
@@ -2077,6 +2079,142 @@ NVFP4_BLOCKED_OUTER = QuantCastCuteRecipe.from_gold(
 )
 
 
+# ---------------------------------------------------------------------------
+# 16x16 randomized Hadamard transform (bf16 in, bf16 out, no scale). Mirrors hadamard_rht_f:
+# reshape the last dim into groups of 16 and right-multiply each group by the 16x16 RHT matrix
+# (`out = x.reshape(..., 16) @ rht`). Memory-bound (4 bytes/element moved), but the per-group 16x16
+# matmul must NOT be run on the fp32 CUDA cores: a scalar dot-product kernel is compute-bound at ~36%
+# (256 fp32 MACs/group saturate the CUDA cores before DRAM), and torch.compile's cuBLAS GEMM stalls at
+# ~29% (skinny K=N=16 tiles terribly). The fix is tensor cores: we run the transform as a batched GEMM
+# on the SM80 warp-level bf16 `mma.sync` atom (m16n8k16), K=16 = a single k-step, exactly like the
+# Triton `tl.dot` kernel.
+#
+# Layout: flatten x to (n_groups, 16); one m16n8k16 MMA consumes a 16-group x 16 tile. `cute.gemm`
+# computes D[m,n] = sum_k A[m,k]*B[n,k], so with A = x tile (M=16 groups, K=16) and B[n,k] = rht[k,n]
+# (i.e. rht^T, N=16) we get out[g,j] = sum_k x[g,k]*rht[k,j]. Each warp handles _RHT_TPW tiles; global
+# <-> smem transfers are coalesced 128-bit vectorized copies (a warp streams _RHT_TPW*512 contiguous
+# bf16), and smem <-> MMA register fragments go through the tiled-MMA partition (fast, smem-only). The
+# 16x16 rht is staged in smem once per block, transposed on the fly (sB[n,k] = rht[k,n]) so the wrapper
+# passes rht row-major with no host/runtime transpose. Reaches ~69% (fastest RHT path, ~triton parity,
+# near the ~75% relu ceiling; ~2.3x compile, ~1.9x the scalar cute kernel).
+#
+# Bit-exactness vs the torch reference: bf16*bf16 is exact in fp32 (8+8 < 24 mantissa bits), so the
+# tensor-core fp32 accumulation reproduces torch's bf16 matmul (fp32 products, fp32 accumulate,
+# round-to-bf16) bit-for-bit -- verified against `x.reshape(...,16) @ rht` and against Triton's tl.dot.
+# This matters because the cute test compares bf16 outputs to ~1 ULP fp32, i.e. it demands exactness.
+# ---------------------------------------------------------------------------
+_RHT_WARPS = 4                          # warps per block
+_RHT_TPW = 2                            # 16-group tiles per warp (swept best: WARPSxTPW = 4x2)
+_RHT_VW = 8                             # bf16 per vectorized copy (8 * 16b = 128b)
+_RHT_THREADS = _RHT_WARPS * 32
+_RHT_WT = _RHT_WARPS * _RHT_TPW         # tiles per block
+_RHT_SMEM_ITERS = (256 + _RHT_THREADS - 1) // _RHT_THREADS  # threads-strided fill of the 256 rht elems
+
+
+@cute.struct
+class _RhtSmem:
+    sA: cute.struct.Align[cute.struct.MemRange[cutlass.BFloat16, _RHT_WT * 256], 1024]
+    sC: cute.struct.Align[cute.struct.MemRange[cutlass.BFloat16, _RHT_WT * 256], 1024]
+    sB: cute.struct.Align[cute.struct.MemRange[cutlass.BFloat16, 256], 1024]
+
+
+@cute.kernel
+def _rht_kernel(tiled_mma: cute.TiledMma, gX: cute.Tensor, gY: cute.Tensor, gR: cute.Tensor,
+                ntiles: cutlass.Constexpr):
+    tidx, _, _ = cute.arch.thread_idx()
+    bidx, _, _ = cute.arch.block_idx()
+    lane = tidx % 32
+    wp = tidx // 32
+    smem = utils.SmemAllocator()
+    st = smem.allocate(_RhtSmem)
+    # smem views (pulled out before the branches so no python struct is live across an `if`).
+    sBflat = st.sB.get_tensor(cute.make_layout(256))
+    sBt = st.sB.get_tensor(cute.make_layout((16, 16), stride=(16, 1)))            # (N, K) = rht^T
+    sA2 = st.sA.get_tensor(cute.make_layout((_RHT_WT, 256), stride=(256, 1)))     # per-tile flat (copy)
+    sC2 = st.sC.get_tensor(cute.make_layout((_RHT_WT, 256), stride=(256, 1)))
+    sA3 = st.sA.get_tensor(cute.make_layout((_RHT_WT, 16, 16), stride=(256, 16, 1)))  # (M, K) (MMA)
+    sC3 = st.sC.get_tensor(cute.make_layout((_RHT_WT, 16, 16), stride=(256, 16, 1)))  # (M, N)
+    tv = cute.make_layout((32, _RHT_VW), stride=(_RHT_VW, 1))                     # coalesced 128b copy
+    cp = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), cutlass.BFloat16, num_bits_per_copy=_RHT_VW * 16)
+
+    # stage rht^T in smem once per block: sBt[n,k] = rht[k,n] = gR[k*16+n] (gR is rht row-major).
+    for it in cutlass.range_constexpr(_RHT_SMEM_ITERS):
+        p = tidx + it * _RHT_THREADS
+        if p < 256:
+            sBflat[p] = gR[(p % 16) * 16 + (p // 16)]
+    cute.arch.sync_threads()
+
+    base = bidx * _RHT_WT
+    # pass 1: coalesced global -> smem for all of this warp's tiles.
+    for t in cutlass.range_constexpr(_RHT_TPW):
+        slot = wp * _RHT_TPW + t
+        tile = base + slot
+        if tile < ntiles:
+            gAt = cute.composition(cute.local_tile(gX, (256,), (tile,)), tv)[(lane, None)]
+            sAw = cute.composition(sA2[slot, None], tv)[(lane, None)]
+            cute.copy(cp, gAt, sAw)
+    cute.arch.sync_threads()
+
+    # pass 2: tensor-core MMA per tile (B fragment loaded once, reused across the warp's tiles).
+    thr_mma = tiled_mma.get_slice(lane)
+    tCrB = thr_mma.make_fragment_B(thr_mma.partition_B(sBt))
+    cute.autovec_copy(thr_mma.partition_B(sBt), tCrB)
+    for t in cutlass.range_constexpr(_RHT_TPW):
+        slot = wp * _RHT_TPW + t
+        tile = base + slot
+        if tile < ntiles:
+            sA = sA3[slot, None, None]
+            sC = sC3[slot, None, None]
+            tCrA = thr_mma.make_fragment_A(thr_mma.partition_A(sA))
+            tCrC = thr_mma.make_fragment_C(thr_mma.partition_C(sC))
+            cute.autovec_copy(thr_mma.partition_A(sA), tCrA)
+            for i in cutlass.range_constexpr(cute.size(tCrC)):
+                tCrC[i] = cutlass.Float32(0.0)
+            cute.gemm(tiled_mma, tCrC, tCrA, tCrB, tCrC)
+            tCsC = thr_mma.partition_C(sC)
+            for i in cutlass.range_constexpr(cute.size(tCrC)):
+                tCsC[i] = tCrC[i].to(cutlass.BFloat16)
+    cute.arch.sync_threads()
+
+    # pass 3: coalesced smem -> global for all of this warp's tiles.
+    for t in cutlass.range_constexpr(_RHT_TPW):
+        slot = wp * _RHT_TPW + t
+        tile = base + slot
+        if tile < ntiles:
+            sCw = cute.composition(sC2[slot, None], tv)[(lane, None)]
+            gCt = cute.composition(cute.local_tile(gY, (256,), (tile,)), tv)[(lane, None)]
+            cute.copy(cp, sCw, gCt)
+
+
+@cute.jit
+def _rht_jit(mX, mY, mR, ntiles: cutlass.Constexpr):
+    mma_atom = cute.make_mma_atom(
+        warp_mma.MmaF16BF16Op(cutlass.BFloat16, cutlass.Float32, (16, 8, 16)))
+    tiled_mma = cute.make_tiled_mma(mma_atom)  # default atom layout = one warp (32 threads)
+    nblocks = (ntiles + _RHT_WT - 1) // _RHT_WT
+    _rht_kernel(tiled_mma, mX, mY, mR, ntiles).launch(
+        grid=[nblocks, 1, 1], block=[_RHT_THREADS, 1, 1])
+
+
+def rht_cute(x, rht, **kwargs):
+    assert x.is_contiguous() and x.dim() == 2
+    M, N = x.shape
+    assert N % 16 == 0, f"rht cute kernel needs N % 16 == 0, got {N}"
+    assert (M * N) % 256 == 0, "rht cute kernel needs numel % 256 == 0 (whole 16-group MMA tiles)"
+    y = torch.empty(M, N, dtype=torch.bfloat16, device=x.device)
+    ntiles = (M * N) // 256  # number of 16-group x 16 MMA tiles
+    # assumed_align=16 enables the 128-bit vectorized copies (torch allocations are >=256B aligned).
+    mX = from_dlpack(x.reshape(-1), assumed_align=16).mark_layout_dynamic()  # flatten (per-16-group)
+    mY = from_dlpack(y.reshape(-1), assumed_align=16).mark_layout_dynamic()
+    mR = from_dlpack(rht.reshape(-1)).mark_layout_dynamic()  # (256,) rht row-major; transposed in smem
+    fn = _compiled(("rht", M, N), _rht_jit, mX, mY, mR, ntiles)
+    fn(mX, mY, mR)
+    return (y,)
+
+
+BF16_RHT = QuantCastCuteRecipe.from_gold(HadamardRht, cute_fn=rht_cute)
+
+
 ALL_RECIPES = [
     # elementwise
     ("fp8_tensorwise_precalc_scale", FP8_TENSORWISE_PRECALC_SCALE),
@@ -2100,4 +2238,6 @@ ALL_RECIPES = [
     # 1x16, 4-bit
     ("nvfp4_swizzle", NVFP4_SWIZZLE),
     ("nvfp4_blocked_outer", NVFP4_BLOCKED_OUTER),
+    # RHT
+    ("bf16_rht", BF16_RHT),
 ]
