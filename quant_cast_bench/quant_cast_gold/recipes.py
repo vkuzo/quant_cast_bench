@@ -1271,22 +1271,23 @@ ALL_RECIPES = [
     ("fp8_tensorwise_precalc_scale", Float8TensorwiseGold),
     ("fp8_rowwise_precalc_scale", RowwisePrecalcGold),
     ("fp8_colwise_precalc_scale", ColwisePrecalcGold),
-    # 1x32, 8-bit
+    # 8-bit 1D, dim-k reduction
     ("mxfp8_floor", Mxfp8FloorGold),
     ("mxfp8_floor_swizzle", Mxfp8FloorSwizzleGold),
-    ("mxfp8_floor_dim_m", Mxfp8FloorDimMGold),
-    ("mxfp8_floor_dim_km", Mxfp8FloorDimKmGold),
-    ("mxfp8_32x32_floor", Mxfp832x32FloorGold),
-    # 1x128, 8-bit
     ("fp8_deepseek_1x128", Deepseek1x128Gold),
+    # 8-bit 1D, dim-m reduction
+    ("mxfp8_floor_dim_m", Mxfp8FloorDimMGold),
     ("fp8_deepseek_1x128_dim_m", Deepseek1x128DimMGold),
+    # 8-bit 1D, dim-km reduction 
+    ("mxfp8_floor_dim_km", Mxfp8FloorDimKmGold),
     ("fp8_deepseek_1x128_dim_km", Deepseek1x128DimKmGold),
-    # 128x128, 8-bit
+    # 8-bit 2D
+    ("mxfp8_32x32_floor", Mxfp832x32FloorGold),
     ("fp8_deepseek_128x128", Deepseek128x128Gold),
-    # rowwise/colwise, 8-bit
+    # 8-bit rowwise/colwise
     ("fp8_rowwise", RowwiseFp8Gold),
     ("fp8_colwise", ColwiseFp8Gold),
-    # 1x16, 4 bit
+    # 4 bit 1D
     ("nvfp4_swizzle", Nvfp4GsSwizzleGold),
     ("nvfp4_blocked_outer", Nvfp4BlockedOuterGold),
     # RHT
