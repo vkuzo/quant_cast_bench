@@ -32,26 +32,32 @@ I did this to:
 3. evaluate options for near-SOL quant backend
 
 Findings:
-1. missing in PT Core eager for modern recipes:
+1. missing in PT Core eager for modern quant casting:
    - fast RTNE casting to FP4 in eager
-   - exposing stochastic rounding primitives in eager
-     - expose integer randomness directly (TODO link Joel's PR)
-     - given a random seed, figure out how to express the SR primitive in eager (TODO link issue)
-   - TODO do the MoE case
+   - stochastic rounding in eager
+     - expose integer randomness directly (https://github.com/pytorch/pytorch/pull/190253)
+     - align on a design for a stochastic rounding op in eager (https://github.com/pytorch/pytorch/issues/175409)
+   - TODO work through the MoE case
 2. options for quant cast API frontend
-   - (preferred) eager PyTorch (preferred), express quantization casting as a composition of primitives on plain tensors
-   - (acceptable) flex_gemm/flex_ep/flex_moe taking tile-invariant quantization callbacks
+   - (preferred) eager PyTorch, express quantization casting as a composition of primitives on plain tensors
+   - (acceptable) flex_gemm/flex_ep/flex_moe, taking tile-invariant quantization function callbacks + tiling metadata
    - (acceptable) flex_tile_map with a dummy backend, to enable fusion of gemm + f to flex_gemm(..., f)
      - Note: a reason for this to exist with today's tooling is line up torch.autograd.Function boundaries for CODA flex_gemm
      - to get good performance with flex_tile_map + general case of quant, we need a compiler that outputs cuteDSL
-   - (acceptable) per-recipe human written gold reference + LLM kernel gen, just not for PT core
-   - quantization specific DSL - avoid
-3. options for quant API backend
-   - intermediate
-     - torchinductor (we already have this), has various quant gaps today
+3. options for quant cast API backend
+   - (acceptable) per-recipe human written gold reference + LLM kernel gen
    - lowering target
      - cuteDSL - needed for near-SOL training
-     - triton - decent baseline, covers most inference cases, falls short for training
+     - triton - good baseline, but SOL not reachable for training (quantizing `input.t()`)
+   - compilers
+     - torchinductor (we already have this)
+       - triton backend
+         - works well for quant inference in 8 bits
+         - various gaps at 4 bits and for training that can be improved
+       - cuteDSL backend
+         - could extend to quant patterns (currently GEMM only) to cover training better
+     - (?) mini-compiler for quantization cast reductions to cuteDSL
+       - can expand quant recipe coverage for flex* family of products to cover training better
 
 ## tile invariance and quantization
 
