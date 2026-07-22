@@ -24,6 +24,35 @@ Coverage so far:
 Note: these are all **single kernel**.  For recipes such as nvfp4 with global outer scale, we assume that
 the outer scale is computed elsewhere and the user is responsible for composing the pieces together.
 
+## motivation and tl;dr;
+
+I did this to:
+1. see what is missing in PT Core eager to express modern quantization recipes
+2. evaluate options for quant API frontend
+3. evaluate options for near-SOL quant backend
+
+Findings:
+1. missing in PT Core eager for modern recipes:
+   - fast RTNE casting to FP4 in eager
+   - exposing stochastic rounding primitives in eager
+     - expose integer randomness directly (TODO link Joel's PR)
+     - given a random seed, figure out how to express the SR primitive in eager (TODO link issue)
+   - TODO do the MoE case
+2. options for quant cast API frontend
+   - (preferred) eager PyTorch (preferred), express quantization casting as a composition of primitives on plain tensors
+   - (acceptable) flex_gemm/flex_ep/flex_moe taking tile-invariant quantization callbacks
+   - (acceptable) flex_tile_map with a dummy backend, to enable fusion of gemm + f to flex_gemm(..., f)
+     - Note: a reason for this to exist with today's tooling is line up torch.autograd.Function boundaries for CODA flex_gemm
+     - to get good performance with flex_tile_map + general case of quant, we need a compiler that outputs cuteDSL
+   - (acceptable) per-recipe human written gold reference + LLM kernel gen, just not for PT core
+   - quantization specific DSL - avoid
+3. options for quant API backend
+   - intermediate
+     - torchinductor (we already have this), has various quant gaps today
+   - lowering target
+     - cuteDSL - needed for near-SOL training
+     - triton - decent baseline, covers most inference cases, falls short for training
+
 ## tile invariance and quantization
 
 **tile invariance** of a function `f` is desireable as it gives a backend maximium
