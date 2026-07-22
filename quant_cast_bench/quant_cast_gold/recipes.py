@@ -14,7 +14,7 @@ from typing import Callable, Tuple
 import torch
 import torch.func._random as prng
 
-from quant_cast_gold.utils import f32_to_f4_unpacked, f4_unpacked_to_f32, pack_uint4, unpack_uint4
+from .utils import f32_to_f4_unpacked, f4_unpacked_to_f32, pack_uint4, unpack_uint4
 
 # Optional hardware fp4 encode: PyTorch core exposes an `inline_asm_elementwise` higher-order op
 # (torch >= 2.12) that can emit `cvt.rn.satfinite.e2m1x2.f32` on Blackwell (SM100+). It only works

@@ -1,0 +1,10 @@
+Metadata-Version: 2.4
+Name: quant_cast_bench
+Version: 0.0.1
+Summary: Reference recipes and benchmarks for single-kernel quantization casts (fp8 / mxfp8 / nvfp4).
+Requires-Python: >=3.10
+License-File: LICENSE
+Requires-Dist: fire
+Requires-Dist: tabulate
+Requires-Dist: jinja2
+Dynamic: license-file

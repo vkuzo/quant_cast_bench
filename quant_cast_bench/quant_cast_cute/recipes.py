@@ -9,8 +9,6 @@ Correctness-first: kernels are naive (tiling not tuned). `cute.compile` is cache
 shape) since it is slow and the benchmark calls each fn many times.
 """
 
-import os
-import sys
 from dataclasses import dataclass
 from typing import Callable
 
@@ -20,8 +18,7 @@ import torch
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cute.testing import _maybe_recast_from_f4  # packs an fp4 register vector to bytes
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from quant_cast_gold.recipes import (
+from quant_cast_bench.quant_cast_gold.recipes import (
     ColwiseFp8Gold,
     ColwisePrecalcGold,
     Deepseek1x128DimMGold,

@@ -7,8 +7,8 @@ from torch.nn.functional import SwizzleType
 # Side-effect import: registers the FlexQuant HOP, its Dynamo variable,
 # and its Inductor lowering. Imported eagerly so the registrations are in
 # place before the user's first torch.compile call.
-from hop import flex_cast_quant_dense_with_hop
-from swizzle import to_blocked_2d
+from .hop import flex_cast_quant_dense_with_hop
+from .swizzle import to_blocked_2d
 
 
 class _HopMode(Enum):

@@ -16,7 +16,7 @@ import torch
 from torch._inductor.utils import do_bench_using_profiling
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from quant_cast_gold.recipes import ALL_RECIPES
+from quant_cast_bench.quant_cast_gold.recipes import ALL_RECIPES
 
 B200_PEAK_BW_GBPS = 8000.0  # 8 TB/s
 
@@ -112,9 +112,9 @@ def main(
     # hand-written kernel sets (triton_fn / cute_fn). All recipe kinds carry example_input_fn /
     # perf_description, so the rest of the sweep is identical.
     if mode == "triton":
-        from quant_cast_triton.recipes import ALL_RECIPES as recipes_all
+        from quant_cast_bench.quant_cast_triton.recipes import ALL_RECIPES as recipes_all
     elif mode == "cute":
-        from quant_cast_cute.recipes import ALL_RECIPES as recipes_all
+        from quant_cast_bench.quant_cast_cute.recipes import ALL_RECIPES as recipes_all
     else:
         recipes_all = ALL_RECIPES
 

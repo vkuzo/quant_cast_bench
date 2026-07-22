@@ -9,7 +9,7 @@ import pytest
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from quant_cast_triton.recipes import ALL_RECIPES
+from quant_cast_bench.quant_cast_triton.recipes import ALL_RECIPES
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="requires CUDA"

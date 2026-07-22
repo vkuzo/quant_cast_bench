@@ -15,7 +15,7 @@ import torch
 import triton
 import triton.language as tl
 
-from recipes import (
+from .recipes import (
     _deepseek_fp8_128_128_reference,
     _deepseek_fp8_1_128_dim_m_reference,
 )

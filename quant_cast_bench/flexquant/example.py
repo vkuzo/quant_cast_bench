@@ -5,8 +5,8 @@ fp8 gemm, plus nvfp4 quantization with two-level (outer + inner) scaling.
 
 import torch
 
-from api import flex_cast_quant_dense
-from nvfp4_utils import F4_E2M1_MAX, f32_to_f4_unpacked, pack_uint4
+from .api import flex_cast_quant_dense
+from .nvfp4_utils import F4_E2M1_MAX, f32_to_f4_unpacked, pack_uint4
 
 FP8_MAX = torch.finfo(torch.float8_e4m3fn).max  # 448.0
 EPS = 1e-12

@@ -2,7 +2,7 @@ from typing import Callable, Tuple, Union
 
 import torch
 
-from triton_kernels import (
+from .triton_kernels import (
     triton_fp8_blockwise_act_quant_transposed_lhs,
     triton_fp8_blockwise_weight_quant_128_128,
 )

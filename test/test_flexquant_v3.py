@@ -4,12 +4,16 @@ Comparison discipline mirrors flexquant v1/v2 test.py: bit-exact `torch.equal` o
 qdata (compared as fp32) and scale. Recipes live in recipes.py.
 """
 
+import os
+import sys
+
 import pytest
 import torch
 import torch.nn.functional as F
 
-from api import FlexTileMapBackend, OutputKind, flex_tile_map
-from recipes import (
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from quant_cast_bench.flexquant_v3.api import FlexTileMapBackend, OutputKind, flex_tile_map
+from quant_cast_bench.flexquant_v3.recipes import (
     DEEPSEEK_1X128,
     DEEPSEEK_1X128_DIM_M,
     MXFP8_FLOOR,
