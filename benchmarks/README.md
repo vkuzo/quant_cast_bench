@@ -88,7 +88,7 @@ fp8_deepseek_1x128_dim_m             0.1506  5404.2       67.6%  (128,1) block, 
 fp8_deepseek_1x128_dim_km            0.2358  4625.7       57.8%  (1,128) dim-k + (128,1) dim-m, one pass, t-contig
 fp8_deepseek_128x128                 0.1306  6166.2       77.1%  (128,128) block
 fp8_rowwise                          0.1291  6238.8       78.0%  (1,-1) block
-fp8_colwise                           0.276  2917.8       36.5%  (-1,1) block, t-contig
+fp8_colwise                          0.2259  3564.8       44.6%  (-1,1) block, t-contig
 nvfp4_swizzle                        0.1371  5017.3       62.7%  (1,16) block, fp4 qdata, swizzle
 ```
 
