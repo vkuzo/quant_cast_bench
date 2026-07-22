@@ -94,7 +94,7 @@ nvfp4_swizzle                        0.1371  5017.3       62.7%  (1,16) block, f
 
 ### `--mode cute`
 
-The CuTeDSL (`cutlass.cute`) kernels are **correctness-first (naive tiling), with ten tuned
+The CuTeDSL (`cutlass.cute`) kernels are **correctness-first (naive tiling), with eleven tuned
 exceptions** — treat the untuned rows as a functional baseline, not a fair comparison to the
 compile/triton numbers above:
 
@@ -190,6 +190,26 @@ compile/triton numbers above:
   the ceiling: the *linear* scale layout hits ~70% on the same kernel, but our recipe needs the
   blocked swizzle.) (`nvfp4_blocked_outer` keeps the naive kernel — it wasn't the target.)
 
+* `mxfp8_floor_dim_km` (57.4%) — the one-pass both-directions mxfp8-floor cast: read `x` once and
+  emit four outputs, dim-K (`qk (M,N)` + `sk (M,N//32)`, 1×32 blocks along columns) and dim-M
+  (`qm (N,M)` + `sm (N,M//32)`, 32×1 blocks down rows, transposed). The **fused TMA BM×BN template**
+  (mirrors `mxfp8_floor_dim_m`): TMA-load one (64,256) row-major tile into smem, read it once and
+  reduce BOTH ways, then emit the two quantized tiles. dim-M (the binding half): each of the
+  TM·TN/32 (col, 32-row-block) groups reads its 32 rows *down* a column, e8m0-scales, quantizes, and
+  writes the run into an sOUT laid out (TN,TM) — the transpose is the register→smem write — for a TMA
+  store to the `(N,M)` output. dim-K rides the loaded tile nearly for free: each (row, 32-col-block)
+  group reads its 32 *along* a row, and since `qk` keeps `x`'s layout it quantizes in-register and
+  stores the contiguous 32-run **directly to gmem with a 128-bit vectorized copy** (adjacent threads
+  = adjacent col-blocks → coalesced). Went **18.9% → 57.4%** (naive 32×32/1-warp kernel → this),
+  beating triton (47.1%) and nearing the standalone `mxfp8_floor_dim_m` (60.3%). Keeping `qk` out of
+  smem was worth +5 pts alone (52% → 57%): it frees 16 KB → +1 CTA/SM (occupancy 37.5% → 50%) and
+  drops the dim-K transpose-store bank conflicts. **The remaining ceiling is L1/TEX (ncu ~82%)**: the
+  dim-K row reads are ≥16-way bank-conflicted because a 32-col bf16 block is exactly 16 banks wide,
+  so thread-per-block reads collapse to 2 bank groups regardless of tile/mapping (bank depends only
+  on column when TN is a multiple of 64). Killing that needs a **swizzled smem layout** for the input
+  tile (XOR swizzle, as CUTLASS GEMM uses) that *also* keeps the dim-M column reads conflict-free —
+  the real next step, left as future work.
+
 ```
 shape: (16384, 16384)  mode: cute
 recipe                          gpu_time_ms    gbps    pct_peak  perf_description
@@ -198,6 +218,7 @@ relu (baseline)                      0.1791  5995.5       74.9%
 fp8_tensorwise_precalc_scale         0.1173  6866.5       85.8%  elementwise
 mxfp8_floor_swizzle                  0.1504  5409.0       67.6%  (1,32) block, swizzle
 mxfp8_floor_dim_m                    0.1687  4824.1       60.3%  (32,1) block, t-contig
+mxfp8_floor_dim_km                   0.2373  4595.1       57.4%  (1,32) dim-k + (32,1) dim-m, one pass, t-contig
 mxfp8_32x32_floor                    0.1423  5662.4       70.8%  (32,32) block
 fp8_deepseek_1x128                   0.1381  5891.7       73.6%  (1,128) block
 fp8_deepseek_1x128_dim_m             0.1649  4935.6       61.7%  (128,1) block, t-contig
