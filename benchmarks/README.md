@@ -94,7 +94,7 @@ nvfp4_swizzle                        0.1371  5017.3       62.7%  (1,16) block, f
 
 ### `--mode cute`
 
-The CuTeDSL (`cutlass.cute`) kernels are **correctness-first (naive tiling), with eleven tuned
+The CuTeDSL (`cutlass.cute`) kernels are **correctness-first (naive tiling), with twelve tuned
 exceptions** — treat the untuned rows as a functional baseline, not a fair comparison to the
 compile/triton numbers above:
 
@@ -128,6 +128,19 @@ compile/triton numbers above:
   CTAs/SM, which halved bandwidth (38.7%); dropping to (128,128) restores 48 KB/4 CTAs → 61.7%,
   matching `mxfp8_floor_dim_m`'s footprint. Beats the triton dim-M kernel and approaches its
   compile-mode SOL. (Replaces the old scalar `x.t()` path at ~7%.)
+* `fp8_deepseek_1x128_dim_km` (41.2%) — the one-pass both-directions deepseek cast (dim-K `qk (M,N)`
+  + `sk (M,N//128)`; dim-M `qm (N,M)` + `sm (N,M//128)`, transposed), the fp32-scale/128-block analog
+  of `mxfp8_floor_dim_km`. Same fused TMA template: TMA-load one (128,128) tile, reduce both ways —
+  dim-M writes the transposed run into sOUT for a TMA store; dim-K keeps `x`'s layout so it quantizes
+  in-register and stores each 32-chunk **directly to gmem** with a 128-bit copy. Beats compile
+  (35.8%) but sits **below the 1×32 sibling (57.4%) and triton (57.8%)**, for two reasons ncu makes
+  clear (both intrinsic to the 128-block): (1) the dim-K row reads are **32-way** bank-conflicted (vs
+  16-way at 1×32) — a 128-col bf16 block is bank-aligned, so a thread-per-block read has every lane on
+  the same bank regardless of tile/mapping; (2) doing both 128-reductions per thread needs 154
+  reg/thread → 3 CTAs/SM. Occupancy is *not* the lever, though (L1/TEX ~86%): warp-splitting the two
+  directions (one dir/thread, ~72 reg, 2× occupancy) made it **worse** (35%), as did non-unrolled
+  chunk loops (30%) — both cost ILP. The real fix for the conflict is a **swizzled sIN smem layout**
+  (as for the 1×32 sibling), left as future work.
 * `fp8_deepseek_128x128` (70.1%) — non-transposing **TMA** with a block-wide reduction (one fp32
   scale per whole 128×128 block). One CTA/block: TMA-load the (128,128) tile to smem, each thread
   reduces its share to a local amax, then a warp-reduce + smem block-reduce gives the block amax;
@@ -222,6 +235,7 @@ mxfp8_floor_dim_km                   0.2373  4595.1       57.4%  (1,32) dim-k + 
 mxfp8_32x32_floor                    0.1423  5662.4       70.8%  (32,32) block
 fp8_deepseek_1x128                   0.1381  5891.7       73.6%  (1,128) block
 fp8_deepseek_1x128_dim_m             0.1649  4935.6       61.7%  (128,1) block, t-contig
+fp8_deepseek_1x128_dim_km            0.3308  3296.7       41.2%  (1,128) dim-k + (128,1) dim-m, one pass, t-contig
 fp8_deepseek_128x128                 0.1436  5608.5       70.1%  (128,128) block
 fp8_rowwise                          0.1262  6380.5       79.8%  (1,-1) block
 fp8_colwise                          0.2187  3683.1       46.0%  (-1,1) block, t-contig
