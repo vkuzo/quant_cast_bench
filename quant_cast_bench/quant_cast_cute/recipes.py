@@ -268,9 +268,12 @@ FP8_COLWISE_PRECALC_SCALE = QuantCastCuteRecipe.from_gold(
 
 
 # ---------------------------------------------------------------------------
-# deepseek fp8 1x128: one fp32 scale per 1x128 block. One warp (32 threads x 4 vals) per block;
-# abs-max via intra-thread reduce + warp_reduction_max. x is tiled (1,128) and the scale (M,N//128)
-# tiled (1,1) so both share the same block index (bidx) -- no scatter. Mirrors deepseek_1x128_f.
+# deepseek fp8 1x128 (strided/scalar path): one fp32 scale per 1x128 block. One warp (32 threads x 4
+# vals) per block; abs-max via intra-thread reduce + warp_reduction_max. x is tiled (1,128) and the
+# scale (M,N//128) tiled (1,1) so both share the same block index (bidx) -- no scatter. Scalar
+# (non-vectorized) copies. Retained ONLY for the dim-M variant, which feeds a transposed x.t() view:
+# its loads are inherently uncoalesced, so the vectorized 1-D path below cannot apply. The contiguous
+# dim-K case uses the vectorized `_deepseek_1x128_opt_kernel`. Mirrors deepseek_1x128_f.
 # ---------------------------------------------------------------------------
 @cute.kernel
 def _deepseek_1x128_kernel(gX: cute.Tensor, gY: cute.Tensor, gScale: cute.Tensor, tv_layout: cute.Layout):
@@ -302,16 +305,77 @@ def _deepseek_1x128_jit(mX, mY, mScale):
     )
 
 
+# ---------------------------------------------------------------------------
+# deepseek fp8 1x128 (vectorized dim-K path): the 85.9%-tensorwise / 67.6%-mxfp8_swizzle recipe
+# applied to 1x128 blocks. 1-D flatten, 128 threads/CTA, VPT=32 (128-bit vectorized ld/st via
+# assumed_align=16). A 1x128 block is 4 contiguous threads (4 x 32 = 128), so the per-thread abs-max
+# is combined across the group with warp_reduction_max(threads_in_group=4). Because N % 128 == 0,
+# every 128-aligned run stays within one row, so a 4-thread group IS exactly one 1x128 block; the
+# group leader (tidx%4==0) scatters the fp32 scale to its (row, col-block) slot. Replaces the scalar
+# one-warp-per-block kernel (~9% peak).
+# ---------------------------------------------------------------------------
+_DS_THREADS = 128
+_DS_VPT = 32                              # 32 vals/thread; 4 threads (128 vals) = one 1x128 block
+_DS_GROUP = 128 // _DS_VPT                # 4-thread group reduce width
+_DS_CHUNK = _DS_THREADS * _DS_VPT         # 4096 elements per CTA (1-D tile) = 32 blocks
+_DS_LD_BITS = min(128, _DS_VPT * 16)      # bf16 in  -> 128-bit vectorized load
+_DS_ST_BITS = min(128, _DS_VPT * 8)       # fp8 out  -> 128-bit vectorized store
+
+
+@cute.kernel
+def _deepseek_1x128_opt_kernel(gX: cute.Tensor, gY: cute.Tensor, sflat: cute.Tensor,
+                               cX: cute.Tensor, tv_layout: cute.Layout,
+                               N: cutlass.Constexpr, ncb: cutlass.Constexpr):
+    tidx, _, _ = cute.arch.thread_idx()
+    bidx, _, _ = cute.arch.block_idx()
+    thrX = cute.composition(gX[(None, bidx)], tv_layout)[(tidx, None)]
+    thrY = cute.composition(gY[(None, bidx)], tv_layout)[(tidx, None)]
+    thrC = cute.composition(cX[(None, bidx)], tv_layout)[(tidx, None)]
+    ld_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gX.element_type,
+                                  num_bits_per_copy=_DS_LD_BITS)
+    st_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gY.element_type,
+                                  num_bits_per_copy=_DS_ST_BITS)
+    frgX = cute.make_rmem_tensor(cute.get(tv_layout, mode=[1]), gX.element_type)
+    cute.copy(ld_atom, thrX, frgX)
+    v = frgX.load().to(cutlass.Float32)
+    local = cutlass.max(v, -v).reduce(cute.ReductionOp.MAX, cutlass.Float32(0.0), 0)
+    amax = cutlass.max(cute.arch.warp_reduction_max(local, threads_in_group=_DS_GROUP),
+                       cutlass.Float32(1e-12))
+    scale = amax / 448.0
+    frgY = cute.make_rmem_tensor(cute.get(tv_layout, mode=[1]), gY.element_type)
+    frgY.store((v * (1.0 / scale)).to(gY.element_type))
+    cute.copy(st_atom, frgY, thrY)
+    # group leader writes the fp32 scale for its 1x128 block at (row, col-block)
+    if tidx % _DS_GROUP == 0:
+        p = thrC[0][0]                                   # flat index of the block's first element
+        sflat[(p // N) * ncb + (p % N) // 128] = scale.to(sflat.element_type)
+
+
+@cute.jit
+def _deepseek_1x128_opt_jit(mX, mY, sflat, N: cutlass.Constexpr, ncb: cutlass.Constexpr):
+    tv_layout = cute.make_layout((_DS_THREADS, _DS_VPT), stride=(_DS_VPT, 1))
+    tiler = (_DS_CHUNK,)
+    gX = cute.zipped_divide(mX, tiler)
+    gY = cute.zipped_divide(mY, tiler)
+    cX = cute.zipped_divide(cute.make_identity_tensor(mX.shape), tiler)
+    _deepseek_1x128_opt_kernel(gX, gY, sflat, cX, tv_layout, N, ncb).launch(
+        grid=[cute.size(gX, mode=[1]), 1, 1], block=[_DS_THREADS, 1, 1])
+
+
 def fp8_deepseek_1x128_cute(x, **kwargs):
     assert x.is_contiguous() and x.dim() == 2
     M, N = x.shape
+    assert N % 128 == 0 and (M * N) % _DS_CHUNK == 0, \
+        f"deepseek_1x128 cute kernel needs N%128==0 and numel%{_DS_CHUNK}==0"
     y = torch.empty(M, N, dtype=torch.float8_e4m3fn, device=x.device)
-    s = torch.empty(M, N // 128, dtype=torch.float32, device=x.device)
-    mX = from_dlpack(x).mark_layout_dynamic()
-    mY = from_dlpack(y).mark_layout_dynamic()
-    mS = from_dlpack(s).mark_layout_dynamic()
-    fn = _compiled(("deepseek_1x128", M, N), _deepseek_1x128_jit, mX, mY, mS)
-    fn(mX, mY, mS)
+    ncb = N // 128
+    s = torch.empty(M, ncb, dtype=torch.float32, device=x.device)
+    # flatten (elementwise-style); assumed_align=16 enables the 128-bit vectorized copies.
+    mX = from_dlpack(x.reshape(-1), assumed_align=16).mark_layout_dynamic()
+    mY = from_dlpack(y.reshape(-1), assumed_align=16).mark_layout_dynamic()
+    sflat = from_dlpack(s.reshape(-1)).mark_layout_dynamic()
+    fn = _compiled(("deepseek_1x128", M, N), _deepseek_1x128_opt_jit, mX, mY, sflat, N, ncb)
+    fn(mX, mY, sflat)
     return y, s
 
 
