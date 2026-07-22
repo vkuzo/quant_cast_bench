@@ -45,4 +45,5 @@ fp32_to_bf16_sr,triton,0.2786,5781.0,72.26
 fp32_to_bf16_sr_global_offsets,triton,0.2595,6206.6,77.58
 bf16_rht,triton,0.1982,5417.0,67.71
 bf16_rht,cute,0.1968,5456.1,68.20
-fp32_to_bf16_sr,cute,0.2411,6679.0,83.49
+fp32_to_bf16_sr,cute,0.2407,6691.8,83.65
+fp32_to_bf16_sr_global_offsets,cute,0.2429,6629.7,82.87

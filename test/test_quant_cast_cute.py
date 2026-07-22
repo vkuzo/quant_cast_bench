@@ -40,8 +40,14 @@ def test_cute_matches_reference(name, recipe):
     torch.manual_seed(0)
     inputs = recipe.example_input_fn(512, 512)
 
-    ref_outs = recipe.pt_ref_fn(*inputs)
-    cute_outs = recipe.cute_fn(*inputs)
+    # flex_tile_map framework kwargs naming the tile's global origin + parent row stride. The test
+    # runs the whole tensor as one tile, so origin = (0, 0) and num_col = full width. These are needed
+    # by the global-offsets SR *reference* (`sr_bf16_global_f`) to reconstruct each element's global
+    # index from a sub-tile; every recipe fn takes **kwargs, and all the cute kernels ignore them
+    # (they own their own tiling), so passing them is harmless.
+    tile_kwargs = {"global_row": 0, "global_col": 0, "num_col": inputs[0].shape[-1]}
+    ref_outs = recipe.pt_ref_fn(*inputs, **tile_kwargs)
+    cute_outs = recipe.cute_fn(*inputs, **tile_kwargs)
 
     assert len(cute_outs) == len(ref_outs), f"{name}: output count {len(cute_outs)} != {len(ref_outs)}"
     for i, (t, r) in enumerate(zip(cute_outs, ref_outs)):
@@ -58,9 +64,10 @@ def test_cute_matches_reference(name, recipe):
     # bit-for-bit on all but <1% of bytes; float (fp32 scale) outputs must be allclose to ~1 ULP.
     recipe.correctness_fn(inputs, cute_outs)
     if "_sr" in name:
-        # stochastic rounding: the cute kernel draws its dither from an in-kernel fmix32 hash, which
-        # cannot bit-match the reference's torch Philox -- only the SR property (checked above via the
-        # gold correctness_fn) is well-defined, so a per-element bound is meaningless (like triton).
+        # stochastic rounding: the cute kernel draws its dither from a hand-written in-kernel Philox
+        # keyed on the global flat index, which cannot bit-match the reference's torch Philox -- only
+        # the SR property (checked above via the gold correctness_fn) is well-defined, so a per-element
+        # bound is meaningless (like triton).
         return
     for i, (t, r) in enumerate(zip(cute_outs, ref_outs)):
         if t.dtype in (torch.float4_e2m1fn_x2, torch.float8_e8m0fnu, torch.float8_e4m3fn):
