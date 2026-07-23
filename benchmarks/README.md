@@ -71,6 +71,7 @@ fp8_tensorwise_precalc_scale           0.1442  5584.6       69.8%  elementwise
 mxfp8_floor_swizzle                    0.1361  5980.4       74.8%  (1,32) block, swizzle
 fp8_deepseek_1x128                     0.1329  6120.9       76.5%  (1,128) block
 mxfp8_floor_dim_m                      0.5798  1403.5       17.5%  (32,1) block, t-contig
+mxfp8_floor_dim_m_swizzle              0.5527  1472.2       18.4%  (32,1) block, t-contig, swizzle
 fp8_deepseek_1x128_dim_m               0.2637  3085.9       38.6%  (128,1) block, t-contig
 mxfp8_floor_dim_km                     0.7135  1528.5       19.1%  (1,32) dim-k + (32,1) dim-m, one pass, t-contig
 fp8_deepseek_1x128_dim_km              0.3877  2812.6       35.2%  (1,128) dim-k + (128,1) dim-m, one pass, t-contig
@@ -95,6 +96,7 @@ fp8_tensorwise_precalc_scale           0.1425  5649.8       70.6%  elementwise
 mxfp8_floor_swizzle                    0.1312    6200       77.5%  (1,32) block, swizzle
 fp8_deepseek_1x128                     0.1344  6052.8       75.7%  (1,128) block
 mxfp8_floor_dim_m                      0.1829  4449.3       55.6%  (32,1) block, t-contig
+mxfp8_floor_dim_m_swizzle              0.1416  5744.9       71.8%  (32,1) block, t-contig, swizzle
 fp8_deepseek_1x128_dim_m                0.144  5652.1       70.7%  (128,1) block, t-contig
 mxfp8_floor_dim_km                     0.2948  3698.6       46.2%  (1,32) dim-k + (32,1) dim-m, one pass, t-contig
 fp8_deepseek_1x128_dim_km              0.2475  4405.5       55.1%  (1,128) dim-k + (128,1) dim-m, one pass, t-contig
@@ -110,7 +112,7 @@ fp32_to_bf16_sr_global_offsets         0.2598  6199.6       77.5%  tile-invarian
 
 ### `--mode cute`
 
-The CuTeDSL (`cutlass.cute`) kernels are **correctness-first (naive tiling), with fifteen tuned
+The CuTeDSL (`cutlass.cute`) kernels are **correctness-first (naive tiling), with sixteen tuned
 exceptions** — treat the untuned rows as a functional baseline, not a fair comparison to the
 compile/triton numbers above:
 
@@ -139,6 +141,16 @@ compile/triton numbers above:
   blocks per column to the e8m0-floor scale, quantize, transpose in the register→smem write, and
   TMA-store the (256,64) tile to the row-major (N,M) output. Beats the triton kernel (60.1%) and
   approaches the CUDA SOL (67.7%). See [`quant_cast_cute/recipes.py`](../quant_cast_bench/quant_cast_cute/recipes.py).
+* `mxfp8_floor_dim_m_swizzle` (72.3%) — identical to `mxfp8_floor_dim_m` (same TMA load → per-column
+  e8m0-floor reduce → transposed register→smem write → TMA store), except the e8m0 byte is scattered
+  into the NVIDIA-swizzled 4D `(nrb, ncb, 32, 16)` scale grid (acting on the transposed-frame scale
+  `(N, M//32)`) instead of the plain 2D buffer, using the same flatten as `mxfp8_floor_swizzle`.
+  **Surprisingly it's ~10 pts *faster* than the plain kernel (62.1%), not equal**: the qdata TMA
+  pipeline is byte-identical, so the only difference is the scale store — and the plain `(N, M//32)`
+  store is a strided scatter (adjacent columns/threads write `M//32`-apart addresses), whereas the
+  swizzled write packs neighboring rows/blocks into compact, coalesced offsets, relieving the scale
+  store rather than costing anything. The swizzle row-part (`row_base`) is loop-invariant per thread,
+  so it's hoisted out of the 32-row-block loop. Also beats triton (71.8%).
 * `fp8_deepseek_1x128_dim_m` (61.7%) — the same TMA path as `mxfp8_floor_dim_m`, with a 128-row
   block (not 32) and an fp32 `amax/448` scale (not an e8m0 byte). TMA-load a (128,128) tile, each
   thread scans its 128-row column for the amax in four 32-wide chunks (vector reduce, only 32 f32
@@ -291,6 +303,7 @@ fp8_tensorwise_precalc_scale           0.1173  6867.1       85.8%  elementwise
 mxfp8_floor_swizzle                    0.1293  6292.7       78.7%  (1,32) block, swizzle
 fp8_deepseek_1x128                     0.1409  5776.4       72.2%  (1,128) block
 mxfp8_floor_dim_m                      0.1637  4969.6       62.1%  (32,1) block, t-contig
+mxfp8_floor_dim_m_swizzle              0.1407  5784.7       72.3%  (32,1) block, t-contig, swizzle
 fp8_deepseek_1x128_dim_m               0.1648  4936.8       61.7%  (128,1) block, t-contig
 mxfp8_floor_dim_km                     0.2459  4433.9       55.4%  (1,32) dim-k + (32,1) dim-m, one pass, t-contig
 fp8_deepseek_1x128_dim_km               0.331  3294.8       41.2%  (1,128) dim-k + (128,1) dim-m, one pass, t-contig

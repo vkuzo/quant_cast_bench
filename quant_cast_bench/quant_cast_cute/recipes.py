@@ -35,6 +35,7 @@ from quant_cast_bench.quant_cast_gold.recipes import (
     Mxfp832x32FloorGold,
     Mxfp8FloorDimKmGold,
     Mxfp8FloorDimMGold,
+    Mxfp8FloorDimMSwizzleGold,
     Mxfp8FloorGold,
     Mxfp8FloorSwizzleGold,
     Nvfp4BlockedOuterGold,
@@ -884,6 +885,120 @@ def mxfp8_floor_dim_m_cute(x, **kwargs):
 
 MXFP8_FLOOR_DIM_M = QuantCastCuteRecipe.from_gold(
     Mxfp8FloorDimMGold, cute_fn=mxfp8_floor_dim_m_cute
+)
+
+
+# ---------------------------------------------------------------------------
+# mxfp8 FLOOR dim-M + NVIDIA-swizzled scale: identical to _mxfp8_dim_m_kernel above (TMA G2S of the
+# (TM, TN) x-tile as RB double-buffered 32-row loads -> per-column amax/quantize -> transposed
+# register->smem write -> TMA S2G of the (TN, TM) y-tile), EXCEPT the e8m0 byte is scattered into the
+# 4D (nrb, ncb, 32, 16) blocked-scale grid instead of the plain (N, M//32) 2D buffer. The swizzle acts
+# on the TRANSPOSED-frame scale (N, M//32): pre-swizzle row = n = n0+col over N, pre-swizzle col =
+# 32-row-block index = m0//32+it over M//32. The 4D flatten factors as ((br*ncb+bc)*32+b)*16+(a*4+c4)
+# with br=row//128, r128=row%128, a=r128//32, b=r128%32, bc=col//4, c4=col%4 (same formula as
+# _swizzle_flat / the mxfp8_floor_swizzle kernels). The qdata path and TMA pipeline are unchanged, so
+# perf tracks the plain dim-M kernel; only the scale store address changes.
+# ---------------------------------------------------------------------------
+@cute.kernel
+def _mxfp8_dim_m_swizzle_kernel(atom_in: cute.CopyAtom, ten_in: cute.Tensor, atom_out: cute.CopyAtom,
+                                ten_out: cute.Tensor, scales: cute.Tensor, sib: cute.Layout,
+                                sol: cute.Layout, ncb: cutlass.Constexpr):
+    tidx, _, _ = cute.arch.thread_idx()
+    bidx, bidy, _ = cute.arch.block_idx()   # bidx = m_tile, bidy = n_tile
+    warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+    smem = utils.SmemAllocator()
+    st = smem.allocate(_Mxfp8DimMSmem)
+    bar0 = st.bar.data_ptr()
+    if tidx == 0:
+        for b in cutlass.range_constexpr(_DIMM_RB):
+            cute.arch.mbarrier_init(bar0 + b, 1)
+    cute.arch.mbarrier_init_fence()
+    cute.arch.sync_threads()
+
+    sub_elems = 32 * _DIMM_TN
+    sIN0 = st.sin.get_tensor(sib)
+    sIN = [sIN0] + [cute.make_tensor(sIN0.iterator + b * sub_elems, sib)
+                    for b in range(1, _DIMM_RB)]
+    sOUT = st.sout.get_tensor(sol)
+    gIN = cute.local_tile(ten_in, (32, _DIMM_TN), (None, None))
+    gOUT = cute.local_tile(ten_out, (_DIMM_TN, _DIMM_TM), (None, None))
+    tOsO, tBgB = cpasync.tma_partition(atom_out, 0, cute.make_layout(1),
+                                       cute.group_modes(sOUT, 0, 2), cute.group_modes(gOUT, 0, 2))
+
+    if warp == 0:
+        for b in cutlass.range_constexpr(_DIMM_RB):
+            tAsA, tAgA = cpasync.tma_partition(atom_in, 0, cute.make_layout(1),
+                                               cute.group_modes(sIN[b], 0, 2),
+                                               cute.group_modes(gIN, 0, 2))
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_arrive_and_expect_tx(bar0 + b, _DIMM_SUB_BYTES)
+            cute.copy(atom_in, tAgA[(None, bidx * _DIMM_RB + b, bidy)], tAsA, tma_bar_ptr=bar0 + b)
+
+    m0 = bidx * _DIMM_TM
+    n0 = bidy * _DIMM_TN
+    col = tidx                                               # THREADS == TN: one column per thread
+    # Row (= n) is the same for every it of this thread, so the swizzle row-part is hoisted.
+    row = n0 + col
+    r128 = row % 128
+    row_base = ((row // 128) * ncb * 32 + (r128 % 32)) * 16 + (r128 // 32) * 4
+    for it in cutlass.range_constexpr(_DIMM_RB):
+        cute.arch.mbarrier_wait(bar0 + it, 0)                # consume buffer it (next still loading)
+        frgIn = cute.make_rmem_tensor(cute.make_layout(32), cutlass.Float32)
+        for r in cutlass.range_constexpr(32):
+            frgIn[r] = sIN[it][r, col].to(cutlass.Float32)   # column read (warp-coalesced)
+        v = frgIn.load()
+        amax = cute.where(v < 0, -v, v).reduce(cute.ReductionOp.MAX, cutlass.Float32(0.0), 0)
+        sfp, biased = _e8m0_floor(amax)
+        frgOut = cute.make_rmem_tensor(cute.make_layout(32), cutlass.Float8E4M3FN)
+        frgOut.store((v * (1.0 / sfp)).to(cutlass.Float8E4M3FN))  # reciprocal-mul, not 32 divs
+        for r in cutlass.range_constexpr(32):
+            sOUT[col, it * 32 + r] = frgOut[r]               # contiguous run = the transpose
+        mcol = m0 // 32 + it                                 # 32-row-block index over M//32
+        scales[row_base + (mcol // 4) * 512 + (mcol % 4)] = biased.to(scales.element_type)
+
+    cute.arch.fence_proxy("async.shared", space="cta")
+    cute.arch.sync_threads()
+    if warp == 0:
+        cute.copy(atom_out, tOsO, tBgB[(None, bidy, bidx)])       # y tile (n_tile, m_tile)
+
+
+@cute.jit
+def _mxfp8_dim_m_swizzle_jit(mIN, mOUT, scales, ncb: cutlass.Constexpr):
+    sib = cute.make_layout((32, _DIMM_TN), stride=(_DIMM_TN, 1))
+    sol = cute.make_layout((_DIMM_TN, _DIMM_TM), stride=(_DIMM_TM, 1))
+    atom_in, ten_in = cpasync.make_tiled_tma_atom(
+        cpasync.CopyBulkTensorTileG2SOp(), mIN, sib, (32, _DIMM_TN))
+    atom_out, ten_out = cpasync.make_tiled_tma_atom(
+        cpasync.CopyBulkTensorTileS2GOp(), mOUT, sol, (_DIMM_TN, _DIMM_TM))
+    M2, N2 = mIN.shape
+    grid = ((M2 + _DIMM_TM - 1) // _DIMM_TM, (N2 + _DIMM_TN - 1) // _DIMM_TN, 1)
+    _mxfp8_dim_m_swizzle_kernel(atom_in, ten_in, atom_out, ten_out, scales, sib, sol,
+                                ncb).launch(grid=grid, block=(_DIMM_THREADS, 1, 1),
+                                            cluster=(1, 1, 1))
+
+
+def mxfp8_floor_dim_m_swizzle_cute(x, **kwargs):
+    assert x.is_contiguous() and x.dim() == 2
+    M, N = x.shape
+    assert M % _DIMM_TM == 0 and N % _DIMM_TN == 0, \
+        f"mxfp8_floor_dim_m_swizzle cute kernel needs M%{_DIMM_TM}==0 and N%{_DIMM_TN}==0"
+    y = torch.empty(N, M, dtype=torch.float8_e4m3fn, device=x.device)  # transposed row-major output
+    nrb = (N + 127) // 128                       # swizzle acts on transposed scale (N, M//32)
+    ncb = ((M // 32) + 3) // 4
+    s_u8 = torch.zeros(nrb, ncb, 32, 16, dtype=torch.uint8, device=x.device)  # padding stays 0
+    mIN = (from_dlpack(x, assumed_align=16).mark_layout_dynamic(leading_dim=1)
+           .mark_compact_shape_dynamic(mode=1, divisibility=16))
+    mOUT = (from_dlpack(y, assumed_align=16).mark_layout_dynamic(leading_dim=1)
+            .mark_compact_shape_dynamic(mode=1, divisibility=16))
+    scales = from_dlpack(s_u8.reshape(-1)).mark_layout_dynamic()
+    fn = _compiled(("mxfp8_floor_dim_m_swizzle", M, N), _mxfp8_dim_m_swizzle_jit, mIN, mOUT, scales,
+                   ncb)
+    fn(mIN, mOUT, scales)
+    return y, s_u8.view(torch.float8_e8m0fnu)
+
+
+MXFP8_FLOOR_DIM_M_SWIZZLE = QuantCastCuteRecipe.from_gold(
+    Mxfp8FloorDimMSwizzleGold, cute_fn=mxfp8_floor_dim_m_swizzle_cute
 )
 
 
@@ -2439,6 +2554,7 @@ ALL_RECIPES = [
     ("fp8_deepseek_1x128", FP8_DEEPSEEK_1X128),
     # 8-bit 1D, dim-m reduction
     ("mxfp8_floor_dim_m", MXFP8_FLOOR_DIM_M),
+    ("mxfp8_floor_dim_m_swizzle", MXFP8_FLOOR_DIM_M_SWIZZLE),
     ("fp8_deepseek_1x128_dim_m", FP8_DEEPSEEK_1X128_DIM_M),
     # 8-bit 1D, dim-km reduction
     ("mxfp8_floor_dim_km", MXFP8_FLOOR_DIM_KM),
