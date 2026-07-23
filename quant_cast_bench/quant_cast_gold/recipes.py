@@ -811,6 +811,47 @@ Mxfp8FloorSwizzleGold = QuantCastSingleKernelGold(
 
 
 # ---------------------------------------------------------------------------
+# Golden recipe: mxfp8 FLOOR reduced across M (32x1 blocks), transposed output, with the e8m0
+# scale in the swizzled (NVIDIA 32x4x4 blocked) layout. Combines mxfp8_floor_dim_m_f (dim-M
+# reduction -> transposed (N, M) qdata + (N, M//32) scale) with the _to_blocked_4d swizzle applied
+# to that transposed scale -- i.e. mxfp8_floor_swizzle_f in the dim-M / transposed frame.
+# ---------------------------------------------------------------------------
+def mxfp8_floor_dim_m_swizzle_f(x, **kwargs):
+    qdata, scale_e8m0 = mxfp8_floor_dim_m_f(x)  # (N, M), (N, M//32)
+    return qdata, _to_blocked_4d(scale_e8m0)
+
+
+def mxfp8_floor_dim_m_swizzle_dq_f(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    # not a dataclass field -- inverse for the correctness check / consumers. `q` is (N, M) in
+    # the transposed dim-M frame, so its 32-blocks run along the last (M) axis; reuse
+    # mxfp8_floor_swizzle_dq_f, which un-swizzles the 4D scale grid and dequants last-dim 32-blocks.
+    return mxfp8_floor_swizzle_dq_f(q, scale)
+
+
+def _mxfp8_floor_dim_m_swizzle_correctness(
+    inputs: Tuple[torch.Tensor, ...], outputs: Tuple[torch.Tensor, torch.Tensor]
+) -> None:
+    """dequant works in the (N, M) transposed frame (like _mxfp8_floor_dim_m_correctness); transpose
+    back before comparing to `x`."""
+    (x,) = inputs
+    qdata, scale = outputs
+    x_hat = mxfp8_floor_dim_m_swizzle_dq_f(qdata, scale).t()
+    sqnr = _compute_error(x.float(), x_hat.float())
+    threshold = 15.0
+    assert sqnr > threshold, (
+        f"mxfp8_floor_dim_m_swizzle: sqnr={sqnr.item():.2f} dB below {threshold} dB"
+    )
+
+
+Mxfp8FloorDimMSwizzleGold = QuantCastSingleKernelGold(
+    pt_ref_fn=mxfp8_floor_dim_m_swizzle_f,
+    correctness_fn=_mxfp8_floor_dim_m_swizzle_correctness,
+    example_input_fn=lambda M, K: (torch.randn(M, K, dtype=torch.bfloat16, device="cuda"),),
+    perf_description="(32,1) block, t-contig, swizzle",
+)
+
+
+# ---------------------------------------------------------------------------
 # Golden recipe: float8 tensorwise (per-tensor) scaling.
 #
 # Unlike the block recipes, the scale is a single per-tensor value that needs a GLOBAL
@@ -1277,6 +1318,7 @@ ALL_RECIPES = [
     ("fp8_deepseek_1x128", Deepseek1x128Gold),
     # 8-bit 1D, dim-m reduction
     ("mxfp8_floor_dim_m", Mxfp8FloorDimMGold),
+    ("mxfp8_floor_dim_m_swizzle", Mxfp8FloorDimMSwizzleGold),
     ("fp8_deepseek_1x128_dim_m", Deepseek1x128DimMGold),
     # 8-bit 1D, dim-km reduction 
     ("mxfp8_floor_dim_km", Mxfp8FloorDimKmGold),
