@@ -12,7 +12,11 @@ class FlexTileMapBackend(enum.Enum):
     REFERENCE = "reference"
     # for debugging, manually tiles in 256x256 tiles and runs the callback on each
     MANUAL_TILE = "manual_tile"
-    # TODO(future): actual backend
+    # generate a Triton kernel by tracing `f` and lowering it onto a naive-tiling Inductor
+    # template. The caller owns the compile-vs-eager choice (like flex_attention / flex_gemm):
+    # torch.compile(flex_tile_map)(...) takes the template path; an uncompiled call runs the
+    # HOP's eager body.
+    TRITON_TEMPLATE = "triton_template"
 
 
 class OutputKind(enum.Enum):
@@ -259,6 +263,24 @@ def flex_tile_map(
             pad_input_to_multiple_of,
             valid_tile_size_fn,
         )
+
+    elif _backend is FlexTileMapBackend.TRITON_TEMPLATE:
+        assert not aux_inputs, "TRITON_TEMPLATE: aux inputs not supported yet"
+        assert pad_input_to_multiple_of is None and valid_tile_size_fn is None, (
+            "TRITON_TEMPLATE: naive tiling only (no pad / tile constraint yet)"
+        )
+        # Just call the HOP. The compile-vs-eager decision belongs to the caller: under
+        # torch.compile(flex_tile_map) Dynamo captures the HOP and Inductor lowers it onto the
+        # Triton template; otherwise the HOP's eager body runs `f` directly.
+        from .hop import flex_tile_map_hop  # side-effect: registers HOP/dynamo/lowering
+
+        # Specialize the tiled input to static shapes. This path doesn't support dynamic shapes:
+        # the templates are constexpr-tiled and the lowering builds FixedLayout from concrete M/N.
+        # Without this, compiling flex_tile_map on two different shapes trips Dynamo's automatic
+        # dynamic, which traces the subgraph with free-symbol SymInt placeholders the HOP node
+        # can't feed -- surfacing as a noisy `forward() missing positional arguments` TypeError.
+        torch._dynamo.mark_static(input)
+        outs = flex_tile_map_hop(input, f)
 
     else:
         raise AssertionError(f"unknown {_backend=}")

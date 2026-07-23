@@ -22,6 +22,7 @@ from quant_cast_bench.flexquant_v3.recipes import (
     SR_BF16,
     SR_BF16_GLOBAL,
 )
+from quant_cast_bench.quant_cast_gold.recipes import debug_relu_f, deepseek_1x128_dim_m_f
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="requires CUDA"
@@ -114,6 +115,62 @@ _DIM_M_SWAP = (OutputKind.SWAP_TILE_INDEX, OutputKind.SWAP_TILE_INDEX)
 # dim-M whole-tensor correctness and REFERENCE == MANUAL_TILE (square) are covered by the
 # generic RECIPES_V2 suite (DEEPSEEK_1X128_DIM_M carries output_kinds=SWAP_TILE_INDEX). The
 # non-square case below is kept: it uniquely exercises the grid-transpose with P != Q.
+def test_triton_template_relu_eager():
+    # uncompiled: the TRITON_TEMPLATE backend calls the HOP, whose eager body runs `f` directly.
+    torch.manual_seed(0)
+    x = torch.randn(256, 256, dtype=torch.bfloat16, device="cuda")
+    (out,) = flex_tile_map(x, debug_relu_f, _backend=FlexTileMapBackend.TRITON_TEMPLATE)
+    torch.testing.assert_close(out, torch.relu(x))
+
+
+def test_triton_template_pointwise_compiled_falls_back():
+    # the compiled pointwise lowering was removed (regular Inductor handles pointwise casts). The
+    # custom lowering now raises NotImplementedError for a pointwise `f`, but Inductor catches that
+    # and gracefully falls back to the HOP's eager body -- so the result is still correct, just not
+    # produced by our template.
+    torch.manual_seed(0)
+    x = torch.randn(256, 256, dtype=torch.bfloat16, device="cuda")
+    compiled = torch.compile(flex_tile_map)
+    (out,) = compiled(x, debug_relu_f, _backend=FlexTileMapBackend.TRITON_TEMPLATE)
+    torch.testing.assert_close(out, torch.relu(x))
+
+
+def test_triton_template_deepseek_dim_m_compiled():
+    # dim-M deepseek exercises the emitter's TRANSPOSED reduction path: the traced `f` splits
+    # dim0 into 128-row groups, reduces the MIDDLE axis (amax over rows), then `.t()`s both
+    # outputs. FxTritonEmitter lowers the row-group reshape + a tl.trans, and the dim-M template
+    # stores the transposed tiles into the (N, M) / (N, M//128) output layouts.
+    torch.manual_seed(0)
+    x = torch.randn(256, 256, dtype=torch.bfloat16, device="cuda")
+
+    qr, sr = deepseek_1x128_dim_m_f(x)  # eager reference (whole tensor, transposed outputs)
+
+    compiled = torch.compile(flex_tile_map)
+    q, s = compiled(x, deepseek_1x128_dim_m_f, _backend=FlexTileMapBackend.TRITON_TEMPLATE)
+
+    assert q.shape == (256, 256) and q.dtype == torch.float8_e4m3fn
+    assert s.shape == (256, 2) and s.dtype == torch.float32
+    # tile-invariant recipe, so the template result is bit-exact vs the reference.
+    assert _qdata_equal(q, qr)
+    assert torch.equal(s, sr)
+
+
+def test_triton_template_deepseek_dim_m_non_square_compiled():
+    # non-square input exercises the transposed store with P != Q: a 384x512 input reduces down
+    # rows and produces (512, 384) qdata / (512, 3) scale.
+    torch.manual_seed(0)
+    x = torch.randn(384, 512, dtype=torch.bfloat16, device="cuda")
+
+    qr, sr = deepseek_1x128_dim_m_f(x)
+
+    compiled = torch.compile(flex_tile_map)
+    q, s = compiled(x, deepseek_1x128_dim_m_f, _backend=FlexTileMapBackend.TRITON_TEMPLATE)
+
+    assert q.shape == (512, 384) and s.shape == (512, 384 // 128)
+    assert _qdata_equal(q, qr)
+    assert torch.equal(s, sr)
+
+
 def test_deepseek_dim_m_non_square():
     # non-square input exercises the grid-transpose (P != Q): a 384x512 input produces a
     # (512, 384) qdata / (512, 3) scale swapped-grid output; REFERENCE == MANUAL_TILE bit-exact.

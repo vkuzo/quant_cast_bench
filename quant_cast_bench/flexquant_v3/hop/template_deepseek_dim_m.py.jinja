@@ -1,0 +1,48 @@
+{# Group-reduction Triton template, dim-M variant (deepseek fp8 1x128 dim_m).
+
+   The dim-M recipe reduces DOWN ROWS in 128-groups and TRANSPOSES both outputs, so the emitter
+   body ends in `tl.trans(...)`: `qdata_var` is (BLOCK_N, BLOCK_M) and `scale_var` is
+   (BLOCK_N, BLOCK_M//128). We still tile the INPUT as (BLOCK_M, BLOCK_N) (BLOCK_M a multiple of
+   the 128 row-group), load it row-major, splice the emitter body at __EMITTER_BODY__, then store
+   the transposed tiles into the transposed output layouts: qdata (N, M) and scale (N, M//128).
+
+   The body is str.replace'd into this source in the lowering BEFORE jinja rendering (see the
+   dim-K template for why kwargs can't carry it).
+
+   Inductor input/output convention:
+     input_nodes  = [X, S]     (S is the mutated secondary output: the per-group scale)
+     primary output = qdata    layout (N, M); allocated by maybe_append_choice via layout
+#}
+{{def_kernel("X", "S")}}
+    pid_m = tl.program_id(0)  # over input row-tiles (BLOCK_M)
+    pid_n = tl.program_id(1)  # over input col-tiles (BLOCK_N)
+
+    stride_xm, stride_xn = {{stride("X")}}
+    stride_sm, stride_sn = {{stride("S")}}
+
+    M = {{size("X", 0)}}
+    N = {{size("X", 1)}}
+    MG = M // 128  # scale is one row-group column per 128 input rows
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)  # input rows
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)  # input cols
+    x_offs = offs_m[:, None] * stride_xm + offs_n[None, :] * stride_xn
+    x_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    x_var = tl.load(X + x_offs, mask=x_mask, other=0.0)
+
+    # ---- spliced FxTritonEmitter body: reads x_var, writes (transposed) qdata_var + scale_var ----
+    __EMITTER_BODY__
+    # ---- end spliced body ----
+
+    # scale store: layout (N, M//128). rows = input cols (offs_n); cols = this tile's row-groups.
+    offs_mg = pid_m * (BLOCK_M // 128) + tl.arange(0, BLOCK_M // 128)
+    s_offs = offs_n[:, None] * stride_sm + offs_mg[None, :] * stride_sn
+    s_mask = (offs_n[:, None] < N) & (offs_mg[None, :] < MG)
+    tl.store(S + s_offs, scale_var, mask=s_mask)
+
+    # primary output: qdata, layout (N, M) row-major (the transpose of the input tile). dim0 = N
+    # indexed by input cols (offs_n), dim1 = M indexed by input rows (offs_m).
+    idx_n = offs_n[:, None]
+    idx_m = offs_m[None, :]
+    out_mask = (idx_n < N) & (idx_m < M)
+    {{ store_output(("idx_n", "idx_m"), "qdata_var", "out_mask", val_shape=("BLOCK_N", "BLOCK_M")) }}
