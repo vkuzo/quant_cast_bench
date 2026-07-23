@@ -34,6 +34,7 @@ from quant_cast_bench.quant_cast_gold.recipes import (
     HadamardRht,
     Mxfp832x32FloorGold,
     Mxfp8FloorDimKmGold,
+    Mxfp8FloorDimKmSwizzleGold,
     Mxfp8FloorDimMGold,
     Mxfp8FloorDimMSwizzleGold,
     Mxfp8FloorGold,
@@ -1162,6 +1163,149 @@ def mxfp8_floor_dim_km_cute(x, **kwargs):
 
 MXFP8_FLOOR_DIM_KM = QuantCastCuteRecipe.from_gold(
     Mxfp8FloorDimKmGold, cute_fn=mxfp8_floor_dim_km_cute
+)
+
+
+# ---------------------------------------------------------------------------
+# mxfp8 FLOOR both directions, one pass, with BOTH e8m0 scales in the swizzled 4D (nrb, ncb, 32, 16)
+# grid. Identical to _mxfp8_dim_km_kernel (same fused TMA load + dim-M transposed store + dim-K direct
+# store); only the two scale-store addresses change from plain 2D writes to the swizzle flatten
+# (same formula as _swizzle_flat / the other *_swizzle kernels). dim-K scale sk (M, N//32): pre-swizzle
+# row = m0+row (over M), col = 32-col-block n0//32+kb (over N//32). dim-M scale sm (N, M//32) in the
+# transposed frame: pre-swizzle row = n0+col (over N), col = 32-row-block m0//32+rb (over M//32). The
+# row is NOT loop-invariant here (it depends on the group index), so the swizzle offset is recomputed
+# per group. Mirrors mxfp8_floor_dim_km_swizzle_f. Requires M%TM==0, N%TN==0.
+# ---------------------------------------------------------------------------
+@cute.kernel
+def _mxfp8_dim_km_swizzle_kernel(atom_in: cute.CopyAtom, ten_in: cute.Tensor,
+                                 atom_m: cute.CopyAtom, ten_m: cute.Tensor, mK: cute.Tensor,
+                                 sk: cute.Tensor, sm: cute.Tensor, sil: cute.Layout,
+                                 solm: cute.Layout, N: cutlass.Int64,
+                                 ncb_k: cutlass.Constexpr, ncb_m: cutlass.Constexpr):
+    tidx, _, _ = cute.arch.thread_idx()
+    bidx, bidy, _ = cute.arch.block_idx()   # bidx = m_tile, bidy = n_tile
+    warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+    smem = utils.SmemAllocator()
+    st = smem.allocate(_Mxfp8DimKmSmem)
+    bar = st.bar.data_ptr()
+    if tidx == 0:
+        cute.arch.mbarrier_init(bar, 1)
+    cute.arch.mbarrier_init_fence()
+    cute.arch.sync_threads()
+    sIN = st.sin.get_tensor(sil)             # (TM, TN) row-major
+    sOUTm = st.soutm.get_tensor(solm)        # (TN, TM) row-major (dim-M transpose)
+    gIN = cute.local_tile(ten_in, (_DKM_TM, _DKM_TN), (None, None))
+    gM = cute.local_tile(ten_m, (_DKM_TN, _DKM_TM), (None, None))
+    tAsA, tAgA = cpasync.tma_partition(atom_in, 0, cute.make_layout(1),
+                                       cute.group_modes(sIN, 0, 2), cute.group_modes(gIN, 0, 2))
+    tMsM, tMgM = cpasync.tma_partition(atom_m, 0, cute.make_layout(1),
+                                       cute.group_modes(sOUTm, 0, 2), cute.group_modes(gM, 0, 2))
+    if warp == 0:
+        with cute.arch.elect_one():
+            cute.arch.mbarrier_arrive_and_expect_tx(bar, _DKM_IN_BYTES)
+        cute.copy(atom_in, tAgA[(None, bidx, bidy)], tAsA, tma_bar_ptr=bar)
+    cute.arch.mbarrier_wait(bar, 0)
+
+    m0 = bidx * _DKM_TM
+    n0 = bidy * _DKM_TN
+    st_k = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), mK.element_type, num_bits_per_copy=128)
+    for it in cutlass.range_constexpr(_DKM_ITERS):
+        g = tidx + it * _DKM_THREADS
+        if g < _DKM_GROUPS:
+            # --- dim-M: 32-row column block -> transposed store into sOUTm (TMA-stored at the end)
+            col = g % _DKM_TN
+            rb = g // _DKM_TN
+            r0 = rb * 32
+            frgM = cute.make_rmem_tensor(cute.make_layout(32), cutlass.Float32)
+            for r in cutlass.range_constexpr(32):
+                frgM[r] = sIN[r0 + r, col].to(cutlass.Float32)   # column read (down the tile)
+            vm = frgM.load()
+            amax_m = cute.where(vm < 0, -vm, vm).reduce(cute.ReductionOp.MAX, cutlass.Float32(0.0), 0)
+            sfp_m, biased_m = _e8m0_floor(amax_m)
+            frgOm = cute.make_rmem_tensor(cute.make_layout(32), cutlass.Float8E4M3FN)
+            frgOm.store((vm * (1.0 / sfp_m)).to(cutlass.Float8E4M3FN))
+            for r in cutlass.range_constexpr(32):
+                sOUTm[col, r0 + r] = frgOm[r]                     # contiguous run = the transpose
+            # swizzled sm store: row = n0+col (over N), col = m0//32+rb (over M//32)
+            rrm = n0 + col
+            ccm = m0 // 32 + rb
+            r128m = rrm % 128
+            flat_m = (((rrm // 128) * ncb_m + ccm // 4) * 32 + r128m % 32) * 16 + (r128m // 32 * 4 + ccm % 4)
+            sm[flat_m] = biased_m.to(sm.element_type)
+
+            # --- dim-K: 32-col row block. qk keeps x's layout (no transpose) -> quantize in registers
+            # and store the contiguous 32-run DIRECTLY to gmem with a 128-bit vectorized copy.
+            kb = g % _DKM_KB
+            row = g // _DKM_KB
+            c0 = kb * 32
+            frgK = cute.make_rmem_tensor(cute.make_layout(32), cutlass.Float32)
+            for c in cutlass.range_constexpr(32):
+                frgK[c] = sIN[row, c0 + c].to(cutlass.Float32)    # row read (along the tile)
+            vk = frgK.load()
+            amax_k = cute.where(vk < 0, -vk, vk).reduce(cute.ReductionOp.MAX, cutlass.Float32(0.0), 0)
+            sfp_k, biased_k = _e8m0_floor(amax_k)
+            frgOk = cute.make_rmem_tensor(cute.make_layout(32), cutlass.Float8E4M3FN)
+            frgOk.store((vk * (1.0 / sfp_k)).to(cutlass.Float8E4M3FN))
+            off = cute.assume((m0 + row) * N + (n0 + c0), divby=32)
+            gk = cute.make_tensor(mK.iterator + off, cute.make_layout(32))
+            cute.copy(st_k, frgOk, gk)
+            # swizzled sk store: row = m0+row (over M), col = n0//32+kb (over N//32)
+            rrk = m0 + row
+            cck = n0 // 32 + kb
+            r128k = rrk % 128
+            flat_k = (((rrk // 128) * ncb_k + cck // 4) * 32 + r128k % 32) * 16 + (r128k // 32 * 4 + cck % 4)
+            sk[flat_k] = biased_k.to(sk.element_type)
+
+    cute.arch.fence_proxy("async.shared", space="cta")
+    cute.arch.sync_threads()
+    if warp == 0:
+        cute.copy(atom_m, tMsM, tMgM[(None, bidy, bidx)])         # qm tile (n_tile, m_tile)
+
+
+@cute.jit
+def _mxfp8_dim_km_swizzle_jit(mIN, mM, mK, sk, sm, M: cutlass.Constexpr, N: cutlass.Constexpr,
+                              ncb_k: cutlass.Constexpr, ncb_m: cutlass.Constexpr):
+    sil = cute.make_layout((_DKM_TM, _DKM_TN), stride=(_DKM_TN, 1))
+    solm = cute.make_layout((_DKM_TN, _DKM_TM), stride=(_DKM_TM, 1))   # dim-M transposed
+    atom_in, ten_in = cpasync.make_tiled_tma_atom(
+        cpasync.CopyBulkTensorTileG2SOp(), mIN, sil, (_DKM_TM, _DKM_TN))
+    atom_m, ten_m = cpasync.make_tiled_tma_atom(
+        cpasync.CopyBulkTensorTileS2GOp(), mM, solm, (_DKM_TN, _DKM_TM))
+    M2, N2 = mIN.shape
+    grid = ((M2 + _DKM_TM - 1) // _DKM_TM, (N2 + _DKM_TN - 1) // _DKM_TN, 1)
+    _mxfp8_dim_km_swizzle_kernel(atom_in, ten_in, atom_m, ten_m, mK, sk, sm, sil, solm,
+                                 cutlass.Int64(N), ncb_k, ncb_m).launch(
+        grid=grid, block=(_DKM_THREADS, 1, 1), cluster=(1, 1, 1))
+
+
+def mxfp8_floor_dim_km_swizzle_cute(x, **kwargs):
+    assert x.is_contiguous() and x.dim() == 2
+    M, N = x.shape
+    assert M % _DKM_TM == 0 and N % _DKM_TN == 0, \
+        f"mxfp8_floor_dim_km_swizzle cute kernel needs M%{_DKM_TM}==0 and N%{_DKM_TN}==0"
+    yk = torch.empty(M, N, dtype=torch.float8_e4m3fn, device=x.device)              # dim-K (M,N)
+    ym = torch.empty(N, M, dtype=torch.float8_e4m3fn, device=x.device)             # dim-M (N,M) transp
+    # sk: (M, N//32) swizzled; sm: (N, M//32) swizzled. zeroed so padded slots match gold's zeros.
+    ncb_k = ((N // 32) + 3) // 4
+    ncb_m = ((M // 32) + 3) // 4
+    sk_u8 = torch.zeros((M + 127) // 128, ncb_k, 32, 16, dtype=torch.uint8, device=x.device)
+    sm_u8 = torch.zeros((N + 127) // 128, ncb_m, 32, 16, dtype=torch.uint8, device=x.device)
+    # TMA needs full layout/divisibility marking (leading dim contiguous, 16-elem aligned).
+    mIN = (from_dlpack(x, assumed_align=16).mark_layout_dynamic(leading_dim=1)
+           .mark_compact_shape_dynamic(mode=1, divisibility=16))
+    mM = (from_dlpack(ym, assumed_align=16).mark_layout_dynamic(leading_dim=1)
+          .mark_compact_shape_dynamic(mode=1, divisibility=16))
+    mK = from_dlpack(yk.reshape(-1), assumed_align=16).mark_layout_dynamic()  # direct gmem store
+    sk = from_dlpack(sk_u8.reshape(-1)).mark_layout_dynamic()
+    sm = from_dlpack(sm_u8.reshape(-1)).mark_layout_dynamic()
+    fn = _compiled(("mxfp8_floor_dim_km_swizzle", M, N), _mxfp8_dim_km_swizzle_jit,
+                   mIN, mM, mK, sk, sm, M, N, ncb_k, ncb_m)
+    fn(mIN, mM, mK, sk, sm)
+    return yk, sk_u8.view(torch.float8_e8m0fnu), ym, sm_u8.view(torch.float8_e8m0fnu)
+
+
+MXFP8_FLOOR_DIM_KM_SWIZZLE = QuantCastCuteRecipe.from_gold(
+    Mxfp8FloorDimKmSwizzleGold, cute_fn=mxfp8_floor_dim_km_swizzle_cute
 )
 
 
@@ -2558,6 +2702,7 @@ ALL_RECIPES = [
     ("fp8_deepseek_1x128_dim_m", FP8_DEEPSEEK_1X128_DIM_M),
     # 8-bit 1D, dim-km reduction
     ("mxfp8_floor_dim_km", MXFP8_FLOOR_DIM_KM),
+    ("mxfp8_floor_dim_km_swizzle", MXFP8_FLOOR_DIM_KM_SWIZZLE),
     ("fp8_deepseek_1x128_dim_km", FP8_DEEPSEEK_1X128_DIM_KM),
     # 8-bit 2D
     ("mxfp8_32x32_floor", MXFP8_32X32_FLOOR),

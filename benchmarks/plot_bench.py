@@ -42,7 +42,7 @@ _GROUP_SIZES = [
     ("8-bit elementwise", 1),
     ("8-bit dim-k", 2),
     ("8-bit dim-m", 3),
-    ("8-bit dim-km", 2),
+    ("8-bit dim-km", 3),
     ("8-bit square", 2),
     ("row|col-wise", 2),
     ("other", None),  # None = all remaining rows
