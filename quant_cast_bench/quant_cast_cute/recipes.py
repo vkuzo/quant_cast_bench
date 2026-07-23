@@ -756,7 +756,13 @@ MXFP8_FLOOR = QuantCastCuteRecipe.from_gold(Mxfp8FloorGold, cute_fn=mxfp8_floor_
 # tile) only reached ~35% of peak: the memory transactions were scalar CopyUniversalOp, and more
 # warps/block did NOT help (occupancy was not the binding lever). The win is TMA: this kernel uses
 # the canonical warp-specialized bulk-tensor path (like torchao's cutedsl quantize_2d) --
-#   - TMA G2S loads a (TM, TN) row-major tile of x into smem (sIN);
+#   - TMA G2S loads the (TM, TN) row-major tile of x into smem (sIN) as RB=TM/32 separate 32-row
+#     buffers, each behind its own mbarrier. Warp 0 issues ALL RB async loads up front (double-
+#     buffered), then every warp consumes buffer it while buffer it+1 is still streaming in -- so a
+#     block's compute overlaps the next block's load and there are RB TMAs in flight per CTA instead
+#     of one. We were DRAM-latency-bound (ncu: DRAM ~64%, SM ~42%, warps ~44%; smem caps 4 CTAs/SM),
+#     so the extra memory-level parallelism (2 outstanding loads/CTA) is what lifts DRAM throughput.
+#     Same 48KB smem (the two 32-row buffers reuse the old 32KB sIN region), so no occupancy cost;
 #   - the (TM/32 x TN) scale-groups are split across all threads; each owns one (32-row block, col),
 #     reads its 32 rows down a column of sIN (warp-coalesced, conflict-free), reduces to a per-column
 #     amax, computes the e8m0 FLOOR scale, quantizes its 32 values, and writes them as a CONTIGUOUS
@@ -769,68 +775,73 @@ MXFP8_FLOOR = QuantCastCuteRecipe.from_gold(Mxfp8FloorGold, cute_fn=mxfp8_floor_
 # pattern (single arrival, warp-0 gated) required for a multi-warp block.
 # ---------------------------------------------------------------------------
 _DIMM_TM, _DIMM_TN, _DIMM_WARPS = 64, 256, 8      # tuned on B200 @ 16384 (needs M%TM==0, N%TN==0)
-_DIMM_THREADS = _DIMM_WARPS * 32
-_DIMM_RB = _DIMM_TM // 32                          # 32-row blocks per tile
-_DIMM_GROUPS = _DIMM_TN * _DIMM_RB                 # (col, row-block) scale groups
-_DIMM_ITERS = (_DIMM_GROUPS + _DIMM_THREADS - 1) // _DIMM_THREADS
-_DIMM_IN_BYTES = _DIMM_TM * _DIMM_TN * 2           # bf16 tile bytes for the TMA expect-tx
+_DIMM_THREADS = _DIMM_WARPS * 32                   # == _DIMM_TN: one column per thread per 32-block
+_DIMM_RB = _DIMM_TM // 32                          # 32-row blocks per tile = pipeline stages/buffers
+_DIMM_SUB_BYTES = 32 * _DIMM_TN * 2                # bf16 bytes of ONE 32-row buffer for expect-tx
+assert _DIMM_THREADS == _DIMM_TN                   # each thread owns exactly one column of a block
 
 
 @cute.struct
 class _Mxfp8DimMSmem:
-    bar: cute.struct.MemRange[cutlass.Int64, 1]
+    bar: cute.struct.MemRange[cutlass.Int64, _DIMM_RB]        # one mbarrier per in-flight buffer
     sin: cute.struct.Align[cute.struct.MemRange[cutlass.BFloat16, _DIMM_TM * _DIMM_TN], 1024]
     sout: cute.struct.Align[cute.struct.MemRange[cutlass.Float8E4M3FN, _DIMM_TM * _DIMM_TN], 1024]
 
 
 @cute.kernel
 def _mxfp8_dim_m_kernel(atom_in: cute.CopyAtom, ten_in: cute.Tensor, atom_out: cute.CopyAtom,
-                        ten_out: cute.Tensor, scales: cute.Tensor, sil: cute.Layout,
+                        ten_out: cute.Tensor, scales: cute.Tensor, sib: cute.Layout,
                         sol: cute.Layout, M: cutlass.Int64):
     tidx, _, _ = cute.arch.thread_idx()
     bidx, bidy, _ = cute.arch.block_idx()   # bidx = m_tile, bidy = n_tile
     warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     smem = utils.SmemAllocator()
     st = smem.allocate(_Mxfp8DimMSmem)
-    bar = st.bar.data_ptr()
+    bar0 = st.bar.data_ptr()
     if tidx == 0:
-        cute.arch.mbarrier_init(bar, 1)
+        for b in cutlass.range_constexpr(_DIMM_RB):
+            cute.arch.mbarrier_init(bar0 + b, 1)
     cute.arch.mbarrier_init_fence()
     cute.arch.sync_threads()
-    sIN = st.sin.get_tensor(sil)                             # (TM, TN) row-major
+
+    # RB separate 32-row input buffers carved from the one 32KB sIN region (double buffering).
+    sub_elems = 32 * _DIMM_TN
+    sIN0 = st.sin.get_tensor(sib)                            # buffer 0: rows 0..31, (32, TN)
+    sIN = [sIN0] + [cute.make_tensor(sIN0.iterator + b * sub_elems, sib)
+                    for b in range(1, _DIMM_RB)]
     sOUT = st.sout.get_tensor(sol)                           # (TN, TM) row-major (transposed)
-    gIN = cute.local_tile(ten_in, (_DIMM_TM, _DIMM_TN), (None, None))
+    gIN = cute.local_tile(ten_in, (32, _DIMM_TN), (None, None))     # tiled into 32-row blocks
     gOUT = cute.local_tile(ten_out, (_DIMM_TN, _DIMM_TM), (None, None))
-    tAsA, tAgA = cpasync.tma_partition(atom_in, 0, cute.make_layout(1),
-                                       cute.group_modes(sIN, 0, 2), cute.group_modes(gIN, 0, 2))
     tOsO, tBgB = cpasync.tma_partition(atom_out, 0, cute.make_layout(1),
                                        cute.group_modes(sOUT, 0, 2), cute.group_modes(gOUT, 0, 2))
+
+    # Warp 0 issues ALL RB async loads up front so they stream concurrently (double-buffered).
     if warp == 0:
-        with cute.arch.elect_one():
-            cute.arch.mbarrier_arrive_and_expect_tx(bar, _DIMM_IN_BYTES)
-        cute.copy(atom_in, tAgA[(None, bidx, bidy)], tAsA, tma_bar_ptr=bar)
-    cute.arch.mbarrier_wait(bar, 0)
+        for b in cutlass.range_constexpr(_DIMM_RB):
+            tAsA, tAgA = cpasync.tma_partition(atom_in, 0, cute.make_layout(1),
+                                               cute.group_modes(sIN[b], 0, 2),
+                                               cute.group_modes(gIN, 0, 2))
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_arrive_and_expect_tx(bar0 + b, _DIMM_SUB_BYTES)
+            cute.copy(atom_in, tAgA[(None, bidx * _DIMM_RB + b, bidy)], tAsA, tma_bar_ptr=bar0 + b)
 
     m0 = bidx * _DIMM_TM
     n0 = bidy * _DIMM_TN
     mblk = M // 32
-    for it in cutlass.range_constexpr(_DIMM_ITERS):
-        g = tidx + it * _DIMM_THREADS
-        if g < _DIMM_GROUPS:
-            col = g % _DIMM_TN
-            rb = g // _DIMM_TN
-            r0 = rb * 32
-            frgIn = cute.make_rmem_tensor(cute.make_layout(32), cutlass.Float32)
-            for r in cutlass.range_constexpr(32):
-                frgIn[r] = sIN[r0 + r, col].to(cutlass.Float32)   # column read (warp-coalesced)
-            v = frgIn.load()
-            amax = cute.where(v < 0, -v, v).reduce(cute.ReductionOp.MAX, cutlass.Float32(0.0), 0)
-            sfp, biased = _e8m0_floor(amax)
-            frgOut = cute.make_rmem_tensor(cute.make_layout(32), cutlass.Float8E4M3FN)
-            frgOut.store((v * (1.0 / sfp)).to(cutlass.Float8E4M3FN))  # reciprocal-mul, not 32 divs
-            for r in cutlass.range_constexpr(32):
-                sOUT[col, r0 + r] = frgOut[r]                     # contiguous run = the transpose
-            scales[(n0 + col) * mblk + (m0 // 32 + rb)] = biased.to(scales.element_type)
+    col = tidx                                               # THREADS == TN: one column per thread
+    for it in cutlass.range_constexpr(_DIMM_RB):
+        cute.arch.mbarrier_wait(bar0 + it, 0)                # consume buffer it (next still loading)
+        frgIn = cute.make_rmem_tensor(cute.make_layout(32), cutlass.Float32)
+        for r in cutlass.range_constexpr(32):
+            frgIn[r] = sIN[it][r, col].to(cutlass.Float32)   # column read (warp-coalesced)
+        v = frgIn.load()
+        amax = cute.where(v < 0, -v, v).reduce(cute.ReductionOp.MAX, cutlass.Float32(0.0), 0)
+        sfp, biased = _e8m0_floor(amax)
+        frgOut = cute.make_rmem_tensor(cute.make_layout(32), cutlass.Float8E4M3FN)
+        frgOut.store((v * (1.0 / sfp)).to(cutlass.Float8E4M3FN))  # reciprocal-mul, not 32 divs
+        for r in cutlass.range_constexpr(32):
+            sOUT[col, it * 32 + r] = frgOut[r]               # contiguous run = the transpose
+        scales[(n0 + col) * mblk + (m0 // 32 + it)] = biased.to(scales.element_type)
 
     cute.arch.fence_proxy("async.shared", space="cta")
     cute.arch.sync_threads()
@@ -840,15 +851,15 @@ def _mxfp8_dim_m_kernel(atom_in: cute.CopyAtom, ten_in: cute.Tensor, atom_out: c
 
 @cute.jit
 def _mxfp8_dim_m_jit(mIN, mOUT, scales, M: cutlass.Constexpr):
-    sil = cute.make_layout((_DIMM_TM, _DIMM_TN), stride=(_DIMM_TN, 1))
+    sib = cute.make_layout((32, _DIMM_TN), stride=(_DIMM_TN, 1))       # one 32-row input buffer
     sol = cute.make_layout((_DIMM_TN, _DIMM_TM), stride=(_DIMM_TM, 1))
     atom_in, ten_in = cpasync.make_tiled_tma_atom(
-        cpasync.CopyBulkTensorTileG2SOp(), mIN, sil, (_DIMM_TM, _DIMM_TN))
+        cpasync.CopyBulkTensorTileG2SOp(), mIN, sib, (32, _DIMM_TN))
     atom_out, ten_out = cpasync.make_tiled_tma_atom(
         cpasync.CopyBulkTensorTileS2GOp(), mOUT, sol, (_DIMM_TN, _DIMM_TM))
     M2, N2 = mIN.shape
     grid = ((M2 + _DIMM_TM - 1) // _DIMM_TM, (N2 + _DIMM_TN - 1) // _DIMM_TN, 1)
-    _mxfp8_dim_m_kernel(atom_in, ten_in, atom_out, ten_out, scales, sil, sol,
+    _mxfp8_dim_m_kernel(atom_in, ten_in, atom_out, ten_out, scales, sib, sol,
                         cutlass.Int64(M)).launch(grid=grid, block=(_DIMM_THREADS, 1, 1),
                                                  cluster=(1, 1, 1))
 
