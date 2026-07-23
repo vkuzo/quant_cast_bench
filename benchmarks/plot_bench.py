@@ -71,8 +71,7 @@ _TITLE = "quant_cast memory bandwidth by implementation (16384×16384, B200)"
 def _plot(data, kernels, out_path):
     """Scatter the pivoted data to `out_path`: bandwidth on the x-axis, one kernel per row on the
     y-axis (first kernel at the top)."""
-    # width fixed; height set so each row takes ~half the vertical space it did at 9in/15 rows
-    fig, ax = plt.subplots(figsize=(9, 4.5))
+    fig, ax = plt.subplots(figsize=(9, 6))
     # one scatter series per mode, distinct marker+color, points NOT connected
     for mode in _MODES:
         idx = [i for i, k in enumerate(kernels) if mode in data[k]]
