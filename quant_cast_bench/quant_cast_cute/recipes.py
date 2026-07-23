@@ -1198,25 +1198,31 @@ MXFP8_32X32_FLOOR = QuantCastCuteRecipe.from_gold(
 # index and scatter the biased byte to a flat uint8 scale buffer. Mirrors mxfp8_floor_swizzle_f.
 #
 # The qdata output is NOT transposed (same (M, N) layout as x), so this is a streaming cast: read
-# bf16, write fp8, plus a tiny scattered scale-byte write (numel/32 bytes ~= 0.4% of traffic). So it
-# wants the SAME recipe that took fp8_tensorwise to DRAM speed-of-light -- FLATTEN to 1-D, 128
-# threads/CTA, each owning a CONTIGUOUS run loaded/stored via 128-bit VECTORIZED copy atoms
-# (`num_bits_per_copy` + `assumed_align=16`). We can't tile 2-D here: with a (TR, TN) tile,
-# composition flattens the ROW mode fastest, so a linear thread-layout gives each thread a strided
-# (multi-row) fragment that can't be vectorized. The 1-D flatten keeps fragments contiguous+compact;
-# we recover the block's (row, col) arithmetically from its flat position (N is a per-shape compile
-# constant, so p//N, p%N fold to shifts for power-of-two N) for the swizzled scale offset.
+# bf16, write fp8, plus a tiny scattered scale-byte write (numel/32 bytes ~= 0.4% of traffic). Each
+# block is a CONTIGUOUS 32-run (N % 32 == 0 keeps it within one row), loaded/stored via 128-bit
+# VECTORIZED copy atoms (`num_bits_per_copy` + `assumed_align=16`); the block reduction is thread-local
+# (no cross-thread reduce).
 #
-# Each thread owns one full 1x32 block (VPT=32), so the block reduction is thread-local (no cross-
-# thread reduce). Because N % 32 == 0, every 32-aligned run stays within one row, so a thread's run
-# IS exactly one 1x32 mxfp8 block. The old kernel launched only 16 threads/CTA with scalar copies
-# (~9% peak); this is the mxfp8_floor analog of the 85.9% tensorwise kernel.
+# The prior 1-D-flatten VPT=32 kernel (one block/thread, ~67%) recomputed the full 4D swizzle offset
+# per block per thread and was ALU-pipe bound (ncu ALU ~68% >= DRAM 73%). Switching to the
+# WARP-PER-ROW mapping from _nvfp4_swizzle_kernel (see its comment) took it to ~79.5% (matches triton,
+# was 8 pts behind): warp w owns a fixed row, so the row-dependent swizzle math (row_base) is computed
+# ONCE per warp and reused across all its blocks, leaving only the cheap +(gc//4)*512 + gc%4 term; ILP
+# loads issue first for MLP. Tuned WARPS=2, XSPLIT=4, ILP=4. Mirrors mxfp8_floor_swizzle_f.
 # ---------------------------------------------------------------------------
-_SWZ_THREADS = 128
-_SWZ_VPT = 32                             # one full 1x32 block per thread (fp8-aligned, local reduce)
-_SWZ_CHUNK = _SWZ_THREADS * _SWZ_VPT      # 4096 elements per CTA (1-D tile); 128 blocks
-_SWZ_LD_BITS = min(128, _SWZ_VPT * 16)    # bf16 input  -> 128-bit vectorized load
-_SWZ_ST_BITS = min(128, _SWZ_VPT * 8)     # fp8 output  -> 128-bit vectorized store
+# WARP-PER-ROW mapping (ported from _nvfp4_swizzle_kernel): the 1-D-flatten VPT=32 kernel recomputed
+# the full 4D swizzle offset per block per thread (~7 pt ALU-pipe tax -- ncu showed ALU ~68% >= DRAM
+# 73%). warp w owns row bidy*WARPS+w; its 32 lanes + a grid.x column split + ILP stripe that row's
+# 32-elem mxfp8 blocks. Because the row is FIXED per warp, the row-dependent swizzle math (row_base) is
+# computed ONCE per warp and reused across every block the lane visits; only the cheap per-block
+# +(gc//4)*512 + gc%4 term remains. All ILP loads issue first so global-load latency overlaps via MLP.
+_SWZ_WARPS = 2                            # warps/CTA; warp w owns row bidy*WARPS+w
+_SWZ_XSPLIT = 4                           # grid.x column split within a row
+_SWZ_ILP = 4                              # blocks/thread per loop iter (loads issued together)
+_SWZ_THREADS = 32 * _SWZ_WARPS
+_SWZ_LDWIDTH = 8                          # bf16 per 128-bit load (NLD = 32//LDWIDTH sub-loads/block)
+_SWZ_LD_BITS = _SWZ_LDWIDTH * 16          # bf16 input  -> 128-bit vectorized load
+_SWZ_ST_BITS = 128                        # fp8 output  -> 128-bit vectorized store (32 fp8 = 2 stores)
 
 
 # swizzle offset (device): pre-swizzle scale position (row, col) -> flat offset into the 4D
@@ -1236,48 +1242,73 @@ def _swizzle_flat(row, col, ncb: cutlass.Int32):
 
 @cute.kernel
 def _mxfp8_floor_swizzle_kernel(gX: cute.Tensor, gY: cute.Tensor, sflat: cute.Tensor,
-                                cX: cute.Tensor, tv_layout: cute.Layout,
-                                N: cutlass.Constexpr, ncb: cutlass.Constexpr):
+                                M: cutlass.Constexpr, N: cutlass.Constexpr, ncb: cutlass.Constexpr):
     tidx, _, _ = cute.arch.thread_idx()
-    bidx, _, _ = cute.arch.block_idx()
-    thrX = cute.composition(gX[(None, bidx)], tv_layout)[(tidx, None)]
-    thrY = cute.composition(gY[(None, bidx)], tv_layout)[(tidx, None)]
-    thrC = cute.composition(cX[(None, bidx)], tv_layout)[(tidx, None)]
+    bidx, bidy, _ = cute.arch.block_idx()
+    warp_id = tidx // 32
+    lane = tidx % 32
     ld_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gX.element_type,
                                   num_bits_per_copy=_SWZ_LD_BITS)
     st_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gY.element_type,
                                   num_bits_per_copy=_SWZ_ST_BITS)
-    frgX = cute.make_rmem_tensor(cute.get(tv_layout, mode=[1]), gX.element_type)
-    cute.copy(ld_atom, thrX, frgX)
-    v = frgX.load().to(cutlass.Float32)
-    amax = cutlass.max(v, -v).reduce(cute.ReductionOp.MAX, cutlass.Float32(0.0), 0)
-    sfp, biased = _e8m0_floor(amax)
-    frgY = cute.make_rmem_tensor(cute.get(tv_layout, mode=[1]), gY.element_type)
-    frgY.store((v * (1.0 / sfp)).to(gY.element_type))  # reciprocal-mul (pow2 scale -> bit-identical)
-    cute.copy(st_atom, frgY, thrY)
-    # pre-swizzle (row, 32-group col) from the block's flat position; scatter the e8m0 byte.
-    p = thrC[0][0]                                       # flat index of this block's first element
-    flat = _swizzle_flat(p // N, (p % N) // 32, cutlass.Int32(ncb))
-    sflat[flat] = biased.to(sflat.element_type)
+    ld_layout = cute.make_layout(_SWZ_LDWIDTH)
+    blk_layout = cute.make_layout(32)                    # one 1x32 mxfp8 block per group
+    GPR = N // 32                                        # 32-elem mxfp8 blocks per row (constexpr)
+    NLD = 32 // _SWZ_LDWIDTH                              # 128-bit sub-loads per block
+
+    row = bidy * _SWZ_WARPS + warp_id                    # warp owns one row
+    if row < M:
+        # Row-invariant swizzle offset (bc=0, c4=0), computed ONCE per warp-row: the 4D
+        # (nrb,ncb,32,16) flatten factors as row_base + (col//4)*512 + (col%4).
+        r128 = row % 128
+        row_base = ((row // 128) * ncb * 32 + (r128 % 32)) * 16 + (r128 // 32) * 4
+        nthreads_row = _SWZ_XSPLIT * 32
+        base = bidx * 32 + lane
+        while base < GPR:
+            # issue all ILP loads first (each block = one contiguous 32-run -> NLD 128-bit loads;
+            # the ILP blocks are independent -> overlap) so global-load latency is hidden via MLP.
+            fragbuf = cute.make_rmem_tensor(cute.make_layout(_SWZ_ILP * 32), gX.element_type)
+            for jj in cutlass.range_constexpr(_SWZ_ILP):
+                gc = base + jj * nthreads_row
+                if gc < GPR:
+                    off = cute.assume(row * N + gc * 32, divby=32)
+                    for w in cutlass.range_constexpr(NLD):
+                        cute.copy(
+                            ld_atom,
+                            cute.make_tensor(gX.iterator + off + w * _SWZ_LDWIDTH, ld_layout),
+                            cute.make_tensor(fragbuf.iterator + jj * 32 + w * _SWZ_LDWIDTH,
+                                             ld_layout))
+            for jj in cutlass.range_constexpr(_SWZ_ILP):
+                gc = base + jj * nthreads_row
+                if gc < GPR:
+                    blk = cute.make_rmem_tensor(blk_layout, cutlass.Float32)
+                    blk.store(cute.make_tensor(fragbuf.iterator + jj * 32, blk_layout).load().to(
+                        cutlass.Float32))
+                    v = blk.load()
+                    amax = cutlass.max(v, -v).reduce(cute.ReductionOp.MAX, cutlass.Float32(0.0), 0)
+                    sfp, biased = _e8m0_floor(amax)
+                    frgY = cute.make_rmem_tensor(blk_layout, gY.element_type)
+                    frgY.store((v * (1.0 / sfp)).to(gY.element_type))  # pow2 scale -> bit-identical
+                    offq = cute.assume(row * N + gc * 32, divby=32)
+                    cute.copy(st_atom, frgY,
+                              cute.make_tensor(gY.iterator + offq, blk_layout))
+                    sflat[row_base + (gc // 4) * 512 + (gc % 4)] = biased.to(sflat.element_type)
+            base = base + nthreads_row * _SWZ_ILP
 
 
 @cute.jit
-def _mxfp8_floor_swizzle_jit(mX, mY, sflat, N: cutlass.Constexpr, ncb: cutlass.Constexpr):
-    # 1-D tile: thread t owns the contiguous 32-run [t*32, t*32+32) of the CTA's 4096-element chunk.
-    tv_layout = cute.make_layout((_SWZ_THREADS, _SWZ_VPT), stride=(_SWZ_VPT, 1))
-    tiler = (_SWZ_CHUNK,)
-    gX = cute.zipped_divide(mX, tiler)
-    gY = cute.zipped_divide(mY, tiler)
-    cX = cute.zipped_divide(cute.make_identity_tensor(mX.shape), tiler)
-    _mxfp8_floor_swizzle_kernel(gX, gY, sflat, cX, tv_layout, N, ncb).launch(
-        grid=[cute.size(gX, mode=[1]), 1, 1], block=[_SWZ_THREADS, 1, 1])
+def _mxfp8_floor_swizzle_jit(mX, mY, sflat, M: cutlass.Constexpr, N: cutlass.Constexpr,
+                             ncb: cutlass.Constexpr):
+    # warp-per-row grid: grid.y covers M in steps of WARPS, grid.x is the XSPLIT column split.
+    grid_y = (M + _SWZ_WARPS - 1) // _SWZ_WARPS
+    _mxfp8_floor_swizzle_kernel(mX, mY, sflat, M, N, ncb).launch(
+        grid=[_SWZ_XSPLIT, grid_y, 1], block=[_SWZ_THREADS, 1, 1])
 
 
 def mxfp8_floor_swizzle_cute(x, **kwargs):
     assert x.is_contiguous() and x.dim() == 2
     M, N = x.shape
-    assert N % 32 == 0 and (M * N) % _SWZ_CHUNK == 0, \
-        f"mxfp8_floor_swizzle cute kernel needs N%32==0 and numel%{_SWZ_CHUNK}==0"
+    assert N % 32 == 0, "mxfp8_floor_swizzle cute kernel needs N % 32 == 0 (whole 32-groups per row)"
     y = torch.empty(M, N, dtype=torch.float8_e4m3fn, device=x.device)
     ngc = N // 32
     nrb = (M + 127) // 128
@@ -1287,7 +1318,7 @@ def mxfp8_floor_swizzle_cute(x, **kwargs):
     mX = from_dlpack(x.reshape(-1), assumed_align=16).mark_layout_dynamic()
     mY = from_dlpack(y.reshape(-1), assumed_align=16).mark_layout_dynamic()
     sflat = from_dlpack(s_u8.reshape(-1)).mark_layout_dynamic()
-    fn = _compiled(("mxfp8_floor_swizzle", M, N), _mxfp8_floor_swizzle_jit, mX, mY, sflat, N, ncb)
+    fn = _compiled(("mxfp8_floor_swizzle", M, N), _mxfp8_floor_swizzle_jit, mX, mY, sflat, M, N, ncb)
     fn(mX, mY, sflat)
     return y, s_u8.view(torch.float8_e8m0fnu)
 

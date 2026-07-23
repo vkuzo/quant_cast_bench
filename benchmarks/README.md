@@ -90,22 +90,22 @@ fp32_to_bf16_sr_global_offsets         2.8898   557.3        7.0%  elementwise S
 shape: (16384, 16384)  mode: triton
 recipe                            gpu_time_ms    gbps    pct_peak  perf_description
 ------------------------------  -------------  ------  ----------  -------------------------------------------------
-relu (baseline)                        0.1791  5994.5       74.9%
-fp8_tensorwise_precalc_scale            0.143  5629.6       70.4%  elementwise
-mxfp8_floor_swizzle                    0.1314  6191.7       77.4%  (1,32) block, swizzle
-fp8_deepseek_1x128                     0.1344  6052.4       75.7%  (1,128) block
-mxfp8_floor_dim_m                      0.1788  4551.6       56.9%  (32,1) block, t-contig
-fp8_deepseek_1x128_dim_m               0.1468    5543       69.3%  (128,1) block, t-contig
-mxfp8_floor_dim_km                     0.3106  3511.4       43.9%  (1,32) dim-k + (32,1) dim-m, one pass, t-contig
-fp8_deepseek_1x128_dim_km              0.2555  4267.5       53.3%  (1,128) dim-k + (128,1) dim-m, one pass, t-contig
-mxfp8_32x32_floor                      0.1322  6095.4       76.2%  (32,32) block
-fp8_deepseek_128x128                   0.1308  6156.4       77.0%  (128,128) block
-fp8_rowwise                            0.1382  5829.3       72.9%  (1,-1) block
-fp8_colwise                            0.2413    3338       41.7%  (-1,1) block, t-contig
-nvfp4_swizzle                          0.1386  4962.1       62.0%  (1,16) block, fp4 qdata, swizzle
-bf16_rht                               0.1984  5411.1       67.6%  16x16 RHT, tl.dot (BLOCK_G=512)
-fp32_to_bf16_sr                        0.2773  5807.7       72.6%  elementwise SR, tl.randint4x (tile-local)
-fp32_to_bf16_sr_global_offsets         0.2612  6165.2       77.1%  tile-invariant SR, global-index key
+relu (baseline)                         0.179  5997.2       75.0%
+fp8_tensorwise_precalc_scale           0.1425  5649.8       70.6%  elementwise
+mxfp8_floor_swizzle                    0.1312    6200       77.5%  (1,32) block, swizzle
+fp8_deepseek_1x128                     0.1344  6052.8       75.7%  (1,128) block
+mxfp8_floor_dim_m                      0.1829  4449.3       55.6%  (32,1) block, t-contig
+fp8_deepseek_1x128_dim_m                0.144  5652.1       70.7%  (128,1) block, t-contig
+mxfp8_floor_dim_km                     0.2948  3698.6       46.2%  (1,32) dim-k + (32,1) dim-m, one pass, t-contig
+fp8_deepseek_1x128_dim_km              0.2475  4405.5       55.1%  (1,128) dim-k + (128,1) dim-m, one pass, t-contig
+mxfp8_32x32_floor                      0.1334  6040.4       75.5%  (32,32) block
+fp8_deepseek_128x128                   0.1308  6157.9       77.0%  (128,128) block
+fp8_rowwise                            0.1369  5881.3       73.5%  (1,-1) block
+fp8_colwise                            0.2304  3495.9       43.7%  (-1,1) block, t-contig
+nvfp4_swizzle                          0.1384  4968.4       62.1%  (1,16) block, fp4 qdata, swizzle
+bf16_rht                               0.1981    5420       67.8%  16x16 RHT, tl.dot (BLOCK_G=512)
+fp32_to_bf16_sr                        0.2768  5818.6       72.7%  elementwise SR, tl.randint4x (tile-local)
+fp32_to_bf16_sr_global_offsets         0.2598  6199.6       77.5%  tile-invariant SR, global-index key
 ```
 
 ### `--mode cute`
@@ -116,22 +116,25 @@ compile/triton numbers above:
 
 * `fp8_tensorwise_precalc_scale` (85.8%) — vectorized 128-bit copy atoms (`num_bits_per_copy` +
   `assumed_align=16`) hit DRAM speed-of-light.
-* `mxfp8_floor_swizzle` (67.6%) — same vectorized-copy recipe as tensorwise: flatten to 1-D, 128
-  threads/CTA, each thread owns one contiguous 1×32 block, 128-bit vectorized load/store. The
-  e8m0 scale is scattered to the swizzled 4D grid. ncu shows the ~68% ceiling is structural: the
-  per-block reduction forces the full 32-wide f32 vector live (48 reg/thread → 48% occupancy, vs
-  the 29 reg / 80% occ of the pure-elementwise tensorwise), and the scattered scale-byte write
-  costs ~5 pts (a 1-D CTA covers part of one row, so the swizzled positions don't coalesce). A
-  paired-lane VPT=16 variant restored occupancy (32 reg / 83%) but was *slower* (61.6%) — reducing
-  from a smaller register fragment loses memory-level parallelism. Reaching the triton 81.5% would
-  need a TMA + 128×128 swizzle-atom kernel (reduce from smem to avoid the register spike; write the
-  512 scale bytes contiguously) — future work.
-* `fp8_deepseek_1x128` (73.6%) — the same vectorized-copy recipe applied to 1×128 blocks: flatten
-  to 1-D, 128 threads/CTA, VPT=32 with 128-bit vectorized load/store. A 1×128 block spans 4
-  contiguous threads (4×32=128), so the per-thread abs-max is combined across the group with
-  `warp_reduction_max(threads_in_group=4)` and the group leader scatters the fp32 scale. It edges
-  out `mxfp8_floor_swizzle` (67.6%) despite the same 48-reg reduction profile because the fp32 scale
-  write happens once per 128 elements (vs once per 32 for swizzle) — 4× fewer scattered stores.
+* `mxfp8_floor_swizzle` (78.7%) — one e8m0-floor scale per 1×32 block, scattered to the swizzled 4D
+  `(nrb, ncb, 32, 16)` scale grid. The **warp-per-row ("wpr") mapping** (ported from
+  `_nvfp4_swizzle_kernel`) is what lifts it from the old 1-D-flatten kernel's ~67% to match triton
+  (77.5%): warp `w` owns row `bidy*WARPS+w`; its 32 lanes + a `grid.x` column split (XSPLIT) + ILP
+  stripe that row's N/32 blocks, all 128-bit vectorized loads issued first for memory-level
+  parallelism. ncu on the old kernel showed it was **ALU-pipe bound (~68%), not DRAM bound**: a 1-D
+  flatten recomputed the full 4D swizzle offset (a 6-op div/mod chain, `_swizzle_flat`) *per block
+  per thread*. Because wpr fixes the row per warp, the row-dependent term
+  `row_base = ((row//128)*ncb*32 + (r128%32))*16 + (r128//32)*4` is computed **once per warp** and
+  amortized over every block the lane visits — only the cheap `+(gc//4)*512 + gc%4` remains per
+  block. Tuned WARPS=2, XSPLIT=4, ILP=4. Bit-exact vs gold; edges triton at peak. (This is the same
+  wpr + hoisted-swizzle recipe that fixed `nvfp4_swizzle` below.)
+* `fp8_deepseek_1x128` (72.2%) — the vectorized-copy recipe applied to 1×128 blocks: flatten to 1-D,
+  128 threads/CTA, VPT=32 with 128-bit vectorized load/store. A 1×128 block spans 4 contiguous
+  threads (4×32=128), so the per-thread abs-max is combined across the group with
+  `warp_reduction_max(threads_in_group=4)` and the group leader scatters the fp32 scale. The
+  per-block reduction forces the full 32-wide f32 vector live (48 reg/thread → ~48% occupancy, vs
+  the 29 reg / 80% occ of the pure-elementwise tensorwise), which caps it near the triton parity
+  (75.7%); DRAM is ~76%, near the practical ceiling.
 * `mxfp8_floor_dim_m` (60.3%) — warp-specialized **TMA**: TMA-load a (64,256) tile, reduce 32-row
   blocks per column to the e8m0-floor scale, quantize, transpose in the register→smem write, and
   TMA-store the (256,64) tile to the row-major (N,M) output. Beats the triton kernel (60.1%) and
@@ -281,24 +284,24 @@ compile/triton numbers above:
 
 ```
 shape: (16384, 16384)  mode: cute
-recipe                          gpu_time_ms    gbps    pct_peak  perf_description
-----------------------------  -------------  ------  ----------  --------------------------------
-relu (baseline)                        0.1791  5996.6       75.0%
-fp8_tensorwise_precalc_scale           0.1172  6873.2       85.9%  elementwise
-mxfp8_floor_swizzle                    0.1518  5360.2       67.0%  (1,32) block, swizzle
-fp8_deepseek_1x128                     0.1412  5763.1       72.0%  (1,128) block
-mxfp8_floor_dim_m                      0.1653  4923.6       61.5%  (32,1) block, t-contig
-fp8_deepseek_1x128_dim_m               0.1654  4918.6       61.5%  (128,1) block, t-contig
-mxfp8_floor_dim_km                     0.2505  4353.6       54.4%  (1,32) dim-k + (32,1) dim-m, one pass, t-contig
-fp8_deepseek_1x128_dim_km              0.3309    3296       41.2%  (1,128) dim-k + (128,1) dim-m, one pass, t-contig
-mxfp8_32x32_floor                      0.1426  5649.9       70.6%  (32,32) block
-fp8_deepseek_128x128                   0.1443  5582.2       69.8%  (128,128) block
-fp8_rowwise                            0.1312  6137.6       76.7%  (1,-1) block
-fp8_colwise                            0.2185  3686.7       46.1%  (-1,1) block, t-contig
-nvfp4_swizzle                          0.1467  4689.9       58.6%  (1,16) block, fp4 qdata, swizzle
-bf16_rht                               0.1983  5415.2       67.7%  16x16 RHT, warp mma.sync (4x2 tiles)
-fp32_to_bf16_sr                        0.2473    6512       81.4%  elementwise SR, hand-written Philox-4x32
-fp32_to_bf16_sr_global_offsets         0.2438  6606.9       82.6%  tile-invariant SR, same global-keyed kernel
+recipe                            gpu_time_ms    gbps    pct_peak  perf_description
+------------------------------  -------------  ------  ----------  -------------------------------------------------
+relu (baseline)                        0.1791  5994.8       74.9%
+fp8_tensorwise_precalc_scale           0.1173  6867.1       85.8%  elementwise
+mxfp8_floor_swizzle                    0.1293  6292.7       78.7%  (1,32) block, swizzle
+fp8_deepseek_1x128                     0.1409  5776.4       72.2%  (1,128) block
+mxfp8_floor_dim_m                      0.1637  4969.6       62.1%  (32,1) block, t-contig
+fp8_deepseek_1x128_dim_m               0.1648  4936.8       61.7%  (128,1) block, t-contig
+mxfp8_floor_dim_km                     0.2459  4433.9       55.4%  (1,32) dim-k + (32,1) dim-m, one pass, t-contig
+fp8_deepseek_1x128_dim_km               0.331  3294.8       41.2%  (1,128) dim-k + (128,1) dim-m, one pass, t-contig
+mxfp8_32x32_floor                      0.1431  5630.4       70.4%  (32,32) block
+fp8_deepseek_128x128                   0.1439  5597.8       70.0%  (128,128) block
+fp8_rowwise                            0.1299  6198.3       77.5%  (1,-1) block
+fp8_colwise                            0.2181  3692.9       46.2%  (-1,1) block, t-contig
+nvfp4_swizzle                          0.1392  4942.5       61.8%  (1,16) block, fp4 qdata, swizzle
+bf16_rht                               0.1987  5402.5       67.5%  16x16 RHT, warp mma.sync (4x2 tiles)
+fp32_to_bf16_sr                        0.2459  6549.7       81.9%  elementwise SR, hand-written Philox-4x32
+fp32_to_bf16_sr_global_offsets         0.2458  6551.4       81.9%  tile-invariant SR, same global-keyed kernel
 ```
 
 ## Known issues
@@ -494,42 +497,28 @@ shared-memory transpose to decouple store coalescing from tile height), not chea
 
 ## cuteDSL notes
 
-### Optimizing `mxfp8_floor_swizzle` further (67.6% → target ~triton 81.5%)
+### How `mxfp8_floor_swizzle` was optimized (67.6% → 78.7%, matching triton)
 
-The current cute kernel uses the tensorwise vectorized-copy recipe (1-D flatten, 128 thr/CTA, each
-thread owns one contiguous 1×32 block, 128-bit ld/st). ncu shows the ~68% ceiling is structural, and
-splits into two independent costs — an **occupancy** cost (~12 pts) and a **scatter** cost (~5 pts):
+The original cute kernel used the tensorwise vectorized-copy recipe (1-D flatten, 128 thr/CTA, each
+thread owns one contiguous 1×32 block, 128-bit ld/st) and plateaued at ~67.6%. ncu on that kernel
+showed the ceiling was **ALU-pipe bound (~68%), not DRAM bound**: the 1-D flatten recomputed the full
+4D swizzle offset (a 6-op div/mod chain, `_swizzle_flat`) *per block per thread*.
 
-| variant | reg/thread | occupancy | DRAM % | note |
-|---|---|---|---|---|
-| elementwise ceiling (no reduce/scatter) | 29 | 80% | 85.7% | same as tensorwise |
-| VPT=32, one block/thread (shipped) | 48 | 48.7% | 73.5% | reduction forces 32-wide f32 live |
-| VPT=32, contiguous scale store | 47 | 47.4% | 78.1% | isolates the scatter cost (~5 pts) |
-| VPT=16 paired lanes (2 lanes/block) | 32 | 83.4% | 64.1% | higher occ, **lower** BW — rejected |
+The fix that closed the gap was **not** the TMA + smem-reduction kernel originally sketched here —
+it was the much simpler **warp-per-row ("wpr") + hoisted-swizzle** mapping ported from
+`_nvfp4_swizzle_kernel` (the nvfp4 cast, which had already been optimized the same way): warp `w`
+owns a fixed row, so the row-dependent swizzle term `row_base` is computed **once per warp** and
+amortized over every 1×32 block the lane visits (only the cheap `+(gc//4)*512 + gc%4` remains
+per-block), and all 128-bit loads for the ILP group are issued first for memory-level parallelism.
+Tuned WARPS=2, XSPLIT=4, ILP=4. That alone took it to 78.7%, edging triton (77.5%) — no TMA or smem
+staging needed. See `_mxfp8_floor_swizzle_kernel` in
+[`quant_cast_cute/recipes.py`](../quant_cast_bench/quant_cast_cute/recipes.py).
 
-Two dead ends already ruled out (don't repeat):
+Two dead ends ruled out along the way (don't repeat), both on the old 1-D-flatten kernel:
 
 * **Reduce in bf16** to shrink the live vector — the compiler CSEs the store's f32 back, regs stay 48.
 * **Paired-lane VPT=16** (two lanes share the block amax via `warp_reduction_max(threads_in_group=2)`)
   — cuts regs to 32 and lifts occupancy to 83%, but DRAM *drops* to 64%: reducing from a smaller
   register fragment loses memory-level parallelism. For a reduction kernel, **bigger VPT wins** even
-  at lower occupancy.
-
-Suggested next step — a **TMA + 128×128 swizzle-atom kernel** (mirrors `mxfp8_floor_dim_m`, minus the
-transpose since qdata here is *not* transposed). This attacks both costs at once:
-
-1. **CTA = one swizzle atom** = 128 rows × 4 col-blocks (128×128 = 512 mxfp8 blocks). The atom's 512
-   e8m0 bytes are **contiguous** in the `(nrb, ncb, 32, 16)` grid at offset `(br*ncb+bc)*512`, so the
-   scale write becomes one coalesced store instead of a byte scatter → recovers the ~5 pts. (This is
-   exactly how the nvfp4 triton kernel lays out its scale store — see `_nvfp4_swizzle_kernel`.)
-2. **TMA-load the (128,128) bf16 tile into smem**, then do the per-block abs-max **reductions from
-   smem**, not from a register fragment. This is the key occupancy fix: the 32 values a block reduces
-   live in smem, so no thread holds a 32-wide f32 vector → registers stay near the 29-reg elementwise
-   profile → occupancy back to ~80% (recovers the ~12 pts). Quantize, write fp8 to an smem out-tile,
-   TMA-store row-major→row-major (no transpose gotcha, unlike dim_m).
-3. Reuse the multi-warp TMA barrier pattern and `_e8m0_floor` helper already in `recipes.py`; the
-   `mxfp8_floor_dim_m` kernel is the working template for the TMA load/store + barrier plumbing.
-
-Expected: ~80%+ (elementwise ceiling 85.7% minus a small reduction/coalescing tax), matching triton.
-The trade-off is complexity — it's roughly the effort of the dim_m TMA kernel, which is why the
-simpler 67.6% vectorized-copy version was shipped first.
+  at lower occupancy. (The wpr rewrite sidesteps this entirely — it attacked the ALU tax, not
+  occupancy.)
