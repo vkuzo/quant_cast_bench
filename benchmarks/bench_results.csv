@@ -7,6 +7,7 @@ mxfp8_floor_dim_m,compile,0.5798,1403.5,17.54
 mxfp8_floor_dim_m_swizzle,compile,0.5527,1472.2,18.40
 fp8_deepseek_1x128_dim_m,compile,0.2637,3085.9,38.57
 mxfp8_floor_dim_km,compile,0.7135,1528.5,19.11
+mxfp8_floor_dim_km_swizzle,compile,0.687,1587.4,19.84
 fp8_deepseek_1x128_dim_km,compile,0.3877,2812.6,35.16
 mxfp8_32x32_floor,compile,0.3787,2127.1,26.59
 fp8_deepseek_128x128,compile,0.2290,3516.6,43.96
@@ -24,6 +25,7 @@ mxfp8_floor_dim_m,triton,0.1829,4449.3,55.62
 mxfp8_floor_dim_m_swizzle,triton,0.1416,5744.9,71.81
 fp8_deepseek_1x128_dim_m,triton,0.1440,5652.1,70.65
 mxfp8_floor_dim_km,triton,0.2948,3698.6,46.23
+mxfp8_floor_dim_km_swizzle,triton,0.2986,3652.3,45.65
 fp8_deepseek_1x128_dim_km,triton,0.2475,4405.5,55.07
 mxfp8_32x32_floor,triton,0.1334,6040.4,75.50
 fp8_deepseek_128x128,triton,0.1308,6157.9,76.97
@@ -41,6 +43,7 @@ mxfp8_floor_dim_m,cute,0.1637,4969.6,62.12
 mxfp8_floor_dim_m_swizzle,cute,0.1407,5784.7,72.31
 fp8_deepseek_1x128_dim_m,cute,0.1648,4936.8,61.71
 mxfp8_floor_dim_km,cute,0.2459,4433.9,55.42
+mxfp8_floor_dim_km_swizzle,cute,0.2194,4970.1,62.13
 fp8_deepseek_1x128_dim_km,cute,0.3310,3294.8,41.19
 mxfp8_32x32_floor,cute,0.1431,5630.4,70.38
 fp8_deepseek_128x128,cute,0.1439,5597.8,69.97

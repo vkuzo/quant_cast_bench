@@ -852,6 +852,48 @@ Mxfp8FloorDimMSwizzleGold = QuantCastSingleKernelGold(
 
 
 # ---------------------------------------------------------------------------
+# Golden recipe: mxfp8 FLOOR in BOTH directions (one pass), with BOTH e8m0 scales in the swizzled
+# (NVIDIA 32x4x4 blocked) layout. Combines mxfp8_floor_dim_km_f (dim-K -> qk (M,N) + sk (M,N//32);
+# dim-M -> qm (N,M) + sm (N,M//32), transposed) with the _to_blocked_4d swizzle applied to each of
+# the two scales -- i.e. mxfp8_floor_swizzle_f (dim-K frame) and mxfp8_floor_dim_m_swizzle_f (dim-M /
+# transposed frame) fused into one pass. Qdata is unchanged; only the two scale layouts differ.
+# ---------------------------------------------------------------------------
+def mxfp8_floor_dim_km_swizzle_f(x, **kwargs):
+    """One pass over x, both directions, both scales swizzled. Returns
+    (qk (M,N), sk_blocked, qm (N,M), sm_blocked) where sk/sm are the 4D block grids
+    `(nrb, ncb, 32, 16)` of sk (M,N//32) / sm (N,M//32)."""
+    qk, sk, qm, sm = mxfp8_floor_dim_km_f(x)
+    return qk, _to_blocked_4d(sk), qm, _to_blocked_4d(sm)
+
+
+def _mxfp8_floor_dim_km_swizzle_correctness(
+    inputs: Tuple[torch.Tensor, ...],
+    outputs: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+) -> None:
+    """Both quantizations dequant back to `x` with SQNR above threshold, each un-swizzling its 4D
+    scale grid: the dim-K pair directly, the dim-M pair in the transposed frame (then .t())."""
+    (x,) = inputs
+    qk, sk, qm, sm = outputs
+    sqnr_k = _compute_error(x.float(), mxfp8_floor_swizzle_dq_f(qk, sk).float())
+    sqnr_m = _compute_error(x.float(), mxfp8_floor_swizzle_dq_f(qm, sm).t().float())
+    threshold = 15.0
+    assert sqnr_k > threshold, (
+        f"mxfp8_floor_dim_km_swizzle (dim-k): sqnr={sqnr_k.item():.2f} dB below {threshold} dB"
+    )
+    assert sqnr_m > threshold, (
+        f"mxfp8_floor_dim_km_swizzle (dim-m): sqnr={sqnr_m.item():.2f} dB below {threshold} dB"
+    )
+
+
+Mxfp8FloorDimKmSwizzleGold = QuantCastSingleKernelGold(
+    pt_ref_fn=mxfp8_floor_dim_km_swizzle_f,
+    correctness_fn=_mxfp8_floor_dim_km_swizzle_correctness,
+    example_input_fn=lambda M, K: (torch.randn(M, K, dtype=torch.bfloat16, device="cuda"),),
+    perf_description="(1,32) dim-k + (32,1) dim-m, one pass, t-contig, swizzle",
+)
+
+
+# ---------------------------------------------------------------------------
 # Golden recipe: float8 tensorwise (per-tensor) scaling.
 #
 # Unlike the block recipes, the scale is a single per-tensor value that needs a GLOBAL
@@ -1322,6 +1364,7 @@ ALL_RECIPES = [
     ("fp8_deepseek_1x128_dim_m", Deepseek1x128DimMGold),
     # 8-bit 1D, dim-km reduction 
     ("mxfp8_floor_dim_km", Mxfp8FloorDimKmGold),
+    ("mxfp8_floor_dim_km_swizzle", Mxfp8FloorDimKmSwizzleGold),
     ("fp8_deepseek_1x128_dim_km", Deepseek1x128DimKmGold),
     # 8-bit 2D
     ("mxfp8_32x32_floor", Mxfp832x32FloorGold),

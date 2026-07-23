@@ -25,6 +25,7 @@ from quant_cast_bench.quant_cast_gold.recipes import (
     HadamardRht,
     Mxfp832x32FloorGold,
     Mxfp8FloorDimKmGold,
+    Mxfp8FloorDimKmSwizzleGold,
     Mxfp8FloorDimMGold,
     Mxfp8FloorDimMSwizzleGold,
     Mxfp8FloorGold,
@@ -840,6 +841,78 @@ MXFP8_FLOOR_DIM_KM = QuantCastTritonRecipe.from_gold(
 
 
 # ---------------------------------------------------------------------------
+# mxfp8 FLOOR both directions, one pass, with BOTH e8m0 scales in the swizzled 4D (nrb, ncb, 32, 16)
+# grid. Same quant + qdata stores as _mxfp8_floor_dim_km_kernel; only the two scale stores change from
+# plain 2D writes to swizzled scatters (reusing the flat formula of _mxfp8_floor_swizzle_kernel /
+# _mxfp8_floor_dim_m_swizzle_kernel). dim-K scale sk (M, N//32): pre-swizzle row = m (over M), col =
+# 32-col-block (over N//32). dim-M scale sm (N, M//32), transposed frame: pre-swizzle row = n (over N),
+# col = 32-row-block (over M//32). Mirrors mxfp8_floor_dim_km_swizzle_f. Requires M%128==0, N%128==0.
+# ---------------------------------------------------------------------------
+@triton.autotune(configs=_DIM_KM_CONFIGS, key=["M", "N"])
+@triton.jit
+def _mxfp8_floor_dim_km_swizzle_kernel(
+    x_ptr, yk_ptr, sk_ptr, ym_ptr, sm_ptr, M, N,
+    sxm, sxn, sykm, sykn, symn, symm, NCB_K, NCB_M,
+    BN: tl.constexpr, RB: tl.constexpr,
+):
+    BM: tl.constexpr = RB * 32   # rows in the tile
+    CB: tl.constexpr = BN // 32  # 32-col blocks in the tile
+    pid_m = tl.program_id(0)     # row-block group (BM rows)
+    pid_n = tl.program_id(1)     # col group (BN cols)
+    offs_m = pid_m * BM + tl.arange(0, BM)
+    offs_n = pid_n * BN + tl.arange(0, BN)
+    x = tl.load(x_ptr + offs_m[:, None] * sxm + offs_n[None, :] * sxn).to(tl.float32)  # (BM, BN)
+    # dim-K: 1x32 blocks along columns -> (BM, CB, 32), reduce the 32.
+    xk = tl.reshape(x, (BM, CB, 32))
+    bk = _amax_to_e8m0_floor_tl(tl.max(tl.abs(xk), axis=2))  # (BM, CB) per (row, col-block)
+    yk = tl.reshape((xk / _e8m0_to_fp32_tl(bk)[:, :, None]).to(tl.float8e4nv), (BM, BN))
+    tl.store(yk_ptr + offs_m[:, None] * sykm + offs_n[None, :] * sykn, yk)
+    # swizzled sk store: scale (M, N//32); pre-swizzle position row = m (over M), col-block (over N//32).
+    row_k = offs_m[:, None]                              # (BM, 1)
+    col_k = (pid_n * CB + tl.arange(0, CB))[None, :]     # (1, CB)
+    r128k = row_k % 128
+    flat_k = (((row_k // 128) * NCB_K + col_k // 4) * 32 + r128k % 32) * 16 + (r128k // 32 * 4 + col_k % 4)
+    tl.store(sk_ptr + flat_k, bk.to(tl.uint8))
+    # dim-M: 32x1 blocks along rows -> (RB, 32, BN), reduce the 32; transposed store.
+    xm = tl.reshape(x, (RB, 32, BN))
+    bm = _amax_to_e8m0_floor_tl(tl.max(tl.abs(xm), axis=1))  # (RB, BN) per (row-block, col)
+    ym = tl.reshape((xm / _e8m0_to_fp32_tl(bm)[:, None, :]).to(tl.float8e4nv), (BM, BN))
+    tl.store(ym_ptr + offs_n[:, None] * symn + offs_m[None, :] * symm, tl.trans(ym))
+    # swizzled sm store: scale (N, M//32) transposed; pre-swizzle row = n (over N), col = 32-row-block.
+    row_m = offs_n[None, :]                              # (1, BN)
+    col_m = (pid_m * RB + tl.arange(0, RB))[:, None]     # (RB, 1)
+    r128m = row_m % 128
+    flat_m = (((row_m // 128) * NCB_M + col_m // 4) * 32 + r128m % 32) * 16 + (r128m // 32 * 4 + col_m % 4)
+    tl.store(sm_ptr + flat_m, bm.to(tl.uint8))
+
+
+def mxfp8_floor_dim_km_swizzle_triton(x, **kwargs):
+    assert x.is_contiguous() and x.dim() == 2
+    M, N = x.shape
+    assert M % 128 == 0 and N % 128 == 0, \
+        "mxfp8_floor_dim_km_swizzle kernel needs M%128==0 and N%128==0"
+    yk = torch.empty_like(x, dtype=torch.float8_e4m3fn)                    # (M, N)
+    ym = torch.empty(N, M, dtype=torch.float8_e4m3fn, device=x.device)    # (N, M) transposed
+    # sk: (M, N//32) swizzled; sm: (N, M//32) swizzled. zero-filled so padded slots match gold's zeros.
+    ncb_k = ((N // 32) + 3) // 4
+    ncb_m = ((M // 32) + 3) // 4
+    sk = torch.zeros((M + 127) // 128, ncb_k, 32, 16, dtype=torch.uint8, device=x.device)
+    sm = torch.zeros((N + 127) // 128, ncb_m, 32, 16, dtype=torch.uint8, device=x.device)
+    grid = lambda meta: (M // (meta["RB"] * 32), N // meta["BN"])  # noqa: E731
+    _mxfp8_floor_dim_km_swizzle_kernel[grid](
+        x, yk, sk, ym, sm, M, N,
+        x.stride(0), x.stride(1), yk.stride(0), yk.stride(1),
+        ym.stride(0), ym.stride(1), ncb_k, ncb_m,
+    )
+    return yk, sk.view(torch.float8_e8m0fnu), ym, sm.view(torch.float8_e8m0fnu)
+
+
+MXFP8_FLOOR_DIM_KM_SWIZZLE = QuantCastTritonRecipe.from_gold(
+    Mxfp8FloorDimKmSwizzleGold, triton_fn=mxfp8_floor_dim_km_swizzle_triton
+)
+
+
+# ---------------------------------------------------------------------------
 # mxfp8 FLOOR 1x32 with the e8m0 scale written directly into the NVIDIA-swizzled 4D block grid
 # (nrb, ncb, 32, 16). Same quant as mxfp8_floor; the scale for pre-swizzle position (row, col)
 # lands at flat offset ((br*ncb+bc)*32 + b)*16 + (a*4+c4), where br=row//128, r128=row%128,
@@ -1253,6 +1326,7 @@ ALL_RECIPES = [
     ("fp8_deepseek_1x128_dim_m", FP8_DEEPSEEK_1X128_DIM_M),
     # 8-bit 1D, dim-km reduction
     ("mxfp8_floor_dim_km", MXFP8_FLOOR_DIM_KM),
+    ("mxfp8_floor_dim_km_swizzle", MXFP8_FLOOR_DIM_KM_SWIZZLE),
     ("fp8_deepseek_1x128_dim_km", FP8_DEEPSEEK_1X128_DIM_KM),
     # 8-bit 2D
     ("mxfp8_32x32_floor", MXFP8_32X32_FLOOR),
