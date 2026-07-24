@@ -196,7 +196,7 @@ HADAMARD_RHT = RecipeV2.from_gold(
 )
 # stochastic rounding fp32 -> bf16 (tile-LOCAL, from SrF32ToBf16 gold). The DELIBERATE
 # non-tile-invariant counterexample: the dither is keyed on tile-local element order, so
-# MANUAL_TILE rounds differently from REFERENCE (test_flex_tile_map_backends_keep_numerics is
+# MANUAL_TILE rounds differently from INDUCTOR (test_flex_tile_map_backends_keep_numerics is
 # skipped for it -- see the skip in test.py). Its example_input_fn supplies the fp32 constant
 # input + the REPLICATE PRNG key.
 SR_BF16 = RecipeV2.from_gold(
@@ -204,7 +204,7 @@ SR_BF16 = RecipeV2.from_gold(
     aux_kinds=(AuxKind.REPLICATE,),
 )
 # tiling-INVARIANT SR (from SrF32ToBf16Global): keys the dither on each element's GLOBAL
-# position, so REFERENCE == MANUAL_TILE bit-for-bit (unlike SR_BF16). Its backend check is still
+# position, so INDUCTOR == MANUAL_TILE bit-for-bit (unlike SR_BF16). Its backend check is still
 # skipped in the generic suite (kept alongside SR_BF16); the invariance is asserted by
 # test_sr_bf16_global_tiling_invariant.
 SR_BF16_GLOBAL = RecipeV2.from_gold(
@@ -212,7 +212,7 @@ SR_BF16_GLOBAL = RecipeV2.from_gold(
     aux_kinds=(AuxKind.REPLICATE,),
 )
 # debug: plain relu, fully tile-invariant (no reduction/scale/aux), single output. The bring-up
-# recipe for the TRITON_TEMPLATE backend; also exercised by the generic REFERENCE/MANUAL_TILE suite.
+# recipe for the TRITON_TEMPLATE backend; also exercised by the generic INDUCTOR/MANUAL_TILE suite.
 DEBUG_RELU = RecipeV2.from_gold(DebugReluGold)
 RECIPES_V2 = [
     ("fp8_deepseek_1x128", DEEPSEEK_1X128),

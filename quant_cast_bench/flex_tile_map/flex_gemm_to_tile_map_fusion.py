@@ -1,8 +1,8 @@
-"""mm + flex_tile_map_ref -> flex_gemm fusion, in BOTH forward and backward.
+"""mm + flex_tile_map_inductor -> flex_gemm fusion, in BOTH forward and backward.
 
 A self-contained Inductor post-grad pass, auto-installed when the flex_tile_map package is
-imported. It matches ONLY the reference-path HOP (``flex_tile_map_ref_hop``, see
-``reference_hop.py``); the hand-rolled Triton-template HOP in ``hop/`` is deliberately NOT fused.
+imported. It matches ONLY the INDUCTOR-backend HOP (``flex_tile_map_inductor_hop``, see
+``inductor_hop.py``); the hand-rolled Triton-template HOP in ``hop/`` is deliberately NOT fused.
 
 The user writes two separate ops -- ``c = a @ b`` then ``d = flex_tile_map(c, f)`` -- so the
 autograd boundary sits around the epilogue ``f`` alone. Under ``torch.compile`` this pass
@@ -11,14 +11,14 @@ the fused kernel. Because the pass runs on the forward and backward post-grad gr
 the fusion fires in each (the backward's ``grad_d = grad_e @ w.T`` feeds its own epilogue).
 
 Two stages run per graph:
-  1. FUSION: rewrite every ``flex_tile_map_ref_hop(sub, mm(a, b), *aux)`` into a ``flex_gemm_hop``.
+  1. FUSION: rewrite every ``flex_tile_map_inductor_hop(sub, mm(a, b), *aux)`` into a ``flex_gemm_hop``.
      When the mm result is ALSO consumed outside the epilogue (the common forward case: its raw
      product is saved for the backward's VJP, e.g. ``cos(c)``), the fused body returns a two-tuple
      ``(epilogue(mm), mm)`` so flex_gemm emits the raw accumulator as a second output of the SAME
      kernel -- ``a @ b`` is then computed exactly once instead of recomputed as a separate mm just
      to feed that other use.
-  2. INLINE: any ``flex_tile_map_ref_hop`` that survived (its operand is NOT an mm -- e.g. a
-     standalone cast with no preceding gemm, as in the benchmark's REFERENCE+compile path) is
+  2. INLINE: any ``flex_tile_map_inductor_hop`` that survived (its operand is NOT an mm -- e.g. a
+     standalone cast with no preceding gemm, as in the benchmark's INDUCTOR+compile path) is
      spliced back into the parent graph as ordinary nodes, so regular Inductor lowers it. This is
      necessary because a HOP with no registered lowering hard-errors under Inductor (there is no
      graceful fallback to the eager body).
@@ -39,7 +39,7 @@ from torch._inductor.pattern_matcher import (
     register_graph_pattern,
 )
 
-from .reference_hop import flex_tile_map_ref_hop
+from .inductor_hop import flex_tile_map_inductor_hop
 
 __all__ = [
     "flex_gemm_hop",
@@ -58,7 +58,7 @@ def _resolve_gm(owning_gm, arg):
         return getattr(owning_gm, arg.target)
     if isinstance(arg, torch.fx.GraphModule):
         return arg
-    raise AssertionError(f"unexpected flex_tile_map_ref subgraph arg: {arg!r}")
+    raise AssertionError(f"unexpected flex_tile_map_inductor subgraph arg: {arg!r}")
 
 
 def _register_submodule(owning_gm, submod) -> str:
@@ -150,11 +150,11 @@ def _build_fused_body(
 
 
 @register_graph_pattern(
-    CallFunctionVarArgs(flex_tile_map_ref_hop), pass_dict=FLEX_TILE_MAP_PASS
+    CallFunctionVarArgs(flex_tile_map_inductor_hop), pass_dict=FLEX_TILE_MAP_PASS
 )
 def _fuse_mm_into_flex_gemm(match: Match, *args, **kwargs):
     ftm_node = match.nodes[-1]
-    # node is flex_tile_map_ref_hop(subgraph, *operands); operands correspond positionally to the
+    # node is flex_tile_map_inductor_hop(subgraph, *operands); operands correspond positionally to the
     # epilogue subgraph placeholders. Exactly one operand is the mm "tile"; the rest are captured
     # aux tensors (which may come BEFORE the tile -- e.g. in a backward graph Dynamo can order a
     # saved activation ahead of the grad tile).
@@ -245,7 +245,7 @@ def _fuse_mm_into_flex_gemm(match: Match, *args, **kwargs):
 
 
 # ---------------------------------------------------------------------------
-# Stage 2: inline a surviving (non-fused) reference HOP back into the graph
+# Stage 2: inline a surviving (non-fused) inductor HOP back into the graph
 # ---------------------------------------------------------------------------
 
 
@@ -257,13 +257,13 @@ def _fresh_attr_name(owning_gm, base) -> str:
     return name
 
 
-def _inline_reference_hop(graph, ftm_node):
-    """Splice ``flex_tile_map_ref_hop``'s epilogue subgraph into the parent graph as plain nodes.
+def _inline_inductor_hop(graph, ftm_node):
+    """Splice ``flex_tile_map_inductor_hop``'s epilogue subgraph into the parent graph as plain nodes.
 
     Runs only on HOP nodes that did NOT fuse (no mm operand). Copies the subgraph body before the
     HOP node, binding its placeholders to the HOP's operands, then rewires the HOP's outputs to the
     copied output. Regular Inductor then lowers the inlined ops -- reproducing the generic kernel
-    the REFERENCE backend produced before it routed through a HOP (and handling reductions, unlike
+    the INDUCTOR backend produced before it routed through a HOP (and handling reductions, unlike
     a pointwise-only subgraph lowering).
     """
     owning_gm = graph.owning_module
@@ -299,7 +299,7 @@ def _inline_reference_hop(graph, ftm_node):
         # tuple-returning epilogue: downstream reads via getitem on the HOP node.
         for user in list(ftm_node.users):
             assert user.op == "call_function" and user.target is operator.getitem, (
-                f"expected getitem on a tuple-returning flex_tile_map_ref, got {user.format_node()}"
+                f"expected getitem on a tuple-returning flex_tile_map_inductor, got {user.format_node()}"
             )
             user.replace_all_uses_with(mapped[user.args[1]])
             graph.erase_node(user)
@@ -320,10 +320,10 @@ def _run_pass(graph: torch.fx.Graph) -> None:
     survivors = [
         n
         for n in graph.nodes
-        if n.op == "call_function" and n.target is flex_tile_map_ref_hop
+        if n.op == "call_function" and n.target is flex_tile_map_inductor_hop
     ]
     for n in survivors:
-        _inline_reference_hop(graph, n)
+        _inline_inductor_hop(graph, n)
     if survivors:
         graph.owning_module.recompile()
 

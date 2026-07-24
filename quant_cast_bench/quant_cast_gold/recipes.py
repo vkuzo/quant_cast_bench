@@ -1341,7 +1341,7 @@ def sr_bf16_global_f(x, key, **kwargs):
     `(global_row + i) * num_col + (global_col + j)`; we build a per-element Philox key
     `[seed, global_index]` (vectorized, no host sync) and draw one uniform each. Because the
     index is global, element (i, j) gets the same draw regardless of which tile it lands in, so
-    REFERENCE == MANUAL_TILE bit-for-bit. Returns `(out,)`.
+    INDUCTOR == MANUAL_TILE bit-for-bit. Returns `(out,)`.
     """
     assert x.dtype == torch.float32, f"SR bf16 expects fp32 input, got {x.dtype}"
     global_row = kwargs["global_row"]

@@ -9,6 +9,7 @@ import pytest
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from qdata_utils import mismatch_fraction, qdata_equal
 from quant_cast_bench.quant_cast_cute.recipes import ALL_RECIPES
 
 pytestmark = pytest.mark.skipif(
@@ -16,21 +17,6 @@ pytestmark = pytest.mark.skipif(
 )
 
 _MAX_MISMATCH_FRAC = 0.01
-
-
-def _as_bytes_or_fp32(t):
-    if t.dtype in (torch.float4_e2m1fn_x2, torch.float8_e8m0fnu):
-        return t.view(torch.uint8)
-    return t.to(torch.float32)
-
-
-def _qdata_equal(a, b):
-    return torch.equal(_as_bytes_or_fp32(a), _as_bytes_or_fp32(b))
-
-
-def _mismatch_fraction(a, b):
-    av, bv = _as_bytes_or_fp32(a), _as_bytes_or_fp32(b)
-    return (av != bv).float().mean().item()
 
 
 @pytest.mark.parametrize("name, recipe", ALL_RECIPES, ids=[n for n, _ in ALL_RECIPES])
@@ -55,7 +41,7 @@ def test_cute_matches_reference(name, recipe):
             f"{name} output {i}: shape/dtype mismatch ({t.shape}/{t.dtype} vs {r.shape}/{r.dtype})"
         )
 
-    if all(_qdata_equal(t, r) for t, r in zip(cute_outs, ref_outs)):
+    if all(qdata_equal(t, r) for t, r in zip(cute_outs, ref_outs)):
         return  # exact match
 
     # Legitimate CuTeDSL-vs-PyTorch hardware-rounding differences: fp8/fp4 cast RNE ties, and f32
@@ -71,7 +57,7 @@ def test_cute_matches_reference(name, recipe):
         return
     for i, (t, r) in enumerate(zip(cute_outs, ref_outs)):
         if t.dtype in (torch.float4_e2m1fn_x2, torch.float8_e8m0fnu, torch.float8_e4m3fn):
-            frac = _mismatch_fraction(t, r)
+            frac = mismatch_fraction(t, r)
             assert frac < _MAX_MISMATCH_FRAC, (
                 f"{name} output {i}: {frac:.3%} of narrow-type elements differ -- likely a real bug"
             )
