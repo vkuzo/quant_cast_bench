@@ -9,6 +9,7 @@ import pytest
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from qdata_utils import mismatch_fraction, qdata_equal
 from quant_cast_bench.quant_cast_triton.recipes import ALL_RECIPES
 
 pytestmark = pytest.mark.skipif(
@@ -19,23 +20,6 @@ pytestmark = pytest.mark.skipif(
 # fraction of the RNE-tie divergence between Triton's and PyTorch's fp8/fp4 casts we tolerate
 # before treating it as a real bug (see the fallback in the test below).
 _MAX_MISMATCH_FRAC = 0.01
-
-
-def _as_bytes_or_fp32(t):
-    # packed fp4 / e8m0 have no lossless float cast, so compare their raw bytes; everything else
-    # (fp8_e4m3, fp32) casts to fp32 (lossless).
-    if t.dtype in (torch.float4_e2m1fn_x2, torch.float8_e8m0fnu):
-        return t.view(torch.uint8)
-    return t.to(torch.float32)
-
-
-def _qdata_equal(a, b):
-    return torch.equal(_as_bytes_or_fp32(a), _as_bytes_or_fp32(b))
-
-
-def _mismatch_fraction(a, b):
-    av, bv = _as_bytes_or_fp32(a), _as_bytes_or_fp32(b)
-    return (av != bv).float().mean().item()
 
 
 @pytest.mark.parametrize("name, recipe", ALL_RECIPES, ids=[n for n, _ in ALL_RECIPES])
@@ -60,7 +44,7 @@ def test_triton_matches_reference(name, recipe):
             f"{name} output {i}: shape/dtype mismatch ({t.shape}/{t.dtype} vs {r.shape}/{r.dtype})"
         )
 
-    if all(_qdata_equal(t, r) for t, r in zip(tri_outs, ref_outs)):
+    if all(qdata_equal(t, r) for t, r in zip(tri_outs, ref_outs)):
         return  # exact match to the reference (the common case)
 
     # Some outputs differ. Two legitimate sources:
@@ -76,7 +60,7 @@ def test_triton_matches_reference(name, recipe):
     if "_sr" in name:
         return
     for i, (t, r) in enumerate(zip(tri_outs, ref_outs)):
-        frac = _mismatch_fraction(t, r)
+        frac = mismatch_fraction(t, r)
         assert frac < _MAX_MISMATCH_FRAC, (
             f"{name} output {i}: {frac:.3%} of elements differ from reference -- too many for "
             f"RNE ties, likely a real bug"

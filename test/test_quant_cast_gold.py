@@ -29,7 +29,7 @@ def test_ref_correctness(name, gold):
     # each gold recipe is internally consistent: pt_ref_fn's own outputs clear its correctness_fn.
     # example_input_fn builds the full positional inputs (x, *aux). Calls pt_ref_fn directly on
     # the whole tensor (no flex_tile_map). The whole tensor is one tile, so we pass the origin
-    # position kwargs a REFERENCE-style whole-tensor call would -- recipes that ignore them accept
+    # position kwargs a INDUCTOR-style whole-tensor call would -- recipes that ignore them accept
     # **kwargs; sr_bf16_global needs them for its per-element global-position dither.
     torch.manual_seed(0)
     inputs = gold.example_input_fn(512, 512)

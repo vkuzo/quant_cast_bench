@@ -16,6 +16,7 @@ from torch._inductor.utils import run_and_get_code, run_fw_bw_and_get_code
 from torch.testing import FileCheck
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from qdata_utils import qdata_equal
 # Importing the package auto-installs the mm -> flex_gemm post-grad fusion pass (see
 # flex_gemm_to_tile_map_fusion._auto_install).
 from quant_cast_bench.flex_tile_map.api import FlexTileMapBackend, OutputKind, flex_tile_map
@@ -53,17 +54,9 @@ HAS_CUTEDSL = _cutedsl_version is not None and _cutedsl_version >= _MIN_CUTEDSL
 SM100 = torch.cuda.is_available() and torch.cuda.get_device_capability(0) >= (10, 0)
 
 
-def _qdata_equal(a, b):
-    # dtype-aware bit-exact qdata compare: packed fp4 (float4_e2m1fn_x2) has no float cast,
-    # so compare its raw bytes via the uint8 view; everything else compares as fp32.
-    if a.dtype == torch.float4_e2m1fn_x2:
-        return torch.equal(a.view(torch.uint8), b.view(torch.uint8))
-    return torch.equal(a.to(torch.float32), b.to(torch.float32))
-
-
 # raw-fn correctness (each recipe's pt_ref_fn output clears its own correctness_fn, no
 # flex_tile_map) is a gold-package concern and lives in quant_cast_gold/test.py::test_ref_correctness.
-# The tests below exercise the flex_tile_map path (REFERENCE, and REFERENCE == MANUAL_TILE).
+# The tests below exercise the flex_tile_map path (INDUCTOR, and INDUCTOR == MANUAL_TILE).
 
 
 @pytest.mark.parametrize(
@@ -97,17 +90,17 @@ def test_flex_tile_map_ref_correctness(name, recipe):
 )
 def test_flex_tile_map_backends_keep_numerics(name, recipe):
     # every RecipeV2 is tile-invariant, so the MANUAL_TILE backend must produce bit-identical
-    # outputs to REFERENCE. Compares every output tensor (qdata + any scale/aux outputs)
-    # exactly via _qdata_equal (packed fp4 via its uint8 view; everything else -- fp8_e4m3,
-    # e8m0, fp32, 4D swizzle grids -- as a bit-exact fp32 compare).
+    # outputs to INDUCTOR. Compares every output tensor (qdata + any scale/aux outputs)
+    # exactly via qdata_equal (packed fp4 and e8m0 scales via their uint8 view; everything else --
+    # fp8_e4m3, fp32, 4D swizzle grids -- as a bit-exact fp32 compare).
     #
-    # the SR recipes are skipped here; both keep their REFERENCE-vs-MANUAL_TILE behavior in
+    # the SR recipes are skipped here; both keep their INDUCTOR-vs-MANUAL_TILE behavior in
     # dedicated tests. sr_bf16 is the NON-tile-invariant counterexample (dither keyed on
-    # tile-local order, so MANUAL_TILE != REFERENCE by design -- test_sr_bf16_tiling_changes_rounding).
+    # tile-local order, so MANUAL_TILE != INDUCTOR by design -- test_sr_bf16_tiling_changes_rounding).
     # sr_bf16_global IS tile-invariant (keyed on global position); that equality is asserted by
     # test_sr_bf16_global_tiling_invariant, so it's skipped here too rather than duplicated.
     if name in ("fp32_to_bf16_sr", "fp32_to_bf16_sr_global_offsets"):
-        pytest.skip(f"{name}: REFERENCE-vs-MANUAL_TILE behavior is covered by a dedicated SR test")
+        pytest.skip(f"{name}: INDUCTOR-vs-MANUAL_TILE behavior is covered by a dedicated SR test")
 
     torch.manual_seed(0)
     inputs = recipe.example_input_fn(512, 512)
@@ -119,7 +112,7 @@ def test_flex_tile_map_backends_keep_numerics(name, recipe):
         output_kinds=recipe.output_kinds,
         valid_tile_size_fn=recipe.valid_tile_size_fn,
     )
-    ref = flex_tile_map(x, recipe.pt_ref_fn, _backend=FlexTileMapBackend.REFERENCE, **kw)
+    ref = flex_tile_map(x, recipe.pt_ref_fn, _backend=FlexTileMapBackend.INDUCTOR, **kw)
     tile = flex_tile_map(x, recipe.pt_ref_fn, _backend=FlexTileMapBackend.MANUAL_TILE, **kw)
 
     assert len(ref) == len(tile), f"{name}: output count {len(tile)} != {len(ref)}"
@@ -127,7 +120,7 @@ def test_flex_tile_map_backends_keep_numerics(name, recipe):
         assert r.shape == t.shape and r.dtype == t.dtype, (
             f"{name} output {i}: shape/dtype mismatch ({t.shape}/{t.dtype} vs {r.shape}/{r.dtype})"
         )
-        assert _qdata_equal(t, r), f"{name} output {i}: MANUAL_TILE differs from REFERENCE"
+        assert qdata_equal(t, r), f"{name} output {i}: MANUAL_TILE differs from INDUCTOR"
 
 
 # dim-M deepseek: `f` transposes the tile + reduces last dim, and OutputKind.SWAP_TILE_INDEX
@@ -136,7 +129,7 @@ def test_flex_tile_map_backends_keep_numerics(name, recipe):
 _DIM_M_SWAP = (OutputKind.SWAP_TILE_INDEX, OutputKind.SWAP_TILE_INDEX)
 
 
-# dim-M whole-tensor correctness and REFERENCE == MANUAL_TILE (square) are covered by the
+# dim-M whole-tensor correctness and INDUCTOR == MANUAL_TILE (square) are covered by the
 # generic RECIPES_V2 suite (DEEPSEEK_1X128_DIM_M carries output_kinds=SWAP_TILE_INDEX). The
 # non-square case below is kept: it uniquely exercises the grid-transpose with P != Q.
 def test_triton_template_relu_eager():
@@ -152,7 +145,7 @@ def test_triton_template_pointwise_compiled_raises():
     # reduction-only), and a HOP `@register_lowering` that raises does NOT gracefully fall back to
     # the eager body -- it hard-errors (InductorError: LoweringException). This replaces a prior
     # test that asserted a graceful fallback; that only ever "passed" on a stale on-disk Inductor
-    # cache (fresh, it fails identically). Pointwise casts belong on REFERENCE / regular Inductor.
+    # cache (fresh, it fails identically). Pointwise casts belong on INDUCTOR / regular Inductor.
     torch.manual_seed(0)
     torch._dynamo.reset()
     x = torch.randn(256, 256, dtype=torch.bfloat16, device="cuda")
@@ -178,7 +171,7 @@ def test_triton_template_deepseek_dim_m_compiled():
     assert q.shape == (256, 256) and q.dtype == torch.float8_e4m3fn
     assert s.shape == (256, 2) and s.dtype == torch.float32
     # tile-invariant recipe, so the template result is bit-exact vs the reference.
-    assert _qdata_equal(q, qr)
+    assert qdata_equal(q, qr)
     assert torch.equal(s, sr)
 
 
@@ -194,23 +187,23 @@ def test_triton_template_deepseek_dim_m_non_square_compiled():
     q, s = compiled(x, deepseek_1x128_dim_m_f, _backend=FlexTileMapBackend.TRITON_TEMPLATE)
 
     assert q.shape == (512, 384) and s.shape == (512, 384 // 128)
-    assert _qdata_equal(q, qr)
+    assert qdata_equal(q, qr)
     assert torch.equal(s, sr)
 
 
 def test_deepseek_dim_m_non_square():
     # non-square input exercises the grid-transpose (P != Q): a 384x512 input produces a
-    # (512, 384) qdata / (512, 3) scale swapped-grid output; REFERENCE == MANUAL_TILE bit-exact.
+    # (512, 384) qdata / (512, 3) scale swapped-grid output; INDUCTOR == MANUAL_TILE bit-exact.
     torch.manual_seed(0)
     (x,) = DEEPSEEK_1X128_DIM_M.example_input_fn(384, 512)
 
     kernel = DEEPSEEK_1X128_DIM_M.pt_ref_fn
     kw = dict(output_kinds=_DIM_M_SWAP, valid_tile_size_fn=DEEPSEEK_1X128_DIM_M.valid_tile_size_fn)
-    qr, sr = flex_tile_map(x, kernel, _backend=FlexTileMapBackend.REFERENCE, **kw)
+    qr, sr = flex_tile_map(x, kernel, _backend=FlexTileMapBackend.INDUCTOR, **kw)
     qt, st = flex_tile_map(x, kernel, _backend=FlexTileMapBackend.MANUAL_TILE, **kw)
     assert qr.shape == (512, 384)  # grid-transposed
     assert sr.shape == (512, 384 // 128)
-    assert _qdata_equal(qt, qr)
+    assert qdata_equal(qt, qr)
     assert torch.equal(st, sr)
 
 
@@ -273,7 +266,7 @@ def test_pad_ref_shapes_swizzle():
     ids=["mxfp8_floor", "mxfp8_floor_swizzle", "fp8_deepseek_1x128"],
 )
 def test_pad_backends_match(recipe, pad_to):
-    # padded ragged input: MANUAL_TILE must match REFERENCE bit-exact (padding happens before
+    # padded ragged input: MANUAL_TILE must match INDUCTOR bit-exact (padding happens before
     # tiling in both paths, so the two backends see the identical padded tensor).
     torch.manual_seed(0)
     (x,) = recipe.example_input_fn(200, 300)
@@ -282,9 +275,9 @@ def test_pad_backends_match(recipe, pad_to):
         pad_input_to_multiple_of=pad_to,
         valid_tile_size_fn=recipe.valid_tile_size_fn,
     )
-    qdata_ref, scale_ref = flex_tile_map(x, kernel, _backend=FlexTileMapBackend.REFERENCE, **kw)
+    qdata_ref, scale_ref = flex_tile_map(x, kernel, _backend=FlexTileMapBackend.INDUCTOR, **kw)
     qdata_tile, scale_tile = flex_tile_map(x, kernel, _backend=FlexTileMapBackend.MANUAL_TILE, **kw)
-    assert _qdata_equal(qdata_tile, qdata_ref)
+    assert qdata_equal(qdata_tile, qdata_ref)
     assert scale_tile.shape == scale_ref.shape
     assert torch.equal(scale_tile, scale_ref)
 
@@ -303,12 +296,12 @@ def test_pad_matches_manual_pad():
     # manual pad: 200 stays (mult of 1), 300 -> 320 (mult of 32); high-edge zero pad.
     x_padded = F.pad(x, (0, _ceil_to(300, 32) - 300, 0, 0))
     qdata_ref, scale_ref = kernel(x_padded)
-    assert _qdata_equal(qdata, qdata_ref)
+    assert qdata_equal(qdata, qdata_ref)
     assert torch.equal(scale, scale_ref)
 
 
 def test_sr_bf16_tiling_changes_rounding():
-    # documents the accepted non-invariance: REFERENCE vs MANUAL_TILE differ bit-for-bit
+    # documents the accepted non-invariance: INDUCTOR vs MANUAL_TILE differ bit-for-bit
     # (tile-local offsets repeat), yet both stay unbiased (mean ~= input).
     torch.manual_seed(0)
     inputs = SR_BF16.example_input_fn(512, 512)  # (x, key); x is the fp32 constant
@@ -316,7 +309,7 @@ def test_sr_bf16_tiling_changes_rounding():
     v = x.flatten()[0].item()
 
     kw = dict(aux_inputs=aux, aux_kinds=SR_BF16.aux_kinds)
-    (out_ref,) = flex_tile_map(x, SR_BF16.pt_ref_fn, _backend=FlexTileMapBackend.REFERENCE, **kw)
+    (out_ref,) = flex_tile_map(x, SR_BF16.pt_ref_fn, _backend=FlexTileMapBackend.INDUCTOR, **kw)
     (out_tile,) = flex_tile_map(x, SR_BF16.pt_ref_fn, _backend=FlexTileMapBackend.MANUAL_TILE, **kw)
 
     assert not torch.equal(out_ref, out_tile)
@@ -325,7 +318,7 @@ def test_sr_bf16_tiling_changes_rounding():
 
 
 def test_sr_bf16_global_tiling_invariant():
-    # the tiling-invariant SR: keyed on GLOBAL element position, so REFERENCE == MANUAL_TILE
+    # the tiling-invariant SR: keyed on GLOBAL element position, so INDUCTOR == MANUAL_TILE
     # bit-for-bit (contrast test_sr_bf16_tiling_changes_rounding, which uses the tile-local key).
     torch.manual_seed(0)
     inputs = SR_BF16_GLOBAL.example_input_fn(512, 512)  # (x, key); x is the fp32 constant
@@ -333,7 +326,7 @@ def test_sr_bf16_global_tiling_invariant():
     v = x.flatten()[0].item()
 
     kw = dict(aux_inputs=aux, aux_kinds=SR_BF16_GLOBAL.aux_kinds)
-    (out_ref,) = flex_tile_map(x, SR_BF16_GLOBAL.pt_ref_fn, _backend=FlexTileMapBackend.REFERENCE, **kw)
+    (out_ref,) = flex_tile_map(x, SR_BF16_GLOBAL.pt_ref_fn, _backend=FlexTileMapBackend.INDUCTOR, **kw)
     (out_tile,) = flex_tile_map(x, SR_BF16_GLOBAL.pt_ref_fn, _backend=FlexTileMapBackend.MANUAL_TILE, **kw)
 
     assert torch.equal(out_ref, out_tile)  # global-position keying is tiling-invariant
@@ -343,7 +336,7 @@ def test_sr_bf16_global_tiling_invariant():
 # ---------------------------------------------------------------------------
 # mm + flex_tile_map -> flex_gemm fusion (fwd + bwd), mirroring flex_tile_map_v2/test.py.
 # The user writes `c = mm(a, b); d = flex_tile_map(c, f)` and, under torch.compile, an Inductor
-# post-grad pass re-fuses the pair into a single flex_gemm. Uses the REFERENCE backend (the
+# post-grad pass re-fuses the pair into a single flex_gemm. Uses the INDUCTOR backend (the
 # fusible BaseHOP path); the hand-rolled Triton-template backend is deliberately not fused.
 # ---------------------------------------------------------------------------
 
@@ -489,13 +482,13 @@ def test_functional_mlp_fusion_fires_in_forward_and_backward():
 def test_functional_mlp_fusion_fires_without_autograd_function():
     # Same as test_functional_mlp_fusion_fires_in_forward_and_backward, but WITHOUT wrapping the
     # activation in a torch.autograd.Function: flex_tile_map is applied inline in the forward and
-    # autograd is left to differentiate through it. flex_tile_map_ref_hop is a BaseHOP, so under
+    # autograd is left to differentiate through it. flex_tile_map_inductor_hop is a BaseHOP, so under
     # torch.compile AOTAutograd derives the VJP for free (grad_c = grad_out * (c > 0), capturing c
     # as a lifted freevar) -- yielding a joint graph, and a fusion in BOTH the forward and backward,
     # identical to the hand-written autograd.Function version. This is the README's "after" form
     # (fuse mm + activation directly under @torch.compile).
     #
-    # The inline form also works in EAGER: flex_tile_map_ref wraps a single-tensor epilogue so its
+    # The inline form also works in EAGER: flex_tile_map_inductor wraps a single-tensor epilogue so its
     # BaseHOP subgraph returns a 1-tuple, which is what BaseHOP's backward (create_fw_bw_graph)
     # needs to count outputs correctly -- so the eager fn() below is a valid reference.
     torch._dynamo.reset()
@@ -559,7 +552,7 @@ def test_compile_manual_tile_raises():
     reason="flex_gemm QUACK fusion requires SM100 + nvidia-cutlass-dsl >= 4.5.2",
 )
 def test_reference_compile_no_mm_inlines():
-    # REFERENCE + compile with NO preceding mm: the ref HOP survives stage-1 fusion and is spliced
+    # INDUCTOR + compile with NO preceding mm: the ref HOP survives stage-1 fusion and is spliced
     # back in (stage 2) as plain pointwise ops, so regular Inductor lowers it. Compiling at all
     # proves the inline happened -- a surviving HOP has no lowering and hard-errors. Guards the
     # benchmark's `--mode compile` path.
@@ -567,7 +560,7 @@ def test_reference_compile_no_mm_inlines():
     x = torch.randn(256, 256, device="cuda", dtype=torch.bfloat16)
 
     def fn(x):
-        return flex_tile_map(x, lambda a: a.sin(), _backend=FlexTileMapBackend.REFERENCE)
+        return flex_tile_map(x, lambda a: a.sin(), _backend=FlexTileMapBackend.INDUCTOR)
 
     out, (code,) = run_and_get_code(
         torch.compile(fn, backend="inductor", fullgraph=True), x

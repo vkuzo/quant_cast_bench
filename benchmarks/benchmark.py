@@ -83,11 +83,11 @@ def _bench_one(recipe, M, K, mode):
         def run():
             return compiled(inputs[0], f, _backend=FlexTileMapBackend.TRITON_TEMPLATE)
     elif mode == "compile":
-        # the generic (no-template) path: drive the reference `f` through flex_tile_map's REFERENCE
-        # backend under torch.compile. REFERENCE calls `f(input, *aux, global_row=.., global_col=..,
+        # the generic (no-template) path: drive the reference `f` through flex_tile_map's INDUCTOR
+        # backend under torch.compile. INDUCTOR calls `f(input, *aux, global_row=.., global_col=..,
         # num_col=..)` directly (no HOP), so regular Inductor lowers it -- the same kernel as
         # compiling pt_ref_fn directly, but routed through the flex_tile_map entrypoint so it diffs
-        # apples-to-apples against flex_tile_map_triton. aux_inputs are forwarded whole (REFERENCE
+        # apples-to-apples against flex_tile_map_triton. aux_inputs are forwarded whole (INDUCTOR
         # treats the whole tensor as one tile, so aux_kinds tiling metadata is irrelevant here);
         # the tile_kwargs above are supplied by flex_tile_map itself, not passed in.
         from quant_cast_bench.flex_tile_map.api import FlexTileMapBackend, flex_tile_map
@@ -100,7 +100,7 @@ def _bench_one(recipe, M, K, mode):
                 inputs[0],
                 f,
                 aux_inputs=tuple(inputs[1:]),
-                _backend=FlexTileMapBackend.REFERENCE,
+                _backend=FlexTileMapBackend.INDUCTOR,
             )
     else:
         # "triton"/"cute": run the recipe's hand-written kernel directly.
@@ -146,7 +146,7 @@ def main(
         f"mode must be 'compile', 'triton', 'cute', or 'flex_tile_map_triton', got {mode!r}"
     )
 
-    # "compile" sweeps the gold recipes through flex_tile_map's REFERENCE backend under
+    # "compile" sweeps the gold recipes through flex_tile_map's INDUCTOR backend under
     # torch.compile (regular Inductor lowers `f`); "triton"/"cute" sweep the hand-written kernel
     # sets (triton_fn / cute_fn); "flex_tile_map_triton" sweeps the flex_tile_map RecipeV2 set
     # through the TRITON_TEMPLATE backend (the hand template). All recipe kinds carry
