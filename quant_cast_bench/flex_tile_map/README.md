@@ -13,24 +13,24 @@ Reason #1 to exist: express CODA in fwd+bwd without resorting to large `torch.au
 fuses gemm to epilogue by hand
 
 ```python
-class MmSinMm(torch.autograd.Function):
+class FunctionalMLP(torch.autograd.Function):  # out = relu(x @ w1) @ w2
     @staticmethod
-    def forward(ctx, a, b, w):
-        d, c = flex_gemm(torch.mm, (a, b), lambda c: (c.sin(), c))
-        e = torch.mm(d, w)
-        ctx.save_for_backward(a, b, w, c, d)
+    def forward(ctx, x, w1, w2):
+        d, c = flex_gemm(torch.mm, (x, w1), lambda c: (c.relu(), c))
+        e = torch.mm(d, w2)
+        ctx.save_for_backward(x, w1, w2, c, d)
         return e
 
     @staticmethod
     def backward(ctx, grad_e):
-        a, b, w, c, d = ctx.saved_tensors
-        grad_d = flex_gemm(torch.mm, (grad_e, w.t()), lambda gd: gd * c.cos())
-        grad_a = torch.mm(grad_d, b.t())
-        grad_b = torch.mm(a.t(), grad_d)
-        grad_w = torch.mm(d.t(), grad_e)
-        return grad_a, grad_b, grad_w
+        x, w1, w2, c, d = ctx.saved_tensors
+        grad_d = flex_gemm(torch.mm, (grad_e, w2.t()), lambda gd: gd * (c > 0))
+        grad_x = torch.mm(grad_d, w1.t())
+        grad_w1 = torch.mm(x.t(), grad_d)
+        grad_w2 = torch.mm(d.t(), grad_e)
+        return grad_x, grad_w1, grad_w2
 
-e = MmSinMm.apply(a, b, w)
+e = FunctionalMLP.apply(x, w1, w2)
 ```
 
 **After** (with flex_tile_map): user writes `torch.mm` + `flex_tile_map(..., fn)`,
@@ -39,14 +39,13 @@ torch.compile fuses the fwd+bwd parts to get equivalent code to the manual
 
 ```python
 @torch.compile()
-def f(a, b, w):
-    c = torch.mm(a, b)
-    d = flex_tile_map(c, lambda c: c.sin())  # fuses with the mm above -> one flex_gemm kernel
-    return torch.mm(d, w)
+def f(x, w1, w2):  # out = relu(x @ w1) @ w2
+    c = torch.mm(x, w1)
+    d = flex_tile_map(c, lambda c: c.relu())  # fuses with the mm above -> one flex_gemm kernel
+    return torch.mm(d, w2)
 
-e = f(a, b, w)
+e = f(x, w1, w2)
 ```
-
 
 Reason #2 to exist: general frontend for easy to medium cases for quant casting. Punt on hard cases
 
@@ -87,12 +86,12 @@ There are two independent HigherOrderOperators, on purpose:
   incompatible `cutlass.cute` APIs); the fusion tests gate on that version.
 
   **Dual-output epilogue (no redundant matmul).** When the mm result is also consumed outside the
-  epilogue — the usual forward case, where the raw product `c = a @ b` is saved for the backward's
-  VJP (`grad_c = grad_out * cos(c)`) — the pass builds the fused body to return a two-tuple
+  epilogue — the usual forward case, where the raw product `c = x @ w1` is saved for the backward's
+  VJP (`grad_c = grad_out * (c > 0)`) — the pass builds the fused body to return a two-tuple
   `(epilogue(mm), mm)`. This drives flex_gemm's aux-output path so the raw accumulator is emitted as
   a *second output of the same fused kernel* (both derived from the one in-register accumulator),
-  instead of leaving a separate `extern_kernels.mm` behind to recompute `a @ b` just for the save.
-  The forward then computes `a @ b` exactly once (one fused kernel + the un-fused second gemm).
+  instead of leaving a separate `extern_kernels.mm` behind to recompute `x @ w1` just for the save.
+  The forward then computes `x @ w1` exactly once (one fused kernel + the un-fused down-proj gemm).
   flex_gemm's QUACK backend supports at most one such aux output.
 
 Future work: the hand-rolled Triton-template HOP could migrate to `BaseHOP` too, for the same
