@@ -9,10 +9,17 @@ import sys
 
 import pytest
 import torch
+import torch._inductor.exc
 import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from quant_cast_bench.flex_tile_map.api import FlexTileMapBackend, OutputKind, flex_tile_map
+from quant_cast_bench.flex_tile_map.flex_gemm_to_tile_map_fusion import (
+    count_node_targets,
+    flex_gemm_hop,
+    install_flex_tile_map_pass,
+)
+from quant_cast_bench.flex_tile_map.reference_hop import flex_tile_map_ref_hop
 from quant_cast_bench.flex_tile_map.recipes import (
     DEEPSEEK_1X128,
     DEEPSEEK_1X128_DIM_M,
@@ -27,6 +34,15 @@ from quant_cast_bench.quant_cast_gold.recipes import debug_relu_f, deepseek_1x12
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="requires CUDA"
 )
+
+try:
+    import cutlass  # noqa: F401
+
+    HAS_CUTEDSL = True
+except ImportError:
+    HAS_CUTEDSL = False
+
+SM100 = torch.cuda.is_available() and torch.cuda.get_device_capability(0) >= (10, 0)
 
 
 def _qdata_equal(a, b):
@@ -123,16 +139,19 @@ def test_triton_template_relu_eager():
     torch.testing.assert_close(out, torch.relu(x))
 
 
-def test_triton_template_pointwise_compiled_falls_back():
-    # the compiled pointwise lowering was removed (regular Inductor handles pointwise casts). The
-    # custom lowering now raises NotImplementedError for a pointwise `f`, but Inductor catches that
-    # and gracefully falls back to the HOP's eager body -- so the result is still correct, just not
-    # produced by our template.
+def test_triton_template_pointwise_compiled_raises():
+    # A pointwise `f` under TRITON_TEMPLATE has no template lowering (the template is
+    # reduction-only), and a HOP `@register_lowering` that raises does NOT gracefully fall back to
+    # the eager body -- it hard-errors (InductorError: LoweringException). This replaces a prior
+    # test that asserted a graceful fallback; that only ever "passed" on a stale on-disk Inductor
+    # cache (fresh, it fails identically). Pointwise casts belong on REFERENCE / regular Inductor.
     torch.manual_seed(0)
+    torch._dynamo.reset()
     x = torch.randn(256, 256, dtype=torch.bfloat16, device="cuda")
     compiled = torch.compile(flex_tile_map)
-    (out,) = compiled(x, debug_relu_f, _backend=FlexTileMapBackend.TRITON_TEMPLATE)
-    torch.testing.assert_close(out, torch.relu(x))
+    with torch._inductor.config.patch(force_disable_caches=True):
+        with pytest.raises(torch._inductor.exc.InductorError):
+            compiled(x, debug_relu_f, _backend=FlexTileMapBackend.TRITON_TEMPLATE)
 
 
 def test_triton_template_deepseek_dim_m_compiled():
@@ -311,3 +330,158 @@ def test_sr_bf16_global_tiling_invariant():
 
     assert torch.equal(out_ref, out_tile)  # global-position keying is tiling-invariant
     assert abs(out_ref.float().mean().item() - v) < 2e-3  # still unbiased
+
+
+# ---------------------------------------------------------------------------
+# mm + flex_tile_map -> flex_gemm fusion (fwd + bwd), mirroring flex_tile_map_v2/test.py.
+# The user writes `c = mm(a, b); d = flex_tile_map(c, f)` and, under torch.compile, an Inductor
+# post-grad pass re-fuses the pair into a single flex_gemm. Uses the REFERENCE backend (the
+# fusible BaseHOP path); the hand-rolled Triton-template backend is deliberately not fused.
+# ---------------------------------------------------------------------------
+
+
+def _sqnr(ref, actual):
+    """Signal-to-quantization-noise ratio in dB (standard low-precision numerics metric)."""
+    ref = ref.double()
+    actual = actual.double()
+    noise = (ref - actual).pow(2).mean()
+    if noise == 0:
+        return float("inf")
+    return (10 * torch.log10(ref.pow(2).mean() / noise)).item()
+
+
+def _the_flex_gemm_graph(graphs):
+    """The single recorded post-grad graph that contains a flex_gemm node."""
+    matches = [g for g in graphs if count_node_targets(g, flex_gemm_hop)]
+    assert len(matches) == 1, f"expected exactly one graph with a flex_gemm, got {len(matches)}"
+    return matches[0]
+
+
+def _fwd_epilogue_fn(acc):
+    return acc.sin()
+
+
+class _CustomUserFn(torch.autograd.Function):
+    """y = sin(c), expressed via flex_tile_map, with the mm kept OUTSIDE.
+
+    Both forward and backward wrap their epilogue in flex_tile_map, so both graphs expose a
+    fusible mm -> flex_tile_map pair. The backward is the true VJP of sin: grad_c = grad_out *
+    cos(c), capturing the saved input c into the epilogue (a lifted freevar).
+    """
+
+    @staticmethod
+    def forward(ctx, c):
+        ctx.save_for_backward(c)
+        return flex_tile_map(c, _fwd_epilogue_fn)
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        (c,) = ctx.saved_tensors
+        return flex_tile_map(grad_out, lambda go: go * c.cos())
+
+
+@pytest.mark.skipif(
+    not (SM100 and HAS_CUTEDSL), reason="flex_gemm fusion requires SM100 + CuteDSL"
+)
+def test_only_first_gemm_fuses_forward():
+    torch._dynamo.reset()
+    graphs = install_flex_tile_map_pass()
+
+    def fn(a, b, w):
+        c = torch.mm(a, b)         # first gemm  (fused with epilogue)
+        d = _CustomUserFn.apply(c)  # epilogue    (fusible)
+        return torch.mm(d, w)      # second gemm (not fused)
+
+    # forward only: inputs do not require grad
+    a = torch.randn(256, 64, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(128, 32, device="cuda", dtype=torch.bfloat16)
+
+    actual = torch.compile(fn, backend="inductor", fullgraph=True)(a, b, w)
+    ref = torch.mm(a, b).sin() @ w
+    assert _sqnr(ref, actual) > 30.0
+
+    # exactly the first gemm+epilogue fused into a flex_gemm, no flex_tile_map node left, and the
+    # second gemm stays a plain aten.mm. (forward-only -> a single compiled graph.)
+    g = _the_flex_gemm_graph(graphs)
+    assert count_node_targets(g, flex_gemm_hop) == 1
+    assert count_node_targets(g, flex_tile_map_ref_hop) == 0
+    assert count_node_targets(g, torch.ops.aten.mm.default) == 1
+
+
+@pytest.mark.skipif(
+    not (SM100 and HAS_CUTEDSL), reason="flex_gemm fusion requires SM100 + CuteDSL"
+)
+def test_fusion_fires_in_forward_and_backward():
+    torch._dynamo.reset()
+    graphs = install_flex_tile_map_pass()
+
+    def fn(a, b, w):
+        c = torch.mm(a, b)
+        d = _CustomUserFn.apply(c)
+        return torch.mm(d, w)
+
+    def make_inputs():
+        a = torch.randn(256, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        b = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        w = torch.randn(128, 32, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        return a, b, w
+
+    ca, cb, cw = make_inputs()
+    torch.compile(fn, backend="inductor", fullgraph=True)(ca, cb, cw).sum().backward()
+
+    ea = ca.detach().clone().requires_grad_(True)
+    eb = cb.detach().clone().requires_grad_(True)
+    ew = cw.detach().clone().requires_grad_(True)
+    fn(ea, eb, ew).sum().backward()
+
+    # compiled and eager run in bf16 with different reduction orders, so compare with SQNR.
+    for cg, eg, name in [(ca.grad, ea.grad, "a"), (cb.grad, eb.grad, "b"), (cw.grad, ew.grad, "w")]:
+        assert _sqnr(eg, cg) > 30.0, f"grad {name} SQNR too low"
+
+    # pin the true VJP of sin: grad_d = grad_e @ w.T (grad_e = ones from .sum()),
+    # grad_c = grad_d * cos(c), grad_a = grad_c @ b.T.
+    c = ea @ eb
+    grad_d = torch.ones(256, 32, device="cuda", dtype=torch.bfloat16) @ ew.t()
+    grad_c = grad_d * c.cos()
+    grad_a_ref = grad_c @ eb.t()
+    assert _sqnr(grad_a_ref, ca.grad) > 30.0, "grad a vs pinned VJP"
+
+    # the fusion fired in BOTH the forward and backward graphs (one flex_gemm each), and no
+    # flex_tile_map node survives in any recorded graph.
+    with_flex_gemm = [g for g in graphs if count_node_targets(g, flex_gemm_hop)]
+    assert len(with_flex_gemm) == 2, "expected a flex_gemm in the fwd AND bwd graph"
+    for g in with_flex_gemm:
+        assert count_node_targets(g, flex_gemm_hop) == 1
+    assert all(count_node_targets(g, flex_tile_map_ref_hop) == 0 for g in graphs)
+
+
+@pytest.mark.skipif(
+    not (SM100 and HAS_CUTEDSL), reason="flex_gemm fusion requires SM100 + CuteDSL"
+)
+def test_compile_manual_tile_raises():
+    # MANUAL_TILE is an eager-only debug backend; under torch.compile it must raise.
+    torch._dynamo.reset()
+    x = torch.randn(256, 256, device="cuda", dtype=torch.bfloat16)
+    compiled = torch.compile(flex_tile_map, fullgraph=True)
+    with pytest.raises((NotImplementedError, torch._dynamo.exc.Unsupported, RuntimeError)):
+        compiled(x, debug_relu_f, _backend=FlexTileMapBackend.MANUAL_TILE)
+
+
+@pytest.mark.skipif(
+    not (SM100 and HAS_CUTEDSL), reason="flex_gemm fusion requires SM100 + CuteDSL"
+)
+def test_reference_compile_no_mm_inlines():
+    # REFERENCE + compile with NO preceding mm: the ref HOP survives fusion and is spliced back in
+    # (stage 2), so regular Inductor lowers it. No HOP node survives; numerics are correct. Guards
+    # the benchmark's `--mode compile` path.
+    torch._dynamo.reset()
+    graphs = install_flex_tile_map_pass()
+    x = torch.randn(256, 256, device="cuda", dtype=torch.bfloat16)
+
+    def fn(x):
+        return flex_tile_map(x, lambda a: a.sin(), _backend=FlexTileMapBackend.REFERENCE)
+
+    out = torch.compile(fn, backend="inductor", fullgraph=True)(x)
+    torch.testing.assert_close(out, x.sin(), rtol=2e-2, atol=2e-2)
+    assert all(count_node_targets(g, flex_tile_map_ref_hop) == 0 for g in graphs)

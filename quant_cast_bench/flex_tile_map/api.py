@@ -1,4 +1,5 @@
 import enum
+import inspect
 from typing import Callable, Tuple
 
 import torch
@@ -136,6 +137,37 @@ def _aux_for_tile(aux, kind, r, c, tile_shape, input_shape):
     raise NotImplementedError(f"aux kind {kind} is not yet implemented")
 
 
+def _accepts_frame_kwargs(f: Callable) -> bool:
+    """Whether `f` takes the framework tile-position kwargs (`global_row/global_col/num_col`).
+
+    Recipe fns declare `**kwargs` (or the named params) and want them bound; a plain fusion
+    epilogue like `lambda acc: acc.sin()` takes only the tile and must be called as `f(x)`.
+    Called on the eager path only (see `flex_tile_map`).
+    """
+    try:
+        params = inspect.signature(f).parameters
+    except (TypeError, ValueError):
+        return True
+    if any(p.kind is p.VAR_KEYWORD for p in params.values()):
+        return True
+    return "num_col" in params or "global_row" in params
+
+
+def _reference_f(f: Callable) -> Callable:
+    """Wrap `f` so the whole-tensor tile's origin/stride kwargs are bound, when `f` accepts them.
+
+    REFERENCE treats the whole tensor as one tile at origin (0, 0) with the full row stride. A
+    plain epilogue that doesn't take the kwargs is returned unchanged so it traces as `f(x)`.
+    """
+    if not _accepts_frame_kwargs(f):
+        return f
+
+    def wrapped(inp, *operands):
+        return f(inp, *operands, global_row=0, global_col=0, num_col=inp.shape[1])
+
+    return wrapped
+
+
 def flex_tile_map(
     input: torch.Tensor,
     f: Callable,
@@ -248,11 +280,26 @@ def flex_tile_map(
                 f"valid_tile_size_fn rejects the whole-tensor tile {ts} under REFERENCE"
             )
 
-        # one tile == whole tensor, so every aux is presented whole (REPLICATE) and the tile
-        # origin is (0, 0). num_col is the (post-swap, post-pad) row stride.
-        outs = f(input, *aux_inputs, global_row=0, global_col=0, num_col=input.shape[1])
+        # Route through the fusible reference HOP rather than calling `f` directly. Behavior is
+        # unchanged: eager runs `f(input, *aux)` (BaseHOP's eager body); under torch.compile the
+        # HOP is emitted, and the post-grad fusion pass either fuses a preceding mm into flex_gemm
+        # or inlines the epilogue back for a generic Inductor kernel. One tile == whole tensor, so
+        # aux is presented whole (REPLICATE) at origin (0, 0); `_reference_f` binds those kwargs.
+        from .reference_hop import flex_tile_map_ref  # side-effect: registers the HOP
+
+        # Framework tile-position kwargs (global_row/global_col/num_col) are an eager-only
+        # affordance for position-dependent recipes. Under torch.compile the epilogue follows
+        # flex_gemm's plain f(acc) contract -- a captured-tensor epilogue (the backward VJP) can't
+        # be signature-inspected during tracing -- so pass f through raw.
+        f_ref = f if torch.compiler.is_compiling() else _reference_f(f)
+        outs = flex_tile_map_ref(input, f_ref, aux_inputs)
 
     elif _backend is FlexTileMapBackend.MANUAL_TILE:
+        if torch.compiler.is_compiling():
+            raise NotImplementedError(
+                "flex_tile_map MANUAL_TILE is an eager-only debug backend and is not supported "
+                "under torch.compile"
+            )
         outs = _manual_tile(
             input,
             f,
