@@ -358,54 +358,56 @@ def _sqnr(ref, actual):
     return (10 * torch.log10(ref.pow(2).mean() / noise)).item()
 
 
-def _fwd_epilogue_fn(acc):
-    return acc.sin()
+def _functional_mlp_act_fn(acc):
+    return acc.relu()
 
 
-class _CustomUserFn(torch.autograd.Function):
-    """y = sin(c), expressed via flex_tile_map, with the mm kept OUTSIDE.
+class _FunctionalMLPActFn(torch.autograd.Function):
+    """The activation of a functional (non-gated) MLP: d = relu(c), expressed via flex_tile_map,
+    with the surrounding matmuls (the w1 up-projection and w2 down-projection) kept OUTSIDE.
 
     Both forward and backward wrap their epilogue in flex_tile_map, so both graphs expose a
-    fusible mm -> flex_tile_map pair. The backward is the true VJP of sin: grad_c = grad_out *
-    cos(c), capturing the saved input c into the epilogue (a lifted freevar).
+    fusible mm -> flex_tile_map pair. The backward is the true VJP of relu: grad_c = grad_out *
+    (c > 0), capturing the saved pre-activation c into the epilogue (a lifted freevar).
     """
 
     @staticmethod
     def forward(ctx, c):
         ctx.save_for_backward(c)
-        return flex_tile_map(c, _fwd_epilogue_fn)
+        return flex_tile_map(c, _functional_mlp_act_fn)
 
     @staticmethod
     def backward(ctx, grad_out):
         (c,) = ctx.saved_tensors
-        return flex_tile_map(grad_out, lambda go: go * c.cos())
+        return flex_tile_map(grad_out, lambda go: go * (c > 0))
 
 
 @pytest.mark.skipif(
     not (SM100 and HAS_CUTEDSL),
     reason="flex_gemm QUACK fusion requires SM100 + nvidia-cutlass-dsl >= 4.5.2",
 )
-def test_only_first_gemm_fuses_forward():
+def test_functional_mlp_only_first_gemm_fuses_forward():
     torch._dynamo.reset()
 
-    def fn(a, b, w):
-        c = torch.mm(a, b)          # first gemm  (fused with epilogue -> one QUACK cutedsl kernel)
-        d = _CustomUserFn.apply(c)  # epilogue    (fused into the gemm)
-        return torch.mm(d, w)       # second gemm (NOT fused -> stays a plain extern mm)
+    # A functional (non-gated) MLP forward: out = relu(x @ w1) @ w2.
+    def fn(x, w1, w2):
+        c = torch.mm(x, w1)               # up-proj gemm (fused with relu -> one QUACK cutedsl kernel)
+        d = _FunctionalMLPActFn.apply(c)  # relu activation (fused into the up-proj gemm)
+        return torch.mm(d, w2)            # down-proj gemm (NOT fused -> stays a plain extern mm)
 
     # forward only: inputs do not require grad
-    a = torch.randn(256, 64, device="cuda", dtype=torch.bfloat16)
-    b = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16)
-    w = torch.randn(128, 32, device="cuda", dtype=torch.bfloat16)
+    x = torch.randn(256, 64, device="cuda", dtype=torch.bfloat16)
+    w1 = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16)
+    w2 = torch.randn(128, 32, device="cuda", dtype=torch.bfloat16)
 
     actual, (code,) = run_and_get_code(
-        torch.compile(fn, backend="inductor", fullgraph=True), a, b, w
+        torch.compile(fn, backend="inductor", fullgraph=True), x, w1, w2
     )
-    ref = torch.mm(a, b).sin() @ w
+    ref = torch.mm(x, w1).relu() @ w2
     assert _sqnr(ref, actual) > 30.0
 
-    # the first mm+sin fused into a single QUACK cutedsl kernel, so exactly ONE plain extern mm
-    # (the second gemm) is left -- had the first gemm NOT fused, there would be two.
+    # the up-proj mm+relu fused into a single QUACK cutedsl kernel, so exactly ONE plain extern mm
+    # (the down-proj gemm) is left -- had the up-proj gemm NOT fused, there would be two.
     FileCheck().check("cutedsl_").check_count(
         "extern_kernels.mm(", 1, exactly=True
     ).run(code)
@@ -415,42 +417,43 @@ def test_only_first_gemm_fuses_forward():
     not (SM100 and HAS_CUTEDSL),
     reason="flex_gemm QUACK fusion requires SM100 + nvidia-cutlass-dsl >= 4.5.2",
 )
-def test_fusion_fires_in_forward_and_backward():
+def test_functional_mlp_fusion_fires_in_forward_and_backward():
     torch._dynamo.reset()
 
-    def fn(a, b, w):
-        c = torch.mm(a, b)
-        d = _CustomUserFn.apply(c)
-        return torch.mm(d, w)
+    # A functional (non-gated) MLP: out = relu(x @ w1) @ w2, trained (fwd + bwd).
+    def fn(x, w1, w2):
+        c = torch.mm(x, w1)
+        d = _FunctionalMLPActFn.apply(c)
+        return torch.mm(d, w2)
 
     def make_inputs():
-        a = torch.randn(256, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-        b = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-        w = torch.randn(128, 32, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-        return a, b, w
+        x = torch.randn(256, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        w1 = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        w2 = torch.randn(128, 32, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        return x, w1, w2
 
-    ca, cb, cw = make_inputs()
+    cx, cw1, cw2 = make_inputs()
     compiled = torch.compile(fn, backend="inductor", fullgraph=True)
     # run_fw_bw_and_get_code runs fn() then .sum().backward(), returning the wrapper code for the
     # forward AND backward graphs (and populating .grad along the way).
-    _, codes = run_fw_bw_and_get_code(lambda: compiled(ca, cb, cw))
+    _, codes = run_fw_bw_and_get_code(lambda: compiled(cx, cw1, cw2))
 
-    ea = ca.detach().clone().requires_grad_(True)
-    eb = cb.detach().clone().requires_grad_(True)
-    ew = cw.detach().clone().requires_grad_(True)
-    fn(ea, eb, ew).sum().backward()
+    ex = cx.detach().clone().requires_grad_(True)
+    ew1 = cw1.detach().clone().requires_grad_(True)
+    ew2 = cw2.detach().clone().requires_grad_(True)
+    fn(ex, ew1, ew2).sum().backward()
 
     # compiled and eager run in bf16 with different reduction orders, so compare with SQNR.
-    for cg, eg, name in [(ca.grad, ea.grad, "a"), (cb.grad, eb.grad, "b"), (cw.grad, ew.grad, "w")]:
+    for cg, eg, name in [(cx.grad, ex.grad, "x"), (cw1.grad, ew1.grad, "w1"), (cw2.grad, ew2.grad, "w2")]:
         assert _sqnr(eg, cg) > 30.0, f"grad {name} SQNR too low"
 
-    # pin the true VJP of sin: grad_d = grad_e @ w.T (grad_e = ones from .sum()),
-    # grad_c = grad_d * cos(c), grad_a = grad_c @ b.T.
-    c = ea @ eb
-    grad_d = torch.ones(256, 32, device="cuda", dtype=torch.bfloat16) @ ew.t()
-    grad_c = grad_d * c.cos()
-    grad_a_ref = grad_c @ eb.t()
-    assert _sqnr(grad_a_ref, ca.grad) > 30.0, "grad a vs pinned VJP"
+    # pin the true VJP of relu: grad_d = grad_e @ w2.T (grad_e = ones from .sum()),
+    # grad_c = grad_d * (c > 0), grad_x = grad_c @ w1.T.
+    c = ex @ ew1
+    grad_d = torch.ones(256, 32, device="cuda", dtype=torch.bfloat16) @ ew2.t()
+    grad_c = grad_d * (c > 0)
+    grad_x_ref = grad_c @ ew1.t()
+    assert _sqnr(grad_x_ref, cx.grad) > 30.0, "grad x vs pinned VJP"
 
     # the fusion fired in BOTH the forward and backward graphs -> a fused QUACK cutedsl kernel in
     # each of the two returned code strings.
@@ -458,21 +461,22 @@ def test_fusion_fires_in_forward_and_backward():
     for gcode in codes:
         FileCheck().check("cutedsl_").run(gcode)
 
-    # The forward computes a@b exactly ONCE. Its raw product `c` is saved for the backward's
-    # cos(c), but the fused kernel emits `c` as a SECOND output (dual-output epilogue) rather than
-    # recomputing it as a separate matmul -- so the forward has exactly ONE plain extern mm (the
-    # un-fused second gemm `d @ w`). Before dual-output fusion this was TWO (the saved-c recompute
-    # plus mm2). The forward graph is the one WITHOUT AOTAutograd `tangents_*` inputs.
+    # The forward computes x@w1 exactly ONCE. Its raw product `c` is saved for the backward's
+    # (c > 0) mask, but the fused kernel emits `c` as a SECOND output (dual-output epilogue) rather
+    # than recomputing it as a separate matmul -- so the forward has exactly ONE plain extern mm
+    # (the un-fused down-proj gemm `d @ w2`). Before dual-output fusion this was TWO (the saved-c
+    # recompute plus the down-proj mm). The forward graph is the one WITHOUT AOTAutograd
+    # `tangents_*` inputs.
     (fwd_code,) = [c for c in codes if "tangents" not in c]
     FileCheck().check("cutedsl_").check_count(
         "extern_kernels.mm(", 1, exactly=True
     ).run(fwd_code)
 
     # Pin the backward as tightly as the forward. The backward has four matmuls -- grad_d =
-    # grad_e @ w.T, grad_a = grad_c @ b.T, grad_b = a.T @ grad_c, grad_w = d.T @ grad_e -- and
-    # exactly ONE fuses: the mm2-derivative `grad_d = grad_e @ w.T` that feeds the sin-derivative
-    # epilogue (`* cos(c)`), leaving three plain extern mms. (The backward graph is the one taking
-    # AOTAutograd `tangents_*` inputs.)
+    # grad_e @ w2.T, grad_x = grad_c @ w1.T, grad_w1 = x.T @ grad_c, grad_w2 = d.T @ grad_e -- and
+    # exactly ONE fuses: the down-proj-derivative `grad_d = grad_e @ w2.T` that feeds the
+    # relu-derivative epilogue (`* (c > 0)`), leaving three plain extern mms. (The backward graph is
+    # the one taking AOTAutograd `tangents_*` inputs.)
     (bwd_code,) = [c for c in codes if "tangents" in c]
     FileCheck().check("cutedsl_").run(bwd_code)
     FileCheck().check_count("extern_kernels.mm(", 3, exactly=True).run(bwd_code)
@@ -482,48 +486,49 @@ def test_fusion_fires_in_forward_and_backward():
     not (SM100 and HAS_CUTEDSL),
     reason="flex_gemm QUACK fusion requires SM100 + nvidia-cutlass-dsl >= 4.5.2",
 )
-def test_fusion_fires_without_autograd_function():
-    # Same as test_fusion_fires_in_forward_and_backward, but WITHOUT wrapping the epilogue in a
-    # torch.autograd.Function: flex_tile_map is applied inline in the forward and autograd is left
-    # to differentiate through it. flex_tile_map_ref_hop is a BaseHOP, so under torch.compile
-    # AOTAutograd derives the VJP for free (grad_c = grad_out * cos(c), capturing c as a lifted
-    # freevar) -- yielding a joint graph, and a fusion in BOTH the forward and backward, identical
-    # to the hand-written autograd.Function version. This is the README's "after" form (fuse mm +
-    # epilogue directly under @torch.compile).
+def test_functional_mlp_fusion_fires_without_autograd_function():
+    # Same as test_functional_mlp_fusion_fires_in_forward_and_backward, but WITHOUT wrapping the
+    # activation in a torch.autograd.Function: flex_tile_map is applied inline in the forward and
+    # autograd is left to differentiate through it. flex_tile_map_ref_hop is a BaseHOP, so under
+    # torch.compile AOTAutograd derives the VJP for free (grad_c = grad_out * (c > 0), capturing c
+    # as a lifted freevar) -- yielding a joint graph, and a fusion in BOTH the forward and backward,
+    # identical to the hand-written autograd.Function version. This is the README's "after" form
+    # (fuse mm + activation directly under @torch.compile).
     #
     # The inline form also works in EAGER: flex_tile_map_ref wraps a single-tensor epilogue so its
     # BaseHOP subgraph returns a 1-tuple, which is what BaseHOP's backward (create_fw_bw_graph)
     # needs to count outputs correctly -- so the eager fn() below is a valid reference.
     torch._dynamo.reset()
 
-    def fn(a, b, w):
-        c = torch.mm(a, b)
-        d = flex_tile_map(c, _fwd_epilogue_fn)  # no autograd.Function wrapper
-        return torch.mm(d, w)
+    # out = relu(x @ w1) @ w2, with relu applied inline (no autograd.Function).
+    def fn(x, w1, w2):
+        c = torch.mm(x, w1)
+        d = flex_tile_map(c, _functional_mlp_act_fn)  # no autograd.Function wrapper
+        return torch.mm(d, w2)
 
     def make_inputs():
-        a = torch.randn(256, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-        b = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-        w = torch.randn(128, 32, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-        return a, b, w
+        x = torch.randn(256, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        w1 = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        w2 = torch.randn(128, 32, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        return x, w1, w2
 
-    ca, cb, cw = make_inputs()
+    cx, cw1, cw2 = make_inputs()
     compiled = torch.compile(fn, backend="inductor", fullgraph=True)
-    _, codes = run_fw_bw_and_get_code(lambda: compiled(ca, cb, cw))
+    _, codes = run_fw_bw_and_get_code(lambda: compiled(cx, cw1, cw2))
 
     # Reference: run the SAME fn() eagerly (inline flex_tile_map, no autograd.Function). Eager
     # backward through the inline flex_tile_map works, so this exercises both paths against each
     # other.
-    ea = ca.detach().clone().requires_grad_(True)
-    eb = cb.detach().clone().requires_grad_(True)
-    ew = cw.detach().clone().requires_grad_(True)
-    fn(ea, eb, ew).sum().backward()
+    ex = cx.detach().clone().requires_grad_(True)
+    ew1 = cw1.detach().clone().requires_grad_(True)
+    ew2 = cw2.detach().clone().requires_grad_(True)
+    fn(ex, ew1, ew2).sum().backward()
 
-    for cg, eg, name in [(ca.grad, ea.grad, "a"), (cb.grad, eb.grad, "b"), (cw.grad, ew.grad, "w")]:
+    for cg, eg, name in [(cx.grad, ex.grad, "x"), (cw1.grad, ew1.grad, "w1"), (cw2.grad, ew2.grad, "w2")]:
         assert _sqnr(eg, cg) > 30.0, f"grad {name} SQNR too low"
 
-    # fusion fired in both graphs, and the forward's dual-output epilogue keeps a@b to a single
-    # matmul (one un-fused second gemm + one fused kernel) -- matching the autograd.Function test.
+    # fusion fired in both graphs, and the forward's dual-output epilogue keeps x@w1 to a single
+    # matmul (one un-fused down-proj gemm + one fused kernel) -- matching the autograd.Function test.
     assert len(codes) == 2, f"expected fwd+bwd code, got {len(codes)}"
     for gcode in codes:
         FileCheck().check("cutedsl_").run(gcode)
