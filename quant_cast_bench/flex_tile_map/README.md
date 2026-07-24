@@ -7,29 +7,58 @@ API:
 outputs = flex_tile_map(fn, input, aux_inputs)
 ```
 
-Reason #1 to exist: express CODA (gemm + epilogue) and be able to align torch.autograd.Function boundaries
+Reason #1 to exist: express CODA in fwd+bwd without resorting to large `torch.autograd.Function`
+
+**Before** (without flex_tile_map): user writes large `torch.autograd.Function` and
+fuses gemm to epilogue by hand
 
 ```python
-# before
-class UserFn(torch.autograd.Function):
-  @staticmethod
-  def forward(ctx, ...):
-    ...
-    d = flex_gemm(a, b, epilogue_fn)
-    ...
+class MmSinMm(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, a, b, w):
+        d, c = flex_gemm(torch.mm, (a, b), lambda c: (c.sin(), c))
+        e = torch.mm(d, w)
+        ctx.save_for_backward(a, b, w, c, d)
+        return e
 
-  @staticmethod
-  def backward(ctx, ...):
-    ...
+    @staticmethod
+    def backward(ctx, grad_e):
+        a, b, w, c, d = ctx.saved_tensors
+        grad_d = flex_gemm(torch.mm, (grad_e, w.t()), lambda gd: gd * c.cos())
+        grad_a = torch.mm(grad_d, b.t())
+        grad_b = torch.mm(a.t(), grad_d)
+        grad_w = torch.mm(d.t(), grad_e)
+        return grad_a, grad_b, grad_w
 
-# after
+e = MmSinMm.apply(a, b, w)
+```
+
+**After** (with flex_tile_map): user writes `torch.mm` + `flex_tile_map(..., fn)`,
+torch.compile fuses it into `flex_gemm`.
+
+```python
 @torch.compile()
-def f(...):
-   # torch.compile fuses the two calls below into flex_gemm(a, b, epilogue_fn)
-   # TODO add the extra out
-   c = torch.mm(a, b)
-   d = epilogue_fn(c)
-   ...
+def f(a, b, w):
+    c = torch.mm(a, b)
+    d = flex_tile_map(c, lambda c: c.sin())  # fuses with the mm above -> one flex_gemm kernel
+    return torch.mm(d, w)
+
+e = f(a, b, w)
+```
+
+The above unrolls to:
+
+```
+# forward (1 fused kernel + 1 plain mm)
+d, c = flex_gemm(torch.mm, (a, b), lambda c: (c.sin(), c))   # dual output: (sin(c), c)
+e    = torch.mm(d, w)                                        # second gemm, not fused
+# saved for backward: c, d
+
+# backward (1 fused kernel + 3 plain mms); incoming grad_e
+grad_d = flex_gemm(torch.mm, (grad_e, w.t()), lambda gd: gd * c.cos())  # mm2's VJP fuses with sin's VJP
+grad_a = torch.mm(grad_d, b.t())
+grad_b = torch.mm(a.t(), grad_d)
+grad_w = torch.mm(d.t(), grad_e)
 ```
 
 Reason #2 to exist: general frontend for easy to medium cases for quant casting. Punt on hard cases
