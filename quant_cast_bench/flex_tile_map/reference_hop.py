@@ -46,7 +46,27 @@ def flex_tile_map_ref(input, f, operands=()):
     closure are lifted by Dynamo and appended to the operands automatically.
     """
     if torch.compiler.is_dynamo_compiling():
-        # Dynamo speculates ``f`` into a subgraph itself; pass it through raw.
+        # Dynamo speculates ``f`` into a subgraph itself; pass it through raw. It always traces to
+        # a collection-returning subgraph, so BaseHOP autograd works on the compile path already.
         return flex_tile_map_ref_hop(f, input, *operands)
-    # Eager: BaseHOP.__call__ requires a wrapped callable (no free vars).
-    return flex_tile_map_ref_hop(FunctionWithNoFreeVars(f), input, *operands)
+    # Eager: BaseHOP.__call__ requires a wrapped callable (no free vars). Additionally, BaseHOP's
+    # backward (``create_fw_bw_graph``) counts the subgraph's outputs via ``len(subgraph(...))`` --
+    # a bare-tensor return makes that ``len`` the row count, so the joint fwd/bwd graph gets the
+    # wrong number of outputs (``outs_to_grad length != tangents length``) and backward breaks. Wrap
+    # a single-tensor epilogue so its subgraph returns a 1-tuple, then unwrap on the way out to keep
+    # the eager return type identical to a plain ``f`` (bare tensor for single output, tuple for
+    # multi). A tuple-returning ``f`` is passed through unchanged.
+    state = {}
+
+    def as_tuple(*args, **kwargs):
+        out = f(*args, **kwargs)
+        if isinstance(out, (tuple, list)):
+            state["wrapped"] = False
+            return tuple(out)
+        state["wrapped"] = True
+        return (out,)
+
+    result = flex_tile_map_ref_hop(FunctionWithNoFreeVars(as_tuple), input, *operands)
+    if state.get("wrapped"):
+        return result[0]
+    return result
