@@ -482,6 +482,64 @@ def test_fusion_fires_in_forward_and_backward():
     not (SM100 and HAS_CUTEDSL),
     reason="flex_gemm QUACK fusion requires SM100 + nvidia-cutlass-dsl >= 4.5.2",
 )
+def test_fusion_fires_without_autograd_function():
+    # Same as test_fusion_fires_in_forward_and_backward, but WITHOUT wrapping the epilogue in a
+    # torch.autograd.Function: flex_tile_map is applied inline in the forward and autograd is left
+    # to differentiate through it. flex_tile_map_ref_hop is a BaseHOP, so under torch.compile
+    # AOTAutograd derives the VJP for free (grad_c = grad_out * cos(c), capturing c as a lifted
+    # freevar) -- yielding a joint graph, and a fusion in BOTH the forward and backward, identical
+    # to the hand-written autograd.Function version. This is the README's "after" form (fuse mm +
+    # epilogue directly under @torch.compile).
+    #
+    # The inline form also works in EAGER: flex_tile_map_ref wraps a single-tensor epilogue so its
+    # BaseHOP subgraph returns a 1-tuple, which is what BaseHOP's backward (create_fw_bw_graph)
+    # needs to count outputs correctly -- so the eager fn() below is a valid reference.
+    torch._dynamo.reset()
+
+    def fn(a, b, w):
+        c = torch.mm(a, b)
+        d = flex_tile_map(c, _fwd_epilogue_fn)  # no autograd.Function wrapper
+        return torch.mm(d, w)
+
+    def make_inputs():
+        a = torch.randn(256, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        b = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        w = torch.randn(128, 32, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        return a, b, w
+
+    ca, cb, cw = make_inputs()
+    compiled = torch.compile(fn, backend="inductor", fullgraph=True)
+    _, codes = run_fw_bw_and_get_code(lambda: compiled(ca, cb, cw))
+
+    # Reference: run the SAME fn() eagerly (inline flex_tile_map, no autograd.Function). Eager
+    # backward through the inline flex_tile_map works, so this exercises both paths against each
+    # other.
+    ea = ca.detach().clone().requires_grad_(True)
+    eb = cb.detach().clone().requires_grad_(True)
+    ew = cw.detach().clone().requires_grad_(True)
+    fn(ea, eb, ew).sum().backward()
+
+    for cg, eg, name in [(ca.grad, ea.grad, "a"), (cb.grad, eb.grad, "b"), (cw.grad, ew.grad, "w")]:
+        assert _sqnr(eg, cg) > 30.0, f"grad {name} SQNR too low"
+
+    # fusion fired in both graphs, and the forward's dual-output epilogue keeps a@b to a single
+    # matmul (one un-fused second gemm + one fused kernel) -- matching the autograd.Function test.
+    assert len(codes) == 2, f"expected fwd+bwd code, got {len(codes)}"
+    for gcode in codes:
+        FileCheck().check("cutedsl_").run(gcode)
+    (fwd_code,) = [c for c in codes if "tangents" not in c]
+    FileCheck().check("cutedsl_").check_count(
+        "extern_kernels.mm(", 1, exactly=True
+    ).run(fwd_code)
+    (bwd_code,) = [c for c in codes if "tangents" in c]
+    FileCheck().check("cutedsl_").run(bwd_code)
+    FileCheck().check_count("extern_kernels.mm(", 3, exactly=True).run(bwd_code)
+
+
+@pytest.mark.skipif(
+    not (SM100 and HAS_CUTEDSL),
+    reason="flex_gemm QUACK fusion requires SM100 + nvidia-cutlass-dsl >= 4.5.2",
+)
 def test_compile_manual_tile_raises():
     # MANUAL_TILE is an eager-only debug backend; under torch.compile it must raise.
     torch._dynamo.reset()
