@@ -7,7 +7,7 @@ API:
 outputs = flex_tile_map(fn, input, aux_inputs)
 ```
 
-Reason #1 to exist: express CODA in fwd+bwd without resorting to large `torch.autograd.Function`
+## Reason #1 to exist: express CODA in fwd+bwd without resorting to large `torch.autograd.Function`
 
 **Before** (without flex_tile_map): user writes large `torch.autograd.Function` and
 fuses gemm to epilogue by hand
@@ -47,22 +47,18 @@ def f(x, w1, w2):  # out = relu(x @ w1) @ w2
 e = f(x, w1, w2)
 ```
 
-Reason #2 to exist: general frontend for easy to medium cases for quant casting. Punt on hard cases
+## Reason #2 to exist: lightweight "tiled f" API, backend easier to optimize than general compiler
 
-Achieved memory bandwidth (% of the B200 8 TB/s peak, 16384×16384), deepseek recipes only.
-`compile` = torch.compile + Inductor; `triton` = the hand-written Triton kernel; `flex_tile_map_triton`
-= plain-PyTorch `f` lowered onto the `hop/` Triton template (`TRITON_TEMPLATE` backend). A recipe
-with no diamond isn't wired to the template backend yet (today only the dim-m group reduction is).
+On the chart below - inductor not good at 1x128 cast across m-dim, or 128x128. 
+Easy to hand write triton kernels for these, and ~easy to make it generic to cover quant cast variants.
 
 ![deepseek memory bandwidth by mode](deepseek_mem_bw.png)
 
-The payoff is the `dim_m` row: Inductor stalls at ~38% because it can't fuse the M-dim group
-reduction + transposed store into one pass (it emits ~3 kernels, streaming `x` 3×; see the
-benchmarks README). Writing `f` as plain PyTorch and lowering it onto the `hop/` template gets
-~68% — nearly matching the hand-written Triton kernel (~71%) for free, no kernel authoring. The
-other deepseek recipes aren't wired to the template yet; for the elementwise/square cases (`1x128`,
-`128x128`) regular `compile` is already competitive, so the reduction cases are where the template
-earns its keep.
+
+TODO(later) talk somewhere about quant cast taxonomy, tile invariant-ness, and aligning everything
+
+
+## slop below (ignore)
 
 The chart reuses the benchmarks-README infra (same CSV + `plot_bench.py`, no duplication).
 Regenerate with:
@@ -82,57 +78,3 @@ python benchmarks/plot_bench.py \
 ```
 
 (±1–2 pts run-to-run variance; the `relu` bandwidth ceiling for this shape is ~75%.)
-
-TODO(later) talk somewhere about quant cast taxonomy, tile invariant-ness, and aligning everything
-
-## context
-
-This is a study of how to express quantization of a tensor in a tile 
-invariant way, to inform:
-
-1. what could a general tensor quantization API in PyTorch look like 
-   (`flex_tile_map` below), and whether this makes sense to build
-2. what are requirements that other flex* projects 
-   (flex_gemm, flex_ep, flex_moe) should consider to cover quantization kernel
-   authoring
-
-## HOPs: two separate paths
-
-There are two independent HigherOrderOperators, on purpose:
-
-- **`hop/` — the hand-rolled Triton-template HOP** (`TRITON_TEMPLATE` backend). Traces `f` on the
-  full input shape and lowers it onto a hand-written Triton template. Kept hand-rolled (not
-  migrated to `BaseHOP`) to avoid re-homing the FxTritonEmitter lowering + full-shape reduction
-  tracing. **Not fused** into flex_gemm.
-- **`inductor_hop.py` — a `BaseHOP`** (`INDUCTOR` backend). This is the fusible path: under
-  `torch.compile` the post-grad pass in `flex_gemm_to_tile_map_fusion.py` rewrites a preceding `mm` into a single
-  `flex_gemm` call (in both the forward and backward graphs). It is a `BaseHOP` because that
-  supplies correct forward+backward autograd *and* Dynamo captured-freevar lifting for free — the
-  latter is what makes the backward VJP epilogue (which captures a saved activation) fuse. Its
-  subgraph-first arg order also matches flex_gemm/flex_attention.
-
-  The fused `flex_gemm` uses the **QUACK** backend (`kernel_options={"backend": "QUACK"}`) — the
-  only flex_gemm backend that lowers to a single fused GEMM+epilogue CuteDSL kernel. flex_gemm's
-  default `TRITON` backend merely decomposes back into `mm` + a separate pointwise, i.e. no actual
-  fusion, so it is not used here. QUACK requires `nvidia-cutlass-dsl >= 4.5.2` (older releases have
-  incompatible `cutlass.cute` APIs); the fusion tests gate on that version.
-
-  **Dual-output epilogue (no redundant matmul).** When the mm result is also consumed outside the
-  epilogue — the usual forward case, where the raw product `c = x @ w1` is saved for the backward's
-  VJP (`grad_c = grad_out * (c > 0)`) — the pass builds the fused body to return a two-tuple
-  `(epilogue(mm), mm)`. This drives flex_gemm's aux-output path so the raw accumulator is emitted as
-  a *second output of the same fused kernel* (both derived from the one in-register accumulator),
-  instead of leaving a separate `extern_kernels.mm` behind to recompute `x @ w1` just for the save.
-  The forward then computes `x @ w1` exactly once (one fused kernel + the un-fused down-proj gemm).
-  flex_gemm's QUACK backend supports at most one such aux output.
-
-Future work: the hand-rolled Triton-template HOP could migrate to `BaseHOP` too, for the same
-autograd/freevar-lifting benefits, once its template lowering is re-homed under a `BaseHOP`.
-
-### Notes / caveats
-
-- A HOP `@register_lowering` that raises does **not** gracefully fall back to the eager body — it
-  hard-errors (`InductorError: LoweringException`). So a surviving inductor HOP (no preceding mm)
-  is handled explicitly by a splice-inline stage in `flex_gemm_to_tile_map_fusion.py`, not left to a fallback.
-- The fusion pass auto-installs into `torch._inductor.config.post_grad_custom_post_pass` on import.
-  That is a single global slot, so this stomps any pass a user already set (acceptable for now).
