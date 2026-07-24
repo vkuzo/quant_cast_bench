@@ -26,6 +26,12 @@ There are two independent HigherOrderOperators, on purpose:
   latter is what makes the backward VJP epilogue (which captures a saved activation) fuse. Its
   subgraph-first arg order also matches flex_gemm/flex_attention.
 
+  The fused `flex_gemm` uses the **QUACK** backend (`kernel_options={"backend": "QUACK"}`) — the
+  only flex_gemm backend that lowers to a single fused GEMM+epilogue CuteDSL kernel. flex_gemm's
+  default `TRITON` backend merely decomposes back into `mm` + a separate pointwise, i.e. no actual
+  fusion, so it is not used here. QUACK requires `nvidia-cutlass-dsl >= 4.5.2` (older releases have
+  incompatible `cutlass.cute` APIs); the fusion tests gate on that version.
+
 Future work: the hand-rolled Triton-template HOP could migrate to `BaseHOP` too, for the same
 autograd/freevar-lifting benefits, once its template lowering is re-homed under a `BaseHOP`.
 
