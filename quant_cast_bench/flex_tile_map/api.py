@@ -315,13 +315,18 @@ def flex_tile_map(
         )
 
     elif _backend is FlexTileMapBackend.TRITON_TEMPLATE:
-        assert not aux_inputs, "TRITON_TEMPLATE: aux inputs not supported yet"
+        assert all(k is AuxKind.REPLICATE for k in aux_kinds), (
+            "TRITON_TEMPLATE: only REPLICATE aux inputs are supported (e.g. an nvfp4 per-tensor "
+            f"outer scale); got {aux_kinds}"
+        )
         assert pad_input_to_multiple_of is None and valid_tile_size_fn is None, (
             "TRITON_TEMPLATE: naive tiling only (no pad / tile constraint yet)"
         )
         # Just call the HOP. The compile-vs-eager decision belongs to the caller: under
         # torch.compile(flex_tile_map) Dynamo captures the HOP and Inductor lowers it onto the
-        # Triton template; otherwise the HOP's eager body runs `f` directly.
+        # Triton template; otherwise the HOP's eager body runs `f` directly. Aux inputs are passed
+        # as extra HOP operands (REPLICATE: handed to every tile whole -- the emitter maps each to
+        # a kernel arg loaded once, e.g. the nvfp4 outer scale scalar).
         from .hop import flex_tile_map_hop  # side-effect: registers HOP/dynamo/lowering
 
         # Specialize the tiled input to static shapes. This path doesn't support dynamic shapes:
@@ -330,7 +335,7 @@ def flex_tile_map(
         # dynamic, which traces the subgraph with free-symbol SymInt placeholders the HOP node
         # can't feed -- surfacing as a noisy `forward() missing positional arguments` TypeError.
         torch._dynamo.mark_static(input)
-        outs = flex_tile_map_hop(input, f)
+        outs = flex_tile_map_hop(input, f, *aux_inputs)
 
     else:
         raise AssertionError(f"unknown {_backend=}")

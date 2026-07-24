@@ -19,7 +19,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from qdata_utils import qdata_equal
 # Importing the package auto-installs the mm -> flex_gemm post-grad fusion pass (see
 # flex_gemm_to_tile_map_fusion._auto_install).
-from quant_cast_bench.flex_tile_map.api import FlexTileMapBackend, OutputKind, flex_tile_map
+from quant_cast_bench.flex_tile_map.api import (
+    AuxKind,
+    FlexTileMapBackend,
+    OutputKind,
+    flex_tile_map,
+)
 from quant_cast_bench.flex_tile_map.recipes import (
     DEEPSEEK_1X128,
     DEEPSEEK_1X128_DIM_M,
@@ -29,7 +34,13 @@ from quant_cast_bench.flex_tile_map.recipes import (
     SR_BF16,
     SR_BF16_GLOBAL,
 )
-from quant_cast_bench.quant_cast_gold.recipes import debug_relu_f, deepseek_1x128_dim_m_f
+from quant_cast_bench.quant_cast_gold.recipes import (
+    debug_relu_f,
+    deepseek_1x128_dim_m_f,
+    mxfp8_floor_dim_m_f,
+    nvfp4_gs_f,
+    nvfp4_gs_scale,
+)
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="requires CUDA"
@@ -189,6 +200,57 @@ def test_triton_template_deepseek_dim_m_non_square_compiled():
     assert q.shape == (512, 384) and s.shape == (512, 384 // 128)
     assert qdata_equal(q, qr)
     assert torch.equal(s, sr)
+
+
+def test_triton_template_mxfp8_floor_dim_m_compiled():
+    # mxfp8-floor dim-M: same transposed group-reduction shape as deepseek, but a 32-row group and
+    # an e8m0 (uint8) power-of-two scale. Exercises the emitter's e8m0 exponent extraction --
+    # view.dtype bitcast, bitwise shift/and, isnan, where, full -- and the group-32 template
+    # (template_mxfp8_floor_dim_m.py.jinja), selected via the group-keyed template dispatch.
+    torch.manual_seed(0)
+    x = torch.randn(256, 256, dtype=torch.bfloat16, device="cuda")
+
+    qr, sr = mxfp8_floor_dim_m_f(x)  # eager reference (whole tensor, transposed outputs)
+
+    compiled = torch.compile(flex_tile_map)
+    q, s = compiled(x, mxfp8_floor_dim_m_f, _backend=FlexTileMapBackend.TRITON_TEMPLATE)
+
+    assert q.shape == (256, 256) and q.dtype == torch.float8_e4m3fn
+    assert s.shape == (256, 256 // 32) and s.dtype == torch.float8_e8m0fnu
+    # tile-invariant recipe, so the template result is bit-exact vs the reference (both compared
+    # as bytes: qdata is fp8, scale is e8m0).
+    assert qdata_equal(q, qr)
+    assert qdata_equal(s, sr)
+
+
+@pytest.mark.skipif(not SM100, reason="nvfp4 hardware fp4 pack (cvt.e2m1x2) requires SM100")
+def test_triton_template_nvfp4_compiled():
+    # nvfp4 exercises the emitter's dim-K path (reduce ALONG columns in 16-groups, NO transpose) +
+    # three new capabilities: (1) a REPLICATE aux operand (the per-tensor fp32 outer scale, threaded
+    # through the HOP and loaded once), (2) the fp4 even/odd deinterleave via aten.slice -> tl.split,
+    # (3) the SM100 hardware fp4 pack (cvt.rn.satfinite.e2m1x2.f32) via tl.inline_asm_elementwise.
+    # Outputs: fp4-packed qdata (M, N//2) + e4m3 inner scale (M, N//16), plain row-major (no swizzle).
+    torch.manual_seed(0)
+    x = torch.randn(256, 256, dtype=torch.bfloat16, device="cuda")
+    outer_scale = nvfp4_gs_scale(x)
+
+    qr, sr = nvfp4_gs_f(x, outer_scale)  # eager reference (whole tensor)
+
+    compiled = torch.compile(flex_tile_map)
+    q, s = compiled(
+        x,
+        nvfp4_gs_f,
+        aux_inputs=(outer_scale,),
+        aux_kinds=(AuxKind.REPLICATE,),
+        _backend=FlexTileMapBackend.TRITON_TEMPLATE,
+    )
+
+    assert q.shape == (256, 256 // 2) and q.dtype == torch.float4_e2m1fn_x2
+    assert s.shape == (256, 256 // 16) and s.dtype == torch.float8_e4m3fn
+    # tile-invariant recipe, so the template result is bit-exact vs the reference (qdata compared as
+    # packed-fp4 bytes, scale as e4m3 bytes).
+    assert qdata_equal(q, qr)
+    assert qdata_equal(s, sr)
 
 
 def test_deepseek_dim_m_non_square():

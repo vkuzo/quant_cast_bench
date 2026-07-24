@@ -78,3 +78,31 @@ python benchmarks/plot_bench.py \
 ```
 
 (±1–2 pts run-to-run variance; the `relu` bandwidth ceiling for this shape is ~75%.)
+
+## Known issues
+
+### fp4-packed output can't be the autotuned primary output (nvfp4 dim-K template)
+
+When Inductor autotunes a `TritonTemplate` it benchmarks each candidate config by running the
+kernel on real tensors, and before timing each choice it `zero_()`s the **primary output** buffer
+(the tensor described by the `layout` passed to `maybe_append_choice`, i.e. the one `store_output`
+writes) so every choice starts from an identical buffer. `zero_()` dispatches to `fill_cuda`, which
+is **not implemented for `Float4_e2m1fn_x2`** (fp4 is a packed sub-byte type with almost no eager
+elementwise kernel coverage):
+
+```
+NotImplementedError: "fill_cuda" not implemented for 'Float4_e2m1fn_x2'
+```
+
+So if the fp4-packed qdata is the primary output, every config's `output.zero_()` throws, every
+choice is timed as `Infinity`, and autotuning can't select a kernel.
+
+Workaround (see `hop/template_nvfp4.py.jinja` + `_lower_nvfp4` in `hop/inductor_lowering.py`): the
+nvfp4 dim-K template **inverts** the usual arrangement — the **e4m3 scale is the primary output**
+(fp8_e4m3fn has full eager coverage, so `zero_()` works) and the fp4-packed qdata is a **mutated
+input** (mutated inputs are passed in as-is and are never `zero_()`'d; `empty_strided` allocates
+without ever filling). Outputs are still returned in `(qdata, scale)` order. This is purely an
+autotuning-harness limitation, not a Triton codegen one: inside the kernel fp4x2 is just `tl.uint8`,
+so storing it via `store_output` would work at runtime — it only breaks in the benchmark-and-select
+step. If eager gains `fill_cuda` for fp4 (or the autotuner stops zeroing the primary buffer), the
+inversion can be dropped and qdata made the primary output like the other templates.

@@ -71,17 +71,25 @@ def _bench_one(recipe, M, K, mode):
     tile_kwargs = {"global_row": 0, "global_col": 0, "num_col": inputs[0].shape[-1]}
     if mode == "flex_tile_map_triton":
         # drive the flex_tile_map TRITON_TEMPLATE backend: `f` is traced and lowered onto the
-        # hand-written Triton template (dim-M group reduction). The caller owns the compile
-        # decision (like flex_attention), so we torch.compile the flex_tile_map entrypoint here.
-        # Aux inputs aren't wired through the template path yet.
+        # hand-written Triton template (dim-M group reduction, or nvfp4 dim-K). The caller owns the
+        # compile decision (like flex_attention), so we torch.compile the flex_tile_map entrypoint
+        # here. REPLICATE aux inputs are forwarded whole (e.g. the nvfp4 per-tensor outer scale);
+        # aux_kinds come from the recipe (the template path only supports REPLICATE).
         from quant_cast_bench.flex_tile_map.api import FlexTileMapBackend, flex_tile_map
 
-        assert len(inputs) == 1, "flex_tile_map_triton: single-input recipes only (no aux) so far"
         f = recipe.pt_ref_fn
         compiled = torch.compile(flex_tile_map)
+        aux_inputs = tuple(inputs[1:])
+        aux_kinds = recipe.aux_kinds
 
         def run():
-            return compiled(inputs[0], f, _backend=FlexTileMapBackend.TRITON_TEMPLATE)
+            return compiled(
+                inputs[0],
+                f,
+                aux_inputs=aux_inputs,
+                aux_kinds=aux_kinds,
+                _backend=FlexTileMapBackend.TRITON_TEMPLATE,
+            )
     elif mode == "compile":
         # the generic (no-template) path: drive the reference `f` through flex_tile_map's INDUCTOR
         # backend under torch.compile. INDUCTOR calls `f(input, *aux, global_row=.., global_col=..,
@@ -157,11 +165,15 @@ def main(
         from quant_cast_bench.quant_cast_cute.recipes import ALL_RECIPES as recipes_all
     elif mode == "flex_tile_map_triton":
         from quant_cast_bench.flex_tile_map.recipes import RECIPES_V2
-        # wired through the TRITON_TEMPLATE backend: deepseek 1x128 dim-M (the in-fragment
-        # group-reduction path, transposed outputs), single-input, no aux. The pointwise relu path
-        # was removed -- a pointwise `f` no longer has a template lowering (it raises
-        # NotImplementedError), so it's benchmarked via regular Inductor (`--mode compile`) instead.
-        _WIRED = {"fp8_deepseek_1x128_dim_m"}
+        # wired through the TRITON_TEMPLATE backend: the in-fragment group-reduction casts. Two
+        # dim-M variants (transposed outputs), single-input, no aux -- deepseek 1x128 (128-row group,
+        # fp32 scale) and mxfp8-floor 1x32 (32-row group, e8m0 scale) -- each with its own template
+        # (group baked in), selected by the group width in inductor_lowering._DIM_M_TEMPLATES. Plus
+        # nvfp4 (dim-K, 1x16 along columns, no transpose): a REPLICATE aux (per-tensor outer scale),
+        # fp4-packed qdata + e4m3 scale, via template_nvfp4.py.jinja. The pointwise relu path was
+        # removed -- a pointwise `f` no longer has a template lowering (it raises NotImplementedError),
+        # so it's benchmarked via regular Inductor (`--mode compile`).
+        _WIRED = {"fp8_deepseek_1x128_dim_m", "mxfp8_floor_dim_m", "nvfp4"}
         recipes_all = [(n, r) for n, r in RECIPES_V2 if n in _WIRED]
     else:
         recipes_all = ALL_RECIPES
