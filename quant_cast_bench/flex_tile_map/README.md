@@ -1,5 +1,43 @@
 # flex_tile_map
 
+API:
+
+```python
+# TODO align aux_inputs with flex_gemm
+outputs = flex_tile_map(fn, input, aux_inputs)
+```
+
+Reason #1 to exist: express CODA (gemm + epilogue) and be able to align torch.autograd.Function boundaries
+
+```python
+# before
+class UserFn(torch.autograd.Function):
+  @staticmethod
+  def forward(ctx, ...):
+    ...
+    d = flex_gemm(a, b, epilogue_fn)
+    ...
+
+  @staticmethod
+  def backward(ctx, ...):
+    ...
+
+# after
+@torch.compile()
+def f(...):
+   # torch.compile fuses the two calls below into flex_gemm(a, b, epilogue_fn)
+   # TODO add the extra out
+   c = torch.mm(a, b)
+   d = epilogue_fn(c)
+   ...
+```
+
+Reason #2 to exist: general frontend for easy to medium cases for quant casting. Punt on hard cases
+
+TODO insert quant cast graphs here
+
+TODO talk somewhere about quant cast taxonomy, tile invariant-ness, and aligning everything
+
 ## context
 
 This is a study of how to express quantization of a tensor in a tile 
