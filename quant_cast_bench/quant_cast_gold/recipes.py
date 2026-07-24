@@ -1165,6 +1165,30 @@ Mxfp8BiasGold = QuantCastSingleKernelGold(
 )
 
 # ---------------------------------------------------------------------------
+# Debug recipe: plain elementwise relu. No quant, no scale, no reduction -- the simplest
+# possible tile-invariant `f` (single input, single output). Used to bring up new flex_tile_map
+# backends (e.g. the Triton template path) before layering on real quantization math.
+# ---------------------------------------------------------------------------
+def debug_relu_f(x, **kwargs):  # kwargs: framework-supplied global_row/global_col/num_col (unused)
+    return (torch.relu(x),)
+
+
+def _debug_relu_correctness(
+    inputs: Tuple[torch.Tensor, ...], outputs: Tuple[torch.Tensor]
+) -> None:
+    (x,) = inputs
+    (out,) = outputs
+    assert torch.equal(out, torch.relu(x)), "debug_relu: output != relu(x)"
+
+
+DebugReluGold = QuantCastSingleKernelGold(
+    pt_ref_fn=debug_relu_f,
+    correctness_fn=_debug_relu_correctness,
+    example_input_fn=lambda M, K: (torch.randn(M, K, dtype=torch.bfloat16, device="cuda"),),
+    perf_description="debug: relu, elementwise, no quant",
+)
+
+# ---------------------------------------------------------------------------
 # Golden recipe: the 16x16 randomized Hadamard transform (RHT). A non-quant example: bf16
 # in, bf16 out, NO scale/aux output -- pt_ref_fn returns a 1-tuple `(out,)`. Building block
 # for torchao's RHT-fused nvfp4 kernels. RHT = diag(sign) @ H, where H is the 16x16
@@ -1382,4 +1406,5 @@ ALL_RECIPES = [
     ("fp32_to_bf16_sr_global_offsets", SrF32ToBf16Global),
     # debug (not real recipes)
     ("mxfp8_bias", Mxfp8BiasGold),
+    ("debug_relu", DebugReluGold),
 ]

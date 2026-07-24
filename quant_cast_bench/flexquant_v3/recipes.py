@@ -14,6 +14,7 @@ from .api import AuxKind, OutputKind
 from quant_cast_bench.quant_cast_gold.recipes import (
     ColwiseFp8Gold,
     ColwisePrecalcGold,
+    DebugReluGold,
     Deepseek1x128DimMGold,
     Deepseek1x128Gold,
     Deepseek128x128Gold,
@@ -210,6 +211,9 @@ SR_BF16_GLOBAL = RecipeV2.from_gold(
     SrF32ToBf16Global,
     aux_kinds=(AuxKind.REPLICATE,),
 )
+# debug: plain relu, fully tile-invariant (no reduction/scale/aux), single output. The bring-up
+# recipe for the TRITON_TEMPLATE backend; also exercised by the generic REFERENCE/MANUAL_TILE suite.
+DEBUG_RELU = RecipeV2.from_gold(DebugReluGold)
 RECIPES_V2 = [
     ("fp8_deepseek_1x128", DEEPSEEK_1X128),
     ("fp8_deepseek_128x128", DEEPSEEK_128X128),
@@ -229,6 +233,7 @@ RECIPES_V2 = [
     ("bf16_rht", HADAMARD_RHT),
     ("fp32_to_bf16_sr", SR_BF16),
     ("fp32_to_bf16_sr_global_offsets", SR_BF16_GLOBAL),
+    ("debug_relu", DEBUG_RELU),
 ]
 
 
