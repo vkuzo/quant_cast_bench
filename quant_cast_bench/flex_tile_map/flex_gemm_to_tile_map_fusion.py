@@ -12,6 +12,11 @@ the fusion fires in each (the backward's ``grad_d = grad_e @ w.T`` feeds its own
 
 Two stages run per graph:
   1. FUSION: rewrite every ``flex_tile_map_ref_hop(sub, mm(a, b), *aux)`` into a ``flex_gemm_hop``.
+     When the mm result is ALSO consumed outside the epilogue (the common forward case: its raw
+     product is saved for the backward's VJP, e.g. ``cos(c)``), the fused body returns a two-tuple
+     ``(epilogue(mm), mm)`` so flex_gemm emits the raw accumulator as a second output of the SAME
+     kernel -- ``a @ b`` is then computed exactly once instead of recomputed as a separate mm just
+     to feed that other use.
   2. INLINE: any ``flex_tile_map_ref_hop`` that survived (its operand is NOT an mm -- e.g. a
      standalone cast with no preceding gemm, as in the benchmark's REFERENCE+compile path) is
      spliced back into the parent graph as ordinary nodes, so regular Inductor lowers it. This is
@@ -66,7 +71,9 @@ def _register_submodule(owning_gm, submod) -> str:
     return name
 
 
-def _build_fused_body(epilogue_gm, tile_idx, mm_val, out_val, aux_vals):
+def _build_fused_body(
+    epilogue_gm, tile_idx, mm_val, out_val, aux_vals, also_output_mm=False
+):
     """Build a GraphModule ``(a, b, *aux) -> epilogue(...)`` for flex_gemm.
 
     This matches what flex_gemm's own body looks like: the GEMM operands ``a, b`` are the leading
@@ -78,6 +85,13 @@ def _build_fused_body(epilogue_gm, tile_idx, mm_val, out_val, aux_vals):
     is the operand index that is the mm tile (NOT necessarily 0 -- e.g. in a backward graph Dynamo
     may order a captured activation before the gradient tile). The tile placeholder maps to the mm
     result; every other epilogue placeholder maps to a fresh aux placeholder, in order.
+
+    When ``also_output_mm`` is set the body returns a two-element tuple
+    ``(epilogue(mm(a, b)), mm(a, b))`` instead of just the epilogue result. This drives flex_gemm's
+    aux-output path (``output_plan``: first element = main result, rest = aux outputs), so the raw
+    accumulator ``a @ b`` is emitted as a second output of the SAME fused kernel -- no separate mm.
+    Used when the original mm result is also consumed outside the epilogue (e.g. saved for the
+    backward's ``cos(c)``); see ``_fuse_mm_into_flex_gemm``.
     """
     g = torch.fx.Graph()
     # All placeholders MUST come first and contiguously: process_subgraph_nodes (the flex_gemm
@@ -114,8 +128,21 @@ def _build_fused_body(epilogue_gm, tile_idx, mm_val, out_val, aux_vals):
 
     assert output_val is not None, "epilogue graph has no output"
     out_args = torch.fx.map_arg(output_val.args, lambda x: remap[x])
-    out_node = g.output(out_args[0])
-    out_node.meta["val"] = out_val
+    if also_output_mm:
+        # The epilogue's output is wrapped as a 1-element tuple ``(result,)``; unwrap it so the
+        # fused body returns a flat 2-tuple ``(result, mm)`` -- the shape flex_gemm's output_plan
+        # expects (first element = main output, second = the aux/raw-accumulator output).
+        epilogue_out = out_args[0]
+        if isinstance(epilogue_out, (tuple, list)):
+            assert len(epilogue_out) == 1, (
+                "dual-output fusion supports only a single-output epilogue"
+            )
+            epilogue_out = epilogue_out[0]
+        out_node = g.output((epilogue_out, mm_node))
+        out_node.meta["val"] = [out_val, mm_val]
+    else:
+        out_node = g.output(out_args[0])
+        out_node.meta["val"] = out_val
 
     fused = torch.fx.GraphModule(epilogue_gm, g)
     fused.recompile()
@@ -155,11 +182,19 @@ def _fuse_mm_into_flex_gemm(match: Match, *args, **kwargs):
     graph = match.graph
     owning_gm = graph.owning_module
 
+    # If the mm result is consumed OUTSIDE this epilogue (the common case: a forward mm whose raw
+    # product is saved for the backward's VJP, e.g. cos(c)), emit it as a second output of the
+    # fused kernel instead of leaving the original mm behind. Otherwise the raw a@b would be
+    # recomputed as a separate extern mm just to feed that other use, doubling the GEMM work.
+    extra_mm_users = [u for u in input_node.users if u is not ftm_node]
+
     epilogue_gm = _resolve_gm(owning_gm, subgraph_arg)
     mm_val = input_node.meta["val"]
     out_val = ftm_node.meta["val"]
     aux_vals = [n.meta["val"] for n in aux_nodes]
-    fused_body = _build_fused_body(epilogue_gm, tile_idx, mm_val, out_val, aux_vals)
+    fused_body = _build_fused_body(
+        epilogue_gm, tile_idx, mm_val, out_val, aux_vals, also_output_mm=bool(extra_mm_users)
+    )
 
     body_name = _register_submodule(owning_gm, fused_body)
 
@@ -180,11 +215,32 @@ def _fuse_mm_into_flex_gemm(match: Match, *args, **kwargs):
             flex_gemm_hop,
             args=(aten.mm.default, body_attr, (a, b, *aux_nodes), {}, {"backend": "QUACK"}),
         )
-    new_node.meta.update(ftm_node.meta)
 
-    ftm_node.replace_all_uses_with(new_node)
-    graph.erase_node(ftm_node)
-    if len(input_node.users) == 0:
+    if extra_mm_users:
+        # Dual-output body: new_node returns (epilogue(mm), mm) as a flat 2-tuple. Element 0 is the
+        # epilogue result -- exactly what the HOP itself returned (its users already unwrap it via
+        # getitem 0), so new_node stands in for the HOP unchanged. Element 1 is the raw accumulator;
+        # route the mm's OTHER users (the saved-for-backward use) to a fresh getitem 1, then drop
+        # the now-redundant original mm entirely -- a@b is computed exactly once.
+        #
+        # The HOP's val is a 1-tuple ``(result,)``; unwrap it so new_node's val is the flat
+        # ``[result, mm]`` matching flex_gemm's flat output tuple.
+        main_val = out_val
+        if isinstance(main_val, (tuple, list)):
+            assert len(main_val) == 1, "dual-output fusion supports only a single-output epilogue"
+            main_val = main_val[0]
+        with graph.inserting_before(ftm_node):
+            mm_out = graph.call_function(operator.getitem, (new_node, 1))
+        new_node.meta["val"] = [main_val, mm_val]
+        mm_out.meta.update(input_node.meta)
+        ftm_node.replace_all_uses_with(new_node)
+        graph.erase_node(ftm_node)
+        input_node.replace_all_uses_with(mm_out)
+        graph.erase_node(input_node)
+    else:
+        new_node.meta.update(ftm_node.meta)
+        ftm_node.replace_all_uses_with(new_node)
+        graph.erase_node(ftm_node)
         graph.erase_node(input_node)
 
 

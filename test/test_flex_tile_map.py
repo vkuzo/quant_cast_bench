@@ -458,6 +458,25 @@ def test_fusion_fires_in_forward_and_backward():
     for gcode in codes:
         FileCheck().check("cutedsl_").run(gcode)
 
+    # The forward computes a@b exactly ONCE. Its raw product `c` is saved for the backward's
+    # cos(c), but the fused kernel emits `c` as a SECOND output (dual-output epilogue) rather than
+    # recomputing it as a separate matmul -- so the forward has exactly ONE plain extern mm (the
+    # un-fused second gemm `d @ w`). Before dual-output fusion this was TWO (the saved-c recompute
+    # plus mm2). The forward graph is the one WITHOUT AOTAutograd `tangents_*` inputs.
+    (fwd_code,) = [c for c in codes if "tangents" not in c]
+    FileCheck().check("cutedsl_").check_count(
+        "extern_kernels.mm(", 1, exactly=True
+    ).run(fwd_code)
+
+    # Pin the backward as tightly as the forward. The backward has four matmuls -- grad_d =
+    # grad_e @ w.T, grad_a = grad_c @ b.T, grad_b = a.T @ grad_c, grad_w = d.T @ grad_e -- and
+    # exactly ONE fuses: the mm2-derivative `grad_d = grad_e @ w.T` that feeds the sin-derivative
+    # epilogue (`* cos(c)`), leaving three plain extern mms. (The backward graph is the one taking
+    # AOTAutograd `tangents_*` inputs.)
+    (bwd_code,) = [c for c in codes if "tangents" in c]
+    FileCheck().check("cutedsl_").run(bwd_code)
+    FileCheck().check_count("extern_kernels.mm(", 3, exactly=True).run(bwd_code)
+
 
 @pytest.mark.skipif(
     not (SM100 and HAS_CUTEDSL),
