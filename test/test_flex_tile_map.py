@@ -4,6 +4,7 @@ Comparison discipline mirrors flexquant v1/v2 test.py: bit-exact `torch.equal` o
 qdata (compared as fp32) and scale. Recipes live in recipes.py.
 """
 
+import importlib.metadata
 import os
 import sys
 
@@ -11,15 +12,13 @@ import pytest
 import torch
 import torch._inductor.exc
 import torch.nn.functional as F
+from torch._inductor.utils import run_and_get_code, run_fw_bw_and_get_code
+from torch.testing import FileCheck
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Importing the package auto-installs the mm -> flex_gemm post-grad fusion pass (see
+# flex_gemm_to_tile_map_fusion._auto_install).
 from quant_cast_bench.flex_tile_map.api import FlexTileMapBackend, OutputKind, flex_tile_map
-from quant_cast_bench.flex_tile_map.flex_gemm_to_tile_map_fusion import (
-    count_node_targets,
-    flex_gemm_hop,
-    install_flex_tile_map_pass,
-)
-from quant_cast_bench.flex_tile_map.reference_hop import flex_tile_map_ref_hop
 from quant_cast_bench.flex_tile_map.recipes import (
     DEEPSEEK_1X128,
     DEEPSEEK_1X128_DIM_M,
@@ -35,12 +34,21 @@ pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="requires CUDA"
 )
 
+# The fusion tests exercise flex_gemm's QUACK backend, which emits a fused CuteDSL GEMM+epilogue
+# kernel. QUACK needs nvidia-cutlass-dsl >= 4.5.2: older releases have incompatible cutlass.cute
+# APIs (OperandMajorMode moved out of the top-level namespace, make_trivial_tiled_mma changed
+# signature), so gate on both the import AND the version.
+_MIN_CUTEDSL = (4, 5, 2)
 try:
     import cutlass  # noqa: F401
 
-    HAS_CUTEDSL = True
-except ImportError:
-    HAS_CUTEDSL = False
+    _cutedsl_version = tuple(
+        int(x) for x in importlib.metadata.version("nvidia-cutlass-dsl").split(".")[:3]
+    )
+except (ImportError, importlib.metadata.PackageNotFoundError):
+    _cutedsl_version = None
+
+HAS_CUTEDSL = _cutedsl_version is not None and _cutedsl_version >= _MIN_CUTEDSL
 
 SM100 = torch.cuda.is_available() and torch.cuda.get_device_capability(0) >= (10, 0)
 
@@ -350,13 +358,6 @@ def _sqnr(ref, actual):
     return (10 * torch.log10(ref.pow(2).mean() / noise)).item()
 
 
-def _the_flex_gemm_graph(graphs):
-    """The single recorded post-grad graph that contains a flex_gemm node."""
-    matches = [g for g in graphs if count_node_targets(g, flex_gemm_hop)]
-    assert len(matches) == 1, f"expected exactly one graph with a flex_gemm, got {len(matches)}"
-    return matches[0]
-
-
 def _fwd_epilogue_fn(acc):
     return acc.sin()
 
@@ -381,40 +382,41 @@ class _CustomUserFn(torch.autograd.Function):
 
 
 @pytest.mark.skipif(
-    not (SM100 and HAS_CUTEDSL), reason="flex_gemm fusion requires SM100 + CuteDSL"
+    not (SM100 and HAS_CUTEDSL),
+    reason="flex_gemm QUACK fusion requires SM100 + nvidia-cutlass-dsl >= 4.5.2",
 )
 def test_only_first_gemm_fuses_forward():
     torch._dynamo.reset()
-    graphs = install_flex_tile_map_pass()
 
     def fn(a, b, w):
-        c = torch.mm(a, b)         # first gemm  (fused with epilogue)
-        d = _CustomUserFn.apply(c)  # epilogue    (fusible)
-        return torch.mm(d, w)      # second gemm (not fused)
+        c = torch.mm(a, b)          # first gemm  (fused with epilogue -> one QUACK cutedsl kernel)
+        d = _CustomUserFn.apply(c)  # epilogue    (fused into the gemm)
+        return torch.mm(d, w)       # second gemm (NOT fused -> stays a plain extern mm)
 
     # forward only: inputs do not require grad
     a = torch.randn(256, 64, device="cuda", dtype=torch.bfloat16)
     b = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16)
     w = torch.randn(128, 32, device="cuda", dtype=torch.bfloat16)
 
-    actual = torch.compile(fn, backend="inductor", fullgraph=True)(a, b, w)
+    actual, (code,) = run_and_get_code(
+        torch.compile(fn, backend="inductor", fullgraph=True), a, b, w
+    )
     ref = torch.mm(a, b).sin() @ w
     assert _sqnr(ref, actual) > 30.0
 
-    # exactly the first gemm+epilogue fused into a flex_gemm, no flex_tile_map node left, and the
-    # second gemm stays a plain aten.mm. (forward-only -> a single compiled graph.)
-    g = _the_flex_gemm_graph(graphs)
-    assert count_node_targets(g, flex_gemm_hop) == 1
-    assert count_node_targets(g, flex_tile_map_ref_hop) == 0
-    assert count_node_targets(g, torch.ops.aten.mm.default) == 1
+    # the first mm+sin fused into a single QUACK cutedsl kernel, so exactly ONE plain extern mm
+    # (the second gemm) is left -- had the first gemm NOT fused, there would be two.
+    FileCheck().check("cutedsl_").check_count(
+        "extern_kernels.mm(", 1, exactly=True
+    ).run(code)
 
 
 @pytest.mark.skipif(
-    not (SM100 and HAS_CUTEDSL), reason="flex_gemm fusion requires SM100 + CuteDSL"
+    not (SM100 and HAS_CUTEDSL),
+    reason="flex_gemm QUACK fusion requires SM100 + nvidia-cutlass-dsl >= 4.5.2",
 )
 def test_fusion_fires_in_forward_and_backward():
     torch._dynamo.reset()
-    graphs = install_flex_tile_map_pass()
 
     def fn(a, b, w):
         c = torch.mm(a, b)
@@ -428,7 +430,10 @@ def test_fusion_fires_in_forward_and_backward():
         return a, b, w
 
     ca, cb, cw = make_inputs()
-    torch.compile(fn, backend="inductor", fullgraph=True)(ca, cb, cw).sum().backward()
+    compiled = torch.compile(fn, backend="inductor", fullgraph=True)
+    # run_fw_bw_and_get_code runs fn() then .sum().backward(), returning the wrapper code for the
+    # forward AND backward graphs (and populating .grad along the way).
+    _, codes = run_fw_bw_and_get_code(lambda: compiled(ca, cb, cw))
 
     ea = ca.detach().clone().requires_grad_(True)
     eb = cb.detach().clone().requires_grad_(True)
@@ -447,17 +452,16 @@ def test_fusion_fires_in_forward_and_backward():
     grad_a_ref = grad_c @ eb.t()
     assert _sqnr(grad_a_ref, ca.grad) > 30.0, "grad a vs pinned VJP"
 
-    # the fusion fired in BOTH the forward and backward graphs (one flex_gemm each), and no
-    # flex_tile_map node survives in any recorded graph.
-    with_flex_gemm = [g for g in graphs if count_node_targets(g, flex_gemm_hop)]
-    assert len(with_flex_gemm) == 2, "expected a flex_gemm in the fwd AND bwd graph"
-    for g in with_flex_gemm:
-        assert count_node_targets(g, flex_gemm_hop) == 1
-    assert all(count_node_targets(g, flex_tile_map_ref_hop) == 0 for g in graphs)
+    # the fusion fired in BOTH the forward and backward graphs -> a fused QUACK cutedsl kernel in
+    # each of the two returned code strings.
+    assert len(codes) == 2, f"expected fwd+bwd code, got {len(codes)}"
+    for gcode in codes:
+        FileCheck().check("cutedsl_").run(gcode)
 
 
 @pytest.mark.skipif(
-    not (SM100 and HAS_CUTEDSL), reason="flex_gemm fusion requires SM100 + CuteDSL"
+    not (SM100 and HAS_CUTEDSL),
+    reason="flex_gemm QUACK fusion requires SM100 + nvidia-cutlass-dsl >= 4.5.2",
 )
 def test_compile_manual_tile_raises():
     # MANUAL_TILE is an eager-only debug backend; under torch.compile it must raise.
@@ -469,19 +473,23 @@ def test_compile_manual_tile_raises():
 
 
 @pytest.mark.skipif(
-    not (SM100 and HAS_CUTEDSL), reason="flex_gemm fusion requires SM100 + CuteDSL"
+    not (SM100 and HAS_CUTEDSL),
+    reason="flex_gemm QUACK fusion requires SM100 + nvidia-cutlass-dsl >= 4.5.2",
 )
 def test_reference_compile_no_mm_inlines():
-    # REFERENCE + compile with NO preceding mm: the ref HOP survives fusion and is spliced back in
-    # (stage 2), so regular Inductor lowers it. No HOP node survives; numerics are correct. Guards
-    # the benchmark's `--mode compile` path.
+    # REFERENCE + compile with NO preceding mm: the ref HOP survives stage-1 fusion and is spliced
+    # back in (stage 2) as plain pointwise ops, so regular Inductor lowers it. Compiling at all
+    # proves the inline happened -- a surviving HOP has no lowering and hard-errors. Guards the
+    # benchmark's `--mode compile` path.
     torch._dynamo.reset()
-    graphs = install_flex_tile_map_pass()
     x = torch.randn(256, 256, device="cuda", dtype=torch.bfloat16)
 
     def fn(x):
         return flex_tile_map(x, lambda a: a.sin(), _backend=FlexTileMapBackend.REFERENCE)
 
-    out = torch.compile(fn, backend="inductor", fullgraph=True)(x)
+    out, (code,) = run_and_get_code(
+        torch.compile(fn, backend="inductor", fullgraph=True), x
+    )
     torch.testing.assert_close(out, x.sin(), rtol=2e-2, atol=2e-2)
-    assert all(count_node_targets(g, flex_tile_map_ref_hop) == 0 for g in graphs)
+    # no mm -> nothing to fuse: it lowers to plain pointwise Inductor, not a QUACK cutedsl gemm.
+    FileCheck().check_not("cutedsl_").run(code)

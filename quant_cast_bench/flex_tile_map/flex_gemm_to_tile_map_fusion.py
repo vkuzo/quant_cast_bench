@@ -38,8 +38,6 @@ from .reference_hop import flex_tile_map_ref_hop
 
 __all__ = [
     "flex_gemm_hop",
-    "install_flex_tile_map_pass",
-    "count_node_targets",
     "FLEX_TILE_MAP_PASS",
 ]
 
@@ -169,11 +167,18 @@ def _fuse_mm_into_flex_gemm(match: Match, *args, **kwargs):
         body_attr = graph.get_attr(body_name)
         # Exactly the node the public flex_gemm(torch.mm, (a, b), epilogue_fn) builds: the gemm op,
         # a body graph (a, b, *aux) -> epilogue_fn(..., mm(a, b), ...), the gemm args (with any
-        # captured epilogue tensors appended, as flex_gemm does), empty gemm_kwargs, empty
-        # kernel_options (flex_gemm's default TRITON backend).
+        # captured epilogue tensors appended, as flex_gemm does), empty gemm_kwargs, and
+        # kernel_options selecting the QUACK backend -- the only flex_gemm backend that emits a
+        # single fused GEMM+epilogue kernel (the default TRITON backend just decomposes back into
+        # mm + a separate pointwise, giving no actual fusion). QUACK needs nvidia-cutlass-dsl
+        # >= 4.5.2.
+        #
+        # TODO(temporary): the QUACK backend is hardcoded here so the fusion is easy to inspect in
+        # our tests (a fused kernel shows up as `cutedsl_` in the generated code). Revisit once the
+        # backend should be selectable / chosen by heuristics.
         new_node = graph.call_function(
             flex_gemm_hop,
-            args=(aten.mm.default, body_attr, (a, b, *aux_nodes), {}, {}),
+            args=(aten.mm.default, body_attr, (a, b, *aux_nodes), {}, {"backend": "QUACK"}),
         )
     new_node.meta.update(ftm_node.meta)
 
@@ -268,23 +273,13 @@ def _run_pass(graph: torch.fx.Graph) -> None:
 
 
 class _FlexTileMapPass(CustomGraphPass):
-    """Runs the fusion+inline and (optionally) records the resulting post-grad graph(s).
-
-    The recorded graphs are the *actual* post-grad FX graphs (one per compiled graph -- forward and
-    backward are separate), so a test can iterate ``graph.nodes`` and count real node targets
-    (``flex_gemm_hop``, ``flex_tile_map_ref_hop``, ``aten.mm``).
-    """
-
-    def __init__(self, recorded_graphs=None):
-        self._recorded = recorded_graphs
+    """Runs the fusion+inline on each post-grad graph."""
 
     def __call__(self, graph: torch.fx.Graph) -> None:
         _run_pass(graph)
-        if self._recorded is not None:
-            self._recorded.append(graph)
 
     def uuid(self):
-        # depends on external captured state / an out-of-tree pass, so opt out of fx graph caching.
+        # depends on an out-of-tree pass, so opt out of fx graph caching.
         return None
 
 
@@ -295,19 +290,3 @@ def _auto_install():
     pass a user already set. Acceptable for now (this package owns that slot).
     """
     torch._inductor.config.post_grad_custom_post_pass = _FlexTileMapPass()
-
-
-def install_flex_tile_map_pass():
-    """Re-install the pass in a *recording* variant and return the list it appends graphs to.
-
-    After compilation the list holds the post-grad FX graph(s) the pass ran on -- inspect their
-    ``.nodes`` directly (see :func:`count_node_targets`). Used by tests.
-    """
-    recorded_graphs: list = []
-    torch._inductor.config.post_grad_custom_post_pass = _FlexTileMapPass(recorded_graphs)
-    return recorded_graphs
-
-
-def count_node_targets(graph, target) -> int:
-    """Count call_function nodes in an fx graph whose target is ``target``."""
-    return sum(n.op == "call_function" and n.target is target for n in graph.nodes)
