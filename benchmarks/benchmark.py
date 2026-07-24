@@ -70,11 +70,11 @@ def _bench_one(recipe, M, K, mode):
     # so these are ignored by the recipes that don't use them (verified across all benchmarked fns).
     tile_kwargs = {"global_row": 0, "global_col": 0, "num_col": inputs[0].shape[-1]}
     if mode == "flex_tile_map_triton":
-        # drive the flexquant_v3 TRITON_TEMPLATE backend: `f` is traced and lowered onto the
+        # drive the flex_tile_map TRITON_TEMPLATE backend: `f` is traced and lowered onto the
         # hand-written Triton template (dim-M group reduction). The caller owns the compile
         # decision (like flex_attention), so we torch.compile the flex_tile_map entrypoint here.
         # Aux inputs aren't wired through the template path yet.
-        from quant_cast_bench.flexquant_v3.api import FlexTileMapBackend, flex_tile_map
+        from quant_cast_bench.flex_tile_map.api import FlexTileMapBackend, flex_tile_map
 
         assert len(inputs) == 1, "flex_tile_map_triton: single-input recipes only (no aux) so far"
         f = recipe.pt_ref_fn
@@ -90,7 +90,7 @@ def _bench_one(recipe, M, K, mode):
         # apples-to-apples against flex_tile_map_triton. aux_inputs are forwarded whole (REFERENCE
         # treats the whole tensor as one tile, so aux_kinds tiling metadata is irrelevant here);
         # the tile_kwargs above are supplied by flex_tile_map itself, not passed in.
-        from quant_cast_bench.flexquant_v3.api import FlexTileMapBackend, flex_tile_map
+        from quant_cast_bench.flex_tile_map.api import FlexTileMapBackend, flex_tile_map
 
         f = recipe.pt_ref_fn
         compiled = torch.compile(flex_tile_map, fullgraph=True)
@@ -148,7 +148,7 @@ def main(
 
     # "compile" sweeps the gold recipes through flex_tile_map's REFERENCE backend under
     # torch.compile (regular Inductor lowers `f`); "triton"/"cute" sweep the hand-written kernel
-    # sets (triton_fn / cute_fn); "flex_tile_map_triton" sweeps the flexquant_v3 RecipeV2 set
+    # sets (triton_fn / cute_fn); "flex_tile_map_triton" sweeps the flex_tile_map RecipeV2 set
     # through the TRITON_TEMPLATE backend (the hand template). All recipe kinds carry
     # example_input_fn / perf_description, so the rest of the sweep is identical.
     if mode == "triton":
@@ -156,7 +156,7 @@ def main(
     elif mode == "cute":
         from quant_cast_bench.quant_cast_cute.recipes import ALL_RECIPES as recipes_all
     elif mode == "flex_tile_map_triton":
-        from quant_cast_bench.flexquant_v3.recipes import RECIPES_V2
+        from quant_cast_bench.flex_tile_map.recipes import RECIPES_V2
         # wired through the TRITON_TEMPLATE backend: deepseek 1x128 dim-M (the in-fragment
         # group-reduction path, transposed outputs), single-input, no aux. The pointwise relu path
         # was removed -- a pointwise `f` no longer has a template lowering (it raises

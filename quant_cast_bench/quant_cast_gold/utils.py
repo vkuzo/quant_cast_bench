@@ -2,7 +2,7 @@
 
 Ported from flexquant v1 nvfp4_utils.py (itself copied from torchao custom_fp_utils.py /
 mx_formats/kernels.py). fp4 packs two 4-bit values per byte, stored as
-torch.float4_e2m1fn_x2. Independent of flexquant_v3 (see quant_cast_gold/recipes.py).
+torch.float4_e2m1fn_x2. Independent of flex_tile_map (see quant_cast_gold/recipes.py).
 """
 
 import torch

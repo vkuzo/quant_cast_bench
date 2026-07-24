@@ -37,10 +37,10 @@ from quant_cast_bench.quant_cast_gold.recipes import (
 
 @dataclass(frozen=True)
 class RecipeV2(QuantCastSingleKernelGold):
-    """A flexquant_v3 recipe backed directly by a quant_cast_gold golden recipe.
+    """A flex_tile_map recipe backed directly by a quant_cast_gold golden recipe.
 
     Inherits `pt_ref_fn`/`correctness_fn`/`example_input_fn` from `QuantCastSingleKernelGold`
-    unchanged -- flexquant_v3 adds the things gold doesn't know about: the flex_tile_map
+    unchanged -- flex_tile_map adds the things gold doesn't know about: the flex_tile_map
     tiling constraint (`valid_tile_size_fn`), how each aux input tiles (`aux_kinds`), and how
     each output tile is placed (`output_kinds`). The aux VALUES come from the inherited
     `example_input_fn` (which returns `(x, *aux)`); `aux_kinds` is just the per-aux tiling

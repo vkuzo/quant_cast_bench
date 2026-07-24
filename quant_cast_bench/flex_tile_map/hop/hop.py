@@ -1,4 +1,4 @@
-"""FlexTileMapHOP: HigherOrderOperator for the flexquant_v3 TRITON_TEMPLATE backend.
+"""FlexTileMapHOP: HigherOrderOperator for the flex_tile_map TRITON_TEMPLATE backend.
 
 Modeled after quant_cast_bench/flexquant/hop/hop.py (v1) and
 torch._higher_order_ops.flex_attention.FlexAttentionHOP, but stripped down to a single

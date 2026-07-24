@@ -2,8 +2,8 @@
 
 Each `QuantCastSingleKernelGold` must be internally consistent: running its `correctness_fn`
 on `pt_ref_fn`'s own outputs has to pass. That's a gold-package concern (no flex_tile_map
-involved), so it lives here rather than in flexquant_v3/test.py. Kept independent of
-flexquant_v3 -- inputs (and any aux args) come from each recipe's own `example_input_fn`.
+involved), so it lives here rather than in flex_tile_map/test.py. Kept independent of
+flex_tile_map -- inputs (and any aux args) come from each recipe's own `example_input_fn`.
 """
 
 import os

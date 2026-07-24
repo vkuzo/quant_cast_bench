@@ -1,6 +1,6 @@
 """A from-scratch FX -> Triton code emitter that fills a hand-written template hole.
 
-This is the flexquant_v3 analog of torch's `flex_gemm` epilogue emitter
+This is the flex_tile_map analog of torch's `flex_gemm` epilogue emitter
 (`torch/_inductor/kernel/flex_gemm/epilogue.py`): we walk a traced FX `GraphModule` (the body
 of the user callback `f`) ourselves and emit a Triton code *string* to splice into a
 hand-written template hole. We do NOT push the subgraph through Inductor's
