@@ -32,6 +32,15 @@ There are two independent HigherOrderOperators, on purpose:
   fusion, so it is not used here. QUACK requires `nvidia-cutlass-dsl >= 4.5.2` (older releases have
   incompatible `cutlass.cute` APIs); the fusion tests gate on that version.
 
+  **Dual-output epilogue (no redundant matmul).** When the mm result is also consumed outside the
+  epilogue — the usual forward case, where the raw product `c = a @ b` is saved for the backward's
+  VJP (`grad_c = grad_out * cos(c)`) — the pass builds the fused body to return a two-tuple
+  `(epilogue(mm), mm)`. This drives flex_gemm's aux-output path so the raw accumulator is emitted as
+  a *second output of the same fused kernel* (both derived from the one in-register accumulator),
+  instead of leaving a separate `extern_kernels.mm` behind to recompute `a @ b` just for the save.
+  The forward then computes `a @ b` exactly once (one fused kernel + the un-fused second gemm).
+  flex_gemm's QUACK backend supports at most one such aux output.
+
 Future work: the hand-rolled Triton-template HOP could migrate to `BaseHOP` too, for the same
 autograd/freevar-lifting benefits, once its template lowering is re-homed under a `BaseHOP`.
 
