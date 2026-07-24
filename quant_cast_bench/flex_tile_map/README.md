@@ -49,9 +49,41 @@ e = f(x, w1, w2)
 
 Reason #2 to exist: general frontend for easy to medium cases for quant casting. Punt on hard cases
 
-TODO insert quant cast graphs here
+Achieved memory bandwidth (% of the B200 8 TB/s peak, 16384×16384), deepseek recipes only.
+`compile` = torch.compile + Inductor; `triton` = the hand-written Triton kernel; `flex_tile_map_triton`
+= plain-PyTorch `f` lowered onto the `hop/` Triton template (`TRITON_TEMPLATE` backend). A recipe
+with no diamond isn't wired to the template backend yet (today only the dim-m group reduction is).
 
-TODO talk somewhere about quant cast taxonomy, tile invariant-ness, and aligning everything
+![deepseek memory bandwidth by mode](deepseek_mem_bw.png)
+
+The payoff is the `dim_m` row: Inductor stalls at ~38% because it can't fuse the M-dim group
+reduction + transposed store into one pass (it emits ~3 kernels, streaming `x` 3×; see the
+benchmarks README). Writing `f` as plain PyTorch and lowering it onto the `hop/` template gets
+~68% — nearly matching the hand-written Triton kernel (~71%) for free, no kernel authoring. The
+other deepseek recipes aren't wired to the template yet; for the elementwise/square cases (`1x128`,
+`128x128`) regular `compile` is already competitive, so the reduction cases are where the template
+earns its keep.
+
+The chart reuses the benchmarks-README infra (same CSV + `plot_bench.py`, no duplication).
+Regenerate with:
+
+```bash
+# 1. gather the numbers (merges into the shared CSV; needs a B200)
+python benchmarks/benchmark.py --mode compile              --csv benchmarks/bench_results.csv
+python benchmarks/benchmark.py --mode triton               --csv benchmarks/bench_results.csv
+python benchmarks/benchmark.py --mode flex_tile_map_triton --csv benchmarks/bench_results.csv
+
+# 2. render this chart (no GPU needed) -- deepseek only, no cute, adds the flex_tile_map_triton series
+python benchmarks/plot_bench.py \
+    --modes compile,triton,flex_tile_map_triton --kernel_filter deepseek \
+    --groups False --fig_height 3.0 \
+    --out quant_cast_bench/flex_tile_map/deepseek_mem_bw.png \
+    --title "flex_tile_map deepseek casts: memory bandwidth (16384x16384, B200)"
+```
+
+(±1–2 pts run-to-run variance; the `relu` bandwidth ceiling for this shape is ~75%.)
+
+TODO(later) talk somewhere about quant cast taxonomy, tile invariant-ness, and aligning everything
 
 ## context
 

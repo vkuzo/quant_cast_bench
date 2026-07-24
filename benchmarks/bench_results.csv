@@ -53,3 +53,5 @@ nvfp4_swizzle,cute,0.1392,4942.5,61.78
 bf16_rht,cute,0.1987,5402.5,67.53
 fp32_to_bf16_sr,cute,0.2459,6549.7,81.87
 fp32_to_bf16_sr_global_offsets,cute,0.2458,6551.4,81.89
+relu (baseline),flex_tile_map_triton,0.1835,5850.9,73.14
+fp8_deepseek_1x128_dim_m,flex_tile_map_triton,0.1487,5471.6,68.39

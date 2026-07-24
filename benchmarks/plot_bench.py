@@ -26,14 +26,20 @@ matplotlib.use("Agg")  # headless: write a PNG, never open a window
 import matplotlib.pyplot as plt  # noqa: E402
 from matplotlib.ticker import PercentFormatter  # noqa: E402
 
-_MODES = ["compile", "triton", "cute"]       # fixed series order (also the legend order)
-_COLORS = {"compile": "#4C72B0", "triton": "#DD8452", "cute": "#55A868"}
-_MARKERS = {"compile": "o", "triton": "s", "cute": "^"}  # distinct icon per series
+_MODES = ["compile", "triton", "cute"]       # default series order (also the legend order)
+_COLORS = {
+    "compile": "#4C72B0",
+    "triton": "#DD8452",
+    "cute": "#55A868",
+    "flex_tile_map_triton": "#C44E52",
+}
+_MARKERS = {"compile": "o", "triton": "s", "cute": "^", "flex_tile_map_triton": "D"}  # icon per series
 # legend labels spell out what each mode is
 _LABELS = {
     "compile": "compile: torch.compile + inductor",
     "triton": "triton: triton vibed with opus 4.8",
     "cute": "cute: cuteDSL vibed with opus 4.8",
+    "flex_tile_map_triton": "flex_tile_map_triton: plain-pytorch f on the hop/ template",
 }
 _BASELINE = "relu (baseline)"
 # row groupings (by position, top-to-bottom): (label, number of rows). The last group takes all
@@ -68,12 +74,15 @@ _BW_LABEL = "achieved memory bandwidth (% of B200 peak, 8 TB/s)"
 _TITLE = "quant_cast memory bandwidth by implementation (16384×16384, B200)"
 
 
-def _plot(data, kernels, out_path):
+def _plot(data, kernels, out_path, modes=_MODES, group_sizes=_GROUP_SIZES, title=_TITLE,
+          fig_height=6.0):
     """Scatter the pivoted data to `out_path`: bandwidth on the x-axis, one kernel per row on the
-    y-axis (first kernel at the top)."""
-    fig, ax = plt.subplots(figsize=(9, 6))
+    y-axis (first kernel at the top). `modes` selects (and orders) the series; `group_sizes` draws
+    the row-band separators (pass None to skip them, e.g. for a short single-topic chart);
+    `fig_height` sizes the figure in inches (shrink it for few-row charts so rows aren't sparse)."""
+    fig, ax = plt.subplots(figsize=(9, fig_height))
     # one scatter series per mode, distinct marker+color, points NOT connected
-    for mode in _MODES:
+    for mode in modes:
         idx = [i for i, k in enumerate(kernels) if mode in data[k]]
         pct = [data[k][mode] for k in kernels if mode in data[k]]
         ax.scatter(pct, idx, marker=_MARKERS[mode], color=_COLORS[mode], label=_LABELS[mode],
@@ -95,26 +104,46 @@ def _plot(data, kernels, out_path):
 
     # row groupings: a full-width dashed separator between bands + a label at the top of each band
     # (y-axis is inverted, so the smallest row index in a band is its visual top).
-    start = 0
-    for label, size in _GROUP_SIZES:
-        ax.text(0.7, start - 0.44, label, ha="left", va="top", fontsize=9, style="italic",
-                color="#444444", zorder=4,
-                bbox=dict(facecolor="white", alpha=0.7, edgecolor="none", pad=1.0))
-        if size is None:
-            break  # final "other" group runs to the last row -- no separator after it
-        start += size
-        ax.axhline(start - 0.5, color="gray", ls="--", lw=1.0, alpha=0.7, zorder=1)
+    if group_sizes is not None:
+        start = 0
+        for label, size in group_sizes:
+            ax.text(0.7, start - 0.44, label, ha="left", va="top", fontsize=9, style="italic",
+                    color="#444444", zorder=4,
+                    bbox=dict(facecolor="white", alpha=0.7, edgecolor="none", pad=1.0))
+            if size is None:
+                break  # final "other" group runs to the last row -- no separator after it
+            start += size
+            ax.axhline(start - 0.5, color="gray", ls="--", lw=1.0, alpha=0.7, zorder=1)
 
     # pad the title up to leave room for the horizontal legend sitting just above the axes
-    ax.set_title(_TITLE, pad=34)
-    # legend outside the data area (above the axes), three series laid out horizontally
-    ax.legend(title="mode", ncol=len(_MODES), loc="lower center", bbox_to_anchor=(0.5, 1.0),
+    ax.set_title(title, pad=34)
+    # legend outside the data area (above the axes), series laid out horizontally
+    ax.legend(title="mode", ncol=len(modes), loc="lower center", bbox_to_anchor=(0.5, 1.0),
               frameon=False, borderaxespad=0.0)
     fig.tight_layout()
     fig.savefig(out_path, dpi=150, bbox_inches="tight")  # bbox_inches captures the outside legend
 
 
-def main(csv="benchmarks/bench_results.csv", out="benchmarks/mem_bw.png"):
+def main(
+    csv="benchmarks/bench_results.csv",
+    out="benchmarks/mem_bw.png",
+    modes=None,
+    kernel_filter=None,
+    groups=True,
+    title=_TITLE,
+    fig_height=6.0,
+):
+    """Render the mem-bandwidth scatter from the CSV.
+
+    Defaults reproduce the benchmarks/README.md chart (all kernels, compile/triton/cute, row bands).
+    Override for a focused chart, e.g. the flex_tile_map deepseek view:
+        python benchmarks/plot_bench.py \\
+            --modes compile,triton,flex_tile_map_triton --kernel_filter deepseek \\
+            --groups False --fig_height 3.0 \\
+            --out quant_cast_bench/flex_tile_map/deepseek_mem_bw.png \\
+            --title "flex_tile_map deepseek casts: memory bandwidth (16384x16384, B200)"
+    """
+    modes = modes.split(",") if isinstance(modes, str) else (modes or _MODES)
     # resolve paths relative to the repo root so the script works from any cwd
     root = os.path.dirname(_HERE)
 
@@ -123,9 +152,12 @@ def main(csv="benchmarks/bench_results.csv", out="benchmarks/mem_bw.png"):
 
     data, order = _load(_resolve(csv))
     kernels = [k for k in order if k != _BASELINE]  # exclude the relu baseline entirely
+    if kernel_filter is not None:
+        kernels = [k for k in kernels if kernel_filter in k]
 
-    _plot(data, kernels, _resolve(out))
-    print(f"wrote {_resolve(out)} ({len(kernels)} kernels, modes={_MODES})")
+    _plot(data, kernels, _resolve(out), modes=modes,
+          group_sizes=_GROUP_SIZES if groups else None, title=title, fig_height=fig_height)
+    print(f"wrote {_resolve(out)} ({len(kernels)} kernels, modes={modes})")
 
 
 if __name__ == "__main__":
