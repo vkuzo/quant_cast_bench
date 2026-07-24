@@ -34,7 +34,8 @@ e = MmSinMm.apply(a, b, w)
 ```
 
 **After** (with flex_tile_map): user writes `torch.mm` + `flex_tile_map(..., fn)`,
-torch.compile fuses it into `flex_gemm`.
+torch.compile fuses the fwd+bwd parts to get equivalent code to the manual
+`torch.autograd.Function` above.
 
 ```python
 @torch.compile()
@@ -46,20 +47,6 @@ def f(a, b, w):
 e = f(a, b, w)
 ```
 
-The above unrolls to:
-
-```
-# forward (1 fused kernel + 1 plain mm)
-d, c = flex_gemm(torch.mm, (a, b), lambda c: (c.sin(), c))   # dual output: (sin(c), c)
-e    = torch.mm(d, w)                                        # second gemm, not fused
-# saved for backward: c, d
-
-# backward (1 fused kernel + 3 plain mms); incoming grad_e
-grad_d = flex_gemm(torch.mm, (grad_e, w.t()), lambda gd: gd * c.cos())  # mm2's VJP fuses with sin's VJP
-grad_a = torch.mm(grad_d, b.t())
-grad_b = torch.mm(a.t(), grad_d)
-grad_w = torch.mm(d.t(), grad_e)
-```
 
 Reason #2 to exist: general frontend for easy to medium cases for quant casting. Punt on hard cases
 
