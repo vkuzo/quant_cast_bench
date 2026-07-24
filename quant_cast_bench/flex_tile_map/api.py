@@ -2,7 +2,6 @@ import enum
 from typing import Callable, Tuple
 
 import torch
-import torch.nn.functional as F
 from torch._subclasses.fake_tensor import FakeTensorMode
 from .utils import _pad_to_multiple
 

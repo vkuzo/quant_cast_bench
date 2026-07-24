@@ -12,8 +12,8 @@ import torch
 import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from quant_cast_bench.flexquant_v3.api import FlexTileMapBackend, OutputKind, flex_tile_map
-from quant_cast_bench.flexquant_v3.recipes import (
+from quant_cast_bench.flex_tile_map.api import FlexTileMapBackend, OutputKind, flex_tile_map
+from quant_cast_bench.flex_tile_map.recipes import (
     DEEPSEEK_1X128,
     DEEPSEEK_1X128_DIM_M,
     MXFP8_FLOOR,

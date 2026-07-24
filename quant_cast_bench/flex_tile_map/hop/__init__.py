@@ -1,4 +1,4 @@
-"""flexquant_v3 HOP -- the TRITON_TEMPLATE backend's out-of-tree HigherOrderOperator path.
+"""flex_tile_map HOP -- the TRITON_TEMPLATE backend's out-of-tree HigherOrderOperator path.
 
 Importing this package fires three side-effects:
   1. Defines flex_tile_map_hop (the HOP) and registers its eager +

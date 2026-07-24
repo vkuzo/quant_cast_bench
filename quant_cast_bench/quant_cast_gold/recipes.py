@@ -1,10 +1,10 @@
-"""Golden single-kernel quant-cast reference recipes, decoupled from flexquant_v3.
+"""Golden single-kernel quant-cast reference recipes, decoupled from flex_tile_map.
 
 Each `QuantCastSingleKernelGold` pairs a plain-PyTorch reference kernel (`pt_ref_fn`,
 the function that would be handed to flex_tile_map as `f`) with a `correctness_fn`
 that asserts a candidate set of outputs is "close enough" to `pt_ref_fn`'s own
-semantics. This package is intentionally independent of flexquant_v3 -- it must not
-import from it, since it exists to grade it. flexquant_v3/recipes.py imports these
+semantics. This package is intentionally independent of flex_tile_map -- it must not
+import from it, since it exists to grade it. flex_tile_map/recipes.py imports these
 gold objects and wraps them as `RecipeV2` (adding the flex_tile_map tiling metadata).
 """
 
@@ -90,7 +90,7 @@ class QuantCastSingleKernelGold:
 
 def _compute_error(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     # torchao's `compute_error` (quantization/utils.py:63) -- SQNR in dB. Duplicated
-    # locally (not imported from flexquant_v3/test.py) so gold has no dependency on the
+    # locally (not imported from flex_tile_map/test.py) so gold has no dependency on the
     # thing it grades.
     return 20 * torch.log10(
         torch.linalg.vector_norm(x) / torch.linalg.vector_norm(x - y)
@@ -112,7 +112,7 @@ def deepseek_1x128_f(x, **kwargs):  # kwargs: framework-supplied global_row/glob
 
 def deepseek_1x128_dq_f(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     # not a dataclass field -- used inside _deepseek_1x128_correctness, and importable
-    # directly by consumers (e.g. flexquant_v3's own Recipe.dequant) that need the inverse.
+    # directly by consumers (e.g. flex_tile_map's own Recipe.dequant) that need the inverse.
     M, N = q.shape
     nb = N // 128
     return (q.float().reshape(M, nb, 128) * scale.reshape(M, nb, 1)).reshape(M, N)
@@ -165,7 +165,7 @@ def deepseek_128x128_f(x, **kwargs):
 
 def deepseek_128x128_dq_f(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     # not a dataclass field -- used inside _deepseek_128x128_correctness, and importable
-    # directly by consumers (e.g. flexquant_v3's own Recipe.dequant) that need the inverse.
+    # directly by consumers (e.g. flex_tile_map's own Recipe.dequant) that need the inverse.
     M, N = q.shape
     n1, n2 = M // 128, N // 128
     return (q.float().reshape(n1, 128, n2, 128) * scale.reshape(n1, 1, n2, 1)).reshape(M, N)
@@ -533,7 +533,7 @@ def mxfp8_floor_f(x, **kwargs):
 
 def mxfp8_floor_dq_f(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     # not a dataclass field -- used inside _mxfp8_floor_correctness, and importable
-    # directly by consumers (e.g. flexquant_v3's mxfp8_floor_swizzle_dq_f/MXFP8_BIAS) that
+    # directly by consumers (e.g. flex_tile_map's mxfp8_floor_swizzle_dq_f/MXFP8_BIAS) that
     # need the inverse.
     M, N = q.shape
     nb = N // 32

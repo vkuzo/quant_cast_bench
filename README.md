@@ -38,7 +38,7 @@ python benchmarks/benchmark.py --mode cute       # CuTeDSL kernels (Blackwell)
 ## Layout
 
 - `quant_cast_bench/` — the importable package: `quant_cast_gold` (plain-PyTorch reference recipes),
-  `quant_cast_triton` / `quant_cast_cute` (backend kernels), and the `flexquant` / `flexquant_v3`
+  `quant_cast_triton` / `quant_cast_cute` (backend kernels), and the `flexquant` / `flex_tile_map`
   tiling frameworks.
 - `benchmarks/` — the benchmark sweep (see `benchmarks/README.md`).
 - `test/` — the test suite.

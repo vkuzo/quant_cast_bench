@@ -3,7 +3,7 @@
 Each recipe is a `QuantCastTritonRecipe` -- it inherits the gold reference
 (`pt_ref_fn`/`correctness_fn`/`example_input_fn`/`perf_description`) from a
 `QuantCastSingleKernelGold` and adds `triton_fn`, a Triton-backed implementation of the same
-cast. Mirrors flexquant_v3's `RecipeV2` (inherit-from-gold + `from_gold`). test.py grades each
+cast. Mirrors flex_tile_map's `RecipeV2` (inherit-from-gold + `from_gold`). test.py grades each
 `triton_fn` against its gold `pt_ref_fn`.
 """
 
@@ -42,7 +42,7 @@ from quant_cast_bench.quant_cast_gold.recipes import (
 
 @dataclass(frozen=True)
 class QuantCastTritonRecipe(QuantCastSingleKernelGold):
-    """A gold recipe plus a Triton implementation of its `pt_ref_fn`. Mirrors flexquant_v3's
+    """A gold recipe plus a Triton implementation of its `pt_ref_fn`. Mirrors flex_tile_map's
     RecipeV2: inherits pt_ref_fn/correctness_fn/example_input_fn/perf_description from the gold,
     and adds `triton_fn` (same `(inputs) -> outputs` signature as `pt_ref_fn`)."""
 

@@ -51,7 +51,7 @@ from quant_cast_bench.quant_cast_gold.recipes import (
 
 @dataclass(frozen=True)
 class QuantCastCuteRecipe(QuantCastSingleKernelGold):
-    """A gold recipe plus a CuTeDSL implementation of its `pt_ref_fn`. Mirrors flexquant_v3's
+    """A gold recipe plus a CuTeDSL implementation of its `pt_ref_fn`. Mirrors flex_tile_map's
     RecipeV2 / quant_cast_triton's QuantCastTritonRecipe: inherits from the gold, adds `cute_fn`."""
 
     cute_fn: Callable | None = None
