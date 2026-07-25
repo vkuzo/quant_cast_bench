@@ -2,6 +2,7 @@
 `pt_ref_fn`'s outputs. Mirrors quant_cast_triton/test.py (same comparison + tolerance fallback).
 """
 
+import importlib.metadata
 import os
 import sys
 
@@ -10,10 +11,34 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from qdata_utils import mismatch_fraction, qdata_equal
-from quant_cast_bench.quant_cast_cute.recipes import ALL_RECIPES
+
+# The CuTeDSL kernels import `_maybe_recast_from_f4_f6` (the fp4/fp6 register-packing helper) from
+# cutlass.cute.testing. That is the nvidia-cutlass-dsl >= 4.5.2 name -- older releases spelled it
+# `_maybe_recast_from_f4` (f4-only). Gate the whole module on the installed version so an older (or
+# absent) install skips cleanly instead of erroring at collection with an ImportError, and guard the
+# recipes import (it's used in a parametrize decorator, which runs at collection time regardless of
+# the skip mark).
+_MIN_CUTEDSL = (4, 5, 2)
+try:
+    _cutedsl_version = tuple(
+        int(x) for x in importlib.metadata.version("nvidia-cutlass-dsl").split(".")[:3]
+    )
+except (ImportError, importlib.metadata.PackageNotFoundError):
+    _cutedsl_version = None
+
+HAS_CUTEDSL = _cutedsl_version is not None and _cutedsl_version >= _MIN_CUTEDSL
+
+if HAS_CUTEDSL:
+    from quant_cast_bench.quant_cast_cute.recipes import ALL_RECIPES
+else:
+    ALL_RECIPES = []
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="requires CUDA"
+    not torch.cuda.is_available() or not HAS_CUTEDSL,
+    reason=(
+        f"requires CUDA and nvidia-cutlass-dsl >= {'.'.join(map(str, _MIN_CUTEDSL))} "
+        f"(found {'.'.join(map(str, _cutedsl_version)) if _cutedsl_version else 'none'})"
+    ),
 )
 
 _MAX_MISMATCH_FRAC = 0.01
