@@ -1036,6 +1036,73 @@ Nvfp4GsSwizzleGold = QuantCastSingleKernelGold(
 
 
 # ---------------------------------------------------------------------------
+# Golden recipe: nvfp4 with global scale (two-level), inner scale in PLAIN ROW-MAJOR layout.
+#
+# Identical two-level nvfp4 quantization to nvfp4_gs_swizzle_f, but the per-16-element e4m3 inner
+# scale is returned in its natural (M, N//16) row-major layout instead of the NVIDIA blocked/
+# swizzled 4D grid (the nvfp4 analog of mxfp8_floor vs mxfp8_floor_swizzle). Dropping the swizzle
+# makes the scale a plain 2D block-scale -- trivially tile-invariant, no _to_blocked_4d. The outer
+# scale is still a GLOBAL amax, computed outside flex_tile_map (`nvfp4_gs_scale`) as a REPLICATE aux.
+# ---------------------------------------------------------------------------
+def nvfp4_gs_f(x, outer_scale, **kwargs):
+    """Tile-invariant `f`: nvfp4 cast (per-tensor `outer_scale` aux), inner e4m3 scale returned in
+    plain (M, N//16) row-major layout (no swizzle)."""
+    *lead, last = x.shape
+    x_b = x.reshape(*lead, last // 16, 16)
+    local_amax = x_b.abs().amax(dim=-1, keepdim=True)
+    # inner e4m3 block scale, relative to the outer scale.
+    inner = torch.clamp(
+        (local_amax.to(torch.float32) / F4_E2M1_MAX) / outer_scale,
+        min=E4M3_EPS, max=F8E4M3_MAX,
+    ).to(torch.float8_e4m3fn)
+    # cast: divide by (outer * inner), clamp to fp4 range, pack two per byte.
+    reciprocal = (1.0 / outer_scale) / inner.to(torch.float32)
+    data_scaled = torch.clamp(x_b.to(torch.float32) * reciprocal, -F4_E2M1_MAX, F4_E2M1_MAX)
+    qdata_b = _f32_to_packed_fp4(data_scaled).view(torch.float4_e2m1fn_x2)
+    qdata = qdata_b.reshape(*lead, last // 2)
+    inner_scale = inner.squeeze(-1)  # (*lead, last//16) row-major -- no swizzle
+    return qdata, inner_scale
+
+
+def nvfp4_gs_dq_f(q: torch.Tensor, inner_scale: torch.Tensor, outer_scale: torch.Tensor) -> torch.Tensor:
+    # not a dataclass field -- used inside _nvfp4_gs_correctness, and importable directly by
+    # consumers that need the inverse. Same as nvfp4_gs_swizzle_dq_f but the inner scale is already
+    # in (M, N//16) row-major layout, so there's no _from_blocked_4d un-swizzle.
+    M, half = q.shape
+    N = half * 2
+    cols = N // 16  # number of 16-blocks per row (== inner scale cols)
+    unpacked = f4_unpacked_to_f32(unpack_uint4(q.view(torch.uint8))).reshape(M, N)
+    inner_fp32 = inner_scale.to(torch.float32).reshape(M, cols, 1)
+    return (unpacked.reshape(M, cols, 16) * inner_fp32 * outer_scale).reshape(M, N)
+
+
+def _nvfp4_gs_correctness(
+    inputs: Tuple[torch.Tensor, torch.Tensor], outputs: Tuple[torch.Tensor, torch.Tensor]
+) -> None:
+    """Assert dequant(outputs, using the precalculated outer scale from `inputs`) recovers `x`
+    with SQNR above threshold. nvfp4 is 4-bit, coarser than fp8/mxfp8, so a lower floor."""
+    x, outer_scale = inputs
+    qdata, inner_scale = outputs
+    x_hat = nvfp4_gs_dq_f(qdata, inner_scale, outer_scale)
+    sqnr = _compute_error(x.float(), x_hat.float())
+    threshold = 12.0
+    assert sqnr > threshold, f"nvfp4_gs: sqnr={sqnr.item():.2f} dB below {threshold} dB"
+
+
+def _nvfp4_gs_inputs(M, K):
+    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+    return (x, nvfp4_gs_scale(x))
+
+
+Nvfp4GsGold = QuantCastSingleKernelGold(
+    pt_ref_fn=nvfp4_gs_f,
+    correctness_fn=_nvfp4_gs_correctness,
+    example_input_fn=_nvfp4_gs_inputs,
+    perf_description="(1,16) block, fp4 qdata, no swizzle",
+)
+
+
+# ---------------------------------------------------------------------------
 # Golden recipe: nvfp4 with a 128x128-BLOCKED outer scale (instead of a global scalar).
 #
 # Same two-level nvfp4 as nvfp4_gs_swizzle_f, but the outer scale is one value per 128x128
@@ -1397,6 +1464,7 @@ ALL_RECIPES = [
     ("fp8_rowwise", RowwiseFp8Gold),
     ("fp8_colwise", ColwiseFp8Gold),
     # 4 bit 1D
+    ("nvfp4", Nvfp4GsGold),
     ("nvfp4_swizzle", Nvfp4GsSwizzleGold),
     ("nvfp4_blocked_outer", Nvfp4BlockedOuterGold),
     # RHT

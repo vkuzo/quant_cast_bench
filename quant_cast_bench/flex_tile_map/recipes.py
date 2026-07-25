@@ -26,6 +26,7 @@ from quant_cast_bench.quant_cast_gold.recipes import (
     Mxfp8FloorSwizzleGold,
     Mxfp8BiasGold,
     Nvfp4BlockedOuterGold,
+    Nvfp4GsGold,
     Nvfp4GsSwizzleGold,
     QuantCastSingleKernelGold,
     RowwiseFp8Gold,
@@ -167,6 +168,15 @@ NVFP4_GS_SWIZZLE = RecipeV2.from_gold(
     valid_tile_size_fn=lambda ts, a, p: a[1] % 16 == 0 and p[0] % 128 == 0 and p[1] % 64 == 0,
     aux_kinds=(AuxKind.REPLICATE,),
 )
+# nvfp4 (no swizzle): the per-tensor outer scale (from Nvfp4GsGold.example_input_fn) is a REPLICATE
+# aux; the e4m3 inner scale comes back in plain (M, N//16) row-major (no swizzle). reduction (1x16
+# inner) along columns on `actual`. This is the dim-K TRITON_TEMPLATE recipe (template_nvfp4.py.jinja,
+# fp4-packed qdata via the SM100 hardware pack); it also runs in the generic INDUCTOR/MANUAL_TILE suite.
+NVFP4 = RecipeV2.from_gold(
+    Nvfp4GsGold,
+    valid_tile_size_fn=lambda ts, a, p: a[1] % 16 == 0,
+    aux_kinds=(AuxKind.REPLICATE,),
+)
 # nvfp4 with a 128x128-blocked outer scale (from Nvfp4BlockedOuterGold.example_input_fn) passed as
 # an AuxKind.TILE aux. Same swizzle-atom constraints as NVFP4_GS_SWIZZLE; the 128x128 outer block
 # is coarser than the (128, 64) atom so it adds no new alignment constraint at 128-aligned tiles.
@@ -227,6 +237,7 @@ RECIPES_V2 = [
     ("mxfp8_32x32_floor", MXFP8_32X32_FLOOR),
     ("mxfp8_floor_swizzle", MXFP8_FLOOR_SWIZZLE),
     ("fp8_tensorwise_precalc_scale", FLOAT8_TENSORWISE),
+    ("nvfp4", NVFP4),
     ("nvfp4_swizzle", NVFP4_GS_SWIZZLE),
     ("nvfp4_blocked_outer", NVFP4_BLOCKED_OUTER),
     ("mxfp8_bias", MXFP8_BIAS),

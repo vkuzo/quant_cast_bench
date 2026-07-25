@@ -31,6 +31,7 @@ from quant_cast_bench.quant_cast_gold.recipes import (
     Mxfp8FloorGold,
     Mxfp8FloorSwizzleGold,
     Nvfp4BlockedOuterGold,
+    Nvfp4GsGold,
     Nvfp4GsSwizzleGold,
     QuantCastSingleKernelGold,
     RowwiseFp8Gold,
@@ -1092,6 +1093,54 @@ NVFP4_SWIZZLE = QuantCastTritonRecipe.from_gold(
 
 
 # ---------------------------------------------------------------------------
+# nvfp4 with a per-tensor (global) outer scale, inner scale in PLAIN ROW-MAJOR (M, N//16) layout.
+# Identical quantization to _nvfp4_swizzle_kernel (same per-atom 128x64 tiling, hardware fp4 pack,
+# and bit-exact inner scale / reciprocal / data-scaling), but the e4m3 inner scale is stored to its
+# natural row-major (M, N//16) buffer instead of the swizzled 4D grid -- so the coherent per-atom
+# swizzle store becomes a plain strided 2D store of the (128, 4) scale tile. Mirrors nvfp4_gs_f.
+# Requires M % 128 == 0 and N % 64 == 0. Grid: (N // 64, M // 128).
+# ---------------------------------------------------------------------------
+@triton.jit
+def _nvfp4_kernel(x_ptr, outer_ptr, q_ptr, s_ptr, sxm, sxn, ssm, ssn, M, N):
+    pid_n = tl.program_id(0)
+    pid_m = tl.program_id(1)
+    offs_m = pid_m * 128 + tl.arange(0, 128)[:, None]
+    offs_n = pid_n * 64 + tl.arange(0, 64)[None, :]
+    x = tl.load(x_ptr + offs_m * sxm + offs_n * sxn).to(tl.float32)  # (128, 64)
+    x_blocks = x.reshape(128, 4, 16)
+    amax = tl.max(tl.abs(x_blocks), axis=2)  # (128, 4)
+    outer = tl.load(outer_ptr)  # per-tensor scalar
+    inner_val = tl.minimum(tl.maximum((amax / 6.0) / outer, 0.015625), 448.0)
+    inner_e4 = inner_val.to(tl.float8e4nv)  # (128, 4)
+    recip = (1.0 / outer) / inner_e4.to(tl.float32)  # (128, 4)
+    x_blocks = x_blocks * recip[:, :, None]  # (128, 4, 16); cvt saturates to +-6
+    # plain row-major scale store: this atom's (128, 4) scale tile lands at rows offs_m, cols
+    # pid_n*4 + [0,4) of the (M, N//16) buffer (no swizzle).
+    s_offs_n = pid_n * 4 + tl.arange(0, 4)[None, :]
+    tl.store(s_ptr + offs_m * ssm + s_offs_n * ssn, inner_e4)
+    # hardware fp4 pack: (128,4,16) -> (128,32,2) pairs -> (128,32) packed bytes.
+    q = _convert_fp32_to_fp4_packed(x_blocks.reshape(128, 32, 2).split())
+    q_offs_n = pid_n * 32 + tl.arange(0, 32)[None, :]
+    tl.store(q_ptr + offs_m * (N // 2) + q_offs_n, q)
+
+
+def nvfp4_triton(x, outer_scale, **kwargs):
+    assert x.is_contiguous() and x.dim() == 2
+    M, N = x.shape
+    assert M % 128 == 0 and N % 64 == 0, "MSLK-style nvfp4 kernel needs M%128==0 and N%64==0"
+    q = torch.empty(M, N // 2, dtype=torch.uint8, device=x.device)
+    s = torch.empty(M, N // 16, dtype=torch.float8_e4m3fn, device=x.device)
+    grid = (N // 64, M // 128)
+    _nvfp4_kernel[grid](
+        x, outer_scale, q, s, x.stride(0), x.stride(1), s.stride(0), s.stride(1), M, N
+    )
+    return q.view(torch.float4_e2m1fn_x2), s
+
+
+NVFP4 = QuantCastTritonRecipe.from_gold(Nvfp4GsGold, triton_fn=nvfp4_triton)
+
+
+# ---------------------------------------------------------------------------
 # nvfp4 with a 128x128-blocked outer scale (Mb, Nb): same as above but the outer scale is looked
 # up per (row, 16-group) from its 128x128 block. Mirrors nvfp4_blocked_outer_f.
 # Grid: (cdiv(M, BM), N // 16).
@@ -1335,6 +1384,7 @@ ALL_RECIPES = [
     ("fp8_rowwise", FP8_ROWWISE),
     ("fp8_colwise", FP8_COLWISE),
     # 4 bit 1D
+    ("nvfp4", NVFP4),
     ("nvfp4_swizzle", NVFP4_SWIZZLE),
     ("nvfp4_blocked_outer", NVFP4_BLOCKED_OUTER),
     # RHT

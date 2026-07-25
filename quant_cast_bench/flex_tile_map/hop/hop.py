@@ -30,36 +30,44 @@ class FlexTileMapHOP(HigherOrderOperator):
     def __init__(self) -> None:
         super().__init__("flex_tile_map", cacheable=True)
 
-    def __call__(self, x: torch.Tensor, f: Callable) -> Tuple[torch.Tensor, ...]:
-        return super().__call__(x, f)
+    def __call__(
+        self, x: torch.Tensor, f: Callable, *operands: torch.Tensor
+    ) -> Tuple[torch.Tensor, ...]:
+        return super().__call__(x, f, *operands)
 
 
 flex_tile_map_hop = FlexTileMapHOP()
 
 
 @flex_tile_map_hop.py_impl(DispatchKey.CompositeExplicitAutograd)
-def _flex_tile_map_eager(x: torch.Tensor, f: Callable) -> Tuple[torch.Tensor, ...]:
-    """Eager body: run `f` on the whole tensor. `f` returns a 1-tuple `(out,)`."""
-    return tuple(f(x))
+def _flex_tile_map_eager(
+    x: torch.Tensor, f: Callable, *operands: torch.Tensor
+) -> Tuple[torch.Tensor, ...]:
+    """Eager body: run `f(x, *operands)` on the whole tensor. `operands` are the aux inputs
+    (e.g. an nvfp4 per-tensor outer scale). `f` returns a tuple of outputs."""
+    return tuple(f(x, *operands))
 
 
 def _trace_flex_tile_map(
     proxy_mode: ProxyTorchDispatchMode,
     x: torch.Tensor,
     f: Callable,
+    *operands: torch.Tensor,
 ) -> Tuple[torch.Tensor, ...]:
     """Trace `f` into an FX subgraph and emit a HOP call_function node.
 
-    Mirrors v1's _trace_flex_quant. Traces `f` on a tile the SHAPE of the full input, so a
-    group-reduction `f` (deepseek's reshape into 128-groups) produces a graph that is also valid
-    for full-tensor fake-shape inference (the HOP is invoked whole-tensor). Concrete dims don't
-    leak into codegen: the reduction emitter rewrites them to the BLOCK_M/BLOCK_N block symbols,
-    and the 128 group width is a literal constant in `f` regardless of the trace shape.
+    Mirrors v1's _trace_flex_quant. Traces `f` on a tile the SHAPE of the full input (plus the
+    aux `operands` whole), so a group-reduction `f` (deepseek's reshape into 128-groups) produces
+    a graph that is also valid for full-tensor fake-shape inference (the HOP is invoked
+    whole-tensor). Concrete dims don't leak into codegen: the reduction emitter rewrites them to
+    the BLOCK_M/BLOCK_N block symbols, and the group width is a literal constant in `f` regardless
+    of the trace shape. The aux operands become extra placeholders in the subgraph and extra
+    positional args on the HOP node.
     """
-    example_out = flex_tile_map_hop(x, f)
+    example_out = flex_tile_map_hop(x, f, *operands)
 
     tile_example = x.new_zeros(x.shape, dtype=x.dtype)
-    f_graph = reenter_make_fx(f)(tile_example)
+    f_graph = reenter_make_fx(f)(tile_example, *operands)
 
     if not isinstance(proxy_mode.tracer, torch.fx.Tracer):
         raise AssertionError(
@@ -71,7 +79,7 @@ def _trace_flex_tile_map(
 
     import torch.utils._pytree as pytree
 
-    node_args = (x, f_graph)
+    node_args = (x, f_graph, *operands)
     proxy_args = pytree.tree_map(proxy_mode.tracer.unwrap_proxy, node_args)
     out_proxy = proxy_mode.tracer.create_proxy(
         "call_function",
@@ -90,36 +98,45 @@ def _flex_tile_map_proxy_torch_dispatch_mode(
     mode: ProxyTorchDispatchMode,
     x: torch.Tensor,
     f: Callable,
+    *operands: torch.Tensor,
 ) -> Tuple[torch.Tensor, ...]:
     if mode is None:
         raise AssertionError("Mode should always be enabled for python fallback key")
-    return _trace_flex_tile_map(mode, x, f)
+    return _trace_flex_tile_map(mode, x, f, *operands)
 
 
 @flex_tile_map_hop.py_impl(DispatchKey.Autograd)
-def _flex_tile_map_autograd(x: torch.Tensor, f: Callable) -> Tuple[torch.Tensor, ...]:
+def _flex_tile_map_autograd(
+    x: torch.Tensor, f: Callable, *operands: torch.Tensor
+) -> Tuple[torch.Tensor, ...]:
     """Forward-only autograd dispatch -- runs the eager body. Backward is not implemented."""
     with torch._C._AutoDispatchBelowAutograd():
-        return flex_tile_map_hop(x, f)
+        return flex_tile_map_hop(x, f, *operands)
 
 
 @flex_tile_map_hop.py_functionalize_impl
-def _flex_tile_map_functionalize(ctx, x: torch.Tensor, f: Callable) -> Tuple[torch.Tensor, ...]:
-    """Pass through functionalization: `f` is pure pointwise, so just unwrap `x`."""
+def _flex_tile_map_functionalize(
+    ctx, x: torch.Tensor, f: Callable, *operands: torch.Tensor
+) -> Tuple[torch.Tensor, ...]:
+    """Pass through functionalization: `f` is pure, so just unwrap `x` and the aux operands."""
     x_unwrapped = ctx.unwrap_tensors(x)
+    operands_unwrapped = ctx.unwrap_tensors(operands)
     with ctx.redispatch_to_next():
         functional_f = ctx.functionalize(f)
-        out = flex_tile_map_hop(x_unwrapped, functional_f)
+        out = flex_tile_map_hop(x_unwrapped, functional_f, *operands_unwrapped)
     return ctx.wrap_tensors(out)
 
 
 @register_fake(flex_tile_map_hop)
-def _flex_tile_map_fake(x: torch.Tensor, f: Callable) -> Tuple[torch.Tensor, ...]:
-    """FakeTensor shape/dtype inference: run the traced subgraph on the fake input.
+def _flex_tile_map_fake(
+    x: torch.Tensor, f: Callable, *operands: torch.Tensor
+) -> Tuple[torch.Tensor, ...]:
+    """FakeTensor shape/dtype inference: run the traced subgraph on the fake input + aux operands.
 
     `f` here is the traced GraphModule (or the raw callable at trace time), so running it on the
-    full fake `x` yields correctly-shaped/typed fake outputs -- the output dtype comes from `f`,
-    not a constant. Shapes are specialized static (the API marks `input` static before the HOP
-    call, see api.py), so the subgraph never grows free-symbol SymInt placeholders.
+    full fake `x` (and the aux operands) yields correctly-shaped/typed fake outputs -- the output
+    dtype comes from `f`, not a constant. Shapes are specialized static (the API marks `input`
+    static before the HOP call, see api.py), so the subgraph never grows free-symbol SymInt
+    placeholders.
     """
-    return tuple(f(x))
+    return tuple(f(x, *operands))

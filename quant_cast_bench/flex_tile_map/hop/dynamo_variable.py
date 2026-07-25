@@ -30,14 +30,16 @@ class FlexTileMapHigherOrderVariable(TorchHigherOrderOperatorVariable):
         flat_kwargs = pytree.tree_flatten(kwargs)[0]
         return list(args) + flat_kwargs
 
-    def _trace_callback(self, tx, x: VariableTracker, fn: VariableTracker):
-        """Trace `f` into a subgraph using a placeholder the SHAPE of the full input.
+    def _trace_callback(self, tx, x: VariableTracker, fn: VariableTracker, operands):
+        """Trace `f` into a subgraph using a placeholder the SHAPE of the full input, plus one
+        placeholder per aux operand (passed to the subgraph whole).
 
         Tracing at the real input shape means a group-reduction `f` (deepseek's
         `x.reshape(*lead, last//128, 128)`) produces a graph that is also valid for whole-tensor
         fake-shape inference (the HOP is invoked whole-tensor), and a pointwise `f` traces the
         same graph it would on any shape. Concrete dims don't leak into codegen: the reduction
-        emitter rewrites them to the BLOCK_M/BLOCK_N block symbols.
+        emitter rewrites them to the BLOCK_M/BLOCK_N block symbols. The aux `operands` (e.g. an
+        nvfp4 per-tensor outer scale) become extra subgraph placeholders in order after the input.
         """
         with discard_graph_changes(tx):
             size_vt = x.call_method(tx, "size", [], {})
@@ -50,7 +52,7 @@ class FlexTileMapHigherOrderVariable(TorchHigherOrderOperatorVariable):
         ) = speculate_subgraph(
             tx,
             fn,
-            [placeholder],
+            [placeholder, *operands],
             {},
             description=f"{self._HOP_NAME}: f",
             source_target=self.value,
@@ -68,12 +70,12 @@ class FlexTileMapHigherOrderVariable(TorchHigherOrderOperatorVariable):
     def _call_function(self, tx, args: Sequence[VariableTracker], kwargs) -> VariableTracker:
         from torch._dynamo.variables.builder import wrap_fx_proxy
 
-        (x, f) = self.normalize_to_args(list(args), kwargs)
+        (x, f, *operands) = self.normalize_to_args(list(args), kwargs)
 
-        f_node, _f_lifted_args = self._trace_callback(tx, x, f)
+        f_node, _f_lifted_args = self._trace_callback(tx, x, f, operands)
 
-        # x is the only Tensor we need to proxy; `f` becomes the subgraph attr node.
-        inp_args, _ = proxy_args_kwargs([x], {})
+        # x and the aux operands are the Tensors we proxy; `f` becomes the subgraph attr node.
+        inp_args, _ = proxy_args_kwargs([x, *operands], {})
 
         with torch.fx.experimental.proxy_tensor.set_original_aten_op(self.value):
             proxy = wrap_fx_proxy(
@@ -81,7 +83,7 @@ class FlexTileMapHigherOrderVariable(TorchHigherOrderOperatorVariable):
                 proxy=tx.output.create_proxy(
                     "call_function",
                     self.value,
-                    args=(inp_args[0], f_node),
+                    args=(inp_args[0], f_node, *inp_args[1:]),
                     kwargs={},
                 ),
                 example_value=None,

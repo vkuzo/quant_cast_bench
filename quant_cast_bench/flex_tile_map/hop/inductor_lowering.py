@@ -43,7 +43,16 @@ def _read_template(name: str) -> str:
         return f.read()
 
 
-# ---- reduction path (FxTritonEmitter -> deepseek template) -----------------
+# ---- reduction path (FxTritonEmitter -> dim-M template) --------------------
+
+# dim-M templates, keyed by the reduction group width detected in `f`. Each is a hand-written
+# template with the group baked in (128 for deepseek 1x128, 32 for mxfp8-floor 1x32); they will be
+# unified into one group-parameterized template later (see future_ideas.md). To wire a new
+# group-reduction recipe, add its template file + group here.
+_DIM_M_TEMPLATES = {
+    128: "template_deepseek_dim_m.py.jinja",
+    32: "template_mxfp8_floor_dim_m.py.jinja",
+}
 
 
 @SymbolicGridFn
@@ -69,32 +78,61 @@ def _splice_body(body: str, template_name: str) -> tuple[str, str]:
     return name, src
 
 
-def _lower_reduction(x, gm: torch.fx.GraphModule):
-    """Walk `gm` with FxTritonEmitter and splice the body into the deepseek template."""
-    device = x.get_device()
-    M = x.get_size()[0]
-    N = x.get_size()[1]
-
-    # output dtypes come straight from the traced graph's two outputs (qdata, scale).
+def _graph_output_dtypes(gm: torch.fx.GraphModule):
+    """(qdata_dtype, scale_dtype) from the traced graph's two outputs (qdata, scale)."""
     out_node = next(n for n in gm.graph.nodes if n.op == "output")
     qdata_node, scale_node = out_node.args[0]
-    qdata_dtype = qdata_node.meta["val"].dtype
-    scale_dtype = scale_node.meta["val"].dtype
+    return qdata_node.meta["val"].dtype, scale_node.meta["val"].dtype
 
-    # to_dtype resolves the triton dtype via V.graph.get_current_device_or_throw(), which is only
-    # populated during device-specific codegen -- set it explicitly for the emit.
+
+def _emit(x, gm: torch.fx.GraphModule, aux_names):
+    """Walk `gm` with FxTritonEmitter and return (body, group, reduce_kind).
+
+    to_dtype resolves the triton dtype via V.graph.get_current_device_or_throw(), which is only
+    populated during device-specific codegen -- set it explicitly for the emit.
+    """
     from torch._inductor.virtualized import V
 
-    with V.graph.set_current_device(device):
-        body, group = FxTritonEmitter(gm, output_names=["qdata_var", "scale_var"]).emit()
+    with V.graph.set_current_device(x.get_device()):
+        body, group, reduce_kind = FxTritonEmitter(
+            gm, output_names=["qdata_var", "scale_var"], aux_names=aux_names
+        ).emit()
     if group is None:
         raise NotImplementedError("reduction path requires a group reshape in `f`")
+    return body, group, reduce_kind
 
-    # Only the dim-M variant is supported: reduce down rows in 128-groups and TRANSPOSE both
-    # outputs. BLOCK_M must be a multiple of the group; outputs are the transpose of the input:
-    # qdata (N, M), scale (N, M//group). The kernel tiles the input (M, N) but stores transposed
-    # tiles. (The emitter rejects the dim-K "split last dim" shape up front, in _lower_view.)
-    name, src = _splice_body(body, "template_deepseek_dim_m.py.jinja")
+
+def _autotune(name, src, input_nodes, layout, mutated_inputs, call_sizes, configs):
+    """Build the TritonTemplate, append every config as a choice, and autotune -> primary output."""
+    template = TritonTemplate(name=name, grid=_grid_reduce, source=src)
+    choices: list[Any] = []
+    for cfg in configs:
+        template.maybe_append_choice(
+            choices=choices,
+            input_nodes=input_nodes,
+            layout=layout,
+            mutated_inputs=mutated_inputs,
+            call_sizes=call_sizes,
+            **cfg,
+        )
+    out, _ = autotune_select_algorithm(name, choices, input_nodes, layout)
+    return out
+
+
+def _lower_reduction_dim_m(x, body, group, qdata_dtype, scale_dtype):
+    """dim-M variant: reduce down rows in `group`-row groups and TRANSPOSE both outputs.
+
+    BLOCK_M must be a multiple of the group; outputs are the transpose of the input: qdata (N, M),
+    scale (N, M//group). The kernel tiles the input (M, N) but stores transposed tiles.
+    """
+    device = x.get_device()
+    M, N = x.get_size()[0], x.get_size()[1]
+    template_name = _DIM_M_TEMPLATES.get(group)
+    if template_name is None:
+        raise NotImplementedError(
+            f"no dim-M template for reduction group={group} (have {sorted(_DIM_M_TEMPLATES)})"
+        )
+    name, src = _splice_body(body, template_name)
     qdata_layout = FixedLayout(device, qdata_dtype, [N, M], stride=[M, 1])
     scale = empty_strided([N, M // group], None, dtype=scale_dtype, device=device)
     configs = [
@@ -104,24 +142,46 @@ def _lower_reduction(x, gm: torch.fx.GraphModule):
         for w in (4, 8)
         for s in (2, 4)
     ]
+    qdata = _autotune(
+        name, src, [x, scale], qdata_layout, [scale], [M, N], configs
+    )
+    return (qdata, scale)
 
-    template = TritonTemplate(name=name, grid=_grid_reduce, source=src)
 
-    choices: list[Any] = []
-    for cfg in configs:
-        template.maybe_append_choice(
-            choices=choices,
-            input_nodes=[x, scale],
-            layout=qdata_layout,
-            mutated_inputs=[scale],
-            call_sizes=[M, N],
-            BLOCK_M=cfg["BLOCK_M"],
-            BLOCK_N=cfg["BLOCK_N"],
-            num_warps=cfg["num_warps"],
-            num_stages=cfg["num_stages"],
+def _lower_nvfp4(x, body, group, operands, qdata_dtype, scale_dtype):
+    """dim-K nvfp4 variant: reduce along columns in `group`(=16)-element inner blocks, NO transpose.
+
+    qdata is fp4-packed (M, N//2) (two e2m1 per byte); scale is the e4m3 inner scale (M, N//group).
+    `operands[0]` is the per-tensor outer scale (REPLICATE aux), passed to the template as OUTER and
+    loaded once. BLOCK_N must be a multiple of the 16-element inner block.
+
+    Unlike the dim-M variants the PRIMARY (autotuned) output is the e4m3 SCALE, and the fp4-packed
+    qdata is a mutated input: the autotuner zero_()s the primary buffer to benchmark each choice, and
+    fill/zero_ is unimplemented for float4_e2m1fn_x2. Outputs are still returned (qdata, scale).
+    """
+    device = x.get_device()
+    M, N = x.get_size()[0], x.get_size()[1]
+    if group != 16:
+        raise NotImplementedError(f"nvfp4 dim-K template expects a 16-element block, got {group}")
+    if len(operands) != 1:
+        raise NotImplementedError(
+            f"nvfp4 dim-K template expects one aux (outer scale), got {len(operands)}"
         )
+    (outer,) = maybe_realize(list(operands))
 
-    qdata, _ = autotune_select_algorithm(name, choices, [x, scale], qdata_layout)
+    name, src = _splice_body(body, "template_nvfp4.py.jinja")
+    scale_layout = FixedLayout(device, scale_dtype, [M, N // group], stride=[N // group, 1])
+    qdata = empty_strided([M, N // 2], [N // 2, 1], dtype=qdata_dtype, device=device)
+    configs = [
+        {"BLOCK_M": bm, "BLOCK_N": bn, "num_warps": w, "num_stages": s}
+        for bm in (32, 64, 128)
+        for bn in (16, 32, 64, 128)
+        for w in (4, 8)
+        for s in (2, 4)
+    ]
+    scale = _autotune(
+        name, src, [x, qdata, outer], scale_layout, [qdata], [M, N], configs
+    )
     return (qdata, scale)
 
 
@@ -135,21 +195,31 @@ def _has_reduction(gm: torch.fx.GraphModule) -> bool:
 
 
 @register_lowering(flex_tile_map_hop, type_promotion_kind=None)
-def _flex_tile_map_lowering(x, f_subgraph):
+def _flex_tile_map_lowering(x, f_subgraph, *operands):
     """Lower the HOP: only a group-reduction `f` is supported (bespoke emitter path).
 
-    A pointwise `f` no longer has a lowering here (see the module docstring): plain pointwise casts
-    should be written as ordinary PyTorch and lowered by regular Inductor, not routed through this
-    HOP+template.
+    Routes on the reduction axis detected by the emitter: dim-M (split dim0, transposed outputs:
+    deepseek 1x128 / mxfp8 1x32) vs dim-K (split the last dim, no transpose: nvfp4 1x16 with a
+    per-tensor outer-scale aux). `operands` are the aux inputs (REPLICATE), passed to the template
+    as extra input nodes. A pointwise `f` has no lowering here (see the module docstring): plain
+    pointwise casts should be written as ordinary PyTorch and lowered by regular Inductor.
     """
     # Realize x so it has concrete strides; an unrealized Pointwise (e.g. a fused preceding op)
     # has no stride info and every template choice would get filtered out.
     (x,) = maybe_realize([x])
+    gm = f_subgraph.graph_module
 
-    if not _has_reduction(f_subgraph.graph_module):
+    if not _has_reduction(gm):
         raise NotImplementedError(
             "flex_tile_map TRITON_TEMPLATE lowering supports only group-reduction `f` (e.g. "
-            "deepseek 1x128 dim-M); the pointwise path was removed -- use regular Inductor for "
-            "pointwise casts."
+            "deepseek 1x128 dim-M, nvfp4 1x16 dim-K); the pointwise path was removed -- use "
+            "regular Inductor for pointwise casts."
         )
-    return _lower_reduction(x, f_subgraph.graph_module)
+
+    aux_names = [f"aux{i}_var" for i in range(len(operands))]
+    body, group, reduce_kind = _emit(x, gm, aux_names)
+    qdata_dtype, scale_dtype = _graph_output_dtypes(gm)
+
+    if reduce_kind == "dim_k":
+        return _lower_nvfp4(x, body, group, operands, qdata_dtype, scale_dtype)
+    return _lower_reduction_dim_m(x, body, group, qdata_dtype, scale_dtype)
