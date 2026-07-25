@@ -20,7 +20,9 @@ from cutlass._mlir.dialects import llvm  # inline PTX for the hardware fp4/e4m3 
 from cutlass.cute.nvgpu import cpasync  # TMA (bulk-tensor) copy ops + tma_partition
 from cutlass.cute.nvgpu import warp as warp_mma  # SM80 warp-level mma.sync atoms (m16n8k16)
 from cutlass.cute.runtime import from_dlpack
-from cutlass.cute.testing import _maybe_recast_from_f4  # packs an fp4 register vector to bytes
+from cutlass.cute.testing import (
+    _maybe_recast_from_f4_f6,  # packs an fp4 (or fp6) register vector to bytes
+)
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 from quant_cast_bench.quant_cast_gold.recipes import (
@@ -2045,14 +2047,14 @@ def _nvfp4_block(v, data_val_layout, outer):
     recip = (1.0 / outer) / frgIf[0]
     frgD = cute.make_rmem_tensor(data_val_layout, cutlass.Float32)  # 16 scaled f32 values
     frgD.store(v * recip)
-    packed = _maybe_recast_from_f4(frgD.load().to(cutlass.Float4E2M1FN), cutlass.Float4E2M1FN)
+    packed = _maybe_recast_from_f4_f6(frgD.load().to(cutlass.Float4E2M1FN), cutlass.Float4E2M1FN)
     return packed, frgIe[0]
 
 
 # Hardware fp4 / e4m3 conversions via inline PTX (Blackwell SM10.x), ported verbatim from the
 # human-optimized torchao unified fp4 CuTeDSL cast (pytorch/ao#4517, cute_utils.py). The fast
 # nvfp4_swizzle kernel uses these single hardware instructions instead of `_nvfp4_block`'s
-# 4-lane-broadcast e4m3 fragment conversions + `_maybe_recast_from_f4` fp4 packing -- far fewer
+# 4-lane-broadcast e4m3 fragment conversions + `_maybe_recast_from_f4_f6` fp4 packing -- far fewer
 # registers and instructions (the kernel was compute/register-bound at 56 reg/thread, 44% occ).
 @dsl_user_op
 def _cvt_rn_satfinite_e2m1x2_f32(hi, lo, *, loc=None, ip=None):
@@ -2188,7 +2190,7 @@ def _nvfp4_scale_e4m3(amax, inv_outer):
 #  1. HARDWARE cvts (inline PTX, ported from ao#4517): cvt.rn.satfinite.e2m1x2.f32 packs 8 f32 ->
 #     4 fp4 bytes/call (one mov.b32, no per-byte masking), and cvt e4m3x2 / f16x2.e4m3x2 do the
 #     two-level scale as single instructions -- vs _nvfp4_block's 4-lane-broadcast e4m3 fragments
-#     + _maybe_recast_from_f4 (which cost registers + ALU). (blocked_outer still uses _nvfp4_block.)
+#     + _maybe_recast_from_f4_f6 (which cost registers + ALU). (blocked_outer still uses _nvfp4_block.)
 #  2. HOISTED swizzle offset: the 4D (nrb,ncb,32,16) flatten factors as row_base + (col//4)*512 +
 #     (col%4); the per-row div/mods are computed once/group (not per block), and because a group's
 #     start is a multiple of 32 -> col16 is even -> its NB blocks share bc and land at flat0, +1.
