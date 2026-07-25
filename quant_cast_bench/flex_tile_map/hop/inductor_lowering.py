@@ -148,6 +148,31 @@ def _lower_reduction_dim_m(x, body, group, qdata_dtype, scale_dtype):
     return (qdata, scale)
 
 
+def _lower_mxfp8_32x32(x, body, group, qdata_dtype, scale_dtype):
+    """block_2d mxfp8 variant: one e8m0 scale per 32x32 SQUARE block, NO transpose.
+
+    Reduces over the whole 32x32 block (both dims), so qdata keeps the input shape (M, N) and the
+    scale is (M//32, N//32). Like the dim-M variants the PRIMARY (autotuned) output is the fp8
+    qdata and the e8m0 scale is a mutated input. BLOCK_M and BLOCK_N must both be 32-multiples.
+    """
+    device = x.get_device()
+    M, N = x.get_size()[0], x.get_size()[1]
+    if group != 32:
+        raise NotImplementedError(f"mxfp8 32x32 template expects a 32x32 block, got {group}")
+    name, src = _splice_body(body, "template_mxfp8_32x32_floor.py.jinja")
+    qdata_layout = FixedLayout(device, qdata_dtype, [M, N], stride=[N, 1])
+    scale = empty_strided([M // 32, N // 32], [N // 32, 1], dtype=scale_dtype, device=device)
+    configs = [
+        {"BLOCK_M": bm, "BLOCK_N": bn, "num_warps": w, "num_stages": s}
+        for bm in (32, 64, 128)
+        for bn in (32, 64, 128, 256)
+        for w in (4, 8)
+        for s in (2, 4)
+    ]
+    qdata = _autotune(name, src, [x, scale], qdata_layout, [scale], [M, N], configs)
+    return (qdata, scale)
+
+
 def _lower_nvfp4(x, body, group, operands, qdata_dtype, scale_dtype):
     """dim-K nvfp4 variant: reduce along columns in `group`(=16)-element inner blocks, NO transpose.
 
@@ -199,10 +224,11 @@ def _flex_tile_map_lowering(x, f_subgraph, *operands):
     """Lower the HOP: only a group-reduction `f` is supported (bespoke emitter path).
 
     Routes on the reduction axis detected by the emitter: dim-M (split dim0, transposed outputs:
-    deepseek 1x128 / mxfp8 1x32) vs dim-K (split the last dim, no transpose: nvfp4 1x16 with a
-    per-tensor outer-scale aux). `operands` are the aux inputs (REPLICATE), passed to the template
-    as extra input nodes. A pointwise `f` has no lowering here (see the module docstring): plain
-    pointwise casts should be written as ordinary PyTorch and lowered by regular Inductor.
+    deepseek 1x128 / mxfp8 1x32), dim-K (split the last dim, no transpose: nvfp4 1x16 with a
+    per-tensor outer-scale aux), or block_2d (split BOTH dims into 32x32 blocks, no transpose:
+    mxfp8 32x32). `operands` are the aux inputs (REPLICATE), passed to the template as extra input
+    nodes. A pointwise `f` has no lowering here (see the module docstring): plain pointwise casts
+    should be written as ordinary PyTorch and lowered by regular Inductor.
     """
     # Realize x so it has concrete strides; an unrealized Pointwise (e.g. a fused preceding op)
     # has no stride info and every template choice would get filtered out.
@@ -212,14 +238,16 @@ def _flex_tile_map_lowering(x, f_subgraph, *operands):
     if not _has_reduction(gm):
         raise NotImplementedError(
             "flex_tile_map TRITON_TEMPLATE lowering supports only group-reduction `f` (e.g. "
-            "deepseek 1x128 dim-M, nvfp4 1x16 dim-K); the pointwise path was removed -- use "
-            "regular Inductor for pointwise casts."
+            "deepseek 1x128 dim-M, nvfp4 1x16 dim-K, mxfp8 32x32 block); the pointwise path was "
+            "removed -- use regular Inductor for pointwise casts."
         )
 
     aux_names = [f"aux{i}_var" for i in range(len(operands))]
     body, group, reduce_kind = _emit(x, gm, aux_names)
     qdata_dtype, scale_dtype = _graph_output_dtypes(gm)
 
+    if reduce_kind == "block_2d":
+        return _lower_mxfp8_32x32(x, body, group, qdata_dtype, scale_dtype)
     if reduce_kind == "dim_k":
         return _lower_nvfp4(x, body, group, operands, qdata_dtype, scale_dtype)
     return _lower_reduction_dim_m(x, body, group, qdata_dtype, scale_dtype)

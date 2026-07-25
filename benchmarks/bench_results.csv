@@ -53,7 +53,10 @@ nvfp4_swizzle,cute,0.1392,4942.5,61.78
 bf16_rht,cute,0.1987,5402.5,67.53
 fp32_to_bf16_sr,cute,0.2459,6549.7,81.87
 fp32_to_bf16_sr_global_offsets,cute,0.2458,6551.4,81.89
-relu (baseline),flex_tile_map_triton,0.1835,5850.9,73.14
-fp8_deepseek_1x128_dim_m,flex_tile_map_triton,0.1487,5471.6,68.39
+relu (baseline),flex_tile_map_triton,0.1833,5859.2,73.24
+fp8_deepseek_1x128_dim_m,flex_tile_map_triton,0.1488,5467.7,68.35
 nvfp4,compile,0.3908,1759.9,22.00
 nvfp4,triton,0.1333,5161.5,64.52
+mxfp8_floor_dim_m,flex_tile_map_triton,0.2028,4011.5,50.14
+mxfp8_32x32_floor,flex_tile_map_triton,0.1315,6128.1,76.60
+nvfp4,flex_tile_map_triton,0.1394,4933.7,61.67

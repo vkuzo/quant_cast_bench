@@ -169,11 +169,13 @@ def main(
         # dim-M variants (transposed outputs), single-input, no aux -- deepseek 1x128 (128-row group,
         # fp32 scale) and mxfp8-floor 1x32 (32-row group, e8m0 scale) -- each with its own template
         # (group baked in), selected by the group width in inductor_lowering._DIM_M_TEMPLATES. Plus
-        # nvfp4 (dim-K, 1x16 along columns, no transpose): a REPLICATE aux (per-tensor outer scale),
-        # fp4-packed qdata + e4m3 scale, via template_nvfp4.py.jinja. The pointwise relu path was
+        # mxfp8 32x32 (block_2d: one e8m0 scale per 32x32 square block, no transpose) via
+        # template_mxfp8_32x32_floor.py.jinja, and nvfp4 (dim-K, 1x16 along columns, no transpose):
+        # a REPLICATE aux (per-tensor outer scale), fp4-packed qdata + e4m3 scale, via
+        # template_nvfp4.py.jinja. The pointwise relu path was
         # removed -- a pointwise `f` no longer has a template lowering (it raises NotImplementedError),
         # so it's benchmarked via regular Inductor (`--mode compile`).
-        _WIRED = {"fp8_deepseek_1x128_dim_m", "mxfp8_floor_dim_m", "nvfp4"}
+        _WIRED = {"fp8_deepseek_1x128_dim_m", "mxfp8_floor_dim_m", "mxfp8_32x32_floor", "nvfp4"}
         recipes_all = [(n, r) for n, r in RECIPES_V2 if n in _WIRED]
     else:
         recipes_all = ALL_RECIPES

@@ -1,0 +1,52 @@
+{# mxfp8 FLOOR 32x32 block template: one e8m0 scale per 32x32 SQUARE block (amax over the whole
+   1024-element block), fp8 qdata the same shape as the input. Unlike the dim-M/dim-K templates
+   this reduces over BOTH dims (a 2D block), NO transpose. The emitter body:
+     - reshapes x_var (BLOCK_M, BLOCK_N) -> (BLOCK_M//32, 32, BLOCK_N//32, 32), swaps the two middle
+       axes (tl.trans) and flattens each block to (RB, CB, 1024), reduces the block amax to the e8m0
+       scale, then divides + casts to fp8 and un-blocks back to (BLOCK_M, BLOCK_N);
+     - writes `qdata_var` (BLOCK_M, BLOCK_N) fp8 and `scale_var` (BLOCK_M//32, BLOCK_N//32) e8m0.
+
+   (A hand-written near-duplicate of the other reduction templates; the family will be unified once
+   the template is parameterized over group width / reduction axis -- see future_ideas.md.)
+
+   The body is str.replace'd into this source in the lowering BEFORE jinja rendering.
+
+   Inductor input/output convention (like the dim-M templates: qdata is the primary output):
+     input_nodes  = [X, S]     (S is the mutated secondary output: the per-block e8m0 scale,
+                                layout (M//32, N//32) float8_e8m0fnu)
+     primary output = qdata    layout (M, N) fp8_e4m3, row-major; allocated via layout
+#}
+{{def_kernel("X", "S")}}
+    pid_m = tl.program_id(0)  # over input row-tiles (BLOCK_M)
+    pid_n = tl.program_id(1)  # over input col-tiles (BLOCK_N)
+
+    stride_xm, stride_xn = {{stride("X")}}
+    stride_sm, stride_sn = {{stride("S")}}
+
+    M = {{size("X", 0)}}
+    N = {{size("X", 1)}}
+    MG = M // 32  # scale rows: one e8m0 per 32 input rows
+    NG = N // 32  # scale cols: one e8m0 per 32 input cols
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)  # input rows
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)  # input cols
+    x_offs = offs_m[:, None] * stride_xm + offs_n[None, :] * stride_xn
+    x_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    x_var = tl.load(X + x_offs, mask=x_mask, other=0.0)
+
+    # ---- spliced FxTritonEmitter body: reads x_var, writes qdata_var + scale_var ----
+    __EMITTER_BODY__
+    # ---- end spliced body ----
+
+    # scale store (mutated input): (M//32, N//32) e8m0, row-major, NO transpose.
+    offs_mg = pid_m * (BLOCK_M // 32) + tl.arange(0, BLOCK_M // 32)
+    offs_ng = pid_n * (BLOCK_N // 32) + tl.arange(0, BLOCK_N // 32)
+    s_offs = offs_mg[:, None] * stride_sm + offs_ng[None, :] * stride_sn
+    s_mask = (offs_mg[:, None] < MG) & (offs_ng[None, :] < NG)
+    tl.store(S + s_offs, scale_var, mask=s_mask)
+
+    # primary output: qdata (M, N) fp8, row-major (same shape as the input tile, NO transpose).
+    idx_m = offs_m[:, None]
+    idx_n = offs_n[None, :]
+    out_mask = (idx_m < M) & (idx_n < N)
+    {{ store_output(("idx_m", "idx_n"), "qdata_var", "out_mask", val_shape=("BLOCK_M", "BLOCK_N")) }}

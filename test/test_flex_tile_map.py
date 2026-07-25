@@ -37,6 +37,7 @@ from quant_cast_bench.flex_tile_map.recipes import (
 from quant_cast_bench.quant_cast_gold.recipes import (
     debug_relu_f,
     deepseek_1x128_dim_m_f,
+    mxfp8_32x32_floor_f,
     mxfp8_floor_dim_m_f,
     nvfp4_gs_f,
     nvfp4_gs_scale,
@@ -249,6 +250,27 @@ def test_triton_template_nvfp4_compiled():
     assert s.shape == (256, 256 // 16) and s.dtype == torch.float8_e4m3fn
     # tile-invariant recipe, so the template result is bit-exact vs the reference (qdata compared as
     # packed-fp4 bytes, scale as e4m3 bytes).
+    assert qdata_equal(q, qr)
+    assert qdata_equal(s, sr)
+
+
+def test_triton_template_mxfp8_32x32_floor_compiled():
+    # mxfp8-floor 32x32 exercises the emitter's block_2d path: the traced `f` splits BOTH dims into
+    # 32x32 blocks (a rank-4 reshape + permute swapping the two middle axes), flattens each block to
+    # 1024 elements, reduces the whole-block amax to an e8m0 scale, then un-blocks the fp8 qdata back
+    # to the input shape -- NO transpose. Outputs: fp8 qdata (M, N) + e8m0 scale (M//32, N//32).
+    torch.manual_seed(0)
+    x = torch.randn(256, 256, dtype=torch.bfloat16, device="cuda")
+
+    qr, sr = mxfp8_32x32_floor_f(x)  # eager reference (whole tensor)
+
+    compiled = torch.compile(flex_tile_map)
+    q, s = compiled(x, mxfp8_32x32_floor_f, _backend=FlexTileMapBackend.TRITON_TEMPLATE)
+
+    assert q.shape == (256, 256) and q.dtype == torch.float8_e4m3fn
+    assert s.shape == (256 // 32, 256 // 32) and s.dtype == torch.float8_e8m0fnu
+    # tile-invariant recipe, so the template result is bit-exact vs the reference (qdata compared as
+    # fp8 bytes, scale as e8m0 bytes).
     assert qdata_equal(q, qr)
     assert qdata_equal(s, sr)
 

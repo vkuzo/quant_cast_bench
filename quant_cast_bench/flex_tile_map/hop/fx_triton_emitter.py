@@ -97,8 +97,9 @@ class FxTritonEmitter:
     loaded into the corresponding `aux_names` (e.g. the nvfp4 per-tensor outer scale into
     "outer_var"). It ends by aliasing each graph output to the corresponding `output_names` entry.
     `group` is the detected reduction group width (e.g. 128), or None if `f` had no group reshape;
-    `reduce_kind` is "dim_m" (split dim0, transposed outputs) or "dim_k" (split the last dim, no
-    transpose -- the nvfp4/mxfp8 1xG-along-columns shape), or None.
+    `reduce_kind` is "dim_m" (split dim0, transposed outputs), "dim_k" (split the last dim, no
+    transpose -- the nvfp4/mxfp8 1xG-along-columns shape), "block_2d" (split BOTH dims into square
+    blocks and reduce over the whole block -- mxfp8 32x32), or None.
     """
 
     def __init__(
@@ -212,7 +213,7 @@ class FxTritonEmitter:
             return self._lower_bitcast(node)
         if target == aten.squeeze.dim:
             return self._lower_squeeze(node)
-        if target in (aten.t.default, aten.permute.default):
+        if target in (aten.t.default, aten.permute.default, aten.transpose.int):
             return self._lower_transpose(node)
         if target in (aten.clone.default, aten.alias.default):
             # contiguity/aliasing are memory-format hints; in registers both are no-op passthroughs.
@@ -234,30 +235,49 @@ class FxTritonEmitter:
     def _lower_view(self, node: torch.fx.Node):
         x = self._val(node.args[0])
         out_rank = self._meta_rank(node)
-        v = self._meta_val(node)
-        if out_rank == 3:
-            in_shape = tuple(int(s) for s in self._meta_val(node.args[0]).shape)
-            out_shape = tuple(int(s) for s in v.shape)
-            # A group reshape splits one 2D axis into (num_groups, group). Two variants:
-            #   dim-M: split the FIRST dim  (BM, BN) -> (BM//G, G, BN)   [out_shape[0] != in_shape[0]]
-            #   dim-K: split the LAST dim   (BM, BN) -> (BM, BN//G, G)   [out_shape[0] == in_shape[0]]
-            # dim-M reduces down rows and transposes outputs; dim-K reduces along columns in
-            # G-groups with no transpose (the nvfp4/mxfp8 1xG-along-columns shape).
-            if out_shape[0] == in_shape[0]:
-                self.reduce_kind = "dim_k"
-                self.group = out_shape[2]
-                shape = f"[{self.bm}, {self.bn} // {self.group}, {self.group}]"
+        in_rank = self._meta_rank(node.args[0])
+        in_shape = tuple(int(s) for s in self._meta_val(node.args[0]).shape)
+        out_shape = tuple(int(s) for s in self._meta_val(node).shape)
+        if out_rank == 4:
+            # 2D block reduction (mxfp8 32x32): a square-block cast splits BOTH dims into
+            # (num_blocks, B). Two shapes, distinguished by the input rank:
+            #   in_rank 2: (BM, BN)      -> (BM//B, B, BN//B, B)   [the forward split]
+            #   in_rank 3: (RB, CB, B*B) -> (RB, CB, B, B)          [the reverse, for qdata]
+            # The forward split is where we detect the block_2d kind (group = the block edge B).
+            if in_rank == 2:
+                self.reduce_kind = "block_2d"
+                self.group = out_shape[1]  # block edge (32)
+                g = self.group
+                shape = f"[{self.bm} // {g}, {g}, {self.bn} // {g}, {g}]"
             else:
-                self.reduce_kind = "dim_m"
-                self.group = out_shape[1]
-                shape = f"[{self.bm} // {self.group}, {self.group}, {self.bn}]"
+                g = self.group
+                shape = f"[{self.bm} // {g}, {self.bn} // {g}, {g}, {g}]"
+        elif out_rank == 3:
+            if self.reduce_kind == "block_2d":
+                # combine the two block axes into one reducible axis: (RB, CB, B, B) -> (RB, CB, B*B)
+                g = self.group
+                shape = f"[{self.bm} // {g}, {self.bn} // {g}, {g} * {g}]"
+            else:
+                # A group reshape splits one 2D axis into (num_groups, group). Two variants:
+                #   dim-M: split the FIRST dim (BM, BN) -> (BM//G, G, BN)   [out_shape[0] != in]
+                #   dim-K: split the LAST dim  (BM, BN) -> (BM, BN//G, G)   [out_shape[0] == in]
+                # dim-M reduces down rows and transposes outputs; dim-K reduces along columns in
+                # G-groups with no transpose (the nvfp4/mxfp8 1xG-along-columns shape).
+                if out_shape[0] == in_shape[0]:
+                    self.reduce_kind = "dim_k"
+                    self.group = out_shape[2]
+                    shape = f"[{self.bm}, {self.bn} // {self.group}, {self.group}]"
+                else:
+                    self.reduce_kind = "dim_m"
+                    self.group = out_shape[1]
+                    shape = f"[{self.bm} // {self.group}, {self.group}, {self.bn}]"
         elif out_rank == 2:
             if self.reduce_kind == "dim_k":
                 # only rank-2 view on the dim-K path is the fp4-packed qdata flatten:
                 # (BM, BN//G, G//2) fp4x2 -> (BM, BN//2). Two fp4 per byte halves the columns.
                 shape = f"[{self.bm}, {self.bn} // 2]"
             else:
-                # flatten the group axis back to the full tile: (..., G, ...) -> (BM, BN)
+                # dim-M / block_2d: flatten back to the full tile (..., G, ...) -> (BM, BN)
                 shape = f"[{self.bm}, {self.bn}]"
         else:
             raise NotImplementedError(f"view to rank {out_rank} unsupported")
@@ -269,7 +289,10 @@ class FxTritonEmitter:
         x = self._val(node.args[0])
         if self.group is None:
             raise NotImplementedError("squeeze before any group reshape")
-        if self.reduce_kind == "dim_k":
+        if self.reduce_kind == "block_2d":
+            # (RB, CB, 1) -> (RB, CB) = (BM//B, BN//B): one scale per 32x32 block.
+            shape = f"[{self.bm} // {self.group}, {self.bn} // {self.group}]"
+        elif self.reduce_kind == "dim_k":
             shape = f"[{self.bm}, {self.bn} // {self.group}]"
         else:
             shape = f"[{self.bm} // {self.group}, {self.bn}]"
@@ -288,7 +311,10 @@ class FxTritonEmitter:
         if keepdim:
             # re-insert the reduced axis as size 1 so the following broadcast lines up.
             #   dim-M (axis 1): (NG, 1, BN);  dim-K (axis 2): (BM, BN//G, 1)
-            if self.reduce_kind == "dim_k":
+            #   block_2d (axis 2): (RB, CB, 1) = (BM//B, BN//B, 1)
+            if self.reduce_kind == "block_2d":
+                shape = f"[{self.bm} // {self.group}, {self.bn} // {self.group}, 1]"
+            elif self.reduce_kind == "dim_k":
                 shape = f"[{self.bm}, {self.bn} // {self.group}, 1]"
             else:
                 shape = f"[{self.bm} // {self.group}, 1, {self.bn}]"
@@ -390,14 +416,21 @@ class FxTritonEmitter:
         return self.cse.generate(expr, dtype=dtype)
 
     def _lower_transpose(self, node: torch.fx.Node):
-        # dim-M outputs are `.t()`-ed (2D): a register-level tl.trans of the tile. permute is only
-        # supported when it's a plain 2D transpose (the only shape the dim-M recipe produces).
+        # dim-M outputs are `.t()`-ed (2D): a register-level tl.trans of the tile. The block_2d
+        # (mxfp8 32x32) path swaps two axes of a rank-4 block tile -- traced as a `permute`
+        # ([0, 2, 1, 3]) -- which lowers to the same explicit `tl.trans(x, *perm)` permutation.
         x = self._val(node.args[0])
-        if node.target == aten.permute.default:
-            dims = node.args[1]
-            if list(dims) != [1, 0]:
-                raise NotImplementedError(f"only 2D transpose permute supported, got {dims}")
-        return self.cse.generate(f"tl.trans({x})", dtype=self._meta_dtype(node))
+        rank = self._meta_rank(node.args[0])
+        if node.target == aten.transpose.int:
+            d0, d1 = node.args[1] % rank, node.args[2] % rank
+            perm = list(range(rank))
+            perm[d0], perm[d1] = perm[d1], perm[d0]
+        elif node.target == aten.permute.default:
+            perm = [d % rank for d in node.args[1]]
+        else:  # aten.t.default (2D)
+            perm = [1, 0]
+        dims_str = ", ".join(str(d) for d in perm)
+        return self.cse.generate(f"tl.trans({x}, {dims_str})", dtype=self._meta_dtype(node))
 
     def _lower_pointwise(self, node: torch.fx.Node):
         name = self._op_name(node.target)
