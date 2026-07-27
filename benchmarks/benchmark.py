@@ -111,8 +111,13 @@ def _bench_one(recipe, M, K, mode):
                 _backend=FlexTileMapBackend.INDUCTOR,
             )
     else:
-        # "triton"/"cute": run the recipe's hand-written kernel directly.
-        fn = recipe.triton_fn if mode == "triton" else recipe.cute_fn
+        # "triton"/"cute"/"helion": run the recipe's hand-written kernel directly.
+        if mode == "triton":
+            fn = recipe.triton_fn
+        elif mode == "helion":
+            fn = recipe.helion_fn
+        else:
+            fn = recipe.cute_fn
 
         def run():
             return fn(*inputs, **tile_kwargs)
@@ -150,19 +155,22 @@ def main(
     assert "B200" in device_name, f"this benchmark assumes B200, got {device_name!r}"
 
     mode = mode or "compile"
-    assert mode in ("compile", "triton", "cute", "flex_tile_map_triton"), (
-        f"mode must be 'compile', 'triton', 'cute', or 'flex_tile_map_triton', got {mode!r}"
+    assert mode in ("compile", "triton", "cute", "helion", "flex_tile_map_triton"), (
+        f"mode must be 'compile', 'triton', 'cute', 'helion', or 'flex_tile_map_triton', "
+        f"got {mode!r}"
     )
 
     # "compile" sweeps the gold recipes through flex_tile_map's INDUCTOR backend under
-    # torch.compile (regular Inductor lowers `f`); "triton"/"cute" sweep the hand-written kernel
-    # sets (triton_fn / cute_fn); "flex_tile_map_triton" sweeps the flex_tile_map RecipeV2 set
+    # torch.compile (regular Inductor lowers `f`); "triton"/"cute"/"helion" sweep the hand-written
+    # kernel sets (triton_fn / cute_fn / helion_fn); "flex_tile_map_triton" sweeps the RecipeV2 set
     # through the TRITON_TEMPLATE backend (the hand template). All recipe kinds carry
     # example_input_fn / perf_description, so the rest of the sweep is identical.
     if mode == "triton":
         from quant_cast_bench.quant_cast_triton.recipes import ALL_RECIPES as recipes_all
     elif mode == "cute":
         from quant_cast_bench.quant_cast_cute.recipes import ALL_RECIPES as recipes_all
+    elif mode == "helion":
+        from quant_cast_bench.quant_cast_helion.recipes import ALL_RECIPES as recipes_all
     elif mode == "flex_tile_map_triton":
         from quant_cast_bench.flex_tile_map.recipes import RECIPES_V2
         # wired through the TRITON_TEMPLATE backend: the in-fragment group-reduction casts. Two
