@@ -47,7 +47,9 @@ _LABELS = {
     "helion": "helion: helion vibed with opus 4.8",
 }
 _BASELINE = "relu (baseline)"
-_EXCLUDE = {"fp8_rowwise", "fp8_colwise"}  # kernels dropped from the chart (still in the CSV/tables)
+# kernels dropped from the chart (still in the CSV): fp8_rowwise/fp8_colwise per request;
+# debug_relu is a debug duplicate of the relu baseline.
+_EXCLUDE = {"fp8_rowwise", "fp8_colwise", "debug_relu"}
 # row groupings (by position, top-to-bottom): (label, number of rows). The last group takes all
 # remaining rows. Rendered as full-width dashed separators with a label at the top of each band.
 _GROUP_SIZES = [
