@@ -1,13 +1,14 @@
 # flex_tile_map
 
-API:
-
 ```python
-# TODO align aux_inputs with flex_gemm
-outputs = flex_tile_map(fn, input, aux_inputs)
+outputs = flex_tile_map(fn, input)
 ```
 
-## Motivation #1: compiler hint for easier authoring of CODA (gemm + epilogue) code
+Two reasons for this to exist:
+1. compiler hint for easier authoring of CODA (gemm + epilogue)
+2. provide near-SOTA perf for quantization casts for training
+
+## Motivation #1: compiler hint for easier authoring of CODA (gemm + epilogue)
 
 ### before: large `torch.autograd.Function` with manual CODA in fwd+bwd
 
@@ -46,7 +47,7 @@ e = f(x, w1, w2)
 
 Note: user can still write large `torch.autograd.Function` if they want to.
 
-## Motivation #2: lightweight single-kernel API for quantization casts, faster than compile
+## Motivation #2: provide near-SOTA perf for quantization casts for training
 
 On the chart below - inductor not good at 1x128 cast across m-dim, or 128x128. 
 Easy to hand write triton kernels for these, and ~easy to make it generic to cover quant cast variants.
