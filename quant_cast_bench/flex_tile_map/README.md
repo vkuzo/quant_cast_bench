@@ -7,10 +7,9 @@ API:
 outputs = flex_tile_map(fn, input, aux_inputs)
 ```
 
-## Reason #1 to exist: express CODA in fwd+bwd without resorting to large `torch.autograd.Function`
+## Motivation #1: compiler hint for easier authoring of CODA (gemm + epilogue) code
 
-**Before** (without flex_tile_map): user writes large `torch.autograd.Function` and
-fuses gemm to epilogue by hand
+### before: large `torch.autograd.Function` with manual CODA in fwd+bwd
 
 ```python
 class FunctionalMLP(torch.autograd.Function):  # out = relu(x @ w1) @ w2
@@ -33,9 +32,7 @@ class FunctionalMLP(torch.autograd.Function):  # out = relu(x @ w1) @ w2
 e = FunctionalMLP.apply(x, w1, w2)
 ```
 
-**After** (with flex_tile_map): user writes `torch.mm` + `flex_tile_map(..., fn)`,
-torch.compile fuses the fwd+bwd parts to get equivalent code to the manual
-`torch.autograd.Function` above.
+### after: `flex_tile_map` in fwd, torch.compile fuses gemm to flex_tile_map CODA in fwd+bwd
 
 ```python
 @torch.compile()
@@ -47,7 +44,9 @@ def f(x, w1, w2):  # out = relu(x @ w1) @ w2
 e = f(x, w1, w2)
 ```
 
-## Reason #2 to exist: lightweight "tiled f" API, backend easier to optimize than general compiler
+Note: user can still write large `torch.autograd.Function` if they want to.
+
+## Motivation #2: lightweight single-kernel API for quantization casts, faster than compile
 
 On the chart below - inductor not good at 1x128 cast across m-dim, or 128x128. 
 Easy to hand write triton kernels for these, and ~easy to make it generic to cover quant cast variants.
