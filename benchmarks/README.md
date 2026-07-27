@@ -60,13 +60,15 @@ Default shape is `(M, K) = (16384, 16384)`. Assumes a B200 (peak 8 TB/s).
 ![Memory bandwidth by mode](mem_bw.png)
 
 *Achieved memory bandwidth (% of the B200 8 TB/s peak) on the x-axis, one kernel per row, with a
-marker per implementation (`compile` ●, `triton` ■, `cute` ▲). Every kernel is implemented in all
-three modes. Data lives in
+marker per implementation (`compile` ●, `triton` ■, `cute` ▲, `flex_tile_map_triton` ◆,
+`helion` ★). `compile`/`triton`/`cute` cover every kernel; `flex_tile_map_triton` and `helion`
+implement only a subset (the group-reduction casts), so those series show points on fewer rows.
+Data lives in
 [`bench_results.csv`](bench_results.csv); regenerate the chart with `python benchmarks/plot_bench.py`.
 Refresh the data by re-running the sweeps with the
 `--csv` flag — `rm benchmarks/bench_results.csv` then
-`benchmark.py --mode {compile,triton,cute} --csv benchmarks/bench_results.csv` (once per mode). A
-fresh sweep can differ ±1–2 pts from the tables below (run-to-run variance).*
+`benchmark.py --mode {compile,triton,cute,flex_tile_map_triton,helion} --csv benchmarks/bench_results.csv`
+(once per mode). A fresh sweep can differ ±1–2 pts from the tables below (run-to-run variance).*
 
 ### `--mode compile`
 
@@ -376,10 +378,10 @@ nvfp4                            0.1747  3936.7       49.2%  (1,16) block, fp4 q
 ### `--mode helion`
 
 The Helion kernels (`quant_cast_helion`, one `@helion.kernel` per recipe) are
-**correctness-first, un-autotuned** — each runs a single hand-pinned config (or Helion's default
-`autotune_effort="none"` config), chosen for a fast, deterministic debug loop rather than peak
-bandwidth. Treat these as a functional baseline, not a fair comparison to the tuned
-compile/triton/cute numbers above.
+**correctness-first** — each pins a single config (some picked by an autotuner run and then
+hardcoded, others Helion's default `autotune_effort="none"` config) rather than running a live
+autotune search, chosen for a fast, deterministic debug loop. Treat these as a functional
+baseline, not a fully-tuned comparison to the compile/triton/cute numbers above.
 
 ```
 shape: (16384, 16384)  mode: helion
