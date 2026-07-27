@@ -26,22 +26,28 @@ matplotlib.use("Agg")  # headless: write a PNG, never open a window
 import matplotlib.pyplot as plt  # noqa: E402
 from matplotlib.ticker import PercentFormatter  # noqa: E402
 
-_MODES = ["compile", "triton", "cute"]       # default series order (also the legend order)
+# default series order (also the legend order)
+_MODES = ["compile", "triton", "cute", "flex_tile_map_triton", "helion"]
 _COLORS = {
     "compile": "#4C72B0",
     "triton": "#DD8452",
     "cute": "#55A868",
     "flex_tile_map_triton": "#C44E52",
+    "helion": "#937860",
 }
-_MARKERS = {"compile": "o", "triton": "s", "cute": "^", "flex_tile_map_triton": "D"}  # icon per series
+_MARKERS = {
+    "compile": "o", "triton": "s", "cute": "^", "flex_tile_map_triton": "D", "helion": "*",
+}  # icon per series
 # legend labels spell out what each mode is
 _LABELS = {
     "compile": "compile: torch.compile + inductor",
     "triton": "triton: triton vibed with opus 4.8",
     "cute": "cute: cuteDSL vibed with opus 4.8",
     "flex_tile_map_triton": "flex_tile_map_triton: plain-pytorch f on the hop/ template",
+    "helion": "helion: helion vibed with opus 4.8",
 }
 _BASELINE = "relu (baseline)"
+_EXCLUDE = {"fp8_rowwise", "fp8_colwise"}  # kernels dropped from the chart (still in the CSV/tables)
 # row groupings (by position, top-to-bottom): (label, number of rows). The last group takes all
 # remaining rows. Rendered as full-width dashed separators with a label at the top of each band.
 _GROUP_SIZES = [
@@ -50,7 +56,6 @@ _GROUP_SIZES = [
     ("8-bit dim-m", 3),
     ("8-bit dim-km", 3),
     ("8-bit square", 2),
-    ("row|col-wise", 2),
     ("other", None),  # None = all remaining rows
 ]
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -115,10 +120,13 @@ def _plot(data, kernels, out_path, modes=_MODES, group_sizes=_GROUP_SIZES, title
             start += size
             ax.axhline(start - 0.5, color="gray", ls="--", lw=1.0, alpha=0.7, zorder=1)
 
-    # pad the title up to leave room for the horizontal legend sitting just above the axes
-    ax.set_title(title, pad=34)
-    # legend outside the data area (above the axes), series laid out horizontally
-    ax.legend(title="mode", ncol=len(modes), loc="lower center", bbox_to_anchor=(0.5, 1.0),
+    # legend outside the data area (above the axes), series laid out horizontally. Cap the columns
+    # so many/long labels wrap onto multiple rows instead of stretching the figure super-wide.
+    ncol = min(len(modes), 2)
+    nrows = -(-len(modes) // ncol)  # ceil
+    # pad the title up to leave room for the (possibly multi-row) legend sitting just above the axes
+    ax.set_title(title, pad=20 + 16 * nrows)
+    ax.legend(title="mode", ncol=ncol, loc="lower center", bbox_to_anchor=(0.5, 1.0),
               frameon=False, borderaxespad=0.0)
     fig.tight_layout()
     fig.savefig(out_path, dpi=150, bbox_inches="tight")  # bbox_inches captures the outside legend
@@ -151,7 +159,8 @@ def main(
         return p if os.path.isabs(p) else os.path.join(root, p)
 
     data, order = _load(_resolve(csv))
-    kernels = [k for k in order if k != _BASELINE]  # exclude the relu baseline entirely
+    # exclude the relu baseline entirely, plus any chart-only exclusions (still in the CSV/tables)
+    kernels = [k for k in order if k != _BASELINE and k not in _EXCLUDE]
     if kernel_filter is not None:
         kernels = [k for k in kernels if kernel_filter in k]
 
