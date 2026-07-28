@@ -20,13 +20,16 @@ from quant_cast_bench.quant_cast_gold.recipes import (
     Deepseek1x128DimKmGold,
     Deepseek1x128DimMGold,
     Deepseek128x128Gold,
+    HadamardRht,
     Mxfp832x32FloorGold,
     Mxfp8FloorDimKmGold,
     Mxfp8FloorDimKmSwizzleGold,
     Mxfp8FloorDimMGold,
     Mxfp8FloorDimMSwizzleGold,
     Nvfp4GsGold,
+    Nvfp4GsSwizzleGold,
     QuantCastSingleKernelGold,
+    SrF32ToBf16,
 )
 
 # fp8_e4m3fn representable max; the deepseek scale is amax / fp8_max (see the gold recipe).
@@ -736,6 +739,191 @@ def nvfp4_gs_helion(x, outer_scale, **kwargs):
 NVFP4 = QuantCastHelionRecipe.from_gold(Nvfp4GsGold, helion_fn=nvfp4_gs_helion)
 
 
+# ---------------------------------------------------------------------------
+# nvfp4 (two-level) with the e4m3 INNER scale in the NVIDIA 32x4x4 SWIZZLED block grid. Same two-level
+# cast + fp4-packed qdata as `_nvfp4_gs_kernel` (qdata is byte-identical) -- only the inner scale
+# layout differs: it's scattered straight into the swizzled block grid in-kernel instead of stored
+# plain (M, N//16). Mirrors `nvfp4_gs_swizzle_f` (= nvfp4_gs_f then _to_blocked_4d on the inner scale).
+#
+# Like the mxfp8 swizzle kernels, to make the swizzled store a plain index we tile over the
+# block-count dims [nrb, ncb] and view x with both the M-rows and the 16-block index fully split:
+#   M-rows:   m = 128*RB + 32*a + b       (RB in [0,nrb), a in [0,4), b in [0,32))
+#   N-cols:   n = 64*CB + 16*c + 2*j + k  (CB in [0,ncb), c in [0,4)); each 16-block is (j=8, k=2)
+# so the 16-block index is w = n//16 = 4*CB + c and x_blk is 7D [RB,a,b,CB,c,j,k]. The nvfp4 cast runs
+# per 16-block (reduce (j,k)); the fp4 pack is the same hardware cvt (even k=0 -> low nibble, odd k=1
+# -> high). The swizzle of the inner scale (M, N//16) [m, w] is
+#   blocked[m//128, w//4, m%32, ((m%128)//32)*4 + w%4] = inner[m, w],
+# a pure permute of the reduced inner scale [RB,a,b,CB,c] -> blocked [RB,CB,b,a,c] (the (4,4)->16 merge
+# is a free reshape in the wrapper). block_sizes=[1, 1] pins one 128x64 x-block per program (untiled
+# register dims 4*32*4*8*2 = 8192).
+#
+# Autotuning does NOT work here (inferred, not tried), for two independent reasons:
+#   1. inline-asm autotuner crash: like `_nvfp4_gs_kernel`, this uses `hl.inline_asm_elementwise`
+#      (the _NVFP4_CVT_ASM cvt), and autotune_effort="full" crashes on that HOP -- see the note on the
+#      non-swizzle nvfp4 kernel above (gist linked there). That's why nvfp4 is pinned to "none".
+#   2. swizzle tile-shape overflow: even without the asm crash, the tile-over-block-count structure
+#      means any non-tiny block size makes the register tile block_nrb*block_ncb*8192, which overflows
+#      triton's 1,048,576 per-tensor cap at 16384x16384 (same failure confirmed empirically for
+#      `_mxfp8_floor_dim_km_swizzle_kernel`). The viable search space collapses to ~[1, 1] anyway.
+# ---------------------------------------------------------------------------
+@helion.kernel(
+    config=helion.Config(block_sizes=[1, 1], num_warps=4, num_stages=1),
+    static_shapes=True,
+    ignore_warnings=[helion.exc.TensorOperationInWrapper],
+)
+def _nvfp4_gs_swizzle_kernel(
+    x: torch.Tensor,  # (M, N) bf16 input
+    outer_scale: torch.Tensor,  # (1,) f32 per-tensor outer scale (global amax, host-computed)
+    qdata: torch.Tensor,  # (M, N // 2) uint8, fp4-packed (two e2m1 per byte), mutated in place
+    scale5: torch.Tensor,  # (nrb, ncb, 32, 4, 4) e4m3 inner scale, swizzled, pre (4,4)->16
+) -> None:
+    M, N = x.shape
+    nrb = M // 128  # M 128-row blocks
+    ncb = N // 64   # N 64-col blocks = 4 inner-16-blocks
+    xv = x.view(nrb, 4, 32, ncb, 4, 8, 2)  # [RB, a, b, CB, c, j, k]
+    qv = qdata.view(nrb, 4, 32, ncb, 4, 8)  # (M, N//2) = [RB, a, b, CB, c, j] (8 packed bytes / 16-blk)
+    for tile_rb, tile_cb in hl.tile([nrb, ncb]):
+        outer = hl.load(outer_scale, [0])
+        x_blk = xv[tile_rb, :, :, tile_cb, :, :, :].to(torch.float32)  # (trb,4,32,tcb,4,8,2)
+        amax = torch.amax(torch.amax(torch.abs(x_blk), dim=6), dim=5)  # [RB,a,b,CB,c] over the 16
+        # inner e4m3 block scale relative to the outer scale; round-trip through e4m3 BEFORE using it
+        # in the reciprocal (matches the gold / the non-swizzle kernel -- load-bearing for bit-exact).
+        inner_e4m3 = torch.clamp(
+            (amax / _F4_E2M1_MAX) / outer, _E4M3_EPS, _F8E4M3_MAX
+        ).to(torch.float8_e4m3fn)
+        recip = (1.0 / outer) / inner_e4m3.to(torch.float32)  # [RB,a,b,CB,c]
+        data_scaled = torch.clamp(
+            x_blk * recip[:, :, :, :, :, None, None], -_F4_E2M1_MAX, _F4_E2M1_MAX
+        )  # [RB,a,b,CB,c,j,k]
+        # split the pack pair (k) without strided indexing: mask-and-reduce the size-2 axis.
+        w_odd = hl.arange(2).to(torch.float32)  # [0.0, 1.0]
+        even = torch.sum(data_scaled * (1.0 - w_odd), dim=6)  # [RB,a,b,CB,c,j] -> low nibble ($2)
+        odd = torch.sum(data_scaled * w_odd, dim=6)  # [RB,a,b,CB,c,j] -> high nibble ($1)
+        packed_u16 = hl.inline_asm_elementwise(
+            _NVFP4_CVT_ASM, "=h,r,r", [odd, even],
+            dtype=torch.uint16, is_pure=True, pack=1,
+        )
+        qv[tile_rb, :, :, tile_cb, :, :] = packed_u16.to(torch.uint8)
+        # swizzled inner scale: [RB,a,b,CB,c] -> blocked [RB,CB,b,a,c]
+        scale5[tile_rb, tile_cb, :, :, :] = inner_e4m3.permute(0, 3, 2, 1, 4)
+
+
+def nvfp4_gs_swizzle_helion(x, outer_scale, **kwargs):
+    """nvfp4 two-level cast in Helion with the e4m3 inner scale in the NVIDIA 32x4x4 swizzled block
+    grid: per-16 e4m3 inner scale (relative to the host-computed per-tensor `outer_scale` aux),
+    fp4-packed qdata (M, N//2) + the inner scale scattered directly into the swizzled block grid
+    (nrb, ncb, 32, 16). Matches the gold `nvfp4_gs_swizzle_f`. The (4,4)->16 merge is a free contiguous
+    reshape here. `**kwargs` are accepted and ignored."""
+    assert x.is_contiguous() and x.dim() == 2
+    M, N = x.shape
+    assert M % 128 == 0 and N % 64 == 0, (
+        f"nvfp4 swizzle requires M divisible by 128 and N by 64, got {(M, N)}"
+    )
+    nrb, ncb = M // 128, N // 64
+    qdata = torch.empty((M, N // 2), dtype=torch.uint8, device=x.device)
+    scale5 = torch.empty((nrb, ncb, 32, 4, 4), dtype=torch.float8_e4m3fn, device=x.device)
+    _nvfp4_gs_swizzle_kernel(x, outer_scale.reshape(1).to(torch.float32), qdata, scale5)
+    inner_swizzled = scale5.reshape(nrb, ncb, 32, 16)
+    return qdata.view(torch.float4_e2m1fn_x2), inner_swizzled
+
+
+NVFP4_SWIZZLE = QuantCastHelionRecipe.from_gold(
+    Nvfp4GsSwizzleGold, helion_fn=nvfp4_gs_swizzle_helion
+)
+
+
+# ---------------------------------------------------------------------------
+# bf16 16x16 randomized Hadamard transform (RHT): bf16 in, bf16 out, NO scale (a 1-tuple output).
+# Mirrors hadamard_rht_f -- out = (x.reshape(..., 16) @ rht).reshape(...). The RHT matrix is a (16,16)
+# bf16 aux input (built on the host). Like the triton kernel, flatten the whole tensor to (n_groups,
+# 16) groups of 16 and give each program a (BLOCK_G, 16) tile -> a batch of (BLOCK_G, 16) @ (16, 16)
+# matmuls. Compute in fp32 (upcasting the bf16 inputs is exact, so an fp32 matmul reproduces torch's
+# bf16 gemm with fp32 accumulation) then cast back to bf16. It's a bandwidth-bound elementwise-shaped
+# op (read N, write N; the K=16 dot is tiny), but autotune_effort="none"'s default config picks a tiny
+# block (block_sizes=[32] -> 512 elems/program) and only reaches ~40% peak. A swept block matters here:
+# pin block_sizes=[512] (matching the triton kernel's BLOCK_G=512), num_warps=8 -> ~64% peak. Larger
+# blocks (>=1024 groups) overflow tensor memory since the (bg,16)@(16,16) matmul lowers to tl.dot/tmem.
+# ---------------------------------------------------------------------------
+@helion.kernel(
+    config=helion.Config(atomic_indexing=[], block_sizes=[128], indexing=['pointer', 'pointer', 'pointer'], load_eviction_policies=['first', ''], num_stages=3, num_warps=2, pid_type='flat', range_flattens=[None], range_multi_buffers=[None], range_num_stages=[], range_unroll_factors=[0], range_warp_specializes=[None]), 
+    static_shapes=True,
+    ignore_warnings=[helion.exc.TensorOperationInWrapper],
+)
+def _rht_kernel(
+    x: torch.Tensor,  # (n_groups, 16) bf16 input (the (M, N) tensor flattened to 16-element groups)
+    rht: torch.Tensor,  # (16, 16) bf16 RHT matrix
+    out: torch.Tensor,  # (n_groups, 16) bf16 output, mutated in place
+) -> None:
+    n_groups, _ = x.shape
+    for tile_g in hl.tile(n_groups):
+        x_blk = x[tile_g, :].to(torch.float32)  # (bg, 16)
+        r = rht[:, :].to(torch.float32)  # (16, 16)
+        out[tile_g, :] = torch.matmul(x_blk, r).to(torch.bfloat16)  # (bg, 16), fp32 accum -> bf16
+
+
+def rht_helion(x, rht, **kwargs):
+    """16x16 randomized Hadamard transform along the last dim in Helion (mirrors `hadamard_rht_f`):
+    bf16 in, bf16 out, no scale. `rht` is the (16,16) RHT matrix (host-built aux). Returns a 1-tuple
+    `(out,)`. `**kwargs` are accepted and ignored (the kernel owns its tiling)."""
+    assert x.is_contiguous() and x.dim() == 2
+    M, N = x.shape
+    assert N % 16 == 0, f"bf16_rht requires N divisible by 16, got N={N}"
+    n_groups = (M * N) // 16
+    out = torch.empty_like(x)
+    _rht_kernel(x.view(n_groups, 16), rht.contiguous(), out.view(n_groups, 16))
+    return (out,)
+
+
+BF16_RHT = QuantCastHelionRecipe.from_gold(HadamardRht, helion_fn=rht_helion)
+
+
+# ---------------------------------------------------------------------------
+# Stochastic-rounding fp32 -> bf16 (mirrors sr_bf16_f). SR add-then-truncate: dither the 16 mantissa
+# bits fp32->bf16 drops with a uniform 16-bit value, then mask them off. bf16 shares fp32's exponent
+# so there's no rebias/scale/packing -- just the dither. Randomness comes from Helion's own
+# counter-based Philox (`hl.rand`, offsets derived from the flat tile index), so the draws don't
+# match the torch reference bit-for-bit -- only the SR *property* (unbiased, lands on the two
+# bracketing bf16 grid points) is well-defined, and that's what the test's correctness_fn checks for
+# the *_sr recipes. Elementwise + bandwidth-bound (read fp32, write bf16); autotune_effort="none" ->
+# default config, no search (fast to iterate).
+# ---------------------------------------------------------------------------
+@helion.kernel(
+    config=helion.Config(atomic_indexing=[], block_sizes=[2048], indexing=['tensor_descriptor', 'tensor_descriptor'], load_eviction_policies=[''], maxnreg=128, num_sm_multiplier=8, num_stages=2, num_warps=16, pid_type='persistent_interleaved', range_flattens=[False], range_multi_buffers=[None], range_unroll_factors=[0], range_warp_specializes=[True]), 
+    static_shapes=True,
+    ignore_warnings=[helion.exc.TensorOperationInWrapper],
+)
+def _sr_bf16_kernel(
+    x: torch.Tensor,  # (n,) fp32 input, flattened
+    out: torch.Tensor,  # (n,) bf16 output, mutated in place
+    seed: int,  # Philox seed (first 32 bits of the key)
+) -> None:
+    n, = x.shape
+    for tile in hl.tile(n):
+        xf = x[tile]
+        u = hl.rand([tile], seed=seed)  # uniform [0, 1) per element, distinct offset per flat index
+        rand16 = (u * 65536.0).to(torch.int32)  # uniform 16-bit dither in [0, 2**16)
+        xi = xf.view(torch.int32) + rand16  # bitcast fp32->int32, add the dither...
+        xi = xi & -65536  # ...then truncate the low 16 mantissa bits (-65536 == 0xFFFF0000)
+        out[tile] = xi.view(torch.float32).to(torch.bfloat16)  # exact: low 16 bits are zero
+
+
+def sr_bf16_helion(x, key, **kwargs):
+    """fp32 -> bf16 stochastic rounding in Helion (mirrors `sr_bf16_f`). `key` is a torch Philox key
+    tensor; its first 32-bit word seeds `hl.rand`. SR is unbiased -- a value between two bf16 grid
+    points rounds up with probability (x-lo)/(hi-lo). Returns a 1-tuple `(out,)`. `**kwargs` accepted
+    and ignored (the kernel owns its tiling)."""
+    assert x.dtype == torch.float32, f"SR bf16 expects fp32 input, got {x.dtype}"
+    assert x.is_contiguous()
+    n = x.numel()
+    seed = int(key.reshape(-1)[0].item()) & 0x7FFFFFFF  # first word of the key as a Philox seed
+    out = torch.empty_like(x, dtype=torch.bfloat16)
+    _sr_bf16_kernel(x.view(n), out.view(n), seed)
+    return (out,)
+
+
+FP32_TO_BF16_SR = QuantCastHelionRecipe.from_gold(SrF32ToBf16, helion_fn=sr_bf16_helion)
+
+
 # Order mirrors quant_cast_gold.ALL_RECIPES / quant_cast_triton.ALL_RECIPES (only the recipes with
 # a Helion impl are listed; more will be added as they're ported).
 ALL_RECIPES = [
@@ -748,4 +936,7 @@ ALL_RECIPES = [
     ("mxfp8_32x32_floor", MXFP8_32X32_FLOOR),
     ("fp8_deepseek_128x128", FP8_DEEPSEEK_128X128),
     ("nvfp4", NVFP4),
+    ("nvfp4_swizzle", NVFP4_SWIZZLE),
+    ("bf16_rht", BF16_RHT),
+    ("fp32_to_bf16_sr", FP32_TO_BF16_SR),
 ]

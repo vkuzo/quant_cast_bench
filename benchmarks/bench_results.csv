@@ -3,7 +3,7 @@ relu (baseline),compile,0.1791,5993.7,74.92
 relu (baseline),triton,0.1791,5994.4,74.93
 relu (baseline),cute,0.1792,5993.5,74.92
 relu (baseline),flex_tile_map_triton,0.1791,5994.6,74.93
-relu (baseline),helion,0.1792,5992.8,74.91
+relu (baseline),helion,0.1792,5993.4,74.92
 fp8_tensorwise_precalc_scale,compile,0.1429,5636.6,70.46
 fp8_tensorwise_precalc_scale,triton,0.1422,5663.9,70.80
 fp8_tensorwise_precalc_scale,cute,0.1170,6885.3,86.07
@@ -17,7 +17,7 @@ mxfp8_floor_dim_m,compile,0.5800,1402.9,17.54
 mxfp8_floor_dim_m,triton,0.1687,4822.2,60.28
 mxfp8_floor_dim_m,cute,0.1598,5090.8,63.64
 mxfp8_floor_dim_m,flex_tile_map_triton,0.1909,4261.5,53.27
-mxfp8_floor_dim_m,helion,0.1843,4415.3,55.19
+mxfp8_floor_dim_m,helion,0.1842,4417.7,55.22
 mxfp8_floor_dim_m_swizzle,compile,0.5517,1475.0,18.44
 mxfp8_floor_dim_m_swizzle,triton,0.1399,5816.3,72.70
 mxfp8_floor_dim_m_swizzle,cute,0.1377,5910.1,73.88
@@ -39,7 +39,7 @@ mxfp8_32x32_floor,compile,0.3789,2126.0,26.58
 mxfp8_32x32_floor,triton,0.1287,6260.6,78.26
 mxfp8_32x32_floor,cute,0.1408,5721.8,71.52
 mxfp8_32x32_floor,flex_tile_map_triton,0.1285,6267.0,78.34
-mxfp8_32x32_floor,helion,0.1909,4219.6,52.75
+mxfp8_32x32_floor,helion,0.1927,4179.6,52.24
 fp8_deepseek_128x128,compile,0.2269,3548.9,44.36
 fp8_deepseek_128x128,triton,0.1306,6166.1,77.08
 fp8_deepseek_128x128,cute,0.1415,5690.7,71.13
@@ -52,7 +52,7 @@ fp8_colwise,cute,0.2179,3696.3,46.20
 nvfp4,compile,0.3742,1838.1,22.98
 nvfp4,triton,0.1290,5333.4,66.67
 nvfp4,flex_tile_map_triton,0.1376,4998.3,62.48
-nvfp4,helion,0.3283,2095.0,26.19
+nvfp4,helion,0.3288,2092.0,26.15
 nvfp4_swizzle,compile,0.3863,1780.5,22.26
 nvfp4_swizzle,triton,0.1384,4970.6,62.13
 nvfp4_swizzle,cute,0.1341,5129.4,64.12
@@ -65,8 +65,11 @@ fp32_to_bf16_sr,cute,0.2375,6782.4,84.78
 fp32_to_bf16_sr_global_offsets,triton,0.2582,6238.1,77.98
 fp32_to_bf16_sr_global_offsets,cute,0.2374,6783.8,84.80
 debug_relu,compile,0.1661,6465.6,80.82
-mxfp8_floor_dim_m_swizzle,helion,0.2804,2902.1,36.28
-mxfp8_floor_dim_km,helion,0.5495,1984.6,24.81
-mxfp8_floor_dim_km_swizzle,helion,0.5046,2161.0,27.01
-fp8_deepseek_1x128_dim_km,helion,0.2930,3721.3,46.52
-fp8_deepseek_128x128,helion,0.1355,5944.9,74.31
+mxfp8_floor_dim_m_swizzle,helion,0.2773,2933.9,36.67
+mxfp8_floor_dim_km,helion,0.5480,1989.9,24.87
+mxfp8_floor_dim_km_swizzle,helion,0.5026,2169.8,27.12
+fp8_deepseek_1x128_dim_km,helion,0.2908,3750.5,46.88
+fp8_deepseek_128x128,helion,0.1319,6103.9,76.30
+nvfp4_swizzle,helion,0.2300,2990.4,37.38
+bf16_rht,helion,0.1575,6818.8,85.23
+fp32_to_bf16_sr,helion,4.6893,343.5,4.29
