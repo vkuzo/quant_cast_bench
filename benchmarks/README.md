@@ -1,34 +1,6 @@
 # quant_cast_bench
 
-Memory-bandwidth benchmark for the `quant_cast_gold` recipes. Each recipe is a memory-bound
-cast, so the signal is achieved memory bandwidth vs. the B200 ceiling (8 TB/s). Per `mode`, the
-benchmark either `torch.compile`s each gold recipe's reference fn (`compile`, the default) or
-runs its hand-written kernels (`triton` / `cute`), times each with `do_bench_using_profiling`,
-and reports latency + GB/s + % of peak. The `relu (baseline)` row anchors the achievable ceiling
-for the shape.
-
-## torchinductor gaps vs triton
-
-* square quant block sizes (32x32, 128x128, etc)
-  - For example, on fp8_deepseek_128x128, inductor 44.3% peak mem -> triton 77.1% peak mem
-* reductions across M-dim, or K-dim and M-dim in the same kernel
-  - For example, on mxfp8_floor_dim_m, inductor 17.5% peak mem -> triton 59.9% peak mem
-* fp4
-  - nvfp4_swizzle: inductor 21.3% peak mem -> triton 60.5% peak mem
-  - nvfp4 (no swizzle): inductor 22.0% peak mem -> triton 64.5% peak mem
-* skinny (small-K/N) matmuls that are really memory-bound (inductor lowers to a cuBLAS GEMM)
-  - bf16_rht (16x16 RHT): inductor 29.3% peak mem -> triton 67.7% peak mem
-
-## triton gaps vs SOL (CUDA / CUTLASS / cute)
-
-* reductions across M-dim, or K-dim and M-dim in the same kernel
-  - For example, on mxfp8_floor_dim_m, triton 59.9% peak mem -> CUDA 67.7% peak mem
-
-    - The CUDA kernel writes quantized values directly into a transposed smem layout (out_colwise_sh[col][row]) and TMA-stores that smem tile. Triton has no
-      user-facing __shared__ + __syncthreads(), so every transpose goes through the compiler's tl.trans — which either (a) produces the uncoalesced 21-sectors/request store, or (b) if you TMA-store it, pays a register→smem
-      transpose tax. This is the crux: CUDA decouples "coalesced transposed store" from "small register footprint," and Triton cannot.
-    - Efficient TMA transfers and high occupancy at the same time. CUDA gets both because it manages smem by hand and uses tiny 64-thread CTAs. In Triton, TMA transfer size and occupancy are both governed by the tile size, so
-      you're forced to choose — big tiles (efficient TMA, low occupancy) or small tiles (high occupancy, tiny inefficient TMA transfers).
+Memory-bandwidth benchmark for the `quant_cast_gold` recipes.
 
 ## Repro
 
@@ -36,10 +8,8 @@ for the shape.
 cd /home/dev/quant_cast_bench
 
 # torch.compile the gold reference fns (default mode)
+# modes: compile, triton, cute, helion
 python benchmarks/benchmark.py --mode compile
-
-# hand-written Triton kernels
-python benchmarks/benchmark.py --mode triton
 
 # optional: single shape / single recipe
 python benchmarks/benchmark.py --mode triton --M 16384 --K 16384
@@ -51,18 +21,6 @@ Default shape is `(M, K) = (16384, 16384)`. Assumes a B200 (peak 8 TB/s).
 ## Output
 
 ![Memory bandwidth by mode](mem_bw.png)
-
-*Achieved memory bandwidth (% of the B200 8 TB/s peak) on the x-axis, one kernel per row, with a
-marker per implementation (`compile` ●, `triton` ■, `cute` ▲, `flex_tile_map_triton` ◆,
-`helion` ★). `compile`/`triton`/`cute` cover every kernel; `helion` covers most of them and
-`flex_tile_map_triton` implements only a subset (the group-reduction casts), so those series show
-points on fewer rows.
-Data lives in
-[`bench_results.csv`](bench_results.csv); regenerate the chart with `python benchmarks/plot_bench.py`.
-Refresh the data by re-running the sweeps with the
-`--csv` flag — `rm benchmarks/bench_results.csv` then
-`benchmark.py --mode {compile,triton,cute,flex_tile_map_triton,helion} --csv benchmarks/bench_results.csv`
-(once per mode). A fresh sweep can differ ±1–2 pts from the tables below (run-to-run variance).*
 
 ### `--mode compile`
 
@@ -121,10 +79,6 @@ fp32_to_bf16_sr_global_offsets         0.2582  6238.1       78.0%  tile-invarian
 ```
 
 ### `--mode cute`
-
-The CuTeDSL (`cutlass.cute`) kernels are **correctness-first (naive tiling), with seventeen tuned
-exceptions** — treat the untuned rows as a functional baseline, not a fair comparison to the
-compile/triton numbers above:
 
 * `fp8_tensorwise_precalc_scale` (85.8%) — vectorized 128-bit copy atoms (`num_bits_per_copy` +
   `assumed_align=16`) hit DRAM speed-of-light.
@@ -374,15 +328,6 @@ nvfp4                            0.1376  4998.3       62.5%  (1,16) block, fp4 q
   so the residual gaps are config/autotune spread rather than a fundamental backend penalty.
 
 ### `--mode helion`
-
-The Helion kernels (`quant_cast_helion`, one `@helion.kernel` per recipe) each pin a single config
-(hardcoded from an autotuner run, or Helion's default `autotune_effort="none"` config) rather than
-running a live autotune search, chosen for a fast, deterministic debug loop. The three
-non-transposing casts at the top of the table (`fp8_tensorwise_precalc_scale`, `fp8_deepseek_1x128`,
-`mxfp8_floor_swizzle`) were tuned end-to-end with `autotune_effort="full"` and land at or above their
-bespoke triton/cute siblings; the remaining rows are **correctness-first** (mostly a pinned
-`block_sizes=[1, 1]` or the un-tuned default), so treat those as a functional baseline, not a
-fully-tuned comparison to the compile/triton/cute numbers above.
 
 ```
 shape: (16384, 16384)  mode: helion
