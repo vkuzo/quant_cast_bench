@@ -26,8 +26,10 @@ matplotlib.use("Agg")  # headless: write a PNG, never open a window
 import matplotlib.pyplot as plt  # noqa: E402
 from matplotlib.ticker import PercentFormatter  # noqa: E402
 
-# default series order (also the legend order)
-_MODES = ["compile", "triton", "cute", "flex_tile_map_triton", "helion"]
+# default series order (also the legend order). flex_tile_map_triton is kept in the CSV and the
+# _COLORS/_MARKERS/_LABELS maps below (so `--modes ...,flex_tile_map_triton` still works) but is
+# omitted from the main chart.
+_MODES = ["compile", "helion", "triton", "cute"]
 _COLORS = {
     "compile": "#4C72B0",
     "triton": "#DD8452",

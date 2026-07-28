@@ -380,16 +380,19 @@ baseline, not a fully-tuned comparison to the compile/triton/cute numbers above.
 shape: (16384, 16384)  mode: helion
 recipe                        gpu_time_ms    gbps    pct_peak  perf_description
 --------------------------  -------------  ------  ----------  --------------------------------------------------------
-relu (baseline)                    0.1792  5992.8       74.9%
+relu (baseline)                    0.1792  5993.4       74.9%
 fp8_deepseek_1x128_dim_m           0.1522  5344.8       66.8%  (128,1) block, t-contig
-mxfp8_floor_dim_m                  0.1843  4415.3       55.2%  (32,1) block, t-contig
-mxfp8_floor_dim_m_swizzle          0.2804  2902.1       36.3%  (32,1) block, t-contig, swizzle
-mxfp8_floor_dim_km                 0.5495  1984.6       24.8%  (1,32) dim-k + (32,1) dim-m, one pass, t-contig
-mxfp8_floor_dim_km_swizzle         0.5046    2161       27.0%  (1,32) dim-k + (32,1) dim-m, one pass, t-contig, swizzle
-fp8_deepseek_1x128_dim_km           0.293  3721.3       46.5%  (1,128) dim-k + (128,1) dim-m, one pass, t-contig
-mxfp8_32x32_floor                  0.1909  4219.6       52.8%  (32,32) block
-fp8_deepseek_128x128               0.1355  5944.9       74.3%  (128,128) block
-nvfp4                              0.3283    2095       26.2%  (1,16) block, fp4 qdata, no swizzle
+mxfp8_floor_dim_m                  0.1842  4417.7       55.2%  (32,1) block, t-contig
+mxfp8_floor_dim_m_swizzle          0.2773  2933.9       36.7%  (32,1) block, t-contig, swizzle
+mxfp8_floor_dim_km                  0.548  1989.9       24.9%  (1,32) dim-k + (32,1) dim-m, one pass, t-contig
+mxfp8_floor_dim_km_swizzle         0.5026  2169.8       27.1%  (1,32) dim-k + (32,1) dim-m, one pass, t-contig, swizzle
+fp8_deepseek_1x128_dim_km          0.2908  3750.5       46.9%  (1,128) dim-k + (128,1) dim-m, one pass, t-contig
+mxfp8_32x32_floor                  0.1927  4179.6       52.2%  (32,32) block
+fp8_deepseek_128x128               0.1319  6103.9       76.3%  (128,128) block
+nvfp4                              0.3288    2092       26.1%  (1,16) block, fp4 qdata, no swizzle
+nvfp4_swizzle                        0.23  2990.4       37.4%  (1,16) block, fp4 qdata, swizzle
+bf16_rht                           0.1575  6818.8       85.2%  elementwise RHT
+fp32_to_bf16_sr                    4.6893   343.5        4.3%  elementwise SR, hl.rand (tile-local)
 ```
 
 * `fp8_deepseek_1x128_dim_m` (66.8%, i.e. ~89% of this run's relu ceiling) and `mxfp8_floor_dim_m`
@@ -400,7 +403,7 @@ nvfp4                              0.3283    2095       26.2%  (1,16) block, fp4
   128-row reduction persistent via `reduction_loops=[None]` so `x` is loaded once, not 3×; the
   autotuner's timing was too noisy to trust here). They land in the same ballpark as their bespoke
   `--mode triton` counterparts once the depressed baseline is accounted for.
-* `mxfp8_floor_dim_m_swizzle` (36.3%) is `mxfp8_floor_dim_m` with the e8m0 scale scattered **directly
+* `mxfp8_floor_dim_m_swizzle` (36.7%) is `mxfp8_floor_dim_m` with the e8m0 scale scattered **directly
   into the NVIDIA 32×4×4 swizzled block grid in-kernel** (not stored plain then swizzled in a
   wrapper). To make the swizzled store a plain index, it tiles over the *block-count* dims so the
   tile indices are the block ordinals, which forces the within-block 32/128 axes into 5D register
@@ -409,7 +412,7 @@ nvfp4                              0.3283    2095       26.2%  (1,16) block, fp4
   pinned to `block_sizes=[1, 1]` (one 128×128 block/program). That correctness-first tile is why the
   bandwidth trails the plain dim-M kernel and the triton/cute swizzle versions (72.7% / 73.9%);
   raising the block sizes is the perf follow-up.
-* `mxfp8_floor_dim_km` (24.8%) does **both** mxfp8-floor reductions in one pass over `x` and emits four
+* `mxfp8_floor_dim_km` (24.9%) does **both** mxfp8-floor reductions in one pass over `x` and emits four
   outputs — the dim-K pair `(M, N)` / `(M, N//32)` in the natural frame *and* the dim-M pair `(N, M)` /
   `(N, M//32)` transposed. It reuses the 32×32 block-grid view `(rb, 32, cb, 32)` and takes both
   reductions off the one loaded block (reduce the trailing 32 for dim-K, the leading 32 for dim-M),
@@ -418,36 +421,60 @@ nvfp4                              0.3283    2095       26.2%  (1,16) block, fp4
   compile at 512² in 10 min and would overflow the 1,048,576 per-tensor cap at this shape. The low
   bandwidth is expected — it's one read of `x` but ~2× the output writes (four tensors) on the
   correctness-first tile.
-* `mxfp8_floor_dim_km_swizzle` (27.0%) is `mxfp8_floor_dim_km` with **both** e8m0 scales scattered
+* `mxfp8_floor_dim_km_swizzle` (27.1%) is `mxfp8_floor_dim_km` with **both** e8m0 scales scattered
   directly into the NVIDIA 32×4×4 swizzled block grid in-kernel (qdata is byte-identical). To make
   both swizzled stores plain 5D indices it tiles over the 128×128 block grid and views `x` with both
   within-128 axes fully split (M-rows into `(c4, w32)`, N-cols into `(a, b)`), so one 6D loaded block
   feeds both reductions and both scale stores via pure permutes — no in-kernel reshape across a tiled
   axis (unlike the dim-M-only swizzle kernel). Same `block_sizes=[1, 1]` pin / autotune-none overflow
   as the other dim-km kernels. It's actually a hair *faster* than the plain `mxfp8_floor_dim_km`
-  (24.8%), consistent with the swizzled scale store beating the plain strided one seen elsewhere.
-* `fp8_deepseek_1x128_dim_km` (46.5%) is the deepseek analog — same one-pass four-output structure as
+  (24.9%), consistent with the swizzled scale store beating the plain strided one seen elsewhere.
+* `fp8_deepseek_1x128_dim_km` (46.9%) is the deepseek analog — same one-pass four-output structure as
   `mxfp8_floor_dim_km` but 128×128 blocks with an fp32 `amax/448` reciprocal scale instead of e8m0
-  bit-math. It's ~2× the bandwidth of the mxfp8 dim-km (24.8%) because 128-blocks write 4× fewer scale
+  bit-math. It's ~2× the bandwidth of the mxfp8 dim-km (24.9%) because 128-blocks write 4× fewer scale
   values than 32-blocks (and in larger contiguous chunks). Pinned `block_sizes=[1, 1]` for the same
   reason as the others.
-* `mxfp8_32x32_floor` (52.8%) is deliberately pinned to a **tiny `block_sizes=[1, 1]`** (one 32×32
+* `mxfp8_32x32_floor` (52.2%) is deliberately pinned to a **tiny `block_sizes=[1, 1]`** (one 32×32
   block per program). The kernel views `x` as 4D `(rb, 32, cb, 32)` and tiles only `[rb, cb]`, so the
   block sizes multiply the untiled 32×32 register tile — the default heuristic's `[16, 16]`
   materializes a 1 MB fp32 tile per program that takes ptxas ~18 s to compile cold. `[1, 1]` keeps it
   at 4 KB → ~0.5 s cold compile. That fast-debug tile is the reason the bandwidth is low here (raise
   `block_sizes` or switch to `autotune_effort="full"` if this kernel's perf becomes the point).
-* `fp8_deepseek_128x128` (74.3%) is the deepseek square-block analog of `mxfp8_32x32_floor` — same
+* `fp8_deepseek_128x128` (76.3%) is the deepseek square-block analog of `mxfp8_32x32_floor` — same
   in-place `(rb, 128, cb, 128)` block view but 128×128 blocks with an fp32 `amax/448` reciprocal scale.
-  It lands right at the relu ceiling (74.9%): 128×128 blocks write the fewest scale values of any recipe
-  here (one fp32 per 16384 elements) and there's no transpose, so it's essentially pinned to the
-  input-read + qdata-write bandwidth floor even on the same correctness-first `block_sizes=[1, 1]`.
-* `nvfp4` (26.2%) is the two-level cast (per-tensor outer scale × per-16-block e4m3 inner scale,
+  It sits right at the relu ceiling (74.9%, and edges past it run-to-run): 128×128 blocks write the
+  fewest scale values of any recipe here (one fp32 per 16384 elements) and there's no transpose, so
+  it's essentially pinned to the input-read + qdata-write bandwidth floor even on the same
+  correctness-first `block_sizes=[1, 1]`.
+* `nvfp4` (26.1%) is the two-level cast (per-tensor outer scale × per-16-block e4m3 inner scale,
   fp4-packed qdata) on Helion's default `autotune_effort="none"` config. The fp4 encode+pack uses the
   **hardware `cvt.rn.satfinite.e2m1x2.f32` PTX**, emitted via `hl.inline_asm_elementwise` (Helion's
   own inline-asm HOP — the gold's Inductor `inline_asm_...` is unreachable from a Helion kernel, and
   the native `.to(torch.float4_e2m1fn_x2)` cast mis-lowers). Bit-exact vs gold but un-tuned; the low
   bandwidth is the default config plus the extra even/odd split work, not the encode itself.
+* `nvfp4_swizzle` (37.4%) is `nvfp4` with the per-16 e4m3 inner scale scattered **directly into the
+  NVIDIA 32×4×4 swizzled block grid in-kernel** (qdata byte-identical). Like the mxfp8 swizzle kernels
+  it tiles over the block-count dims and views `x` with the within-128/64 axes fully split (a 7D block),
+  so the fp4 encode, the even/odd pack, and the swizzled scale store are all pure permutes on one loaded
+  block. It's ~1.4× the plain `nvfp4` (26.1%) — the swizzled scale store beats the plain strided one,
+  same effect seen in the mxfp8 dim-km pair. Pinned `block_sizes=[1, 1]`; `autotune_effort="none"` is
+  *not* usable here for two reasons (the inline-asm autotuner crash `nvfp4` also hits, and the swizzle
+  tile-shape overflow the other swizzle kernels hit).
+* `bf16_rht` (85.2%, i.e. above this run's relu ceiling) is the 16×16 randomized Hadamard transform —
+  bf16 in/out, no scale. It flattens `(M, N)` to `(n_groups, 16)` and gives each program a
+  `(BLOCK_G, 16)` tile, so it's a batch of `(BLOCK_G, 16) @ (16, 16)` matmuls; the matmul is done in
+  fp32 (upcasting the bf16 inputs is exact, so fp32 accumulation reproduces torch's bf16 gemm) and cast
+  back. It's bandwidth-bound (read + write bf16, the K=16 dot is tiny). `autotune_effort="none"` picks
+  too small a block (`block_sizes=[32]`, ~40% peak); a pinned wider block matching the triton kernel's
+  `BLOCK_G=512` lifts it to the top of the table (blocks ≥1024 groups overflow tensor memory since the
+  matmul lowers to `tl.dot`/tmem).
+* `fp32_to_bf16_sr` (4.3%) is the stochastic-rounding fp32→bf16 dither (add a uniform 16-bit value to
+  the mantissa, then truncate), with the uniform drawn from Helion's own counter-based Philox
+  (`hl.rand`, offsets from the flat tile index) — so it never materializes a random tensor the way the
+  `compile` mode does, and it's bit-unrelated to the torch reference (only the SR *property* — unbiased,
+  lands on the two bracketing bf16 grid points — is checked). It runs on `autotune_effort="none"`; the
+  very low bandwidth is that default config being a poor fit for this kernel (a wider pinned block is
+  the perf follow-up), not the RNG itself.
 
 ## Known issues
 
