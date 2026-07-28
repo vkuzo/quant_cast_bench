@@ -65,3 +65,8 @@ fp32_to_bf16_sr,cute,0.2375,6782.4,84.78
 fp32_to_bf16_sr_global_offsets,triton,0.2582,6238.1,77.98
 fp32_to_bf16_sr_global_offsets,cute,0.2374,6783.8,84.80
 debug_relu,compile,0.1661,6465.6,80.82
+mxfp8_floor_dim_m_swizzle,helion,0.2804,2902.1,36.28
+mxfp8_floor_dim_km,helion,0.5495,1984.6,24.81
+mxfp8_floor_dim_km_swizzle,helion,0.5046,2161.0,27.01
+fp8_deepseek_1x128_dim_km,helion,0.2930,3721.3,46.52
+fp8_deepseek_128x128,helion,0.1355,5944.9,74.31
