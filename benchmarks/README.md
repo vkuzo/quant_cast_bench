@@ -54,8 +54,9 @@ Default shape is `(M, K) = (16384, 16384)`. Assumes a B200 (peak 8 TB/s).
 
 *Achieved memory bandwidth (% of the B200 8 TB/s peak) on the x-axis, one kernel per row, with a
 marker per implementation (`compile` ●, `triton` ■, `cute` ▲, `flex_tile_map_triton` ◆,
-`helion` ★). `compile`/`triton`/`cute` cover every kernel; `flex_tile_map_triton` and `helion`
-implement only a subset (the group-reduction casts), so those series show points on fewer rows.
+`helion` ★). `compile`/`triton`/`cute` cover every kernel; `helion` covers most of them and
+`flex_tile_map_triton` implements only a subset (the group-reduction casts), so those series show
+points on fewer rows.
 Data lives in
 [`bench_results.csv`](bench_results.csv); regenerate the chart with `python benchmarks/plot_bench.py`.
 Refresh the data by re-running the sweeps with the
@@ -67,6 +68,7 @@ Refresh the data by re-running the sweeps with the
 
 ```
 shape: (16384, 16384)  mode: compile
+versions: torch 2.14.0.dev20260720+cu130, helion 1.2.0, cutlass-dsl 4.5.2
 recipe                            gpu_time_ms    gbps    pct_peak  perf_description
 ------------------------------  -------------  ------  ----------  --------------------------------------------------------
 relu (baseline)                        0.1791  5993.7       74.9%
@@ -94,6 +96,7 @@ fp32_to_bf16_sr_global_offsets        SKIPPED                      elementwise S
 
 ```
 shape: (16384, 16384)  mode: triton
+versions: torch 2.14.0.dev20260720+cu130, helion 1.2.0, cutlass-dsl 4.5.2
 recipe                            gpu_time_ms    gbps    pct_peak  perf_description
 ------------------------------  -------------  ------  ----------  --------------------------------------------------------
 relu (baseline)                        0.1791  5994.4       74.9%
@@ -315,6 +318,7 @@ compile/triton numbers above:
 
 ```
 shape: (16384, 16384)  mode: cute
+versions: torch 2.14.0.dev20260720+cu130, helion 1.2.0, cutlass-dsl 4.5.2
 recipe                            gpu_time_ms    gbps    pct_peak  perf_description
 ------------------------------  -------------  ------  ----------  -------------------------------------------------
 relu (baseline)                        0.1792  5993.5       74.9%
@@ -347,6 +351,7 @@ the "generic backend" number to compare against the bespoke `--mode triton` kern
 
 ```
 shape: (16384, 16384)  mode: flex_tile_map_triton
+versions: torch 2.14.0.dev20260720+cu130, helion 1.2.0, cutlass-dsl 4.5.2
 recipe                      gpu_time_ms    gbps    pct_peak  perf_description
 ------------------------  -------------  ------  ----------  -----------------------------------
 relu (baseline)                  0.1791  5994.6       74.9%
@@ -370,31 +375,57 @@ nvfp4                            0.1376  4998.3       62.5%  (1,16) block, fp4 q
 
 ### `--mode helion`
 
-The Helion kernels (`quant_cast_helion`, one `@helion.kernel` per recipe) are
-**correctness-first** — each pins a single config (some picked by an autotuner run and then
-hardcoded, others Helion's default `autotune_effort="none"` config) rather than running a live
-autotune search, chosen for a fast, deterministic debug loop. Treat these as a functional
-baseline, not a fully-tuned comparison to the compile/triton/cute numbers above.
+The Helion kernels (`quant_cast_helion`, one `@helion.kernel` per recipe) each pin a single config
+(hardcoded from an autotuner run, or Helion's default `autotune_effort="none"` config) rather than
+running a live autotune search, chosen for a fast, deterministic debug loop. The three
+non-transposing casts at the top of the table (`fp8_tensorwise_precalc_scale`, `fp8_deepseek_1x128`,
+`mxfp8_floor_swizzle`) were tuned end-to-end with `autotune_effort="full"` and land at or above their
+bespoke triton/cute siblings; the remaining rows are **correctness-first** (mostly a pinned
+`block_sizes=[1, 1]` or the un-tuned default), so treat those as a functional baseline, not a
+fully-tuned comparison to the compile/triton/cute numbers above.
 
 ```
 shape: (16384, 16384)  mode: helion
+versions: torch 2.14.0.dev20260720+cu130, helion 1.2.0, cutlass-dsl 4.5.2
 recipe                        gpu_time_ms    gbps    pct_peak  perf_description
 --------------------------  -------------  ------  ----------  --------------------------------------------------------
-relu (baseline)                    0.1792  5993.4       74.9%
-fp8_deepseek_1x128_dim_m           0.1522  5344.8       66.8%  (128,1) block, t-contig
-mxfp8_floor_dim_m                  0.1842  4417.7       55.2%  (32,1) block, t-contig
-mxfp8_floor_dim_m_swizzle          0.2773  2933.9       36.7%  (32,1) block, t-contig, swizzle
-mxfp8_floor_dim_km                  0.548  1989.9       24.9%  (1,32) dim-k + (32,1) dim-m, one pass, t-contig
-mxfp8_floor_dim_km_swizzle         0.5026  2169.8       27.1%  (1,32) dim-k + (32,1) dim-m, one pass, t-contig, swizzle
-fp8_deepseek_1x128_dim_km          0.2908  3750.5       46.9%  (1,128) dim-k + (128,1) dim-m, one pass, t-contig
-mxfp8_32x32_floor                  0.1927  4179.6       52.2%  (32,32) block
-fp8_deepseek_128x128               0.1319  6103.9       76.3%  (128,128) block
+relu (baseline)                    0.1791  5993.9       74.9%
+fp8_tensorwise_precalc_scale       0.1179  6827.5       85.3%  elementwise
+mxfp8_floor_swizzle                0.1280  6354.8       79.4%  (1,32) block, swizzle
+fp8_deepseek_1x128                 0.1165  6982.2       87.3%  (1,128) block
+mxfp8_floor_dim_m                  0.1842  4416.7       55.2%  (32,1) block, t-contig
+mxfp8_floor_dim_m_swizzle          0.2787  2920.1       36.5%  (32,1) block, t-contig, swizzle
+fp8_deepseek_1x128_dim_m           0.1522  5344.6       66.8%  (128,1) block, t-contig
+mxfp8_floor_dim_km                 0.5481  1989.8       24.9%  (1,32) dim-k + (32,1) dim-m, one pass, t-contig
+mxfp8_floor_dim_km_swizzle         0.5024  2170.8       27.1%  (1,32) dim-k + (32,1) dim-m, one pass, t-contig, swizzle
+fp8_deepseek_1x128_dim_km          0.2908  3750.4       46.9%  (1,128) dim-k + (128,1) dim-m, one pass, t-contig
+mxfp8_32x32_floor                  0.1927  4179.4       52.2%  (32,32) block
+fp8_deepseek_128x128               0.1320  6103.5       76.3%  (128,128) block
 nvfp4                              0.3288    2092       26.1%  (1,16) block, fp4 qdata, no swizzle
-nvfp4_swizzle                        0.23  2990.4       37.4%  (1,16) block, fp4 qdata, swizzle
-bf16_rht                           0.1575  6818.8       85.2%  elementwise RHT
-fp32_to_bf16_sr                    4.6893   343.5        4.3%  elementwise SR, hl.rand (tile-local)
+nvfp4_swizzle                        0.23  2990.5       37.4%  (1,16) block, fp4 qdata, swizzle
+bf16_rht                           0.1574  6821.7       85.3%  elementwise RHT
+fp32_to_bf16_sr                    4.6889   343.5        4.3%  elementwise SR, hl.rand (tile-local)
 ```
 
+* `fp8_tensorwise_precalc_scale` (85.3%, above the relu ceiling), `fp8_deepseek_1x128` (87.3%) and
+  `mxfp8_floor_swizzle` (79.4%) are the **three non-transposing casts optimized per the full
+  process** (correctness with `autotune_effort="none"`, then a `autotune_effort="full"` search at
+  16384², then the winning config hardcoded), so unlike the correctness-first rows below these are
+  actually tuned — all three land at or above their bespoke triton/cute siblings. `fp8_tensorwise`
+  (elementwise, flatten to 1-D) autotuned to a wide `block_sizes=[8192]` with a `tensor_descriptor`
+  load, matching cute (86.1%) and beating triton/compile (~70.8/70.5%). `fp8_deepseek_1x128` (1×128
+  block reduced in-kernel, no transpose) autotuned to `block_sizes=[64, 2]` with a persistent
+  `reduction_loops=[None]`; the full search needed `HELION_AUTOTUNE_IGNORE_ERRORS=1` to *prune* (not
+  abort on) one candidate that miscompiled (`flatten_loops` + a reduction over a flattened
+  accumulator), and the result beats triton/cute/compile (75.8/76.7/77.2%).
+* `mxfp8_floor_swizzle` (79.4%) is the one of the three where **autotune could not find a config**:
+  the default `[32, 32]` config overflows triton's 1,048,576-element per-tensor cap while computing
+  the autotune baseline (this kernel tiles the block-*count* dims, so the per-program tile numel is
+  `block₀·block₁·16384`), so a custom `autotune_baseline_fn` was supplied — after which the search
+  still returned `NoConfigFound` because the space is dominated by those same overflowing configs. Per
+  the task's fallback clause it was pinned to a manual `block_sizes=[1, 1]` (one 128×128 block/program),
+  which is bit-exact and still reaches 79.4% — matching triton (81.5%) and edging cute (76.5%). This is
+  the same block-count-dim tiling constraint the correctness-first swizzle rows below run into.
 * `fp8_deepseek_1x128_dim_m` (66.8%, i.e. ~89% of this run's relu ceiling) and `mxfp8_floor_dim_m`
   (55.2%) both do the dim-M reduction with an **in-kernel transposed store** — view the input as
   `(rb, group, N)` and the `(N, M)` output as `(N, rb, group)`, then store `y.permute(...)` inside

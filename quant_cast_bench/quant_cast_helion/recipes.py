@@ -19,13 +19,16 @@ import torch
 from quant_cast_bench.quant_cast_gold.recipes import (
     Deepseek1x128DimKmGold,
     Deepseek1x128DimMGold,
+    Deepseek1x128Gold,
     Deepseek128x128Gold,
+    Float8TensorwiseGold,
     HadamardRht,
     Mxfp832x32FloorGold,
     Mxfp8FloorDimKmGold,
     Mxfp8FloorDimKmSwizzleGold,
     Mxfp8FloorDimMGold,
     Mxfp8FloorDimMSwizzleGold,
+    Mxfp8FloorSwizzleGold,
     Nvfp4GsGold,
     Nvfp4GsSwizzleGold,
     QuantCastSingleKernelGold,
@@ -924,9 +927,188 @@ def sr_bf16_helion(x, key, **kwargs):
 FP32_TO_BF16_SR = QuantCastHelionRecipe.from_gold(SrF32ToBf16, helion_fn=sr_bf16_helion)
 
 
+# ---------------------------------------------------------------------------
+# fp8 per-tensor ("tensorwise") cast with a PRECOMPUTED scale. The per-tensor amax/448 scale is a
+# global reduction that is NOT tile-invariant, so (like the gold `float8_tensorwise_f`) it is
+# computed outside the kernel and passed in as a scalar aux -- the kernel just divides every element
+# by that one fixed scalar, a pure bandwidth-bound elementwise op (read bf16, write fp8). Flatten x
+# to 1D so the tiling is a plain 1D sweep. The scalar scale is read with `hl.load(scale, [0])` (the
+# scalar-scale idiom from the nvfp4 kernel). Config pinned from an autotune_effort="full" search at
+# the 16384x16384 benchmark shape (a wide 8192-element 1D tile, 16 warps, tensor-descriptor load).
+# ---------------------------------------------------------------------------
+@helion.kernel(
+    config=helion.Config(atomic_indexing=[], block_sizes=[8192], indexing=['tensor_descriptor', 'pointer', 'pointer'], load_eviction_policies=['first', 'first'], num_stages=2, num_warps=16, pid_type='flat', range_flattens=[None], range_multi_buffers=[None], range_num_stages=[], range_unroll_factors=[0], range_warp_specializes=[None]),
+    static_shapes=True,
+    ignore_warnings=[helion.exc.TensorOperationInWrapper],
+)
+def _float8_tensorwise_kernel(
+    x: torch.Tensor,  # (n,) bf16 input, flattened
+    scale: torch.Tensor,  # (1,) f32 precomputed per-tensor scale (global amax/448, host-computed)
+    qdata: torch.Tensor,  # (n,) fp8_e4m3fn, mutated in place
+) -> None:
+    n, = x.shape
+    for tile in hl.tile(n):
+        s = hl.load(scale, [0])
+        qdata[tile] = (x[tile].to(torch.float32) * (1.0 / s)).to(torch.float8_e4m3fn)
+
+
+def float8_tensorwise_helion(x, scale, **kwargs):
+    """fp8 per-tensor cast in Helion (mirrors the gold `float8_tensorwise_f`): divide every element
+    by the precomputed per-tensor `scale` aux (a scalar fp32 tensor) and cast to fp8. `scale` is an
+    input, not a returned output, so this returns a 1-tuple `(qdata,)`. `**kwargs` are accepted and
+    ignored (the kernel owns its tiling)."""
+    assert x.is_contiguous() and x.dim() == 2
+    M, N = x.shape
+    n = x.numel()
+    qdata = torch.empty((M, N), dtype=torch.float8_e4m3fn, device=x.device)
+    _float8_tensorwise_kernel(x.view(n), scale.reshape(1).to(torch.float32), qdata.view(n))
+    return (qdata,)
+
+
+FP8_TENSORWISE = QuantCastHelionRecipe.from_gold(
+    Float8TensorwiseGold, helion_fn=float8_tensorwise_helion
+)
+
+
+# ---------------------------------------------------------------------------
+# deepseek fp8 1x128 (dim-K): one fp32 scale per (row, 128-column block); qdata keeps the input's
+# (M, N) layout (no transpose), scale is (M, N//128). Mirrors the gold `deepseek_1x128_f`. Viewing x
+# as (M, nb=N//128, 128) makes each 128-column group the trailing reduction axis, so the block amax
+# is a reduce over that axis and the store lands back in place. This is the natural
+# (non-transposed) direction of the deepseek quant, so unlike the dim-M / dim-km variants there is no
+# transpose-store and no 32/128-block-count tiling gymnastics -- a clean 2D tile over (M, nb).
+# Config pinned from an autotune_effort="full" search at the 16384x16384 benchmark shape (a (64, 2)
+# tile over (M, nb), persistent 128-column reduction, 16 warps). NOTE: that search needs
+# HELION_AUTOTUNE_IGNORE_ERRORS=1 -- some flatten_loops+reduction_loops config combos miscompile the
+# dim-2 reduction (`tl.max` over a flattened 2D acc) and would otherwise abort the whole search.
+# ---------------------------------------------------------------------------
+@helion.kernel(
+    config=helion.Config(atomic_indexing=[], block_sizes=[64, 2], flatten_loops=[False], indexing=['pointer', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'pointer', 'tensor_descriptor'], l2_groupings=[1], load_eviction_policies=['last', '', 'last'], loop_orders=[[1, 0]], num_stages=6, num_warps=16, pid_type='flat', range_flattens=[None], range_multi_buffers=[None], range_num_stages=[], range_unroll_factors=[0], range_warp_specializes=[None], reduction_loops=[None]),
+    static_shapes=True,
+    ignore_warnings=[helion.exc.TensorOperationInWrapper],
+)
+def _deepseek_1x128_kernel(
+    x: torch.Tensor,  # (M, N) bf16 input
+    qdata: torch.Tensor,  # (M, N) fp8_e4m3fn, mutated in place
+    scale: torch.Tensor,  # (M, N // 128) f32, mutated in place
+) -> None:
+    M, N = x.shape
+    nb = N // 128  # number of 128-column blocks per row (== scale columns)
+    xv = x.view(M, nb, 128)
+    qv = qdata.view(M, nb, 128)
+    for tile_m, tile_nb in hl.tile([M, nb]):
+        x_blk = xv[tile_m, tile_nb, :].to(torch.float32)  # (t_m, t_nb, 128)
+        amax = torch.clamp(torch.amax(torch.abs(x_blk), dim=2), min=1e-12)  # (t_m, t_nb)
+        s = amax / _FP8_MAX
+        y = (x_blk * (1.0 / s)[:, :, None]).to(torch.float8_e4m3fn)  # (t_m, t_nb, 128)
+        qv[tile_m, tile_nb, :] = y
+        scale[tile_m, tile_nb] = s
+
+
+def fp8_deepseek_1x128_helion(x, **kwargs):
+    """deepseek fp8 1x128 (dim-K) in Helion: abs-max over each 128-column block (one fp32 scale per
+    (row, 128-col-block)), quantize to fp8 in the input's (M, N) layout (no transpose). Matches the
+    gold `deepseek_1x128_f`. `**kwargs` are accepted and ignored (the kernel owns its tiling)."""
+    assert x.is_contiguous() and x.dim() == 2
+    M, N = x.shape
+    assert N % 128 == 0, f"deepseek 1x128 requires N divisible by 128, got N={N}"
+    qdata = torch.empty((M, N), dtype=torch.float8_e4m3fn, device=x.device)
+    scale = torch.empty((M, N // 128), dtype=torch.float32, device=x.device)
+    _deepseek_1x128_kernel(x, qdata, scale)
+    return qdata, scale
+
+
+FP8_DEEPSEEK_1X128 = QuantCastHelionRecipe.from_gold(
+    Deepseek1x128Gold, helion_fn=fp8_deepseek_1x128_helion
+)
+
+
+# ---------------------------------------------------------------------------
+# mxfp8 FLOOR (dim-K) with the e8m0 scale in the NVIDIA 32x4x4 SWIZZLED block grid. The natural
+# (non-transposed) direction of the mxfp8 quant -- 1x32 blocks along columns, qdata stays in (M, N) --
+# but the e8m0 scale is scattered straight into the swizzled block layout in-kernel (not stored plain
+# then swizzled in a wrapper post-pass). Mirrors the gold `mxfp8_floor_swizzle_f` (= mxfp8_floor_f
+# then _to_blocked_4d on the (M, N//32) scale).
+#
+# Swizzle math (`_to_blocked_4d` on the (M, N//32) scale, index [m, w]): the block grid is
+# (nrb=M//128, ncb=N//128, 32, 16) and blocked[m//128, w//4, m%32, ((m%128)//32)*4 + w%4] = scale[m, w].
+# As in the dim-M swizzle kernel, we tile over the BLOCK-COUNT dims [nrb, ncb] so the tile indices ARE
+# the block ordinals (Nb, Cb) and the swizzled store is a plain 5D index. We split BOTH the M-rows and
+# the 32-col-block index fully:
+#   M-rows: m = 128*Nb + 32*a + b   (Nb in [0,nrb), a in [0,4), b in [0,32));  m%32 = b, (m%128)//32 = a
+#   N-cols: n = 128*Cb + 32*c + g32 (Cb in [0,ncb), c in [0,4), g32 in [0,32)); the 32-col block is
+#           w = n//32 = 4*Cb + c, so w//4 = Cb and w%4 = c.
+# so x_blk is 6D [Nb, a, b, Cb, c, g32]. The 1x32 reduction is over g32 (the within-block columns).
+# The swizzle is then a pure permute of the reduced scale [Nb,a,b,Cb,c] -> blocked atom [Nb,Cb,b,a,c];
+# the final (a=4, c=4) -> 16 nibble merge is a free contiguous reshape in the wrapper.
+#
+# Config: autotune_effort="full" genuinely FAILS here (tried at 16384x16384), so this is pinned to a
+# manual block_sizes=[1, 1] -- the same fallback as the sibling swizzle / dim-km kernels. The reason:
+# tiling the BLOCK-COUNT dims means a program's x-load tile is block_nrb * block_ncb * (4*32*4*32) =
+# block_nrb * block_ncb * 16384 fp32 elements, so any block product > 64 overflows triton's hard
+# 1,048,576 per-tensor numel cap. The autotuner doesn't know about that 16384x multiplier: its default
+# baseline config ([32, 32]) overflows (so even computing the baseline needs a custom baseline_fn), and
+# its random search population is dominated by overflowing block sizes -- the full search returned
+# helion.exc.NoConfigFound. The tiny valid corner it can't reliably find is exactly [1, 1]: one 128x128
+# x-block per program (a 16384-element / 64KB fp32 tile), which is bit-exact to the gold AND already
+# fast -- ~0.13 ms / ~79% of peak at 16384x16384, on par with the manual triton/cute swizzle kernels.
+# ---------------------------------------------------------------------------
+@helion.kernel(
+    config=helion.Config(block_sizes=[1, 1], num_warps=4, num_stages=1),
+    static_shapes=True,
+    ignore_warnings=[helion.exc.TensorOperationInWrapper],
+)
+def _mxfp8_floor_swizzle_kernel(
+    x: torch.Tensor,  # (M, N) bf16 input
+    qdata: torch.Tensor,  # (M, N) fp8_e4m3fn, mutated in place (natural frame)
+    scale5: torch.Tensor,  # (nrb, ncb, 32, 4, 4) uint8 e8m0 bits, mutated (swizzled, pre (4,4)->16)
+) -> None:
+    M, N = x.shape
+    nrb = M // 128  # M 128-row blocks
+    ncb = N // 128  # N 128-col blocks (each = 4 col-blocks-of-32)
+    xv = x.view(nrb, 4, 32, ncb, 4, 32)      # M=(Nb, a, b), N=(Cb, c, g32)
+    qv = qdata.view(nrb, 4, 32, ncb, 4, 32)  # natural (M, N), same axes as xv
+    for tile_nb, tile_cb in hl.tile([nrb, ncb]):
+        x_blk = xv[tile_nb, :, :, tile_cb, :, :].to(torch.float32)  # (tnb,4,32,tcb,4,32)
+        amax = torch.amax(torch.abs(x_blk), dim=5)  # (tnb,4,32,tcb,4); reduce the 32 columns (g32)
+        biased = _amax_to_e8m0_floor_biased(amax)  # (tnb,4,32,tcb,4) int32 e8m0 exponent
+        sfp = _e8m0_biased_to_fp32(biased)  # (tnb,4,32,tcb,4) fp32 pow2 factor
+        y = (x_blk / sfp[:, :, :, :, :, None]).to(torch.float8_e4m3fn)  # broadcast over g32
+        qv[tile_nb, :, :, tile_cb, :, :] = y
+        # swizzle: [Nb,a,b,Cb,c] -> blocked atom [Nb,Cb,b,a,c].
+        scale5[tile_nb, tile_cb, :, :, :] = biased.permute(0, 3, 2, 1, 4).to(torch.uint8)
+
+
+def mxfp8_floor_swizzle_helion(x, **kwargs):
+    """mxfp8 floor (dim-K) in Helion with the e8m0 scale in the NVIDIA 32x4x4 swizzled block grid:
+    abs-max over each 1x32 column block, e8m0 FLOOR power-of-two scale, quantize to fp8 in the input's
+    (M, N) layout (no transpose), and write the scale scattered directly into the swizzled block grid
+    (nrb, ncb, 32, 16). Matches the gold `mxfp8_floor_swizzle_f`. The (4,4)->16 nibble merge is a free
+    contiguous reshape here. `**kwargs` are accepted and ignored."""
+    assert x.is_contiguous() and x.dim() == 2
+    M, N = x.shape
+    assert M % 128 == 0 and N % 128 == 0, (
+        f"mxfp8_floor swizzle requires M,N divisible by 128, got {(M, N)}"
+    )
+    nrb, ncb = M // 128, N // 128
+    qdata = torch.empty((M, N), dtype=torch.float8_e4m3fn, device=x.device)
+    scale5 = torch.empty((nrb, ncb, 32, 4, 4), dtype=torch.uint8, device=x.device)
+    _mxfp8_floor_swizzle_kernel(x, qdata, scale5)
+    scale = scale5.reshape(nrb, ncb, 32, 16).view(torch.float8_e8m0fnu)
+    return qdata, scale
+
+
+MXFP8_FLOOR_SWIZZLE = QuantCastHelionRecipe.from_gold(
+    Mxfp8FloorSwizzleGold, helion_fn=mxfp8_floor_swizzle_helion
+)
+
+
 # Order mirrors quant_cast_gold.ALL_RECIPES / quant_cast_triton.ALL_RECIPES (only the recipes with
 # a Helion impl are listed; more will be added as they're ported).
 ALL_RECIPES = [
+    ("fp8_tensorwise_precalc_scale", FP8_TENSORWISE),
+    ("fp8_deepseek_1x128", FP8_DEEPSEEK_1X128),
+    ("mxfp8_floor_swizzle", MXFP8_FLOOR_SWIZZLE),
     ("fp8_deepseek_1x128_dim_m", FP8_DEEPSEEK_1X128_DIM_M),
     ("mxfp8_floor_dim_m", MXFP8_FLOOR_DIM_M),
     ("mxfp8_floor_dim_m_swizzle", MXFP8_FLOOR_DIM_M_SWIZZLE),

@@ -83,6 +83,24 @@ _BW_LABEL = "achieved memory bandwidth (% of B200 peak, 8 TB/s)"
 _TITLE = "quant_cast memory bandwidth by implementation (16384×16384, B200)"
 
 
+def _versions_subtitle():
+    """Best-effort 'torch X · helion Y · cutlass-dsl Z' string for the chart subtitle. Reads the
+    installed package versions so the chart self-documents the toolchain that produced the CSV;
+    any package that isn't importable just shows '?'."""
+    from importlib.metadata import PackageNotFoundError, version
+
+    def _v(dist, mod=None):
+        try:
+            return version(dist)
+        except PackageNotFoundError:
+            try:
+                return __import__(mod or dist).__version__
+            except Exception:
+                return "?"
+
+    return f"torch {_v('torch')}  ·  helion {_v('helion')}  ·  cutlass-dsl {_v('nvidia-cutlass-dsl', 'cutlass')}"
+
+
 def _plot(data, kernels, out_path, modes=_MODES, group_sizes=_GROUP_SIZES, title=_TITLE,
           fig_height=6.0):
     """Scatter the pivoted data to `out_path`: bandwidth on the x-axis, one kernel per row on the
@@ -128,8 +146,14 @@ def _plot(data, kernels, out_path, modes=_MODES, group_sizes=_GROUP_SIZES, title
     # so many/long labels wrap onto multiple rows instead of stretching the figure super-wide.
     ncol = min(len(modes), 2)
     nrows = -(-len(modes) // ncol)  # ceil
-    # pad the title up to leave room for the (possibly multi-row) legend sitting just above the axes
-    ax.set_title(title, pad=20 + 16 * nrows)
+    # stack, top-to-bottom, above the axes: title, version subtitle, then the (multi-row) legend.
+    # pad the title up far enough to clear the legend AND the subtitle line beneath it. The legend
+    # is nrows of entries plus its own "mode" title row, so budget nrows+1 rows for it.
+    legend_pts = 16 * (nrows + 1)
+    ax.set_title(title, pad=20 + legend_pts + 14)
+    ax.annotate(_versions_subtitle(), xy=(0.5, 1.0), xycoords="axes fraction",
+                xytext=(0, legend_pts + 8), textcoords="offset points", ha="center", va="bottom",
+                fontsize=8, color="#555555")
     ax.legend(title="mode", ncol=ncol, loc="lower center", bbox_to_anchor=(0.5, 1.0),
               frameon=False, borderaxespad=0.0)
     fig.tight_layout()
