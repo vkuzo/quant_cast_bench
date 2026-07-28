@@ -24,43 +24,6 @@ Coverage so far:
 Note: these are all **single kernel**.  For recipes such as nvfp4 with global outer scale, we assume that
 the outer scale is computed elsewhere and the user is responsible for composing the pieces together.
 
-## motivation and tl;dr;
-
-I did this to:
-1. see what is missing in PT Core eager to express modern quantization recipes
-2. evaluate options for quant API frontend
-3. evaluate options for near-SOL quant backend
-
-Findings:
-1. missing in PT Core eager for modern quant casting:
-   - fast RTNE casting to FP4 in eager
-   - stochastic rounding in eager
-     - expose integer randomness directly (https://github.com/pytorch/pytorch/pull/190253)
-     - align on a design for a stochastic rounding op in eager (https://github.com/pytorch/pytorch/issues/175409)
-   - TODO work through the MoE case
-2. options for quant cast API frontend
-   - (preferred) eager PyTorch, express quantization casting as a composition of primitives on plain tensors
-   - (acceptable) flex_gemm/flex_ep/flex_moe, taking tile-invariant quantization function callbacks + tiling metadata
-   - (acceptable) flex_tile_map with a dummy backend, to enable fusion of gemm + f to flex_gemm(..., f)
-     - Note: a reason for this to exist with today's tooling is line up torch.autograd.Function boundaries for CODA flex_gemm
-     - to get good performance with flex_tile_map + general case of quant, we need a compiler that outputs cuteDSL
-     - TODO talk about new input broadcasting cases
-     - TODO talk about example flex_tile_map API
-3. options for quant cast API backend
-   - (acceptable) per-recipe human written gold reference + LLM kernel gen
-   - lowering target
-     - cuteDSL - needed for near-SOL training
-     - triton - good baseline, but SOL not reachable for training (quantizing `input.t()`)
-   - compilers
-     - torchinductor (we already have this)
-       - triton backend
-         - works well for quant inference in 8 bits
-         - various gaps at 4 bits and for training that can be improved
-       - cuteDSL backend
-         - could extend to quant patterns (currently GEMM only) to cover training better
-     - (?) mini-compiler for quantization cast reductions to cuteDSL
-       - can expand quant recipe coverage for flex* family of products to cover training better
-
 ## tile invariance and quantization
 
 **tile invariance** of a function `f` is desireable as it gives a backend maximium
@@ -122,11 +85,6 @@ There are two considerations here:
    grid-level swap of tile positions. The grid-level swap of tile positions must be handled by
    a backend that consumes a tile invariant `f`, and it requires extra information (for example,
    `OutputKinds.GRID_SWAP`, or a more general version of it).
-
-
-3. performant kernels to quantize `input.t()` are not currently at SOL performance in triton
-   due to limitations of triton itself (TODO link to details). We need a lower level 
-   DSL (for example, cuteDSL) to reach near-SOL.
 
 ### quantization block size
 
