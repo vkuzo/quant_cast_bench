@@ -349,7 +349,7 @@ fp8_deepseek_128x128               0.1320  6103.5       76.3%  (128,128) block
 nvfp4                              0.3288    2092       26.1%  (1,16) block, fp4 qdata, no swizzle
 nvfp4_swizzle                        0.23  2990.5       37.4%  (1,16) block, fp4 qdata, swizzle
 bf16_rht                           0.1574  6821.7       85.3%  elementwise RHT
-fp32_to_bf16_sr                    4.6889   343.5        4.3%  elementwise SR, hl.rand (tile-local)
+fp32_to_bf16_sr                    0.2458  6553.1       81.9%  elementwise SR, tl.randint4x via inline_triton
 ```
 
 * `fp8_tensorwise_precalc_scale` (85.3%, above the relu ceiling), `fp8_deepseek_1x128` (87.3%) and
@@ -444,13 +444,19 @@ fp32_to_bf16_sr                    4.6889   343.5        4.3%  elementwise SR, h
   too small a block (`block_sizes=[32]`, ~40% peak); a pinned wider block matching the triton kernel's
   `BLOCK_G=512` lifts it to the top of the table (blocks ≥1024 groups overflow tensor memory since the
   matmul lowers to `tl.dot`/tmem).
-* `fp32_to_bf16_sr` (4.3%) is the stochastic-rounding fp32→bf16 dither (add a uniform 16-bit value to
-  the mantissa, then truncate), with the uniform drawn from Helion's own counter-based Philox
-  (`hl.rand`, offsets from the flat tile index) — so it never materializes a random tensor the way the
-  `compile` mode does, and it's bit-unrelated to the torch reference (only the SR *property* — unbiased,
-  lands on the two bracketing bf16 grid points — is checked). It runs on `autotune_effort="none"`; the
-  very low bandwidth is that default config being a poor fit for this kernel (a wider pinned block is
-  the perf follow-up), not the RNG itself.
+* `fp32_to_bf16_sr` (81.9%, above this run's relu ceiling) is the stochastic-rounding fp32→bf16 dither
+  (add a uniform 16-bit value to the mantissa, then truncate). It never materializes a random tensor
+  the way `compile` mode does, and it's bit-unrelated to the torch reference (only the SR *property* —
+  unbiased, lands on the two bracketing bf16 grid points — is checked). The dither is drawn by calling
+  **`tl.randint4x` directly through `hl.inline_triton`** (Helion's raw-Triton HOP) rather than
+  `hl.rand`: `hl.rand` runs a full 10-round Philox per element and throws away 3 of every 4 outputs,
+  which capped this kernel at ~4.3%. Instead the input is viewed as `(n//4, 4)` and one Philox round
+  dithers 4 elements (its four blocks scattered across the size-4 minor axis via a one-hot sum, since
+  Helion rejects strided column indexing). `tl.randint4x` returns `uint32`, so each block is
+  `bitcast` to int32. Because `inline_triton` is a raw-Triton HOP that aborts `autotune_effort="full"`,
+  the config (`block_sizes=[1024]`, `num_warps=8`, `num_stages=7`) was found under
+  `autotune_effort="none"` and hand-pinned. This lands at/above the bespoke triton (73.0%) and cute
+  (84.8%) SR kernels.
 
 ## Known issues
 
