@@ -26,7 +26,7 @@ repo root.
 ## Usage
 
 ```bash
-# run the tests (references, Triton kernels, CuTeDSL kernels, flexquant)
+# run the tests (references, Triton kernels, CuTeDSL kernels, flex_tile_map)
 pytest test/ -q
 
 # run the memory-bandwidth benchmark sweep
@@ -38,8 +38,8 @@ python benchmarks/benchmark.py --mode cute       # CuTeDSL kernels (Blackwell)
 ## Layout
 
 - `quant_cast_bench/` — the importable package: `quant_cast_gold` (plain-PyTorch reference recipes),
-  `quant_cast_triton` / `quant_cast_cute` (backend kernels), and the `flexquant` / `flex_tile_map`
-  tiling frameworks.
+  `quant_cast_triton` / `quant_cast_cute` (backend kernels), and the `flex_tile_map`
+  tiling framework.
 - `benchmarks/` — the benchmark sweep (see `benchmarks/README.md`).
 - `test/` — the test suite.
 
