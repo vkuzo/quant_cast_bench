@@ -72,7 +72,7 @@ fp8_deepseek_1x128_dim_km,helion,0.2908,3750.4,46.88
 fp8_deepseek_128x128,helion,0.1320,6103.5,76.29
 nvfp4_swizzle,helion,0.2300,2990.5,37.38
 bf16_rht,helion,0.1574,6821.7,85.27
-fp32_to_bf16_sr,helion,4.6889,343.5,4.29
+fp32_to_bf16_sr,helion,0.2458,6553.1,81.90
 fp8_tensorwise_precalc_scale,helion,0.1179,6827.5,85.34
 fp8_deepseek_1x128,helion,0.1165,6982.2,87.28
 mxfp8_floor_swizzle,helion,0.1280,6354.8,79.44

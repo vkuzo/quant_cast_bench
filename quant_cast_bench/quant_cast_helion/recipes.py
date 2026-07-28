@@ -883,31 +883,59 @@ BF16_RHT = QuantCastHelionRecipe.from_gold(HadamardRht, helion_fn=rht_helion)
 # ---------------------------------------------------------------------------
 # Stochastic-rounding fp32 -> bf16 (mirrors sr_bf16_f). SR add-then-truncate: dither the 16 mantissa
 # bits fp32->bf16 drops with a uniform 16-bit value, then mask them off. bf16 shares fp32's exponent
-# so there's no rebias/scale/packing -- just the dither. Randomness comes from Helion's own
-# counter-based Philox (`hl.rand`, offsets derived from the flat tile index), so the draws don't
-# match the torch reference bit-for-bit -- only the SR *property* (unbiased, lands on the two
-# bracketing bf16 grid points) is well-defined, and that's what the test's correctness_fn checks for
-# the *_sr recipes. Elementwise + bandwidth-bound (read fp32, write bf16); autotune_effort="none" ->
-# default config, no search (fast to iterate).
+# so there's no rebias/scale/packing -- just the dither. Randomness comes from a counter-based Philox
+# draw, but instead of `hl.rand` we drop into raw Triton via `hl.inline_triton` and call
+# `tl.randint4x` directly -- the same batched primitive the hand-written Triton SR kernel uses (one
+# Philox round yields FOUR int32 draws). The draws don't match the torch reference bit-for-bit --
+# only the SR *property* (unbiased, lands on the two bracketing bf16 grid points) is well-defined, and
+# that's what the test's correctness_fn checks for the *_sr recipes. To consume ALL FOUR draws from
+# the single Philox round, we view the flat input as (n // 4, 4) and dither 4 elements per round: one
+# offset (`hl.tile_index`) per group of 4, the four blocks (a, b, c, d) supplying the four columns'
+# dithers. The columns are filled with a one-hot weighted sum over the size-4 minor axis
+# (`hl.arange(4)`) rather than strided column indexing, which Helion rejects.
+# Elementwise + bandwidth-bound (read fp32, write bf16) -> 81.9% peak. inline_triton is a raw-Triton
+# HOP that aborts autotune_effort="full", so the config below (block_sizes=[1024]) was found under
+# autotune_effort="none" and hand-pinned.
 # ---------------------------------------------------------------------------
-@helion.kernel(
-    config=helion.Config(atomic_indexing=[], block_sizes=[2048], indexing=['tensor_descriptor', 'tensor_descriptor'], load_eviction_policies=[''], maxnreg=128, num_sm_multiplier=8, num_stages=2, num_warps=16, pid_type='persistent_interleaved', range_flattens=[False], range_multi_buffers=[None], range_unroll_factors=[0], range_warp_specializes=[True]), 
-    static_shapes=True,
-    ignore_warnings=[helion.exc.TensorOperationInWrapper],
-)
+@helion.kernel(config=helion.Config(
+    atomic_indexing=[], block_sizes=[1024], indexing=['pointer', 'tensor_descriptor'], load_eviction_policies=[''], num_stages=7, num_warps=8, pid_type='flat', range_flattens=[None], range_multi_buffers=[None], range_num_stages=[0], range_unroll_factors=[0], range_warp_specializes=[None]
+), static_shapes=True, ignore_warnings=[helion.exc.TensorOperationInWrapper])
 def _sr_bf16_kernel(
-    x: torch.Tensor,  # (n,) fp32 input, flattened
+    x: torch.Tensor,  # (n,) fp32 input, flattened (n divisible by 4)
     out: torch.Tensor,  # (n,) bf16 output, mutated in place
     seed: int,  # Philox seed (first 32 bits of the key)
 ) -> None:
     n, = x.shape
-    for tile in hl.tile(n):
-        xf = x[tile]
-        u = hl.rand([tile], seed=seed)  # uniform [0, 1) per element, distinct offset per flat index
-        rand16 = (u * 65536.0).to(torch.int32)  # uniform 16-bit dither in [0, 2**16)
-        xi = xf.view(torch.int32) + rand16  # bitcast fp32->int32, add the dither...
+    nq = n // 4  # groups of 4 elements: one Philox round (4 draws) per group
+    x4 = x.view(nq, 4)
+    out4 = out.view(nq, 4)
+    for tile in hl.tile(nq):
+        xrow = x4[tile, :]  # (t, 4) fp32
+        xi32 = xrow.view(torch.int32)  # bitcast fp32 -> int32
+        col = hl.arange(4)  # size-4 minor index, for the one-hot draw -> column scatter
+        offs = hl.tile_index(tile).to(torch.int64)  # (t,) per-group Philox offset
+        # Raw Triton: one Philox round -> four random blocks (tl.randint4x). It returns uint32, so
+        # bitcast each to int32 to match output_like / the downstream int32 math.
+        r0, r1, r2, r3 = hl.inline_triton(
+            """
+            a, b, c, d = tl.randint4x({seed}, {offs})
+            (a.to(tl.int32, bitcast=True), b.to(tl.int32, bitcast=True),
+             c.to(tl.int32, bitcast=True), d.to(tl.int32, bitcast=True))
+            """,
+            {"seed": seed, "offs": offs},
+            output_like=(offs.to(torch.int32),) * 4,  # four (t,) int32 blocks
+        )
+        # scatter draw j into column j across the size-4 minor axis (no strided column indexing)
+        dither = (
+            r0[:, None] * (col == 0).to(torch.int32)
+            + r1[:, None] * (col == 1).to(torch.int32)
+            + r2[:, None] * (col == 2).to(torch.int32)
+            + r3[:, None] * (col == 3).to(torch.int32)
+        )  # (t, 4) int32
+        rand16 = dither & 0xFFFF  # low 16 bits: uniform dither in [0, 2**16)
+        xi = xi32 + rand16  # add the dither...
         xi = xi & -65536  # ...then truncate the low 16 mantissa bits (-65536 == 0xFFFF0000)
-        out[tile] = xi.view(torch.float32).to(torch.bfloat16)  # exact: low 16 bits are zero
+        out4[tile, :] = xi.view(torch.float32).to(torch.bfloat16)  # exact: low 16 bits are zero
 
 
 def sr_bf16_helion(x, key, **kwargs):
