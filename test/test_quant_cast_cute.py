@@ -43,11 +43,20 @@ pytestmark = pytest.mark.skipif(
 
 _MAX_MISMATCH_FRAC = 0.01
 
+# Recipes whose CuTeDSL kernels emit the Blackwell-only fp4 E2M1 cvt (`cvt.e2m1x2.f32`); ptxas
+# rejects it below sm_100, so gate them to cuda capability 10.0.
+_REQUIRES_SM100 = frozenset({
+    "nvfp4_swizzle",
+    "nvfp4_blocked_outer",
+})
+
 
 @pytest.mark.parametrize("name, recipe", ALL_RECIPES, ids=[n for n, _ in ALL_RECIPES])
 def test_cute_matches_reference(name, recipe):
     # the CuTeDSL kernel should reproduce the gold reference bit-for-bit; where the hardware cvt
     # rounding legitimately differs (fp4/e8m0 ties), accept a valid quantization with tiny divergence.
+    if name in _REQUIRES_SM100 and torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip(f"{name} emits Blackwell-only PTX; requires cuda capability 10.0")
     torch.manual_seed(0)
     inputs = recipe.example_input_fn(512, 512)
 

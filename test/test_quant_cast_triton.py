@@ -21,11 +21,23 @@ pytestmark = pytest.mark.skipif(
 # before treating it as a real bug (see the fallback in the test below).
 _MAX_MISMATCH_FRAC = 0.01
 
+# Recipes whose Triton kernels emit Blackwell-only PTX cvt instructions -- fp4 E2M1
+# (`cvt.e2m1x2.f32`) for the nvfp4 casts, and the MX E8M0 scale cvt (`cvt...ue8m0x2`) for the
+# dim_m mxfp8 casts. ptxas rejects these below sm_100, so gate them to cuda capability 10.0.
+_REQUIRES_SM100 = frozenset({
+    "nvfp4",
+    "nvfp4_swizzle",
+    "mxfp8_floor_dim_m",
+    "mxfp8_floor_dim_m_swizzle",
+})
+
 
 @pytest.mark.parametrize("name, recipe", ALL_RECIPES, ids=[n for n, _ in ALL_RECIPES])
 def test_triton_matches_reference(name, recipe):
     # the Triton kernel should reproduce the gold reference bit-for-bit (identical fp32 math + RNE
     # cast). example_input_fn builds the full positional inputs (x, *aux).
+    if name in _REQUIRES_SM100 and torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip(f"{name} emits Blackwell-only PTX; requires cuda capability 10.0")
     torch.manual_seed(0)
     inputs = recipe.example_input_fn(512, 512)
 

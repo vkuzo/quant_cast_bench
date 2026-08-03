@@ -90,23 +90,45 @@ class QuantCastHelionRecipe(QuantCastSingleKernelGold):
 # ---------------------------------------------------------------------------
 # deepseek fp8 1x128, reduced across M (128x1 blocks along rows), transposed output.
 # ---------------------------------------------------------------------------
-@helion.kernel(config=helion.Config(
-    atomic_indexing=[], 
-    block_sizes=[1, 128], 
-    indexing=['pointer', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'pointer', 'pointer'], 
-    l2_groupings=[2], 
-    load_eviction_policies=['last', 'last', 'first', 'last'], 
-    loop_orders=[[0, 1]], 
-    num_stages=3, 
-    num_warps=4, 
-    pid_type='flat', 
-    range_flattens=[None], 
-    range_multi_buffers=[None], 
-    range_num_stages=[], 
-    range_unroll_factors=[0], 
-    range_warp_specializes=[None], 
-    reduction_loops=[None]
-), static_shapes=True)
+@helion.kernel(configs=[
+    # for b200
+    helion.Config(
+        atomic_indexing=[],
+        block_sizes=[1, 128],
+        indexing=['pointer', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'pointer', 'pointer'],
+        l2_groupings=[2],
+        load_eviction_policies=['last', 'last', 'first', 'last'],
+        loop_orders=[[0, 1]],
+        num_stages=3,
+        num_warps=4,
+        pid_type='flat',
+        range_flattens=[None],
+        range_multi_buffers=[None],
+        range_num_stages=[],
+        range_unroll_factors=[0],
+        range_warp_specializes=[None],
+        reduction_loops=[None]
+    ),
+    # for h100: same as b200 but drops range_warp_specializes, which the sm_90a config-spec
+    # rejects for this kernel (expected 0 values); omitting it lets Helion fill the per-arch
+    # default. Not perf-tuned for h100 -- just a config that compiles and runs there.
+    helion.Config(
+        atomic_indexing=[],
+        block_sizes=[1, 128],
+        indexing=['pointer', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'pointer', 'pointer'],
+        l2_groupings=[2],
+        load_eviction_policies=['last', 'last', 'first', 'last'],
+        loop_orders=[[0, 1]],
+        num_stages=3,
+        num_warps=4,
+        pid_type='flat',
+        range_flattens=[None],
+        range_multi_buffers=[None],
+        range_num_stages=[],
+        range_unroll_factors=[0],
+        reduction_loops=[None]
+    ),
+], static_shapes=True)
 def _deepseek_1x128_dim_m_kernel(
     x: torch.Tensor,  # (M, N) bf16 input
     qdata: torch.Tensor,  # (N, M) fp8_e4m3fn, mutated in place (t-contig output frame)
@@ -154,23 +176,45 @@ FP8_DEEPSEEK_1X128_DIM_M = QuantCastHelionRecipe.from_gold(
 # kernel above (32-row block instead of 128) but with an e8m0 power-of-two scale (bit-math) rather
 # than an fp32 scale. autotune_effort="none" -> default config, no search (fast to iterate).
 # ---------------------------------------------------------------------------
-@helion.kernel(config=helion.Config(
-    atomic_indexing=[], 
-    block_sizes=[4, 32], 
-    indexing=['tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'pointer', 'pointer', 'tensor_descriptor'], 
-    l2_groupings=[4], 
-    load_eviction_policies=['', 'first', '', 'first'], 
-    loop_orders=[[1, 0]], 
-    num_stages=4, 
-    num_warps=1, 
-    pid_type='flat', 
-    range_flattens=[None], 
-    range_multi_buffers=[None], 
-    range_num_stages=[], 
-    range_unroll_factors=[0], 
-    range_warp_specializes=[None], 
-    reduction_loops=[None]
-), static_shapes=True, ignore_warnings=[helion.exc.TensorOperationInWrapper])
+@helion.kernel(configs=[
+    # for b200
+    helion.Config(
+        atomic_indexing=[],
+        block_sizes=[4, 32],
+        indexing=['tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'pointer', 'pointer', 'tensor_descriptor'],
+        l2_groupings=[4],
+        load_eviction_policies=['', 'first', '', 'first'],
+        loop_orders=[[1, 0]],
+        num_stages=4,
+        num_warps=1,
+        pid_type='flat',
+        range_flattens=[None],
+        range_multi_buffers=[None],
+        range_num_stages=[],
+        range_unroll_factors=[0],
+        range_warp_specializes=[None],
+        reduction_loops=[None]
+    ),
+    # for h100: same as b200 but drops range_warp_specializes, which the sm_90a config-spec
+    # rejects for this kernel (expected 0 values); omitting it lets Helion fill the per-arch
+    # default. Not perf-tuned for h100 -- just a config that compiles and runs there.
+    helion.Config(
+        atomic_indexing=[],
+        block_sizes=[4, 32],
+        indexing=['tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'pointer', 'pointer', 'tensor_descriptor'],
+        l2_groupings=[4],
+        load_eviction_policies=['', 'first', '', 'first'],
+        loop_orders=[[1, 0]],
+        num_stages=4,
+        num_warps=1,
+        pid_type='flat',
+        range_flattens=[None],
+        range_multi_buffers=[None],
+        range_num_stages=[],
+        range_unroll_factors=[0],
+        reduction_loops=[None]
+    ),
+], static_shapes=True, ignore_warnings=[helion.exc.TensorOperationInWrapper])
 def _mxfp8_floor_dim_m_kernel(
     x: torch.Tensor,  # (M, N) bf16 input
     qdata: torch.Tensor,  # (N, M) fp8_e4m3fn, mutated in place (t-contig output frame)
@@ -848,7 +892,13 @@ NVFP4_SWIZZLE = QuantCastHelionRecipe.from_gold(
 # blocks (>=1024 groups) overflow tensor memory since the (bg,16)@(16,16) matmul lowers to tl.dot/tmem.
 # ---------------------------------------------------------------------------
 @helion.kernel(
-    config=helion.Config(atomic_indexing=[], block_sizes=[128], indexing=['pointer', 'pointer', 'pointer'], load_eviction_policies=['first', ''], num_stages=3, num_warps=2, pid_type='flat', range_flattens=[None], range_multi_buffers=[None], range_num_stages=[], range_unroll_factors=[0], range_warp_specializes=[None]), 
+    configs=[
+        # for b200
+        helion.Config(atomic_indexing=[], block_sizes=[128], indexing=['pointer', 'pointer', 'pointer'], load_eviction_policies=['first', ''], num_stages=3, num_warps=2, pid_type='flat', range_flattens=[None], range_multi_buffers=[None], range_num_stages=[], range_unroll_factors=[0], range_warp_specializes=[None]),
+        # for h100: drops range_warp_specializes (sm_90a config-spec rejects it here, expected 0);
+        # Helion fills the per-arch default. Not perf-tuned for h100 -- just valid there.
+        helion.Config(atomic_indexing=[], block_sizes=[128], indexing=['pointer', 'pointer', 'pointer'], load_eviction_policies=['first', ''], num_stages=3, num_warps=2, pid_type='flat', range_flattens=[None], range_multi_buffers=[None], range_num_stages=[], range_unroll_factors=[0]),
+    ],
     static_shapes=True,
     ignore_warnings=[helion.exc.TensorOperationInWrapper],
 )
@@ -897,9 +947,18 @@ BF16_RHT = QuantCastHelionRecipe.from_gold(HadamardRht, helion_fn=rht_helion)
 # HOP that aborts autotune_effort="full", so the config below (block_sizes=[1024]) was found under
 # autotune_effort="none" and hand-pinned.
 # ---------------------------------------------------------------------------
-@helion.kernel(config=helion.Config(
-    atomic_indexing=[], block_sizes=[1024], indexing=['pointer', 'tensor_descriptor'], load_eviction_policies=[''], num_stages=7, num_warps=8, pid_type='flat', range_flattens=[None], range_multi_buffers=[None], range_num_stages=[0], range_unroll_factors=[0], range_warp_specializes=[None]
-), static_shapes=True, ignore_warnings=[helion.exc.TensorOperationInWrapper])
+@helion.kernel(configs=[
+    # for b200
+    helion.Config(
+        atomic_indexing=[], block_sizes=[1024], indexing=['pointer', 'tensor_descriptor'], load_eviction_policies=[''], num_stages=7, num_warps=8, pid_type='flat', range_flattens=[None], range_multi_buffers=[None], range_num_stages=[0], range_unroll_factors=[0], range_warp_specializes=[None]
+    ),
+    # for h100: same as b200 but drops range_warp_specializes, which the sm_90a config-spec
+    # rejects for this kernel (expected 0 values); omitting it lets Helion fill the per-arch
+    # default. Not perf-tuned for h100 -- just a config that compiles and runs there.
+    helion.Config(
+        atomic_indexing=[], block_sizes=[1024], indexing=['pointer', 'tensor_descriptor'], load_eviction_policies=[''], num_stages=7, num_warps=8, pid_type='flat', range_flattens=[None], range_multi_buffers=[None], range_num_stages=[0], range_unroll_factors=[0]
+    ),
+], static_shapes=True, ignore_warnings=[helion.exc.TensorOperationInWrapper])
 def _sr_bf16_kernel(
     x: torch.Tensor,  # (n,) fp32 input, flattened (n divisible by 4)
     out: torch.Tensor,  # (n,) bf16 output, mutated in place
@@ -965,7 +1024,13 @@ FP32_TO_BF16_SR = QuantCastHelionRecipe.from_gold(SrF32ToBf16, helion_fn=sr_bf16
 # the 16384x16384 benchmark shape (a wide 8192-element 1D tile, 16 warps, tensor-descriptor load).
 # ---------------------------------------------------------------------------
 @helion.kernel(
-    config=helion.Config(atomic_indexing=[], block_sizes=[8192], indexing=['tensor_descriptor', 'pointer', 'pointer'], load_eviction_policies=['first', 'first'], num_stages=2, num_warps=16, pid_type='flat', range_flattens=[None], range_multi_buffers=[None], range_num_stages=[], range_unroll_factors=[0], range_warp_specializes=[None]),
+    configs=[
+        # for b200
+        helion.Config(atomic_indexing=[], block_sizes=[8192], indexing=['tensor_descriptor', 'pointer', 'pointer'], load_eviction_policies=['first', 'first'], num_stages=2, num_warps=16, pid_type='flat', range_flattens=[None], range_multi_buffers=[None], range_num_stages=[], range_unroll_factors=[0], range_warp_specializes=[None]),
+        # for h100: drops range_warp_specializes (sm_90a config-spec rejects it here, expected 0);
+        # Helion fills the per-arch default. Not perf-tuned for h100 -- just valid there.
+        helion.Config(atomic_indexing=[], block_sizes=[8192], indexing=['tensor_descriptor', 'pointer', 'pointer'], load_eviction_policies=['first', 'first'], num_stages=2, num_warps=16, pid_type='flat', range_flattens=[None], range_multi_buffers=[None], range_num_stages=[], range_unroll_factors=[0]),
+    ],
     static_shapes=True,
     ignore_warnings=[helion.exc.TensorOperationInWrapper],
 )
@@ -1011,7 +1076,13 @@ FP8_TENSORWISE = QuantCastHelionRecipe.from_gold(
 # dim-2 reduction (`tl.max` over a flattened 2D acc) and would otherwise abort the whole search.
 # ---------------------------------------------------------------------------
 @helion.kernel(
-    config=helion.Config(atomic_indexing=[], block_sizes=[64, 2], flatten_loops=[False], indexing=['pointer', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'pointer', 'tensor_descriptor'], l2_groupings=[1], load_eviction_policies=['last', '', 'last'], loop_orders=[[1, 0]], num_stages=6, num_warps=16, pid_type='flat', range_flattens=[None], range_multi_buffers=[None], range_num_stages=[], range_unroll_factors=[0], range_warp_specializes=[None], reduction_loops=[None]),
+    configs=[
+        # for b200
+        helion.Config(atomic_indexing=[], block_sizes=[64, 2], flatten_loops=[False], indexing=['pointer', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'pointer', 'tensor_descriptor'], l2_groupings=[1], load_eviction_policies=['last', '', 'last'], loop_orders=[[1, 0]], num_stages=6, num_warps=16, pid_type='flat', range_flattens=[None], range_multi_buffers=[None], range_num_stages=[], range_unroll_factors=[0], range_warp_specializes=[None], reduction_loops=[None]),
+        # for h100: drops range_warp_specializes (sm_90a config-spec rejects it here, expected 0);
+        # Helion fills the per-arch default. Not perf-tuned for h100 -- just valid there.
+        helion.Config(atomic_indexing=[], block_sizes=[64, 2], flatten_loops=[False], indexing=['pointer', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'pointer', 'tensor_descriptor'], l2_groupings=[1], load_eviction_policies=['last', '', 'last'], loop_orders=[[1, 0]], num_stages=6, num_warps=16, pid_type='flat', range_flattens=[None], range_multi_buffers=[None], range_num_stages=[], range_unroll_factors=[0], reduction_loops=[None]),
+    ],
     static_shapes=True,
     ignore_warnings=[helion.exc.TensorOperationInWrapper],
 )
