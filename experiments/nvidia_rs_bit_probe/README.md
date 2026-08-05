@@ -1,10 +1,12 @@
 # nvidia_rs_bit_probe
 
-Reverse-engineers **how NVIDIA's `cvt.rs` x4 conversion intrinsics slice their single 32-bit random
-word across the 4 output lanes**, for each of:
+Reverse-engineers **how NVIDIA's `cvt.rs` conversion intrinsics slice their single 32-bit random word
+across the output lanes**. `probe.py` covers the three x4 forms; the bf16 x2 form (`cvt.rs.bf16x2.f32`)
+was probed separately with the same method and its result is included below.
 
 | intrinsic | cast | out | discarded f32 mantissa bits (D) |
 |---|---|---|---|
+| `cvt.rs.bf16x2.f32` | 2×f32 → 2×bf16 | b32 (16-bit lanes) | 16 |
 | `cvt.rs.satfinite.e4m3x4.f32` | 4×f32 → 4×fp8 e4m3 | b32 (8-bit lanes) | 20 |
 | `cvt.rs.satfinite.e5m2x4.f32` | 4×f32 → 4×fp8 e5m2 | b32 (8-bit lanes) | 21 |
 | `cvt.rs.satfinite.e2m1x4.f32` | 4×f32 → 4×fp4 e2m1 | b16 (4-bit lanes) | 22 |
@@ -43,14 +45,28 @@ the all-down `F=0` and all-up `F=max, W=all-ones` extremes) and the source-arg�
 
 ## Result
 
-**Shared structure (all three formats):** each output lane reads a **16-bit** slice, every physical
-bit is reused by **exactly two** lanes, and the two lanes sharing a slice consume it with **opposite
-weight order** (one forward, one bit-reversed). Only the *grouping* of bits differs between fp8 and
-fp4.
+**Every output lane reads a 16-bit slice.** The **x4** forms (e4m3/e5m2/e2m1) pack 4 lanes into one
+32-bit word by reusing **each physical bit in exactly two** lanes, the sharing pair consuming it with
+**opposite weight order** (one forward, one bit-reversed); only the *grouping* differs between fp8
+(contiguous halves) and fp4 (byte-interleaved). The **x2** form (bf16) has only 2 lanes and no reuse:
+each lane gets its own contiguous half in natural order.
 
 Notation below: `a→b` means physical word-bit `a` is the **MSB (weight 2¹⁵)** of that lane's slice
 and the run continues to bit `b` as the **LSB (weight 2⁰)**. Source args `$1..$4` pack into output
 elements `3..0` (little-endian), so both are shown.
+
+### bf16x2 — two contiguous 16-bit halves, natural order, no reuse
+
+With only 2 lanes and `D=16`, each lane gets its **own private** contiguous 16-bit half in **natural
+(forward) weight order** — no bit-reversal and no bit shared between lanes (unlike the x4 forms).
+
+| source arg | output elem | bits (MSB→LSB) | order |
+|---|---|---|---|
+| `$1` | elem 1 | `31→16` | forward (`(W>>16) & 0xFFFF`) |
+| `$2` | elem 0 | `15→0`  | forward (`W & 0xFFFF`) |
+
+Since `D` equals the slice width here, the dither fills the whole discarded field (no shift), so the
+add-and-truncate bit trick `(x_bits + R) & ~0xFFFF` is exactly equivalent for bf16 normals.
 
 ### e4m3 and e5m2 (identical) — two contiguous 16-bit halves
 

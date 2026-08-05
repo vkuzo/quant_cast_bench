@@ -7,9 +7,9 @@ Checks, per mode:
                          identical to the eager reference (both read the same raw Philox words via
                          prng.bits).
   * stochastic-nvidia-sm100 -- (Blackwell only, both output dtypes) unbiased/two-neighbor +
-                         deterministic. The float8_e4m3fn eager reference is bit-identical to the
-                         cvt.rs.satfinite.e4m3x4.f32 kernel (reverse-engineered bit layout); the bf16
-                         reference raises NotImplementedError. On non-Blackwell the API raises.
+                         deterministic. The eager reference is bit-identical to the cvt.rs.bf16x2.f32 /
+                         cvt.rs.satfinite.e4m3x4.f32 kernels (reverse-engineered bit layout). On
+                         non-Blackwell the API raises.
 
 Run under pytest (`pytest test.py -q`) or directly (`python test.py`).
 """
@@ -122,26 +122,17 @@ def test_stochastic_nvidia_sm100_unbiased_and_deterministic(dtype):
     assert torch.equal(a.view(torch.uint8), b.view(torch.uint8)), "hardware SR not deterministic"
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
-def test_stochastic_nvidia_sm100_bf16_reference_unavailable():
-    # only fp8 has an eager reference; the bf16 cvt.rs.bf16x2.f32 layout is not reproduced here.
-    try:
-        to(_x(), torch.bfloat16, rounding="stochastic-nvidia-sm100", key=_key(), _reference_impl=True)
-        raise AssertionError("stochastic-nvidia-sm100 bf16 reference should be unavailable")
-    except NotImplementedError:
-        pass
-
-
 @pytest.mark.skipif(not (torch.cuda.is_available() and torch.cuda.get_device_capability() == (10, 0)), reason="cvt.rs emits Blackwell-only PTX; requires cuda capability (10, 0)")
-def test_stochastic_nvidia_sm100_fp8_matches_reference_bitwise():
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_stochastic_nvidia_sm100_matches_reference_bitwise(dtype):
     x = _x()
-    out = to(x, torch.float8_e4m3fn, rounding="stochastic-nvidia-sm100", key=_key())
-    ref = to(x, torch.float8_e4m3fn, rounding="stochastic-nvidia-sm100", key=_key(), _reference_impl=True)
-    # the eager reference reproduces the cvt.rs.satfinite.e4m3x4.f32 intrinsic from its reverse-
-    # engineered random-bit layout, so it is BIT-IDENTICAL to the hardware kernel (normals AND
-    # subnormals), not merely statistically equal.
+    out = to(x, dtype, rounding="stochastic-nvidia-sm100", key=_key())
+    ref = to(x, dtype, rounding="stochastic-nvidia-sm100", key=_key(), _reference_impl=True)
+    # the eager reference reproduces the cvt.rs.bf16x2.f32 / cvt.rs.satfinite.e4m3x4.f32 intrinsic from
+    # its reverse-engineered random-bit layout, so it is BIT-IDENTICAL to the hardware kernel (normals
+    # AND subnormals), not merely statistically equal.
     assert torch.equal(out.view(torch.uint8), ref.view(torch.uint8))
-    _check_sr(out, x, torch.float8_e4m3fn)  # and is still valid unbiased SR
+    _check_sr(out, x, dtype)  # and is still valid unbiased SR
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
