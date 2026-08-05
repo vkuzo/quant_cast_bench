@@ -1,75 +1,58 @@
-"""Compare, bit-for-bit, the integer dither produced by PyTorch's stateless Philox PRNG
-(the gold recipe `sr_bf16_global_f`) against Triton's `tl.randint4x` (the recipe kernel
-`_sr_bf16_global_kernel`), fed identical inputs.
+"""Pytest: verify the integer dither produced in eager PyTorch matches Triton's `tl.randint4x`
+(the recipe kernel `_sr_bf16_global_kernel`), fed identical inputs.
 
-They do NOT match today, and this script demonstrates why. See the explanation printed at
-the end, and the "why" summary in this module docstring:
+Two eager generators are compared to the Triton kernel:
 
-  1. Float vs int. PyTorch's stateless PRNG only exposes a FLOAT uniform in [0, 1). The
-     baseline turns it into the dither via `int(u * 2**16)`, i.e. the TOP fractional bits
-     of the float. `tl.randint4x` returns RAW uint32 words and the recipe uses the LOW 16
-     bits (`rand & 0xFFFF`). Top-16-of-a-float != low-16-of-a-raw-int.
+  * `rand16_bits`  -- built on `torch.func._random.bits` (PR pytorch#190253), which exposes
+    Philox's RAW uint32 words. This MATCHES the Triton kernel bit-for-bit: same Philox4x32-10
+    with the same seed->key / offset->counter mapping, low 16 bits, and the kernel's contiguous
+    (r0,r1,r2,r3) lane order -- so `bits` lines up flat, no permutation needed.
 
-  2. One offset -> four values. The baseline keys one draw per element on counter = f (the
-     global flat index). `tl.randint4x(seed, offset)` returns FOUR words per single offset,
-     so the recipe keys on counter = f >> 2 and interleaves the 4 streams across the 4
-     elements -- a different counter->value mapping with no 1:1 correspondence.
+  * `rand16_uniform` -- the OLD path built on `prng.uniform`, a FLOAT uniform. It does NOT
+    match: `int(u * 2**16)` keeps the float's TOP fractional bits, while the kernel uses the
+    LOW 16 bits of a raw uint32. Kept here as a contrast to show what the raw-bits API fixed.
 
-  (Underlying both: PyTorch packs (seed, offset) into philox4x32's key/counter and consumes
-  one of the 4 philox lanes per element, while Triton maps seed->key, offset->counter and
-  exposes all 4 lanes as r0..r3.)
-
-Usage: python experiments/prng_match/test.py  (requires a CUDA GPU)
+Run: pytest experiments/prng_match/test.py   (requires a CUDA GPU + a build with pytorch#190253)
 """
 
+import os
+import sys
+
+import pytest
 import torch
 import torch.func._random as prng
 
-from api import baseline_rand16, rand16_triton
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from api import rand16_bits, rand16_triton, rand16_uniform  # noqa: E402
+
+def _key(seed=42):
+    return prng.key(seed, device="cuda")
 
 
-def main():
-    M, N, key = 8, 16, prng.key(42, device="cuda")
-    n = M * N
-
-    # Same inputs to both. Origins 0 and num_col=N make the baseline's global flat index
-    # equal the plain row-major flat position f, matching the standalone Triton kernel.
-    rand16_ref = baseline_rand16(M, N, key, global_row=0, global_col=0, num_col=N).reshape(-1)
-    rand16_tri = rand16_triton(n, key)
-
-    print(f"shape: ({M}, {N}) -> {n} elements, key = {key.tolist()}")
-    print(f"baseline (pytorch float PRNG): dtype={rand16_ref.dtype}, shape={tuple(rand16_ref.shape)}")
-    print(f"triton   (tl.randint4x)      : dtype={rand16_tri.dtype}, shape={tuple(rand16_tri.shape)}")
-
-    k = 8
-    print(f"\nfirst {k} dither values (flat index f):")
-    print(f"  {'f':>3} {'baseline':>10} {'triton':>10}")
-    for f in range(k):
-        print(f"  {f:>3} {rand16_ref[f].item():>10} {rand16_tri[f].item():>10}")
-
-    match = torch.equal(rand16_ref, rand16_tri)
-    print(f"\nbitwise equal: {match}  ->  {'[MATCH]' if match else '[MISMATCH]'}")
-
-    print(
-        "\nWhy they do not match today:\n"
-        "  1. float vs int: the baseline draws a FLOAT uniform and takes int(u * 2**16)\n"
-        "     (top fractional bits); the recipe takes the LOW 16 bits of a raw uint32\n"
-        "     (rand & 0xFFFF). Different bits, even from the same generator.\n"
-        "  2. one offset -> four values: the baseline keys one draw per element on\n"
-        "     counter = f; tl.randint4x keys on counter = f >> 2 and returns 4 words that\n"
-        "     are interleaved across the 4 elements -- a different counter->value mapping.\n"
-        "  (underlying: PyTorch packs (seed, offset) into philox4x32's key/counter and\n"
-        "   consumes one of the 4 philox lanes per element, while Triton maps seed->key,\n"
-        "   offset->counter and exposes all 4 lanes as r0..r3.)"
-    )
-
-    # This demo documents a KNOWN non-match; "pass" means we still observe the mismatch.
-    if match:
-        print("\n[FAIL] expected the documented MISMATCH, but the outputs matched.")
-        return 1
-    print("\n[PASS] observed the documented MISMATCH.")
-    return 0
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+@pytest.mark.skipif(not hasattr(prng, "bits"), reason="needs torch.func._random.bits (pytorch#190253)")
+@pytest.mark.parametrize("n", [128, 1024, 1000, 4096])
+def test_bits_matches_triton(n):
+    """The raw-bits eager path reproduces the Triton kernel's dither bit-for-bit, including
+    a non-multiple-of-4 size (1000) that exercises the tail-masking path."""
+    key = _key()
+    assert torch.equal(rand16_bits(n, key), rand16_triton(n, key))
 
 
-if __name__ == "__main__":
-    raise SystemExit(main())
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+@pytest.mark.skipif(not hasattr(prng, "bits"), reason="needs torch.func._random.bits (pytorch#190253)")
+@pytest.mark.parametrize("seed", [0, 1, 42, 123456])
+def test_bits_matches_triton_across_seeds(seed):
+    key = _key(seed)
+    assert torch.equal(rand16_bits(256, key), rand16_triton(256, key))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+def test_uniform_does_not_match_triton():
+    """The old float-uniform path keeps the float's TOP fractional bits, not the raw uint32's
+    LOW 16 bits, so it cannot bit-match the kernel -- documented contrast."""
+    M, N = 8, 16
+    key = _key()
+    tri = rand16_triton(M * N, key)
+    uni = rand16_uniform(M, N, key, global_row=0, global_col=0, num_col=N).reshape(-1)
+    assert not torch.equal(tri, uni)
