@@ -31,7 +31,8 @@ def to(
       * RTNE ("rtne", default)   -- round-to-nearest-even. This IS what `x.to(torch.bfloat16)` does,
                                     so we just call it; no randomness needed.
       * STOCHASTIC ("stochastic") -- unbiased stochastic rounding in software, tile-invariant (output
-                                    independent of the kernel's block size). Portable to any GPU.
+                                    independent of the kernel's block size). Portable to any GPU, but
+                                    requires a torch build with torch.func._random.bits (see below).
       * STOCHASTIC_NVIDIA_SM100 ("stochastic-nvidia-sm100") -- stochastic rounding in hardware via the
                                     NVIDIA Blackwell PTX intrinsic `cvt.rs.bf16x2.f32`. Faster, but
                                     gated to cuda capability (10, 0) and NOT reproducible from eager
@@ -46,10 +47,10 @@ def to(
                 reproducible precedent).
 
     `_reference_impl` (debug only) computes the result with an eager-PyTorch reference instead of the
-    Triton kernel, to cross-check the kernel's logic. For STOCHASTIC it uses a different RNG (a float
-    uniform's top 16 bits, vs the kernel's raw randint4x low 16 bits with a different counter->element
-    layout), so it is statistically equal but NOT bit-identical (see experiments/prng_match/). For
-    STOCHASTIC_NVIDIA_SM100 there is no eager equivalent -- the rounding happens inside the PTX
+    Triton kernel, to cross-check it. For STOCHASTIC the reference is BIT-IDENTICAL to the kernel: it
+    reads Philox's raw uint32 words via torch.func._random.bits -- the same words the kernel's
+    randint4x lays across elements -- and dithers with their low 16 bits (see experiments/prng_match/).
+    For STOCHASTIC_NVIDIA_SM100 there is no eager equivalent -- the rounding happens inside the PTX
     intrinsic and cannot be reproduced without inline_asm -- so it raises NotImplementedError.
     """
     assert x.dtype == torch.float32, f"only fp32 input supported for now, got {x.dtype}"
@@ -64,17 +65,20 @@ def to(
         raise ValueError("stochastic rounding needs a key= (torch.func._random Philox key)")
 
     if rounding == Rounding.STOCHASTIC:
+        if not hasattr(prng, "bits"):
+            raise RuntimeError(
+                "rounding='stochastic' requires the raw-uint32 Philox API torch.func._random.bits, "
+                "which is what lets the eager reference bit-match the kernel; build/install a torch "
+                "that includes https://github.com/pytorch/pytorch/pull/190253."
+            )
         if _reference_impl:
-            # eager reference: draw a FLOAT uniform per element keyed on its GLOBAL flat index
-            # (tile-invariant, reproducible), take its top 16 fractional bits as the dither, add to
-            # the fp32 bits and truncate the low 16 (mask -65536 == 0xFFFF0000; the cast is then
-            # exact). Statistically equal to the kernel but not bit-identical -- the kernel uses the
-            # LOW 16 bits of a raw randint4x uint32 with a different layout.
-            seed = key.reshape(-1)[:1].to(torch.int64)
-            gidx = torch.arange(x.numel(), device=x.device, dtype=torch.int64)
-            keys = torch.stack([seed.expand(gidx.numel()), gidx], dim=-1).to(torch.uint64)
-            u = prng.uniform(keys, (gidx.numel(),)).reshape(x.shape)  # float uniform in [0, 1)
-            rand16 = (u * (1 << 16)).to(torch.int32)
+            # eager reference, BIT-IDENTICAL to the kernel (see experiments/prng_match). `bits`
+            # exposes Philox's raw uint32 words in the same contiguous layout the kernel lays across
+            # elements (word 4c+lane == tl.randint4x(seed,c)[lane]), so element f's dither is just
+            # bits[f]. Take the low 16 bits, add to the fp32 bits, truncate the low 16 (mask -65536
+            # == 0xFFFF0000; the cast is then exact).
+            b = prng.bits(key, x.numel(), dtype=torch.uint32).view(torch.int32).reshape(x.shape)
+            rand16 = (b & 0xFFFF).to(torch.int32)
             xi = (x.contiguous().view(torch.int32) + rand16) & -65536
             return xi.view(torch.float32).to(torch.bfloat16)
         seed = key.reshape(-1)[:1].view(torch.int32)  # on-device int32 seed for the kernel, no sync

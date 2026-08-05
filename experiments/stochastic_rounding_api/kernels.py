@@ -29,10 +29,12 @@ def _sr_bf16_software_kernel(x_ptr, y_ptr, seed_ptr, n_elements, BLOCK: tl.const
     pid = tl.program_id(0)
     grp = pid * BLOCK + tl.arange(0, BLOCK)  # (BLOCK,) group index = global flat index >> 2
     r0, r1, r2, r3 = tl.randint4x(seed, grp)  # 4 streams; the group's 4 elements each take one
-    # interleave the 4 streams back to the contiguous 4*BLOCK element span -> coalesced ld/st.
-    # Element at flat index f gets counter f>>2 (independent of BLOCK) and a stream fixed by f&4 --
-    # a pure function of f, so the dither is invariant to the launch tiling.
-    rand = tl.interleave(tl.interleave(r0, r1), tl.interleave(r2, r3))  # (4*BLOCK,)
+    # lay the 4 streams across the contiguous 4*BLOCK element span in (r0,r1,r2,r3) lane order:
+    # element f takes counter f>>2 (independent of BLOCK -> tile-invariant) and lane f&3, so
+    # element 4c+lane == tl.randint4x(seed,c)[lane] == prng.bits(key,..,uint32)[4c+lane]. The lane
+    # order is a free choice (identical PTX); this one lets api.py's eager reference bit-match
+    # prng.bits with no permutation (see experiments/prng_match).
+    rand = tl.interleave(tl.interleave(r0, r2), tl.interleave(r1, r3))  # (4*BLOCK,) (r0,r1,r2,r3)
     offs = pid * (4 * BLOCK) + tl.arange(0, 4 * BLOCK)  # contiguous global flat indices
     mask = offs < n_elements
     xi = tl.load(x_ptr + offs, mask=mask).to(tl.int32, bitcast=True)
