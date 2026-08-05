@@ -3,8 +3,8 @@
 Checks, per mode:
   * rtne              -- bit-identical to the native `x.to(bfloat16)` and to the reference.
   * stochastic        -- unbiased & two-neighbor (the canonical SR property), tile-invariant across
-                         block sizes, deterministic given a key, and statistically equal to (but not
-                         bit-identical to) the eager reference.
+                         block sizes, deterministic given a key, and bit-identical to the eager
+                         reference (both read the same raw Philox words via prng.bits).
   * stochastic-nvidia-sm100 -- (Blackwell only) unbiased/two-neighbor + deterministic; the reference
                          for this mode raises NotImplementedError. On non-Blackwell the API raises.
 
@@ -87,24 +87,14 @@ def test_stochastic_deterministic():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
-def test_stochastic_matches_reference_statistically():
+def test_stochastic_matches_reference_bitwise():
     x = _x()
     out = to(x, torch.bfloat16, rounding="stochastic", key=_key())
     ref = to(x, torch.bfloat16, rounding="stochastic", key=_key(), _reference_impl=True)
-    # both are unbiased SR (mean rounding error ~= 0) ...
-    assert abs(_check_sr(out, x) - _check_sr(ref, x)) < 1e-3
-    # ... but they use different RNG (raw low-16 bits vs float top-16 bits), so NOT bit-identical.
-    assert not torch.equal(out.view(torch.int16), ref.view(torch.int16))
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
-def test_requires_key():
-    x = _x()
-    try:
-        to(x, torch.bfloat16, rounding="stochastic")  # no key
-        raise AssertionError("stochastic needs a key=")
-    except ValueError:
-        pass
+    # the eager reference reads the same raw Philox words (prng.bits) the kernel's randint4x lays
+    # across elements, so it is BIT-IDENTICAL to the kernel, not merely statistically equal.
+    assert torch.equal(out.view(torch.int16), ref.view(torch.int16))
+    _check_sr(out, x)  # and is still valid unbiased SR
 
 
 # --- hardware stochastic-nvidia-sm100 ----------------------------------------------------------
