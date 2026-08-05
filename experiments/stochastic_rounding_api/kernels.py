@@ -11,7 +11,7 @@ launch tiling (block size):
     is faster but NOT reproducible from eager PyTorch. Requires cuda capability (10, 0).
 
 Both take the Philox `seed` as an on-device int32 tensor (no host sync); `api.py` resolves a
-key/generator down to that seed. Randomness is `tl.randint4x`, which returns four independent uint32
+key down to that seed. Randomness is `tl.randint4x`, which returns four independent uint32
 Philox words per counter; we key the counter on `global_flat_index >> 2` so one Philox call feeds 4
 consecutive elements (software) / the interleave lays 4 words across 4 groups (hardware), wasting no
 words and keeping the counter->element map a pure function of the global index.
