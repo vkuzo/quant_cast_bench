@@ -58,8 +58,11 @@ def to(
     Triton kernel, to cross-check it. For STOCHASTIC the reference is BIT-IDENTICAL to the kernel: it
     reads Philox's raw uint32 words via torch.func._random.bits -- the same words the kernel's
     randint4x lays across elements -- and dithers with their low 16 bits (see experiments/prng_match/).
-    For STOCHASTIC_NVIDIA_SM100 there is no eager equivalent -- the rounding happens inside the PTX
-    intrinsic and cannot be reproduced without inline_asm -- so it raises NotImplementedError.
+    For STOCHASTIC_NVIDIA_SM100 the float8_e4m3fn reference is ALSO bit-identical: it reproduces the
+    cvt.rs.satfinite.e4m3x4.f32 intrinsic in eager PyTorch from its reverse-engineered random-bit
+    layout (each element's 16-bit slice of the shared word, plus the additive round-up rule; see
+    experiments/nvidia_rs_bit_probe). The bf16 (cvt.rs.bf16x2.f32) reference is not implemented and
+    raises NotImplementedError.
     """
     assert x.dtype == torch.float32, f"only fp32 input supported for now, got {x.dtype}"
     assert dtype in (torch.bfloat16, torch.float8_e4m3fn), (
@@ -102,11 +105,44 @@ def to(
 
     if rounding == Rounding.STOCHASTIC_NVIDIA_SM100:
         if _reference_impl:
-            raise NotImplementedError(
-                "hardware cvt.rs stochastic rounding rounds inside the PTX instruction and is not "
-                "reproducible in eager PyTorch without inline_asm; there is no reference impl for "
-                "rounding='stochastic-nvidia-sm100'."
-            )
+            if dtype != torch.float8_e4m3fn:
+                raise NotImplementedError(
+                    "the eager reference for rounding='stochastic-nvidia-sm100' is only implemented "
+                    "for float8_e4m3fn (from the reverse-engineered cvt.rs.satfinite.e4m3x4.f32 "
+                    "random-bit layout, see experiments/nvidia_rs_bit_probe); the bf16 "
+                    "cvt.rs.bf16x2.f32 layout has no eager equivalent here."
+                )
+            # Bit-exact eager model of cvt.rs.satfinite.e4m3x4.f32 (matches sr_fp8_hardware_triton).
+            # The kernel feeds one 32-bit Philox word W per group of 4 elements; the intrinsic hands
+            # each element a 16-bit slice of W (reverse-engineered in experiments/nvidia_rs_bit_probe):
+            #   element base+0 <- W[0:15]               element base+2 <- W[16:31]
+            #   element base+1 <- reverse(W[0:15])      element base+3 <- reverse(W[16:31])
+            # and rounds AWAY from zero iff  frac + R/2^16 >= 1, where frac is |x|'s fractional position
+            # between its two bracketing fp8 grid points (the additive .rs model; holds for normals and
+            # subnormals alike -- only the grid spacing differs). The kernel lays the 4 words of Philox
+            # counter c across groups 4c,4c+2,4c+1,4c+3 (perm [0,2,1,3] within each block of 4 groups,
+            # from its interleave(interleave(r0,r1),interleave(r2,r3))), so we index bits the same way.
+            flat = x.contiguous().reshape(-1)
+            n = flat.numel()
+            assert n % 4 == 0, "e4m3x4 needs an element count divisible by 4"
+            groups = n // 4
+            n_words = ((groups + 3) // 4) * 4  # round up to a whole Philox counter (4 words each)
+            bits = prng.bits(key, n_words, dtype=torch.uint32).to(torch.int64)
+            g = torch.arange(groups, device=flat.device)
+            perm = torch.tensor([0, 2, 1, 3], device=flat.device)  # kernel's interleave order
+            W = bits[4 * (g // 4) + perm[g % 4]]  # (groups,) one random word per group
+            low, high = W & 0xFFFF, (W >> 16) & 0xFFFF
+            low_rev = sum(((low >> i) & 1) << (15 - i) for i in range(16))   # bit-reverse low 16 bits
+            high_rev = sum(((high >> i) & 1) << (15 - i) for i in range(16))  # bit-reverse high 16 bits
+            R = torch.stack([low, low_rev, high, high_rev], dim=1).reshape(-1).double()  # per element
+            # |x|'s two bracketing points on the finite non-negative e4m3fn grid (0 .. 448)
+            codes = torch.arange(256, device=flat.device, dtype=torch.uint8).view(dtype).float()
+            grid = torch.unique(codes[torch.isfinite(codes) & (codes >= 0)]).sort().values.double()
+            ax = flat.abs().double()
+            i = (torch.searchsorted(grid, ax, right=True) - 1).clamp(0, grid.numel() - 2)
+            frac = (ax - grid[i]) / (grid[i + 1] - grid[i])
+            mag = torch.where(frac + R / (1 << 16) >= 1.0, grid[i + 1], grid[i])  # away from zero on carry
+            return (torch.sign(flat) * mag).to(torch.float32).to(dtype).reshape(x.shape)
         cap = torch.cuda.get_device_capability() if torch.cuda.is_available() else None
         if cap != (10, 0):
             raise RuntimeError(
