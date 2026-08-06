@@ -135,6 +135,35 @@ def test_stochastic_nvidia_sm100_matches_reference_bitwise(dtype):
     _check_sr(out, x, dtype)  # and is still valid unbiased SR
 
 
+# distributions that stress the corners `randn` barely reaches: the fp8 subnormal binades
+# (E in {-7,-8,-9}), the bottom bin |x| < 2^-9 (rounds between 0 and 2^-9), and the satfinite
+# clamp (|x| > 448). Each is where the exponent-dependent drop width / bottom-bin / clamp branches
+# of the eager reference must still match the hardware intrinsic bit-for-bit.
+def _stress_dists(seed):
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    r = lambda: torch.randn(N, generator=g, dtype=torch.float32, device="cuda")
+    return {
+        "subnormal": r() * 2.0**-8,                 # heavy in the fp8 subnormal range
+        "bottom_bin": r() * 2.0**-10,               # heavy in |x| < 2^-9 (rounds to 0 or 2^-9)
+        "saturating": r() * 300.0,                  # magnitudes past 448 -> satfinite clamp
+        "uniform": (torch.rand(N, generator=g, dtype=torch.float32, device="cuda") * 2 - 1) * 500,
+    }
+
+
+@pytest.mark.skipif(not (torch.cuda.is_available() and torch.cuda.get_device_capability() == (10, 0)), reason="cvt.rs emits Blackwell-only PTX; requires cuda capability (10, 0)")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("seed", [0, 1, 2, 3])
+def test_stochastic_nvidia_sm100_matches_reference_bitwise_stress(dtype, seed):
+    # the plain bitwise test above uses randn, which rarely produces fp8 subnormals / bottom-bin /
+    # out-of-range values. Sweep distributions that land squarely in those branches and confirm the
+    # eager reference stays byte-identical to the intrinsic there too. (Bitwise match only -- these
+    # distributions overflow the grid by design, so _check_sr's unbiasedness bound would not hold.)
+    for name, x in _stress_dists(seed).items():
+        out = to(x, dtype, rounding="stochastic-nvidia-sm100", key=_key(seed))
+        ref = to(x, dtype, rounding="stochastic-nvidia-sm100", key=_key(seed), _reference_impl=True)
+        assert torch.equal(out.view(torch.uint8), ref.view(torch.uint8)), f"{dtype} {name} mismatch"
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
 def test_stochastic_nvidia_sm100_gated_off_blackwell(dtype):
