@@ -105,12 +105,11 @@ def to(
             #   e4m3x4:  element base+0 <- W[0:15]            element base+2 <- W[16:31]
             #            element base+1 <- reverse(W[0:15])   element base+3 <- reverse(W[16:31])
             # (bf16 reads its two halves in natural weight order; fp8 packs 4 elements into the same
-            # word by reusing each half twice, once bit-reversed.) Rounding then differs by dtype:
-            # bf16's 16-bit slice fills the whole 16-bit discarded mantissa field, so the .rs carry
-            # rule is exactly add-dither-then-truncate (same trick as the software branch; bf16
-            # subnormals ~2^-133 never arise here). fp8's slice does NOT fill its 20 discarded bits
-            # and fp8 has subnormals, so it uses the additive .rs grid model: round AWAY from zero
-            # iff frac + R/2^16 >= 1, frac = |x|'s position between its true fp8 neighbors. Both
+            # word by reusing each half twice, once bit-reversed.) Both dtypes then use the SAME .rs
+            # carry rule -- add the 16-bit dither R to the discarded mantissa field, round up on the
+            # carry-out -- but with a discarded-field width D that lands truncation exactly on the
+            # target grid: bf16 has a fixed D=16 (a plain add-and-truncate), while fp8 varies D per
+            # element so it stays grid-correct for subnormals too (see the fp8 block). Both
             # kernels lay the 4 words of Philox counter c across groups
             # 4c,4c+2,4c+1,4c+3 (perm [0,2,1,3] within each block of 4 groups, from their shared
             # interleave(interleave(r0,r1),interleave(r2,r3))), so we index the words the same way.
@@ -148,18 +147,52 @@ def to(
                 xi = (flat.view(torch.int32) + R.to(torch.int32)) & -(1 << 16)
                 return xi.view(torch.float32).to(torch.bfloat16).reshape(x.shape)
 
-            # fp8_e4m3: R does not fill the 20 discarded bits and fp8 has subnormals, so add-and-
-            # truncate is wrong there (fixed-drop lands on a too-fine grid, then RTNE double-rounds).
-            # Use the additive .rs grid model against the true fp8 neighbors: round AWAY from zero iff
-            # frac + R/2^16 >= 1. More accurate and slower.
-            # |x|'s two bracketing points on the fp8 finite non-negative grid (every bit pattern)
-            codes = torch.arange(256, device=flat.device).to(torch.uint8).view(dtype).float()
-            grid = torch.unique(codes[torch.isfinite(codes) & (codes >= 0)]).sort().values.double()
-            ax = flat.abs().double()
-            i = (torch.searchsorted(grid, ax, right=True) - 1).clamp(0, grid.numel() - 2)
-            frac = (ax - grid[i]) / (grid[i + 1] - grid[i])
-            mag = torch.where(frac + R / (1 << 16) >= 1.0, grid[i + 1], grid[i])  # away from zero on carry
-            return (torch.sign(flat) * mag).to(torch.float32).to(dtype).reshape(x.shape)
+            else:
+                assert dtype == torch.float8_e4m3fn
+
+                # fp8_e4m3: same add-dither-truncate carry rule as bf16, but a FIXED 20-bit drop is wrong
+                # for subnormals (it truncates onto a too-fine grid, then the cast double-rounds). Make the
+                # drop width exponent-dependent so truncation lands exactly on the true fp8 grid: normals
+                # discard D=20 fp32 mantissa bits, and each binade below the min normal exponent
+                # (E_min=-6) needs one more -> D(E) = 20 + max(0, E_min - E). R aligns to the TOP of the
+                # D-bit field (<< D-16), so round-up is the carry out of bit D. This is exact for
+                # |x| >= 2^-9 (E >= -9 -> D <= 23). The bottom bin |x| < 2^-9 rounds between 0 and 2^-9,
+                # which is not a mantissa truncation (0 needs a zero exponent), so it's a direct frac
+                # compare masked in below. Out-of-range magnitudes saturate to +-448 (satfinite).
+
+                # the intrinsic is satfinite, so we clamp to min/max repr value
+                flat_c = flat.clamp(-448.0, 448.0)
+
+                # get the unbiased fp32 exponent, E decides whether the value will
+                # be normal or subnormal in the float8_e4m3fn encoding
+                E = ((flat_c.abs().view(torch.int32).to(torch.int64) >> 23) & 0xFF) - 127  # fp32 exp of |x|
+
+                # exponent-dependent drop width: incrementing D one bit per binade below E_min
+                # freezes the truncation grid at the fixed 2^-9 subnormal ulp (spacing = 2^(E-23+D)),
+                # which is what makes the dither work correctly for subnormals
+                D = 20 + (-6 - E).clamp(min=0)          # per-element discarded-bit width
+
+                # cap to a valid shift/mask width; D>23 only for |x|<2^-9, which is overridden below
+                Dc = D.clamp(max=23)
+
+                # add-dither-truncate, use int64 to prevent overflow in the negative mask
+                # arithmetic and the shifts
+                xbits = flat_c.view(torch.int32).to(torch.int64)
+                xi = (xbits + (R.to(torch.int64) << (Dc - 16))) & -(torch.ones_like(Dc) << Dc)
+                out = xi.to(torch.int32).view(torch.float32)  # sits exactly on the fp8 grid for |x| >= 2^-9
+
+                # special case numbers next to the zero bin
+                # bottom bin |x| < 2^-9: neighbors are 0 and 2^-9, frac = |x| / 2^-9; round away from zero
+                ax = flat.abs().double()
+                promote = ax * (1 << 9) + R / (1 << 16) >= 1.0  # frac + R/2^16 >= 1
+                bottom = torch.sign(flat).double() * torch.where(promote, torch.full_like(ax, 2.0**-9), torch.zeros_like(ax))
+
+                # combine the truncation path (`out`, |x| >= 2^-9) and the bottom-bin path
+                # (`bottom`, |x| < 2^-9) with a mask
+                out = torch.where(ax < 2.0**-9, bottom.to(torch.float32), out)
+
+                # last round to target dtype, and we're done!
+                return out.to(dtype).reshape(x.shape)
         else:
             cap = torch.cuda.get_device_capability() if torch.cuda.is_available() else None
             if cap != (10, 0):
