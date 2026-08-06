@@ -105,10 +105,13 @@ def to(
             #   e4m3x4:  element base+0 <- W[0:15]            element base+2 <- W[16:31]
             #            element base+1 <- reverse(W[0:15])   element base+3 <- reverse(W[16:31])
             # (bf16 reads its two halves in natural weight order; fp8 packs 4 elements into the same
-            # word by reusing each half twice, once bit-reversed.) Rounding is the additive .rs rule:
-            # round AWAY from zero iff  frac + R/2^16 >= 1, where frac is |x|'s fractional position
-            # between its two bracketing grid points -- holds for normals and subnormals alike, only
-            # the grid spacing differs. Both kernels lay the 4 words of Philox counter c across groups
+            # word by reusing each half twice, once bit-reversed.) Rounding then differs by dtype:
+            # bf16's 16-bit slice fills the whole 16-bit discarded mantissa field, so the .rs carry
+            # rule is exactly add-dither-then-truncate (same trick as the software branch; bf16
+            # subnormals ~2^-133 never arise here). fp8's slice does NOT fill its 20 discarded bits
+            # and fp8 has subnormals, so it uses the additive .rs grid model: round AWAY from zero
+            # iff frac + R/2^16 >= 1, frac = |x|'s position between its true fp8 neighbors. Both
+            # kernels lay the 4 words of Philox counter c across groups
             # 4c,4c+2,4c+1,4c+3 (perm [0,2,1,3] within each block of 4 groups, from their shared
             # interleave(interleave(r0,r1),interleave(r2,r3))), so we index the words the same way.
 
@@ -135,23 +138,28 @@ def to(
                 high_rev = sum(((high >> i) & 1) << (15 - i) for i in range(16))  # bit-reverse high 16
                 R = torch.stack([low, low_rev, high, high_rev], dim=1).reshape(-1).double()
 
-            # stochastic rounding implementation which matches bitwise to NVIDIA's
-            # `cvt.rs.bf16x2.f32` and `cvt.rs.satfinite.e4m3x4.f32` intrinsics.
-            # Note that this is **not** the add-dither-truncate algorithm from
-            # the software branch above - this is a more accurate and slower
-            # implementation of SR which is unbiased for both normals and denormals
-            # TODO(future): deslop the implementation below.
-            # === (start slop) ===
-            # |x|'s two bracketing points on the dtype's finite non-negative grid (every bit pattern)
-            n_codes, code_dt = ((1 << 16), torch.int16) if dtype == torch.bfloat16 else (256, torch.uint8)
-            codes = torch.arange(n_codes, device=flat.device).to(code_dt).view(dtype).float()
+            # rounding logic that consumes the per-element 16-bit random slice R
+            if dtype == torch.bfloat16:
+                # bf16: R fills the full 16 discarded mantissa bits, so the cvt.rs additive-carry rule
+                # is exactly add-dither-then-truncate (same trick as the software branch, just fed the
+                # hardware's shared-word bit layout). Round-up = carry out of the low 16 bits into the
+                # kept mantissa. Exact for bf16 normals; randn-scale data never produces bf16
+                # subnormals (~2^-133) where a fixed 16-bit drop would diverge.
+                xi = (flat.view(torch.int32) + R.to(torch.int32)) & -(1 << 16)
+                return xi.view(torch.float32).to(torch.bfloat16).reshape(x.shape)
+
+            # fp8_e4m3: R does not fill the 20 discarded bits and fp8 has subnormals, so add-and-
+            # truncate is wrong there (fixed-drop lands on a too-fine grid, then RTNE double-rounds).
+            # Use the additive .rs grid model against the true fp8 neighbors: round AWAY from zero iff
+            # frac + R/2^16 >= 1. More accurate and slower.
+            # |x|'s two bracketing points on the fp8 finite non-negative grid (every bit pattern)
+            codes = torch.arange(256, device=flat.device).to(torch.uint8).view(dtype).float()
             grid = torch.unique(codes[torch.isfinite(codes) & (codes >= 0)]).sort().values.double()
             ax = flat.abs().double()
             i = (torch.searchsorted(grid, ax, right=True) - 1).clamp(0, grid.numel() - 2)
             frac = (ax - grid[i]) / (grid[i + 1] - grid[i])
             mag = torch.where(frac + R / (1 << 16) >= 1.0, grid[i + 1], grid[i])  # away from zero on carry
             return (torch.sign(flat) * mag).to(torch.float32).to(dtype).reshape(x.shape)
-            # === (end slop) ===
         else:
             cap = torch.cuda.get_device_capability() if torch.cuda.is_available() else None
             if cap != (10, 0):
