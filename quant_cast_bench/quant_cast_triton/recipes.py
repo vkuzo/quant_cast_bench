@@ -23,13 +23,13 @@ from quant_cast_bench.quant_cast_gold.recipes import (
     Deepseek128x128Gold,
     Float8TensorwiseGold,
     HadamardRht,
-    Mxfp832x32FloorGold,
-    Mxfp8FloorDimKmGold,
-    Mxfp8FloorDimKmSwizzleGold,
-    Mxfp8FloorDimMGold,
-    Mxfp8FloorDimMSwizzleGold,
-    Mxfp8FloorGold,
-    Mxfp8FloorSwizzleGold,
+    Mxfp832x32Gold,
+    Mxfp8DimKmGold,
+    Mxfp8DimKmSwizzleGold,
+    Mxfp8DimMGold,
+    Mxfp8DimMSwizzleGold,
+    Mxfp8Gold,
+    Mxfp8SwizzleGold,
     Nvfp4BlockedOuterGold,
     Nvfp4GsGold,
     Nvfp4GsSwizzleGold,
@@ -509,31 +509,32 @@ FP8_COLWISE = QuantCastTritonRecipe.from_gold(ColwiseFp8Gold, triton_fn=fp8_colw
 
 
 # ---------------------------------------------------------------------------
-# e8m0 device helpers (mxfp8). Exact ports of _amax_to_e8m0_floor / _e8m0_to_fp32 (recipes.py)
+# e8m0 device helpers (mxfp8). Exact ports of _amax_to_e8m0 / _e8m0_to_fp32 (recipes.py)
 # so the scale matches the reference bit-for-bit. e8m0 is stored as its uint8 biased-exponent
 # byte (the wrapper .view()s it as float8_e8m0fnu).
 # ---------------------------------------------------------------------------
 @triton.jit
-def _amax_to_e8m0_floor_tl(amax):
-    # amax: fp32. Returns the e8m0 biased exponent as int32 (caller stores it as uint8).
-    i = amax.to(tl.int32, bitcast=True)
-    extracted_pow2 = ((i >> 23) & 0xFF) - 127
-    unbiased = extracted_pow2 - 8  # - f8e4m3_max_pow2
-    unbiased = tl.minimum(tl.maximum(unbiased, -127), 128)
-    biased = unbiased + 127
-    return tl.where(amax != amax, 255, biased)  # NaN -> 255
+def _amax_to_e8m0_tl(amax):
+    # amax: fp32. RCEIL: descale = amax / 448, then round UP to the next power-of-two e8m0
+    # exponent (whenever descale's fp32 mantissa is nonzero). Returns the biased exponent as
+    # int32 (caller stores it as uint8). Mirrors the gold _amax_to_e8m0_rceil bit-math.
+    i = (amax * (1.0 / 448.0)).to(tl.int32, bitcast=True)  # descale bits
+    biased_exponent = (i >> 23) & 0xFF
+    mantissa = i & 0x7FFFFF
+    # normal fp32 rounds up on any set mantissa bit; fp32 subnormals (biased_exp == 0) only above 2^-127.
+    needs_round_up = tl.where(biased_exponent == 0, mantissa > 0x400000, mantissa != 0)
+    return biased_exponent + needs_round_up.to(tl.int32)
 
 
 @triton.jit
-def _amax_to_e8m0_floor_cvt(amax):
-    # Blackwell (SM100+) hardware e8m0 FLOOR: `cvt.rz.satfinite.ue8m0x2.f32` rounds toward zero,
-    # which for a non-negative amax is exactly floor of the exponent. Prescale by 2**-8 to fold in
-    # the f8e4m3 max-pow2 offset, so cvt.rz.ue8m0(amax * 2**-8) = 2**(floor(log2 amax) - 8) as the
-    # biased e8m0 exponent -- matching _amax_to_e8m0_floor_tl without the register-heavy bit math.
+def _amax_to_e8m0_cvt(amax):
+    # Blackwell (SM100+) hardware e8m0 RCEIL: `cvt.rp.ue8m0x2.f32` rounds toward +inf, i.e. rounds
+    # the descale = amax / 448 up to the next power-of-two e8m0 exponent -- matching
+    # _amax_to_e8m0_tl / the gold cvt path without the register-heavy bit math.
     # The x2 op packs two e8m0 into a .b16; we feed 0.0 as the high lane and keep the low byte.
-    a = (amax * 0.00390625).to(tl.float32)  # 2**-8
+    a = (amax * (1.0 / 448.0)).to(tl.float32)  # descale
     packed = tl.inline_asm_elementwise(
-        asm="cvt.rz.satfinite.ue8m0x2.f32 $0, 0f00000000, $1;",
+        asm="cvt.rp.ue8m0x2.f32 $0, 0f00000000, $1;",
         constraints="=h,f",
         args=[a],
         dtype=tl.int16,
@@ -551,11 +552,11 @@ def _e8m0_to_fp32_tl(biased):
 
 
 # ---------------------------------------------------------------------------
-# mxfp8 FLOOR 1x32: one e8m0 scale per (row, 32-col-block). Mirrors mxfp8_floor_f.
+# mxfp8 1x32: one e8m0 scale per (row, 32-col-block). Mirrors mxfp8_f.
 # Grid: (cdiv(M, BM), N // 32).
 # ---------------------------------------------------------------------------
 @triton.jit
-def _mxfp8_floor_kernel(x_ptr, y_ptr, s_ptr, M, N, sxm, sxn, sym, syn, ssm, ssn, BM: tl.constexpr):
+def _mxfp8_kernel(x_ptr, y_ptr, s_ptr, M, N, sxm, sxn, sym, syn, ssm, ssn, BM: tl.constexpr):
     pid_m = tl.program_id(0)
     pid_b = tl.program_id(1)
     offs_m = pid_m * BM + tl.arange(0, BM)
@@ -564,31 +565,31 @@ def _mxfp8_floor_kernel(x_ptr, y_ptr, s_ptr, M, N, sxm, sxn, sym, syn, ssm, ssn,
     mask = m_mask[:, None] & (offs_n[None, :] < N)
     x = tl.load(x_ptr + offs_m[:, None] * sxm + offs_n[None, :] * sxn, mask=mask).to(tl.float32)
     amax = tl.max(tl.abs(x), axis=1)  # (BM,) -- mxfp8 does NOT clamp amax
-    biased = _amax_to_e8m0_floor_tl(amax)
+    biased = _amax_to_e8m0_tl(amax)
     sfp = _e8m0_to_fp32_tl(biased)
     y = (x / sfp[:, None]).to(tl.float8e4nv)
     tl.store(y_ptr + offs_m[:, None] * sym + offs_n[None, :] * syn, y, mask=mask)
     tl.store(s_ptr + offs_m * ssm + pid_b * ssn, biased.to(tl.uint8), mask=m_mask)
 
 
-def mxfp8_floor_triton(x, **kwargs):
+def mxfp8_triton(x, **kwargs):
     assert x.is_contiguous() and x.dim() == 2
     M, N = x.shape
     y = torch.empty_like(x, dtype=torch.float8_e4m3fn)
     s_u8 = torch.empty(M, N // 32, dtype=torch.uint8, device=x.device)
     grid = (triton.cdiv(M, 64), N // 32)
-    _mxfp8_floor_kernel[grid](
+    _mxfp8_kernel[grid](
         x, y, s_u8, M, N, x.stride(0), x.stride(1), y.stride(0), y.stride(1),
         s_u8.stride(0), s_u8.stride(1), BM=64,
     )
     return y, s_u8.view(torch.float8_e8m0fnu)
 
 
-MXFP8_FLOOR = QuantCastTritonRecipe.from_gold(Mxfp8FloorGold, triton_fn=mxfp8_floor_triton)
+MXFP8 = QuantCastTritonRecipe.from_gold(Mxfp8Gold, triton_fn=mxfp8_triton)
 
 
 # ---------------------------------------------------------------------------
-# mxfp8 FLOOR 32x32: one e8m0 scale per 32x32 block. Mirrors mxfp8_32x32_floor_f.
+# mxfp8 32x32: one e8m0 scale per 32x32 block. Mirrors mxfp8_32x32_f.
 # Perf: one 32x32 block per program is tiny/low-intensity. Batch CB col-blocks per program
 # (32 rows x CB*32 cols), reshaping to (32, CB, 32) and reducing the row + within-block dims;
 # autotune CB and num_warps. Grid: (M // 32, cdiv(N, CB*32)).
@@ -611,7 +612,7 @@ def _mxfp8_32x32_kernel(x_ptr, y_ptr, s_ptr, M, N, sxm, sxn, sym, syn, ssm, ssn,
     ).to(tl.float32)  # (32, CB*32)
     xr = tl.reshape(x, (32, CB, 32))
     amax = tl.max(tl.max(tl.abs(xr), axis=2), axis=0)  # (CB,): within-block cols, then 32 rows
-    biased = _amax_to_e8m0_floor_tl(amax)  # (CB,)
+    biased = _amax_to_e8m0_tl(amax)  # (CB,)
     sfp = _e8m0_to_fp32_tl(biased)
     y = tl.reshape((xr / sfp[None, :, None]).to(tl.float8e4nv), (32, CB * 32))
     tl.store(y_ptr + offs_m[:, None] * sym + offs_n[None, :] * syn, y, mask=n_mask[None, :])
@@ -619,7 +620,7 @@ def _mxfp8_32x32_kernel(x_ptr, y_ptr, s_ptr, M, N, sxm, sxn, sym, syn, ssm, ssn,
     tl.store(s_ptr + pid_rb * ssm + s_cols * ssn, biased.to(tl.uint8), mask=s_cols < (N // 32))
 
 
-def mxfp8_32x32_floor_triton(x, **kwargs):
+def mxfp8_32x32_triton(x, **kwargs):
     assert x.is_contiguous() and x.dim() == 2
     M, N = x.shape
     y = torch.empty_like(x, dtype=torch.float8_e4m3fn)
@@ -632,14 +633,14 @@ def mxfp8_32x32_floor_triton(x, **kwargs):
     return y, s_u8.view(torch.float8_e8m0fnu)
 
 
-MXFP8_32X32_FLOOR = QuantCastTritonRecipe.from_gold(
-    Mxfp832x32FloorGold, triton_fn=mxfp8_32x32_floor_triton
+MXFP8_32X32 = QuantCastTritonRecipe.from_gold(
+    Mxfp832x32Gold, triton_fn=mxfp8_32x32_triton
 )
 
 
 # ---------------------------------------------------------------------------
-# mxfp8 FLOOR dim-M: 32-row blocks down M, one e8m0 scale per (32-row-block, col); transposed
-# outputs (N, M) / (N, M//32). Mirrors mxfp8_floor_dim_m_f.
+# mxfp8 dim-M: 32-row blocks down M, one e8m0 scale per (32-row-block, col); transposed
+# outputs (N, M) / (N, M//32). Mirrors mxfp8_dim_m_f.
 # Perf: process RB 32-row blocks x BN cols per program; reshape (RB*32, BN) -> (RB, 32, BN) and
 # reduce the within-block 32. This kernel is memory-bound and OCCUPANCY-limited: the fp32 tile is
 # register-heavy, so a large (RB*32, BN) tile spills registers and collapses occupancy (ncu: RB=4
@@ -659,7 +660,7 @@ _DIM_M_CONFIGS = [
 
 @triton.autotune(configs=_DIM_M_CONFIGS, key=["M", "N"])
 @triton.jit
-def _mxfp8_floor_dim_m_kernel(
+def _mxfp8_dim_m_kernel(
     x_ptr, y_ptr, s_ptr, M, N, sxm, sxn, sym, syn, ssm, ssn, BN: tl.constexpr, RB: tl.constexpr
 ):
     pid_rb = tl.program_id(0)
@@ -672,7 +673,7 @@ def _mxfp8_floor_dim_m_kernel(
     ).to(tl.float32)  # (128, BN)
     xr = tl.reshape(x, (RB, 32, BN))
     amax = tl.max(tl.abs(xr), axis=1)  # (RB, BN): per (row-block, col)
-    biased = _amax_to_e8m0_floor_cvt(amax)  # (RB, BN); hardware cvt.rz e8m0 floor
+    biased = _amax_to_e8m0_cvt(amax)  # (RB, BN); hardware cvt.rp e8m0
     sfp = _e8m0_to_fp32_tl(biased)
     y = tl.reshape((xr / sfp[:, None, :]).to(tl.float8e4nv), (RB * 32, BN))  # (128, BN)
     # transposed qdata store into (N, M): out[n, m] = y[m_in_tile, n]; 128-wide contiguous per row.
@@ -686,37 +687,37 @@ def _mxfp8_floor_dim_m_kernel(
     )
 
 
-def mxfp8_floor_dim_m_triton(x, **kwargs):
+def mxfp8_dim_m_triton(x, **kwargs):
     assert x.is_contiguous() and x.dim() == 2
     M, N = x.shape
-    assert M % 128 == 0, "mxfp8_floor_dim_m fast kernel needs M%128==0"
+    assert M % 128 == 0, "mxfp8_dim_m fast kernel needs M%128==0"
     y = torch.empty((N, M), dtype=torch.float8_e4m3fn, device=x.device)
     s_u8 = torch.empty((N, M // 32), dtype=torch.uint8, device=x.device)
     grid = lambda meta: (M // (meta["RB"] * 32), triton.cdiv(N, meta["BN"]))  # noqa: E731
-    _mxfp8_floor_dim_m_kernel[grid](
+    _mxfp8_dim_m_kernel[grid](
         x, y, s_u8, M, N, x.stride(0), x.stride(1), y.stride(0), y.stride(1),
         s_u8.stride(0), s_u8.stride(1),
     )
     return y, s_u8.view(torch.float8_e8m0fnu)
 
 
-MXFP8_FLOOR_DIM_M = QuantCastTritonRecipe.from_gold(
-    Mxfp8FloorDimMGold, triton_fn=mxfp8_floor_dim_m_triton
+MXFP8_DIM_M = QuantCastTritonRecipe.from_gold(
+    Mxfp8DimMGold, triton_fn=mxfp8_dim_m_triton
 )
 
 
 # ---------------------------------------------------------------------------
-# mxfp8 FLOOR dim-M with the e8m0 scale written into the NVIDIA-swizzled 4D block grid
-# (nrb, ncb, 32, 16). Same quant + transposed qdata store as _mxfp8_floor_dim_m_kernel; only the
+# mxfp8 dim-M with the e8m0 scale written into the NVIDIA-swizzled 4D block grid
+# (nrb, ncb, 32, 16). Same quant + transposed qdata store as _mxfp8_dim_m_kernel; only the
 # scale store changes -- instead of a transposed (N, M//32) 2D write it scatters each block's e8m0
 # byte to its swizzled slot. The swizzle acts on the TRANSPOSED-frame scale (N, M//32): the
 # pre-swizzle position is (row = n in [0, N), col = 32-row-block index in [0, M//32)), so it reuses
-# _mxfp8_floor_swizzle_kernel's flat formula. Mirrors mxfp8_floor_dim_m_swizzle_f. Requires
+# _mxfp8_swizzle_kernel's flat formula. Mirrors mxfp8_dim_m_swizzle_f. Requires
 # M % 128 == 0. Grid: (M // (RB*32), cdiv(N, BN)).
 # ---------------------------------------------------------------------------
 @triton.autotune(configs=_DIM_M_CONFIGS, key=["M", "N"])
 @triton.jit
-def _mxfp8_floor_dim_m_swizzle_kernel(
+def _mxfp8_dim_m_swizzle_kernel(
     x_ptr, y_ptr, s_ptr, M, N, sxm, sxn, sym, syn, NCB, BN: tl.constexpr, RB: tl.constexpr
 ):
     pid_rb = tl.program_id(0)
@@ -729,7 +730,7 @@ def _mxfp8_floor_dim_m_swizzle_kernel(
     ).to(tl.float32)  # (RB*32, BN)
     xr = tl.reshape(x, (RB, 32, BN))
     amax = tl.max(tl.abs(xr), axis=1)  # (RB, BN): per (row-block, col)
-    biased = _amax_to_e8m0_floor_cvt(amax)  # (RB, BN); hardware cvt.rz e8m0 floor
+    biased = _amax_to_e8m0_cvt(amax)  # (RB, BN); hardware cvt.rp e8m0
     sfp = _e8m0_to_fp32_tl(biased)
     y = tl.reshape((xr / sfp[:, None, :]).to(tl.float8e4nv), (RB * 32, BN))  # (128, BN)
     # transposed qdata store into (N, M): out[n, m] = y[m_in_tile, n]; 128-wide contiguous per row.
@@ -749,34 +750,34 @@ def _mxfp8_floor_dim_m_swizzle_kernel(
     tl.store(s_ptr + flat, biased.to(tl.uint8), mask=n_mask[None, :])
 
 
-def mxfp8_floor_dim_m_swizzle_triton(x, **kwargs):
+def mxfp8_dim_m_swizzle_triton(x, **kwargs):
     assert x.is_contiguous() and x.dim() == 2
     M, N = x.shape
-    assert M % 128 == 0, "mxfp8_floor_dim_m_swizzle fast kernel needs M%128==0"
+    assert M % 128 == 0, "mxfp8_dim_m_swizzle fast kernel needs M%128==0"
     y = torch.empty((N, M), dtype=torch.float8_e4m3fn, device=x.device)
     nrb = (N + 127) // 128            # transposed rows = N
     ncb = ((M // 32) + 3) // 4        # transposed cols = M//32 (M%128==0 -> exact M//128)
     # zero-filled so any padded (row/col beyond the real grid) positions match gold's zeros.
     s_u8 = torch.zeros(nrb, ncb, 32, 16, dtype=torch.uint8, device=x.device)
     grid = lambda meta: (M // (meta["RB"] * 32), triton.cdiv(N, meta["BN"]))  # noqa: E731
-    _mxfp8_floor_dim_m_swizzle_kernel[grid](
+    _mxfp8_dim_m_swizzle_kernel[grid](
         x, y, s_u8, M, N, x.stride(0), x.stride(1), y.stride(0), y.stride(1), ncb,
     )
     return y, s_u8.view(torch.float8_e8m0fnu)
 
 
-MXFP8_FLOOR_DIM_M_SWIZZLE = QuantCastTritonRecipe.from_gold(
-    Mxfp8FloorDimMSwizzleGold, triton_fn=mxfp8_floor_dim_m_swizzle_triton
+MXFP8_DIM_M_SWIZZLE = QuantCastTritonRecipe.from_gold(
+    Mxfp8DimMSwizzleGold, triton_fn=mxfp8_dim_m_swizzle_triton
 )
 
 
 # ---------------------------------------------------------------------------
-# mxfp8 FLOOR in BOTH directions, ONE pass. Each program owns a (RB*32) x BN tile of x (read once)
+# mxfp8 in BOTH directions, ONE pass. Each program owns a (RB*32) x BN tile of x (read once)
 # and reduces it both ways: dim-K = 1x32 blocks along columns (reshape (BM, BN//32, 32), reduce the
 # 32), dim-M = 32x1 blocks along rows (reshape (RB, 32, BN), reduce the 32). Emits 4 outputs: qdata_k
-# (M,N)/scale_k (M,N//32) like mxfp8_floor, and qdata_m (N,M)/scale_m (N,M//32) like mxfp8_floor_dim_m
-# (transposed store). Uses the bit-math e8m0 floor (bit-exact vs gold). Requires M%128==0 and N%128==0.
-# Perf: like mxfp8_floor_dim_m, the transposed dim-M store is the binding cost -- taller tiles (larger
+# (M,N)/scale_k (M,N//32) like mxfp8, and qdata_m (N,M)/scale_m (N,M//32) like mxfp8_dim_m
+# (transposed store). Uses the bit-math e8m0 (bit-exact vs gold). Requires M%128==0 and N%128==0.
+# Perf: like mxfp8_dim_m, the transposed dim-M store is the binding cost -- taller tiles (larger
 # RB) widen its contiguous runs, wider BN raises work/occupancy; autotune RB/BN/num_warps to trade
 # off (the fixed 32x32 version only reached ~31%). Grid: (M // (RB*32), N // BN).
 # ---------------------------------------------------------------------------
@@ -790,7 +791,7 @@ _DIM_KM_CONFIGS = [
 
 @triton.autotune(configs=_DIM_KM_CONFIGS, key=["M", "N"])
 @triton.jit
-def _mxfp8_floor_dim_km_kernel(
+def _mxfp8_dim_km_kernel(
     x_ptr, yk_ptr, sk_ptr, ym_ptr, sm_ptr, M, N,
     sxm, sxn, sykm, sykn, sskm, sskn, symn, symm, ssmn, ssmm,
     BN: tl.constexpr, RB: tl.constexpr,
@@ -804,14 +805,14 @@ def _mxfp8_floor_dim_km_kernel(
     x = tl.load(x_ptr + offs_m[:, None] * sxm + offs_n[None, :] * sxn).to(tl.float32)  # (BM, BN)
     # dim-K: 1x32 blocks along columns -> (BM, CB, 32), reduce the 32. mxfp8 does NOT clamp amax.
     xk = tl.reshape(x, (BM, CB, 32))
-    bk = _amax_to_e8m0_floor_tl(tl.max(tl.abs(xk), axis=2))  # (BM, CB) per (row, col-block)
+    bk = _amax_to_e8m0_tl(tl.max(tl.abs(xk), axis=2))  # (BM, CB) per (row, col-block)
     yk = tl.reshape((xk / _e8m0_to_fp32_tl(bk)[:, :, None]).to(tl.float8e4nv), (BM, BN))
     tl.store(yk_ptr + offs_m[:, None] * sykm + offs_n[None, :] * sykn, yk)
     sk_cols = pid_n * CB + tl.arange(0, CB)
     tl.store(sk_ptr + offs_m[:, None] * sskm + sk_cols[None, :] * sskn, bk.to(tl.uint8))
     # dim-M: 32x1 blocks along rows -> (RB, 32, BN), reduce the 32; transposed store.
     xm = tl.reshape(x, (RB, 32, BN))
-    bm = _amax_to_e8m0_floor_tl(tl.max(tl.abs(xm), axis=1))  # (RB, BN) per (row-block, col)
+    bm = _amax_to_e8m0_tl(tl.max(tl.abs(xm), axis=1))  # (RB, BN) per (row-block, col)
     ym = tl.reshape((xm / _e8m0_to_fp32_tl(bm)[:, None, :]).to(tl.float8e4nv), (BM, BN))
     # out[n, m] = ym[row, col] with n=offs_n[col], m=offs_m[row] -> store tl.trans(ym) into (N, M).
     tl.store(ym_ptr + offs_n[:, None] * symn + offs_m[None, :] * symm, tl.trans(ym))
@@ -819,16 +820,16 @@ def _mxfp8_floor_dim_km_kernel(
     tl.store(sm_ptr + offs_n[:, None] * ssmn + sm_cols[None, :] * ssmm, tl.trans(bm.to(tl.uint8)))
 
 
-def mxfp8_floor_dim_km_triton(x, **kwargs):
+def mxfp8_dim_km_triton(x, **kwargs):
     assert x.is_contiguous() and x.dim() == 2
     M, N = x.shape
-    assert M % 128 == 0 and N % 128 == 0, "mxfp8_floor_dim_km kernel needs M%128==0 and N%128==0"
+    assert M % 128 == 0 and N % 128 == 0, "mxfp8_dim_km kernel needs M%128==0 and N%128==0"
     yk = torch.empty_like(x, dtype=torch.float8_e4m3fn)                    # (M, N)
     sk = torch.empty(M, N // 32, dtype=torch.uint8, device=x.device)
     ym = torch.empty(N, M, dtype=torch.float8_e4m3fn, device=x.device)    # (N, M) transposed
     sm = torch.empty(N, M // 32, dtype=torch.uint8, device=x.device)
     grid = lambda meta: (M // (meta["RB"] * 32), N // meta["BN"])  # noqa: E731
-    _mxfp8_floor_dim_km_kernel[grid](
+    _mxfp8_dim_km_kernel[grid](
         x, yk, sk, ym, sm, M, N,
         x.stride(0), x.stride(1), yk.stride(0), yk.stride(1), sk.stride(0), sk.stride(1),
         ym.stride(0), ym.stride(1), sm.stride(0), sm.stride(1),
@@ -836,22 +837,22 @@ def mxfp8_floor_dim_km_triton(x, **kwargs):
     return yk, sk.view(torch.float8_e8m0fnu), ym, sm.view(torch.float8_e8m0fnu)
 
 
-MXFP8_FLOOR_DIM_KM = QuantCastTritonRecipe.from_gold(
-    Mxfp8FloorDimKmGold, triton_fn=mxfp8_floor_dim_km_triton
+MXFP8_DIM_KM = QuantCastTritonRecipe.from_gold(
+    Mxfp8DimKmGold, triton_fn=mxfp8_dim_km_triton
 )
 
 
 # ---------------------------------------------------------------------------
-# mxfp8 FLOOR both directions, one pass, with BOTH e8m0 scales in the swizzled 4D (nrb, ncb, 32, 16)
-# grid. Same quant + qdata stores as _mxfp8_floor_dim_km_kernel; only the two scale stores change from
-# plain 2D writes to swizzled scatters (reusing the flat formula of _mxfp8_floor_swizzle_kernel /
-# _mxfp8_floor_dim_m_swizzle_kernel). dim-K scale sk (M, N//32): pre-swizzle row = m (over M), col =
+# mxfp8 both directions, one pass, with BOTH e8m0 scales in the swizzled 4D (nrb, ncb, 32, 16)
+# grid. Same quant + qdata stores as _mxfp8_dim_km_kernel; only the two scale stores change from
+# plain 2D writes to swizzled scatters (reusing the flat formula of _mxfp8_swizzle_kernel /
+# _mxfp8_dim_m_swizzle_kernel). dim-K scale sk (M, N//32): pre-swizzle row = m (over M), col =
 # 32-col-block (over N//32). dim-M scale sm (N, M//32), transposed frame: pre-swizzle row = n (over N),
-# col = 32-row-block (over M//32). Mirrors mxfp8_floor_dim_km_swizzle_f. Requires M%128==0, N%128==0.
+# col = 32-row-block (over M//32). Mirrors mxfp8_dim_km_swizzle_f. Requires M%128==0, N%128==0.
 # ---------------------------------------------------------------------------
 @triton.autotune(configs=_DIM_KM_CONFIGS, key=["M", "N"])
 @triton.jit
-def _mxfp8_floor_dim_km_swizzle_kernel(
+def _mxfp8_dim_km_swizzle_kernel(
     x_ptr, yk_ptr, sk_ptr, ym_ptr, sm_ptr, M, N,
     sxm, sxn, sykm, sykn, symn, symm, NCB_K, NCB_M,
     BN: tl.constexpr, RB: tl.constexpr,
@@ -865,7 +866,7 @@ def _mxfp8_floor_dim_km_swizzle_kernel(
     x = tl.load(x_ptr + offs_m[:, None] * sxm + offs_n[None, :] * sxn).to(tl.float32)  # (BM, BN)
     # dim-K: 1x32 blocks along columns -> (BM, CB, 32), reduce the 32.
     xk = tl.reshape(x, (BM, CB, 32))
-    bk = _amax_to_e8m0_floor_tl(tl.max(tl.abs(xk), axis=2))  # (BM, CB) per (row, col-block)
+    bk = _amax_to_e8m0_tl(tl.max(tl.abs(xk), axis=2))  # (BM, CB) per (row, col-block)
     yk = tl.reshape((xk / _e8m0_to_fp32_tl(bk)[:, :, None]).to(tl.float8e4nv), (BM, BN))
     tl.store(yk_ptr + offs_m[:, None] * sykm + offs_n[None, :] * sykn, yk)
     # swizzled sk store: scale (M, N//32); pre-swizzle position row = m (over M), col-block (over N//32).
@@ -876,7 +877,7 @@ def _mxfp8_floor_dim_km_swizzle_kernel(
     tl.store(sk_ptr + flat_k, bk.to(tl.uint8))
     # dim-M: 32x1 blocks along rows -> (RB, 32, BN), reduce the 32; transposed store.
     xm = tl.reshape(x, (RB, 32, BN))
-    bm = _amax_to_e8m0_floor_tl(tl.max(tl.abs(xm), axis=1))  # (RB, BN) per (row-block, col)
+    bm = _amax_to_e8m0_tl(tl.max(tl.abs(xm), axis=1))  # (RB, BN) per (row-block, col)
     ym = tl.reshape((xm / _e8m0_to_fp32_tl(bm)[:, None, :]).to(tl.float8e4nv), (BM, BN))
     tl.store(ym_ptr + offs_n[:, None] * symn + offs_m[None, :] * symm, tl.trans(ym))
     # swizzled sm store: scale (N, M//32) transposed; pre-swizzle row = n (over N), col = 32-row-block.
@@ -887,11 +888,11 @@ def _mxfp8_floor_dim_km_swizzle_kernel(
     tl.store(sm_ptr + flat_m, bm.to(tl.uint8))
 
 
-def mxfp8_floor_dim_km_swizzle_triton(x, **kwargs):
+def mxfp8_dim_km_swizzle_triton(x, **kwargs):
     assert x.is_contiguous() and x.dim() == 2
     M, N = x.shape
     assert M % 128 == 0 and N % 128 == 0, \
-        "mxfp8_floor_dim_km_swizzle kernel needs M%128==0 and N%128==0"
+        "mxfp8_dim_km_swizzle kernel needs M%128==0 and N%128==0"
     yk = torch.empty_like(x, dtype=torch.float8_e4m3fn)                    # (M, N)
     ym = torch.empty(N, M, dtype=torch.float8_e4m3fn, device=x.device)    # (N, M) transposed
     # sk: (M, N//32) swizzled; sm: (N, M//32) swizzled. zero-filled so padded slots match gold's zeros.
@@ -900,7 +901,7 @@ def mxfp8_floor_dim_km_swizzle_triton(x, **kwargs):
     sk = torch.zeros((M + 127) // 128, ncb_k, 32, 16, dtype=torch.uint8, device=x.device)
     sm = torch.zeros((N + 127) // 128, ncb_m, 32, 16, dtype=torch.uint8, device=x.device)
     grid = lambda meta: (M // (meta["RB"] * 32), N // meta["BN"])  # noqa: E731
-    _mxfp8_floor_dim_km_swizzle_kernel[grid](
+    _mxfp8_dim_km_swizzle_kernel[grid](
         x, yk, sk, ym, sm, M, N,
         x.stride(0), x.stride(1), yk.stride(0), yk.stride(1),
         ym.stride(0), ym.stride(1), ncb_k, ncb_m,
@@ -908,17 +909,17 @@ def mxfp8_floor_dim_km_swizzle_triton(x, **kwargs):
     return yk, sk.view(torch.float8_e8m0fnu), ym, sm.view(torch.float8_e8m0fnu)
 
 
-MXFP8_FLOOR_DIM_KM_SWIZZLE = QuantCastTritonRecipe.from_gold(
-    Mxfp8FloorDimKmSwizzleGold, triton_fn=mxfp8_floor_dim_km_swizzle_triton
+MXFP8_DIM_KM_SWIZZLE = QuantCastTritonRecipe.from_gold(
+    Mxfp8DimKmSwizzleGold, triton_fn=mxfp8_dim_km_swizzle_triton
 )
 
 
 # ---------------------------------------------------------------------------
-# mxfp8 FLOOR 1x32 with the e8m0 scale written directly into the NVIDIA-swizzled 4D block grid
-# (nrb, ncb, 32, 16). Same quant as mxfp8_floor; the scale for pre-swizzle position (row, col)
+# mxfp8 1x32 with the e8m0 scale written directly into the NVIDIA-swizzled 4D block grid
+# (nrb, ncb, 32, 16). Same quant as mxfp8; the scale for pre-swizzle position (row, col)
 # lands at flat offset ((br*ncb+bc)*32 + b)*16 + (a*4+c4), where br=row//128, r128=row%128,
 # a=r128//32, b=r128%32, bc=col//4, c4=col%4 (derived from _to_blocked_4d). Mirrors
-# mxfp8_floor_swizzle_f.
+# mxfp8_swizzle_f.
 #
 # Perf: mirror Inductor's codegen -- flatten all (row, 32-group) pairs into one 1-D persistent
 # reduction over `n_groups = M * (N//32)`. Each 32-group is exactly a 32-contiguous chunk of the
@@ -934,14 +935,14 @@ _SWIZZLE_CONFIGS = [
 
 @triton.autotune(configs=_SWIZZLE_CONFIGS, key=["n_groups"])
 @triton.jit
-def _mxfp8_floor_swizzle_kernel(x_ptr, y_ptr, s_ptr, n_groups, NGC, NCB, GBLOCK: tl.constexpr):
+def _mxfp8_swizzle_kernel(x_ptr, y_ptr, s_ptr, n_groups, NGC, NCB, GBLOCK: tl.constexpr):
     pid = tl.program_id(0)
     g = pid * GBLOCK + tl.arange(0, GBLOCK)  # flat 32-group indices
     g_mask = g < n_groups
     off = g[:, None] * 32 + tl.arange(0, 32)[None, :]  # (GBLOCK, 32) flat, contiguous per group
     x = tl.load(x_ptr + off, mask=g_mask[:, None]).to(tl.float32)
     amax = tl.max(tl.abs(x), axis=1)  # (GBLOCK,)
-    biased = _amax_to_e8m0_floor_tl(amax)
+    biased = _amax_to_e8m0_tl(amax)
     sfp = _e8m0_to_fp32_tl(biased)
     y = (x / sfp[:, None]).to(tl.float8e4nv)
     tl.store(y_ptr + off, y, mask=g_mask[:, None])
@@ -958,7 +959,7 @@ def _mxfp8_floor_swizzle_kernel(x_ptr, y_ptr, s_ptr, n_groups, NGC, NCB, GBLOCK:
     tl.store(s_ptr + flat, biased.to(tl.uint8), mask=g_mask)
 
 
-def mxfp8_floor_swizzle_triton(x, **kwargs):
+def mxfp8_swizzle_triton(x, **kwargs):
     assert x.is_contiguous() and x.dim() == 2
     M, N = x.shape
     y = torch.empty_like(x, dtype=torch.float8_e4m3fn)
@@ -969,12 +970,12 @@ def mxfp8_floor_swizzle_triton(x, **kwargs):
     # zero-filled so any padded (row/col beyond the real grid) positions match gold's zeros.
     s_u8 = torch.zeros(nrb, ncb, 32, 16, dtype=torch.uint8, device=x.device)
     grid = lambda meta: (triton.cdiv(n_groups, meta["GBLOCK"]),)  # noqa: E731
-    _mxfp8_floor_swizzle_kernel[grid](x, y, s_u8, n_groups, ngc, ncb)
+    _mxfp8_swizzle_kernel[grid](x, y, s_u8, n_groups, ngc, ncb)
     return y, s_u8.view(torch.float8_e8m0fnu)
 
 
-MXFP8_FLOOR_SWIZZLE = QuantCastTritonRecipe.from_gold(
-    Mxfp8FloorSwizzleGold, triton_fn=mxfp8_floor_swizzle_triton
+MXFP8_SWIZZLE = QuantCastTritonRecipe.from_gold(
+    Mxfp8SwizzleGold, triton_fn=mxfp8_swizzle_triton
 )
 
 
@@ -1366,19 +1367,19 @@ ALL_RECIPES = [
     ("fp8_rowwise_precalc_scale", FP8_ROWWISE_PRECALC_SCALE),
     ("fp8_colwise_precalc_scale", FP8_COLWISE_PRECALC_SCALE),
     # 8-bit 1D, dim-k reduction
-    ("mxfp8_floor", MXFP8_FLOOR),
-    ("mxfp8_floor_swizzle", MXFP8_FLOOR_SWIZZLE),
+    ("mxfp8", MXFP8),
+    ("mxfp8_swizzle", MXFP8_SWIZZLE),
     ("fp8_deepseek_1x128", FP8_DEEPSEEK_1X128),
     # 8-bit 1D, dim-m reduction
-    ("mxfp8_floor_dim_m", MXFP8_FLOOR_DIM_M),
-    ("mxfp8_floor_dim_m_swizzle", MXFP8_FLOOR_DIM_M_SWIZZLE),
+    ("mxfp8_dim_m", MXFP8_DIM_M),
+    ("mxfp8_dim_m_swizzle", MXFP8_DIM_M_SWIZZLE),
     ("fp8_deepseek_1x128_dim_m", FP8_DEEPSEEK_1X128_DIM_M),
     # 8-bit 1D, dim-km reduction
-    ("mxfp8_floor_dim_km", MXFP8_FLOOR_DIM_KM),
-    ("mxfp8_floor_dim_km_swizzle", MXFP8_FLOOR_DIM_KM_SWIZZLE),
+    ("mxfp8_dim_km", MXFP8_DIM_KM),
+    ("mxfp8_dim_km_swizzle", MXFP8_DIM_KM_SWIZZLE),
     ("fp8_deepseek_1x128_dim_km", FP8_DEEPSEEK_1X128_DIM_KM),
     # 8-bit 2D
-    ("mxfp8_32x32_floor", MXFP8_32X32_FLOOR),
+    ("mxfp8_32x32", MXFP8_32X32),
     ("fp8_deepseek_128x128", FP8_DEEPSEEK_128X128),
     # 8-bit rowwise/colwise
     ("fp8_rowwise", FP8_ROWWISE),

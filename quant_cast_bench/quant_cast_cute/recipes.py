@@ -16,7 +16,7 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.utils as utils
 import torch
-from cutlass._mlir.dialects import llvm  # inline PTX for the hardware fp4/e4m3 cvts
+from cutlass._mlir.dialects import llvm  # inline PTX for the hardware fp4/e4m3/e8m0 cvts
 from cutlass.cute.nvgpu import cpasync  # TMA (bulk-tensor) copy ops + tma_partition
 from cutlass.cute.nvgpu import warp as warp_mma  # SM80 warp-level mma.sync atoms (m16n8k16)
 from cutlass.cute.runtime import from_dlpack
@@ -34,13 +34,13 @@ from quant_cast_bench.quant_cast_gold.recipes import (
     Deepseek128x128Gold,
     Float8TensorwiseGold,
     HadamardRht,
-    Mxfp832x32FloorGold,
-    Mxfp8FloorDimKmGold,
-    Mxfp8FloorDimKmSwizzleGold,
-    Mxfp8FloorDimMGold,
-    Mxfp8FloorDimMSwizzleGold,
-    Mxfp8FloorGold,
-    Mxfp8FloorSwizzleGold,
+    Mxfp832x32Gold,
+    Mxfp8DimKmGold,
+    Mxfp8DimKmSwizzleGold,
+    Mxfp8DimMGold,
+    Mxfp8DimMSwizzleGold,
+    Mxfp8Gold,
+    Mxfp8SwizzleGold,
     Nvfp4BlockedOuterGold,
     Nvfp4GsSwizzleGold,
     QuantCastSingleKernelGold,
@@ -360,7 +360,7 @@ FP8_DEEPSEEK_1X128 = QuantCastCuteRecipe.from_gold(
 
 # ---------------------------------------------------------------------------
 # deepseek fp8 1x128 dim-M: reduce 128-row blocks down M, transposed outputs (N, M) / (N, M//128).
-# The direct analog of `mxfp8_floor_dim_m` (warp-specialized TMA), with a 128-row block (not 32) and
+# The direct analog of `mxfp8_dim_m` (warp-specialized TMA), with a 128-row block (not 32) and
 # an fp32 amax/448 scale (not an e8m0 byte). Feeding a transposed x.t() to the scalar kernel makes
 # every load uncoalesced (~7% peak); instead:
 #   - TMA G2S loads a (TM, TN) row-major tile of x into smem (sIN), TM a multiple of 128;
@@ -496,7 +496,7 @@ FP8_DEEPSEEK_1X128_DIM_M = QuantCastCuteRecipe.from_gold(
 
 # ---------------------------------------------------------------------------
 # deepseek fp8 1x128 in BOTH directions, one pass over x (mirrors deepseek_1x128_dim_km_f). The
-# deepseek analog of mxfp8_floor_dim_km: same fused TMA BMxBN template, but a 128-block and an fp32
+# deepseek analog of mxfp8_dim_km: same fused TMA BMxBN template, but a 128-block and an fp32
 # max(amax,1e-12)/448 scale (not a 1x32 e8m0 byte). Four outputs: dim-K (qk (M,N), sk (M,N//128) --
 # 1x128 blocks along columns, like deepseek_1x128) and dim-M (qm (N,M), sm (N,M//128) -- 128x1 blocks
 # down rows, transposed, like deepseek_1x128_dim_m).
@@ -510,7 +510,7 @@ FP8_DEEPSEEK_1X128_DIM_M = QuantCastCuteRecipe.from_gold(
 #     and since qk keeps x's (M,N) layout it quantizes in registers and stores each 32-chunk DIRECTLY
 #     to gmem with a 128-bit vectorized copy (a thread owns a whole 128-col block = one 128 B sector).
 # fp32 scales scatter straight to gmem. Reciprocal-mul (v*(1/scale)) avoids per-element divides.
-# ~41% of B200 peak at 16384 (beats compile 35.8%, below triton 57.8% and the mxfp8_floor_dim_km
+# ~41% of B200 peak at 16384 (beats compile 35.8%, below triton 57.8% and the mxfp8_dim_km
 # sibling's 57.4%). Two bottlenecks, BOTH worse than the 1x32 sibling and hard to fix here (ncu):
 # (1) the dim-K row reads are 32-WAY bank-conflicted (vs 16-way at 1x32) -- a 128-col bf16 block is
 # bank-aligned, so every lane of a thread-per-block read hits the same bank regardless of tile/mapping;
@@ -677,19 +677,35 @@ FP8_DEEPSEEK_1X128_DIM_KM = QuantCastCuteRecipe.from_gold(
 )
 
 
+@dsl_user_op
+def _cvt_rp_ue8m0x2_f32(hi, lo, *, loc=None, ip=None):
+    """Convert one f32 to its e8m0 biased-exponent byte via RCEIL (round toward +inf): the
+    hardware `cvt.rp.ue8m0x2.f32` yields a .b16 whose low byte is e8m0(lo); pass hi == lo and
+    keep the low byte. Mirrors _cvt_rn_satfinite_e4m3x2_f32's scalar-via-x2 pattern."""
+    packed = cutlass.Uint16(
+        llvm.inline_asm(
+            T.i16(),
+            [cutlass.Float32(hi).ir_value(loc=loc, ip=ip),
+             cutlass.Float32(lo).ir_value(loc=loc, ip=ip)],
+            "cvt.rp.ue8m0x2.f32 $0, $1, $2;",
+            "=h,f,f",
+            has_side_effects=False, is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+    return cutlass.Uint8(packed & cutlass.Uint16(0xFF))
+
+
 # ---------------------------------------------------------------------------
-# e8m0 FLOOR helper (device): amax (f32 scalar) -> (sfp, biased_uint8). Replicates gold's
-# _amax_to_e8m0_floor + _e8m0_to_fp32 exactly via bit extraction (recast_tensor bitcast), because
-# `.to(Float8E8M0FNU)` rounds UP. `biased` is the e8m0 byte; `sfp` is the exact fp32 pow2 factor.
+# e8m0 RCEIL helper (device): amax (f32 scalar) -> (sfp, biased_uint8). Replicates gold's
+# _amax_to_e8m0_rceil + _e8m0_to_fp32: descale = amax / 448 rounded UP to a power of two via the
+# hardware `cvt.rp.ue8m0x2.f32` (round toward +inf), then reconstruct the exact fp32 pow2 factor
+# by shifting the biased exponent back into the fp32 exponent field. `biased` is the e8m0 byte.
 # ---------------------------------------------------------------------------
 @cute.jit
-def _e8m0_floor(amax):
-    fbits = cute.make_rmem_tensor(cute.make_layout(1), cutlass.Float32)
-    fbits[0] = amax
-    ibits = cute.recast_tensor(fbits, dtype=cutlass.Int32)
-    extracted = ((ibits[0] >> 23) & 0xFF) - 127
-    unbiased = cutlass.min(cutlass.max(extracted - 8, cutlass.Int32(-127)), cutlass.Int32(128))
-    biased = unbiased + 127
+def _e8m0(amax):
+    descale = amax * cutlass.Float32(1.0 / 448.0)
+    biased = cutlass.Int32(_cvt_rp_ue8m0x2_f32(descale, descale))
     ib = cute.make_rmem_tensor(cute.make_layout(1), cutlass.Int32)
     ib[0] = biased << 23
     fb = cute.recast_tensor(ib, dtype=cutlass.Float32)
@@ -697,15 +713,15 @@ def _e8m0_floor(amax):
 
 
 # ---------------------------------------------------------------------------
-# mxfp8 FLOOR 1x32: one e8m0 scale per 1x32 block. One thread per block (owns 32 vals -> fp8
+# mxfp8 1x32: one e8m0 scale per 1x32 block. One thread per block (owns 32 vals -> fp8
 # aligned, intra-thread abs-max reduce). Tile width 512 = BPT blocks; scale (M,N//32) tiled (1,BPT)
-# shares bidx with x tiled (1,512). Mirrors mxfp8_floor_f.
+# shares bidx with x tiled (1,512). Mirrors mxfp8_f.
 # ---------------------------------------------------------------------------
 _MXFP8_1X32_BPT = 16  # 512 // 32
 
 
 @cute.kernel
-def _mxfp8_floor_kernel(gX: cute.Tensor, gY: cute.Tensor, gScale: cute.Tensor,
+def _mxfp8_kernel(gX: cute.Tensor, gY: cute.Tensor, gScale: cute.Tensor,
                         tv_layout: cute.Layout, s_tv_layout: cute.Layout):
     tidx, _, _ = cute.arch.thread_idx()
     bidx, _, _ = cute.arch.block_idx()
@@ -716,7 +732,7 @@ def _mxfp8_floor_kernel(gX: cute.Tensor, gY: cute.Tensor, gScale: cute.Tensor,
     cute.copy(cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gX.element_type), thrX, frgX)
     v = frgX.load().to(cutlass.Float32)
     amax = cutlass.max(v, -v).reduce(cute.ReductionOp.MAX, cutlass.Float32(0.0), 0)
-    sfp, biased = _e8m0_floor(amax)
+    sfp, biased = _e8m0(amax)
     frgY = cute.make_rmem_tensor(cute.get(tv_layout, mode=[1]), gY.element_type)
     frgY.store((v / sfp).to(gY.element_type))
     cute.copy(cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gY.element_type), frgY, thrY)
@@ -726,18 +742,18 @@ def _mxfp8_floor_kernel(gX: cute.Tensor, gY: cute.Tensor, gScale: cute.Tensor,
 
 
 @cute.jit
-def _mxfp8_floor_jit(mX, mY, mScale):
+def _mxfp8_jit(mX, mY, mScale):
     bpt = _MXFP8_1X32_BPT
     tv_layout = cute.make_layout((bpt, 32), stride=(32, 1))
     s_tv_layout = cute.make_layout((bpt, 1), stride=(1, 1))
     gX = cute.zipped_divide(mX, (1, bpt * 32))
     gY = cute.zipped_divide(mY, (1, bpt * 32))
     gScale = cute.zipped_divide(mScale, (1, bpt))
-    _mxfp8_floor_kernel(gX, gY, gScale, tv_layout, s_tv_layout).launch(
+    _mxfp8_kernel(gX, gY, gScale, tv_layout, s_tv_layout).launch(
         grid=[cute.size(gX, mode=[1]), 1, 1], block=[bpt, 1, 1])
 
 
-def mxfp8_floor_cute(x, **kwargs):
+def mxfp8_cute(x, **kwargs):
     assert x.is_contiguous() and x.dim() == 2
     M, N = x.shape
     y = torch.empty(M, N, dtype=torch.float8_e4m3fn, device=x.device)
@@ -745,17 +761,17 @@ def mxfp8_floor_cute(x, **kwargs):
     mX = from_dlpack(x).mark_layout_dynamic()
     mY = from_dlpack(y).mark_layout_dynamic()
     mS = from_dlpack(s_u8).mark_layout_dynamic()
-    fn = _compiled(("mxfp8_floor", M, N), _mxfp8_floor_jit, mX, mY, mS)
+    fn = _compiled(("mxfp8", M, N), _mxfp8_jit, mX, mY, mS)
     fn(mX, mY, mS)
     return y, s_u8.view(torch.float8_e8m0fnu)
 
 
-MXFP8_FLOOR = QuantCastCuteRecipe.from_gold(Mxfp8FloorGold, cute_fn=mxfp8_floor_cute)
+MXFP8 = QuantCastCuteRecipe.from_gold(Mxfp8Gold, cute_fn=mxfp8_cute)
 
 
 # ---------------------------------------------------------------------------
-# mxfp8 FLOOR dim-M: 32-row blocks down M, transposed outputs (N, M) / (N, M//32). The reduction is
-# down columns of x, and the output is transposed -- feeding x.t() to mxfp8_floor makes EVERY load
+# mxfp8 dim-M: 32-row blocks down M, transposed outputs (N, M) / (N, M//32). The reduction is
+# down columns of x, and the output is transposed -- feeding x.t() to mxfp8 makes EVERY load
 # uncoalesced. A hand-rolled coalesced-load + smem-transpose + coalesced-store kernel (1 warp/32x32
 # tile) only reached ~35% of peak: the memory transactions were scalar CopyUniversalOp, and more
 # warps/block did NOT help (occupancy was not the binding lever). The win is TMA: this kernel uses
@@ -769,7 +785,7 @@ MXFP8_FLOOR = QuantCastCuteRecipe.from_gold(Mxfp8FloorGold, cute_fn=mxfp8_floor_
 #     Same 48KB smem (the two 32-row buffers reuse the old 32KB sIN region), so no occupancy cost;
 #   - the (TM/32 x TN) scale-groups are split across all threads; each owns one (32-row block, col),
 #     reads its 32 rows down a column of sIN (warp-coalesced, conflict-free), reduces to a per-column
-#     amax, computes the e8m0 FLOOR scale, quantizes its 32 values, and writes them as a CONTIGUOUS
+#     amax, computes the e8m0 scale, quantizes its 32 values, and writes them as a CONTIGUOUS
 #     run into sOUT laid out (TN, TM) row-major -- i.e. the transpose happens in the register->smem
 #     write, so no smem-transpose/padding dance and no col-major TMA (which the DSL can't drive);
 #   - TMA S2G stores sOUT into the (TN, TM) tile of the row-major (N, M) output at (n_tile, m_tile).
@@ -840,7 +856,7 @@ def _mxfp8_dim_m_kernel(atom_in: cute.CopyAtom, ten_in: cute.Tensor, atom_out: c
             frgIn[r] = sIN[it][r, col].to(cutlass.Float32)   # column read (warp-coalesced)
         v = frgIn.load()
         amax = cute.where(v < 0, -v, v).reduce(cute.ReductionOp.MAX, cutlass.Float32(0.0), 0)
-        sfp, biased = _e8m0_floor(amax)
+        sfp, biased = _e8m0(amax)
         frgOut = cute.make_rmem_tensor(cute.make_layout(32), cutlass.Float8E4M3FN)
         frgOut.store((v * (1.0 / sfp)).to(cutlass.Float8E4M3FN))  # reciprocal-mul, not 32 divs
         for r in cutlass.range_constexpr(32):
@@ -868,11 +884,11 @@ def _mxfp8_dim_m_jit(mIN, mOUT, scales, M: cutlass.Constexpr):
                                                  cluster=(1, 1, 1))
 
 
-def mxfp8_floor_dim_m_cute(x, **kwargs):
+def mxfp8_dim_m_cute(x, **kwargs):
     assert x.is_contiguous() and x.dim() == 2
     M, N = x.shape
     assert M % _DIMM_TM == 0 and N % _DIMM_TN == 0, \
-        f"mxfp8_floor_dim_m cute kernel needs M%{_DIMM_TM}==0 and N%{_DIMM_TN}==0"
+        f"mxfp8_dim_m cute kernel needs M%{_DIMM_TM}==0 and N%{_DIMM_TN}==0"
     y = torch.empty(N, M, dtype=torch.float8_e4m3fn, device=x.device)  # transposed row-major output
     s_u8 = torch.empty(N, M // 32, dtype=torch.uint8, device=x.device)
     # TMA needs full layout/divisibility marking (leading dim contiguous, 16-elem aligned).
@@ -881,25 +897,25 @@ def mxfp8_floor_dim_m_cute(x, **kwargs):
     mOUT = (from_dlpack(y, assumed_align=16).mark_layout_dynamic(leading_dim=1)
             .mark_compact_shape_dynamic(mode=1, divisibility=16))
     scales = from_dlpack(s_u8.reshape(-1)).mark_layout_dynamic()
-    fn = _compiled(("mxfp8_floor_dim_m", M, N), _mxfp8_dim_m_jit, mIN, mOUT, scales, M)
+    fn = _compiled(("mxfp8_dim_m", M, N), _mxfp8_dim_m_jit, mIN, mOUT, scales, M)
     fn(mIN, mOUT, scales)
     return y, s_u8.view(torch.float8_e8m0fnu)
 
 
-MXFP8_FLOOR_DIM_M = QuantCastCuteRecipe.from_gold(
-    Mxfp8FloorDimMGold, cute_fn=mxfp8_floor_dim_m_cute
+MXFP8_DIM_M = QuantCastCuteRecipe.from_gold(
+    Mxfp8DimMGold, cute_fn=mxfp8_dim_m_cute
 )
 
 
 # ---------------------------------------------------------------------------
-# mxfp8 FLOOR dim-M + NVIDIA-swizzled scale: identical to _mxfp8_dim_m_kernel above (TMA G2S of the
+# mxfp8 dim-M + NVIDIA-swizzled scale: identical to _mxfp8_dim_m_kernel above (TMA G2S of the
 # (TM, TN) x-tile as RB double-buffered 32-row loads -> per-column amax/quantize -> transposed
 # register->smem write -> TMA S2G of the (TN, TM) y-tile), EXCEPT the e8m0 byte is scattered into the
 # 4D (nrb, ncb, 32, 16) blocked-scale grid instead of the plain (N, M//32) 2D buffer. The swizzle acts
 # on the TRANSPOSED-frame scale (N, M//32): pre-swizzle row = n = n0+col over N, pre-swizzle col =
 # 32-row-block index = m0//32+it over M//32. The 4D flatten factors as ((br*ncb+bc)*32+b)*16+(a*4+c4)
 # with br=row//128, r128=row%128, a=r128//32, b=r128%32, bc=col//4, c4=col%4 (same formula as
-# _swizzle_flat / the mxfp8_floor_swizzle kernels). The qdata path and TMA pipeline are unchanged, so
+# _swizzle_flat / the mxfp8_swizzle kernels). The qdata path and TMA pipeline are unchanged, so
 # perf tracks the plain dim-M kernel; only the scale store address changes.
 # ---------------------------------------------------------------------------
 @cute.kernel
@@ -951,7 +967,7 @@ def _mxfp8_dim_m_swizzle_kernel(atom_in: cute.CopyAtom, ten_in: cute.Tensor, ato
             frgIn[r] = sIN[it][r, col].to(cutlass.Float32)   # column read (warp-coalesced)
         v = frgIn.load()
         amax = cute.where(v < 0, -v, v).reduce(cute.ReductionOp.MAX, cutlass.Float32(0.0), 0)
-        sfp, biased = _e8m0_floor(amax)
+        sfp, biased = _e8m0(amax)
         frgOut = cute.make_rmem_tensor(cute.make_layout(32), cutlass.Float8E4M3FN)
         frgOut.store((v * (1.0 / sfp)).to(cutlass.Float8E4M3FN))  # reciprocal-mul, not 32 divs
         for r in cutlass.range_constexpr(32):
@@ -980,11 +996,11 @@ def _mxfp8_dim_m_swizzle_jit(mIN, mOUT, scales, ncb: cutlass.Constexpr):
                                             cluster=(1, 1, 1))
 
 
-def mxfp8_floor_dim_m_swizzle_cute(x, **kwargs):
+def mxfp8_dim_m_swizzle_cute(x, **kwargs):
     assert x.is_contiguous() and x.dim() == 2
     M, N = x.shape
     assert M % _DIMM_TM == 0 and N % _DIMM_TN == 0, \
-        f"mxfp8_floor_dim_m_swizzle cute kernel needs M%{_DIMM_TM}==0 and N%{_DIMM_TN}==0"
+        f"mxfp8_dim_m_swizzle cute kernel needs M%{_DIMM_TM}==0 and N%{_DIMM_TN}==0"
     y = torch.empty(N, M, dtype=torch.float8_e4m3fn, device=x.device)  # transposed row-major output
     nrb = (N + 127) // 128                       # swizzle acts on transposed scale (N, M//32)
     ncb = ((M // 32) + 3) // 4
@@ -994,26 +1010,26 @@ def mxfp8_floor_dim_m_swizzle_cute(x, **kwargs):
     mOUT = (from_dlpack(y, assumed_align=16).mark_layout_dynamic(leading_dim=1)
             .mark_compact_shape_dynamic(mode=1, divisibility=16))
     scales = from_dlpack(s_u8.reshape(-1)).mark_layout_dynamic()
-    fn = _compiled(("mxfp8_floor_dim_m_swizzle", M, N), _mxfp8_dim_m_swizzle_jit, mIN, mOUT, scales,
+    fn = _compiled(("mxfp8_dim_m_swizzle", M, N), _mxfp8_dim_m_swizzle_jit, mIN, mOUT, scales,
                    ncb)
     fn(mIN, mOUT, scales)
     return y, s_u8.view(torch.float8_e8m0fnu)
 
 
-MXFP8_FLOOR_DIM_M_SWIZZLE = QuantCastCuteRecipe.from_gold(
-    Mxfp8FloorDimMSwizzleGold, cute_fn=mxfp8_floor_dim_m_swizzle_cute
+MXFP8_DIM_M_SWIZZLE = QuantCastCuteRecipe.from_gold(
+    Mxfp8DimMSwizzleGold, cute_fn=mxfp8_dim_m_swizzle_cute
 )
 
 
 # ---------------------------------------------------------------------------
-# mxfp8 FLOOR in BOTH directions, one pass over x (mirrors mxfp8_floor_dim_km_f / the fused triton
-# kernel). Four outputs: dim-K (qk (M,N), sk (M,N//32) -- 1x32 blocks along columns, like mxfp8_floor)
-# and dim-M (qm (N,M), sm (N,M//32) -- 32x1 blocks down rows, transposed, like mxfp8_floor_dim_m).
+# mxfp8 in BOTH directions, one pass over x (mirrors mxfp8_dim_km_f / the fused triton
+# kernel). Four outputs: dim-K (qk (M,N), sk (M,N//32) -- 1x32 blocks along columns, like mxfp8)
+# and dim-M (qm (N,M), sm (N,M//32) -- 32x1 blocks down rows, transposed, like mxfp8_dim_m).
 #
 # The fused version of the TMA BMxBN template: TMA G2S loads one (TM, TN) row-major tile of x into
 # smem (sIN), read once and reduced BOTH ways, then two TMA S2G stores emit the two quantized tiles:
 #   - dim-M (the binding cost): the TM*TN/32 (col, 32-row-block) groups are split across all threads;
-#     each reads its 32 rows DOWN a column of sIN, reduces to the per-column amax, e8m0-FLOOR scales,
+#     each reads its 32 rows DOWN a column of sIN, reduces to the per-column amax, e8m0 scales,
 #     quantizes, and writes the 32 values as a CONTIGUOUS run into sOUT_M laid out (TN, TM) -- the
 #     transpose happens in the register->smem write (no col-major TMA). TMA-store sOUT_M into the
 #     (TN, TM) tile of the row-major (N, M) output = the dim-M transpose.
@@ -1093,7 +1109,7 @@ def _mxfp8_dim_km_kernel(atom_in: cute.CopyAtom, ten_in: cute.Tensor,
                 frgM[r] = sIN[r0 + r, col].to(cutlass.Float32)   # column read (down the tile)
             vm = frgM.load()
             amax_m = cute.where(vm < 0, -vm, vm).reduce(cute.ReductionOp.MAX, cutlass.Float32(0.0), 0)
-            sfp_m, biased_m = _e8m0_floor(amax_m)
+            sfp_m, biased_m = _e8m0(amax_m)
             frgOm = cute.make_rmem_tensor(cute.make_layout(32), cutlass.Float8E4M3FN)
             frgOm.store((vm * (1.0 / sfp_m)).to(cutlass.Float8E4M3FN))
             for r in cutlass.range_constexpr(32):
@@ -1112,7 +1128,7 @@ def _mxfp8_dim_km_kernel(atom_in: cute.CopyAtom, ten_in: cute.Tensor,
                 frgK[c] = sIN[row, c0 + c].to(cutlass.Float32)    # row read (along the tile)
             vk = frgK.load()
             amax_k = cute.where(vk < 0, -vk, vk).reduce(cute.ReductionOp.MAX, cutlass.Float32(0.0), 0)
-            sfp_k, biased_k = _e8m0_floor(amax_k)
+            sfp_k, biased_k = _e8m0(amax_k)
             frgOk = cute.make_rmem_tensor(cute.make_layout(32), cutlass.Float8E4M3FN)
             frgOk.store((vk * (1.0 / sfp_k)).to(cutlass.Float8E4M3FN))
             off = cute.assume((m0 + row) * N + (n0 + c0), divby=32)
@@ -1141,11 +1157,11 @@ def _mxfp8_dim_km_jit(mIN, mM, mK, sk, sm, M: cutlass.Constexpr, N: cutlass.Cons
         grid=grid, block=(_DKM_THREADS, 1, 1), cluster=(1, 1, 1))
 
 
-def mxfp8_floor_dim_km_cute(x, **kwargs):
+def mxfp8_dim_km_cute(x, **kwargs):
     assert x.is_contiguous() and x.dim() == 2
     M, N = x.shape
     assert M % _DKM_TM == 0 and N % _DKM_TN == 0, \
-        f"mxfp8_floor_dim_km cute kernel needs M%{_DKM_TM}==0 and N%{_DKM_TN}==0"
+        f"mxfp8_dim_km cute kernel needs M%{_DKM_TM}==0 and N%{_DKM_TN}==0"
     yk = torch.empty(M, N, dtype=torch.float8_e4m3fn, device=x.device)              # dim-K (M,N)
     sk_u8 = torch.empty(M, N // 32, dtype=torch.uint8, device=x.device)
     ym = torch.empty(N, M, dtype=torch.float8_e4m3fn, device=x.device)             # dim-M (N,M) transp
@@ -1158,25 +1174,25 @@ def mxfp8_floor_dim_km_cute(x, **kwargs):
     mK = from_dlpack(yk.reshape(-1), assumed_align=16).mark_layout_dynamic()  # direct gmem store
     sk = from_dlpack(sk_u8.reshape(-1)).mark_layout_dynamic()
     sm = from_dlpack(sm_u8.reshape(-1)).mark_layout_dynamic()
-    fn = _compiled(("mxfp8_floor_dim_km", M, N), _mxfp8_dim_km_jit, mIN, mM, mK, sk, sm, M, N)
+    fn = _compiled(("mxfp8_dim_km", M, N), _mxfp8_dim_km_jit, mIN, mM, mK, sk, sm, M, N)
     fn(mIN, mM, mK, sk, sm)
     return yk, sk_u8.view(torch.float8_e8m0fnu), ym, sm_u8.view(torch.float8_e8m0fnu)
 
 
-MXFP8_FLOOR_DIM_KM = QuantCastCuteRecipe.from_gold(
-    Mxfp8FloorDimKmGold, cute_fn=mxfp8_floor_dim_km_cute
+MXFP8_DIM_KM = QuantCastCuteRecipe.from_gold(
+    Mxfp8DimKmGold, cute_fn=mxfp8_dim_km_cute
 )
 
 
 # ---------------------------------------------------------------------------
-# mxfp8 FLOOR both directions, one pass, with BOTH e8m0 scales in the swizzled 4D (nrb, ncb, 32, 16)
+# mxfp8 both directions, one pass, with BOTH e8m0 scales in the swizzled 4D (nrb, ncb, 32, 16)
 # grid. Identical to _mxfp8_dim_km_kernel (same fused TMA load + dim-M transposed store + dim-K direct
 # store); only the two scale-store addresses change from plain 2D writes to the swizzle flatten
 # (same formula as _swizzle_flat / the other *_swizzle kernels). dim-K scale sk (M, N//32): pre-swizzle
 # row = m0+row (over M), col = 32-col-block n0//32+kb (over N//32). dim-M scale sm (N, M//32) in the
 # transposed frame: pre-swizzle row = n0+col (over N), col = 32-row-block m0//32+rb (over M//32). The
 # row is NOT loop-invariant here (it depends on the group index), so the swizzle offset is recomputed
-# per group. Mirrors mxfp8_floor_dim_km_swizzle_f. Requires M%TM==0, N%TN==0.
+# per group. Mirrors mxfp8_dim_km_swizzle_f. Requires M%TM==0, N%TN==0.
 # ---------------------------------------------------------------------------
 @cute.kernel
 def _mxfp8_dim_km_swizzle_kernel(atom_in: cute.CopyAtom, ten_in: cute.Tensor,
@@ -1223,7 +1239,7 @@ def _mxfp8_dim_km_swizzle_kernel(atom_in: cute.CopyAtom, ten_in: cute.Tensor,
                 frgM[r] = sIN[r0 + r, col].to(cutlass.Float32)   # column read (down the tile)
             vm = frgM.load()
             amax_m = cute.where(vm < 0, -vm, vm).reduce(cute.ReductionOp.MAX, cutlass.Float32(0.0), 0)
-            sfp_m, biased_m = _e8m0_floor(amax_m)
+            sfp_m, biased_m = _e8m0(amax_m)
             frgOm = cute.make_rmem_tensor(cute.make_layout(32), cutlass.Float8E4M3FN)
             frgOm.store((vm * (1.0 / sfp_m)).to(cutlass.Float8E4M3FN))
             for r in cutlass.range_constexpr(32):
@@ -1245,7 +1261,7 @@ def _mxfp8_dim_km_swizzle_kernel(atom_in: cute.CopyAtom, ten_in: cute.Tensor,
                 frgK[c] = sIN[row, c0 + c].to(cutlass.Float32)    # row read (along the tile)
             vk = frgK.load()
             amax_k = cute.where(vk < 0, -vk, vk).reduce(cute.ReductionOp.MAX, cutlass.Float32(0.0), 0)
-            sfp_k, biased_k = _e8m0_floor(amax_k)
+            sfp_k, biased_k = _e8m0(amax_k)
             frgOk = cute.make_rmem_tensor(cute.make_layout(32), cutlass.Float8E4M3FN)
             frgOk.store((vk * (1.0 / sfp_k)).to(cutlass.Float8E4M3FN))
             off = cute.assume((m0 + row) * N + (n0 + c0), divby=32)
@@ -1280,11 +1296,11 @@ def _mxfp8_dim_km_swizzle_jit(mIN, mM, mK, sk, sm, M: cutlass.Constexpr, N: cutl
         grid=grid, block=(_DKM_THREADS, 1, 1), cluster=(1, 1, 1))
 
 
-def mxfp8_floor_dim_km_swizzle_cute(x, **kwargs):
+def mxfp8_dim_km_swizzle_cute(x, **kwargs):
     assert x.is_contiguous() and x.dim() == 2
     M, N = x.shape
     assert M % _DKM_TM == 0 and N % _DKM_TN == 0, \
-        f"mxfp8_floor_dim_km_swizzle cute kernel needs M%{_DKM_TM}==0 and N%{_DKM_TN}==0"
+        f"mxfp8_dim_km_swizzle cute kernel needs M%{_DKM_TM}==0 and N%{_DKM_TN}==0"
     yk = torch.empty(M, N, dtype=torch.float8_e4m3fn, device=x.device)              # dim-K (M,N)
     ym = torch.empty(N, M, dtype=torch.float8_e4m3fn, device=x.device)             # dim-M (N,M) transp
     # sk: (M, N//32) swizzled; sm: (N, M//32) swizzled. zeroed so padded slots match gold's zeros.
@@ -1300,19 +1316,19 @@ def mxfp8_floor_dim_km_swizzle_cute(x, **kwargs):
     mK = from_dlpack(yk.reshape(-1), assumed_align=16).mark_layout_dynamic()  # direct gmem store
     sk = from_dlpack(sk_u8.reshape(-1)).mark_layout_dynamic()
     sm = from_dlpack(sm_u8.reshape(-1)).mark_layout_dynamic()
-    fn = _compiled(("mxfp8_floor_dim_km_swizzle", M, N), _mxfp8_dim_km_swizzle_jit,
+    fn = _compiled(("mxfp8_dim_km_swizzle", M, N), _mxfp8_dim_km_swizzle_jit,
                    mIN, mM, mK, sk, sm, M, N, ncb_k, ncb_m)
     fn(mIN, mM, mK, sk, sm)
     return yk, sk_u8.view(torch.float8_e8m0fnu), ym, sm_u8.view(torch.float8_e8m0fnu)
 
 
-MXFP8_FLOOR_DIM_KM_SWIZZLE = QuantCastCuteRecipe.from_gold(
-    Mxfp8FloorDimKmSwizzleGold, cute_fn=mxfp8_floor_dim_km_swizzle_cute
+MXFP8_DIM_KM_SWIZZLE = QuantCastCuteRecipe.from_gold(
+    Mxfp8DimKmSwizzleGold, cute_fn=mxfp8_dim_km_swizzle_cute
 )
 
 
 # ---------------------------------------------------------------------------
-# mxfp8 FLOOR 32x32: one e8m0 scale per 32x32 block (amax over the whole block, e8m0-FLOOR pow2
+# mxfp8 32x32: one e8m0 scale per 32x32 block (amax over the whole block, e8m0 pow2
 # scale). Like deepseek_128x128 this is a NON-transposing block reduction, so it takes the same TMA
 # path (both tiles row-major (TM,TN), no register->smem transpose). Went 37.1% -> 70.9% of B200 peak
 # (beats compile 26.5%, matches the deepseek_128x128 sibling's ~70% ceiling; triton 76.5%). The
@@ -1325,7 +1341,7 @@ MXFP8_FLOOR_DIM_KM_SWIZZLE = QuantCastCuteRecipe.from_gold(
 #   - warp w handles blocks {w, w+WARPS, ...}; for each, lane `l` owns COLUMN l of the block (rows
 #     0..31) -> consecutive lanes hit consecutive smem cols = conflict-free (bank note in
 #     [[cute-tma-transpose-quant]]); lane reduces its 32-row column, warp_reduction_max -> block
-#     amax -> e8m0 floor scale; each lane quantizes its column (vectorized f32->fp8) into sOUT;
+#     amax -> e8m0 scale; each lane quantizes its column (vectorized f32->fp8) into sOUT;
 #     lane0 writes the e8m0 byte;
 #   - TMA S2G stores sOUT into the (TM,TN) tile of the row-major output.
 # TWO decisive findings (both took the kernel from ~38% -> 70%): (1) `v / sfp` on a 32-wide vector
@@ -1396,7 +1412,7 @@ def _mxfp8_32x32_kernel(atom_in: cute.CopyAtom, ten_in: cute.Tensor, atom_out: c
         v = frg.load()
         local = cute.where(v < 0, -v, v).reduce(cute.ReductionOp.MAX, cutlass.Float32(0.0), 0)
         amax = cute.arch.warp_reduction_max(local)       # across the 32 columns -> whole-block amax
-        sfp, biased = _e8m0_floor(amax)
+        sfp, biased = _e8m0(amax)
         inv = 1.0 / sfp                                   # pow2 scale: v*(1/sfp) is bit-exact vs v/sfp
         if lane == 0:
             gbr = bidx * _M32_BR + br
@@ -1427,7 +1443,7 @@ def _mxfp8_32x32_jit(mIN, mOUT, scales, ncb: cutlass.Constexpr):
                         ncb).launch(grid=grid, block=(_M32_THREADS, 1, 1), cluster=(1, 1, 1))
 
 
-def mxfp8_32x32_floor_cute(x, **kwargs):
+def mxfp8_32x32_cute(x, **kwargs):
     assert x.is_contiguous() and x.dim() == 2
     M, N = x.shape
     assert M % _M32_TM == 0 and N % _M32_TN == 0, \
@@ -1446,17 +1462,17 @@ def mxfp8_32x32_floor_cute(x, **kwargs):
     return y, s_u8.view(torch.float8_e8m0fnu)
 
 
-MXFP8_32X32_FLOOR = QuantCastCuteRecipe.from_gold(
-    Mxfp832x32FloorGold, cute_fn=mxfp8_32x32_floor_cute
+MXFP8_32X32 = QuantCastCuteRecipe.from_gold(
+    Mxfp832x32Gold, cute_fn=mxfp8_32x32_cute
 )
 
 
 # ---------------------------------------------------------------------------
-# mxfp8 FLOOR 1x32 with the e8m0 scale written into the NVIDIA-swizzled 4D grid (nrb, ncb, 32, 16).
-# Same quant as mxfp8_floor (one thread per 1x32 block); the scale for pre-swizzle (row, col) lands
+# mxfp8 1x32 with the e8m0 scale written into the NVIDIA-swizzled 4D grid (nrb, ncb, 32, 16).
+# Same quant as mxfp8 (one thread per 1x32 block); the scale for pre-swizzle (row, col) lands
 # at flat offset ((br*ncb+bc)*32 + b)*16 + (a*4+c4) where br=row//128, r128=row%128, a=r128//32,
 # b=r128%32, bc=col//4, c4=col%4 (from _to_blocked_4d). We compute (row, col) from the flat block
-# index and scatter the biased byte to a flat uint8 scale buffer. Mirrors mxfp8_floor_swizzle_f.
+# index and scatter the biased byte to a flat uint8 scale buffer. Mirrors mxfp8_swizzle_f.
 #
 # The qdata output is NOT transposed (same (M, N) layout as x), so this is a streaming cast: read
 # bf16, write fp8, plus a tiny scattered scale-byte write (numel/32 bytes ~= 0.4% of traffic). Each
@@ -1469,7 +1485,7 @@ MXFP8_32X32_FLOOR = QuantCastCuteRecipe.from_gold(
 # WARP-PER-ROW mapping from _nvfp4_swizzle_kernel (see its comment) took it to ~79.5% (matches triton,
 # was 8 pts behind): warp w owns a fixed row, so the row-dependent swizzle math (row_base) is computed
 # ONCE per warp and reused across all its blocks, leaving only the cheap +(gc//4)*512 + gc%4 term; ILP
-# loads issue first for MLP. Tuned WARPS=2, XSPLIT=4, ILP=4. Mirrors mxfp8_floor_swizzle_f.
+# loads issue first for MLP. Tuned WARPS=2, XSPLIT=4, ILP=4. Mirrors mxfp8_swizzle_f.
 # ---------------------------------------------------------------------------
 # WARP-PER-ROW mapping (ported from _nvfp4_swizzle_kernel): the 1-D-flatten VPT=32 kernel recomputed
 # the full 4D swizzle offset per block per thread (~7 pt ALU-pipe tax -- ncu showed ALU ~68% >= DRAM
@@ -1502,7 +1518,7 @@ def _swizzle_flat(row, col, ncb: cutlass.Int32):
 
 
 @cute.kernel
-def _mxfp8_floor_swizzle_kernel(gX: cute.Tensor, gY: cute.Tensor, sflat: cute.Tensor,
+def _mxfp8_swizzle_kernel(gX: cute.Tensor, gY: cute.Tensor, sflat: cute.Tensor,
                                 M: cutlass.Constexpr, N: cutlass.Constexpr, ncb: cutlass.Constexpr):
     tidx, _, _ = cute.arch.thread_idx()
     bidx, bidy, _ = cute.arch.block_idx()
@@ -1547,7 +1563,7 @@ def _mxfp8_floor_swizzle_kernel(gX: cute.Tensor, gY: cute.Tensor, sflat: cute.Te
                         cutlass.Float32))
                     v = blk.load()
                     amax = cutlass.max(v, -v).reduce(cute.ReductionOp.MAX, cutlass.Float32(0.0), 0)
-                    sfp, biased = _e8m0_floor(amax)
+                    sfp, biased = _e8m0(amax)
                     frgY = cute.make_rmem_tensor(blk_layout, gY.element_type)
                     frgY.store((v * (1.0 / sfp)).to(gY.element_type))  # pow2 scale -> bit-identical
                     offq = cute.assume(row * N + gc * 32, divby=32)
@@ -1558,18 +1574,18 @@ def _mxfp8_floor_swizzle_kernel(gX: cute.Tensor, gY: cute.Tensor, sflat: cute.Te
 
 
 @cute.jit
-def _mxfp8_floor_swizzle_jit(mX, mY, sflat, M: cutlass.Constexpr, N: cutlass.Constexpr,
+def _mxfp8_swizzle_jit(mX, mY, sflat, M: cutlass.Constexpr, N: cutlass.Constexpr,
                              ncb: cutlass.Constexpr):
     # warp-per-row grid: grid.y covers M in steps of WARPS, grid.x is the XSPLIT column split.
     grid_y = (M + _SWZ_WARPS - 1) // _SWZ_WARPS
-    _mxfp8_floor_swizzle_kernel(mX, mY, sflat, M, N, ncb).launch(
+    _mxfp8_swizzle_kernel(mX, mY, sflat, M, N, ncb).launch(
         grid=[_SWZ_XSPLIT, grid_y, 1], block=[_SWZ_THREADS, 1, 1])
 
 
-def mxfp8_floor_swizzle_cute(x, **kwargs):
+def mxfp8_swizzle_cute(x, **kwargs):
     assert x.is_contiguous() and x.dim() == 2
     M, N = x.shape
-    assert N % 32 == 0, "mxfp8_floor_swizzle cute kernel needs N % 32 == 0 (whole 32-groups per row)"
+    assert N % 32 == 0, "mxfp8_swizzle cute kernel needs N % 32 == 0 (whole 32-groups per row)"
     y = torch.empty(M, N, dtype=torch.float8_e4m3fn, device=x.device)
     ngc = N // 32
     nrb = (M + 127) // 128
@@ -1579,13 +1595,13 @@ def mxfp8_floor_swizzle_cute(x, **kwargs):
     mX = from_dlpack(x.reshape(-1), assumed_align=16).mark_layout_dynamic()
     mY = from_dlpack(y.reshape(-1), assumed_align=16).mark_layout_dynamic()
     sflat = from_dlpack(s_u8.reshape(-1)).mark_layout_dynamic()
-    fn = _compiled(("mxfp8_floor_swizzle", M, N), _mxfp8_floor_swizzle_jit, mX, mY, sflat, M, N, ncb)
+    fn = _compiled(("mxfp8_swizzle", M, N), _mxfp8_swizzle_jit, mX, mY, sflat, M, N, ncb)
     fn(mX, mY, sflat)
     return y, s_u8.view(torch.float8_e8m0fnu)
 
 
-MXFP8_FLOOR_SWIZZLE = QuantCastCuteRecipe.from_gold(
-    Mxfp8FloorSwizzleGold, cute_fn=mxfp8_floor_swizzle_cute
+MXFP8_SWIZZLE = QuantCastCuteRecipe.from_gold(
+    Mxfp8SwizzleGold, cute_fn=mxfp8_swizzle_cute
 )
 
 
@@ -1849,7 +1865,7 @@ FP8_ROWWISE = QuantCastCuteRecipe.from_gold(RowwiseFp8Gold, cute_fn=fp8_rowwise_
 #     reduces its TM rows in smem to a partial abs-max, then one atomic_max per column into a (N,) fp32
 #     scratch -- combines the per-column amax across the M-grid.
 #   pass 2 (quant): TMA-load a (TM, TN) row-major tile of x, quantize each column with the precomputed
-#     scale (amax/448), transpose in the register->smem write (like mxfp8_floor_dim_m -- the DSL can't
+#     scale (amax/448), transpose in the register->smem write (like mxfp8_dim_m -- the DSL can't
 #     drive a col-major TMA store), and TMA-store the (TN, TM) tile into the row-major (N, M) output;
 #     the (N, 1) scale is written once (from the m_tile=0 row of blocks). Both DRAM passes ride the TMA
 #     engine and the transpose happens in the register->smem write.
@@ -2176,7 +2192,7 @@ def _nvfp4_scale_e4m3(amax, inv_outer):
 # 8-f32 -> 4-byte packer (_cvt_rn_satfinite_e2m1x2_f32_x4) instead follows the PR's sibling *triton*
 # kernel's pack=4 asm; and the swizzle-offset hoisting (fix 2 below) is not in the PR.
 #
-# Like mxfp8_floor_swizzle this is a non-transposing streaming cast (qdata is (M, N//2), same row
+# Like mxfp8_swizzle this is a non-transposing streaming cast (qdata is (M, N//2), same row
 # order as x), so it uses the SAME DRAM-speed recipe: FLATTEN to 1-D, 128 threads/CTA, each thread
 # owning CONTIGUOUS runs loaded/stored via 128-bit VECTORIZED copy atoms. The old kernel launched
 # only 8 threads/CTA with scalar (per-element) CopyUniversalOp loads (~7.9%). The unit of work is a
@@ -2695,19 +2711,19 @@ ALL_RECIPES = [
     ("fp8_rowwise_precalc_scale", FP8_ROWWISE_PRECALC_SCALE),
     ("fp8_colwise_precalc_scale", FP8_COLWISE_PRECALC_SCALE),
     # 8-bit 1D, dim-k reduction
-    ("mxfp8_floor", MXFP8_FLOOR),
-    ("mxfp8_floor_swizzle", MXFP8_FLOOR_SWIZZLE),
+    ("mxfp8", MXFP8),
+    ("mxfp8_swizzle", MXFP8_SWIZZLE),
     ("fp8_deepseek_1x128", FP8_DEEPSEEK_1X128),
     # 8-bit 1D, dim-m reduction
-    ("mxfp8_floor_dim_m", MXFP8_FLOOR_DIM_M),
-    ("mxfp8_floor_dim_m_swizzle", MXFP8_FLOOR_DIM_M_SWIZZLE),
+    ("mxfp8_dim_m", MXFP8_DIM_M),
+    ("mxfp8_dim_m_swizzle", MXFP8_DIM_M_SWIZZLE),
     ("fp8_deepseek_1x128_dim_m", FP8_DEEPSEEK_1X128_DIM_M),
     # 8-bit 1D, dim-km reduction
-    ("mxfp8_floor_dim_km", MXFP8_FLOOR_DIM_KM),
-    ("mxfp8_floor_dim_km_swizzle", MXFP8_FLOOR_DIM_KM_SWIZZLE),
+    ("mxfp8_dim_km", MXFP8_DIM_KM),
+    ("mxfp8_dim_km_swizzle", MXFP8_DIM_KM_SWIZZLE),
     ("fp8_deepseek_1x128_dim_km", FP8_DEEPSEEK_1X128_DIM_KM),
     # 8-bit 2D
-    ("mxfp8_32x32_floor", MXFP8_32X32_FLOOR),
+    ("mxfp8_32x32", MXFP8_32X32),
     ("fp8_deepseek_128x128", FP8_DEEPSEEK_128X128),
     # 8-bit rowwise/colwise
     ("fp8_rowwise", FP8_ROWWISE),

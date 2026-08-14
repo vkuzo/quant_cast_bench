@@ -483,34 +483,47 @@ ColwisePrecalcGold = QuantCastSingleKernelGold(
 
 
 # ---------------------------------------------------------------------------
-# Golden recipe: mxfp8 with FLOOR rounding (1x32 blocks, e8m0 power-of-two scale).
+# Golden recipe: mxfp8 with RCEIL scaling (1x32 blocks, e8m0 power-of-two scale).
 #
 # Tile-invariant like deepseek_1x128 (reduce over 32-element groups along N, no transpose),
-# but the scale is an e8m0 (float8_e8m0fnu) power-of-two rather than fp32: derived by
-# extracting amax's fp32 exponent via integer bit-ops (FLOOR, no log2), and the cast
-# reconstructs the pow2 factor by shifting the biased exponent back into the fp32 exponent
-# field.
+# but the scale is an e8m0 (float8_e8m0fnu) power-of-two rather than fp32. Matches torchao's
+# `to_mx(..., scaling_mode=ScaleCalculationMode.RCEIL)` (NVIDIA cuBLAS d-block quantization):
+# the scale is `descale = amax / f8e4m3_max` rounded UP to a power of two, and the cast
+# reconstructs the pow2 factor by shifting the biased exponent back into the fp32 exponent field.
 # ---------------------------------------------------------------------------
-def _amax_to_e8m0_floor(amax):
-    """amax (any shape) -> e8m0 (float8_e8m0fnu) power-of-two block scale via FLOOR: extract
-    amax's fp32 exponent by integer bit-ops (no log2). Shared by the mxfp8-floor recipes."""
-    e8m0_exponent_bias = 127
-    f32_exp_bias = 127
-    mbits_f32 = 23
-    f8e4m3_max_pow2 = 8
+def _amax_to_e8m0_rceil(amax):
+    """amax (any shape) -> e8m0 (float8_e8m0fnu) power-of-two block scale via RCEIL, matching
+    torchao's `_to_mx_rceil`: `descale = amax / f8e4m3_max`, then round descale UP to a power of
+    two (i.e. up to the next e8m0 biased exponent whenever its fp32 mantissa is nonzero). Shared by
+    the mxfp8 recipes. On SM100 under compile/fake, uses the hardware `cvt.rp.ue8m0x2.f32` (round
+    toward +inf) via the core `inline_asm_elementwise` HOP; otherwise the pure-PyTorch bit-math
+    round-up (mirrors torchao's `_f32_to_e8m0_rceil`)."""
     e8m0_nan = 255
+    descale = amax.to(torch.float32) * (1.0 / torch.finfo(torch.float8_e4m3fn).max)  # /448.0
 
-    max_abs = amax.to(torch.float32)
-    max_abs_int32 = max_abs.view(torch.int32)
-    extracted_pow2 = ((max_abs_int32 >> mbits_f32) & 0xFF) - f32_exp_bias
-    scale_unbiased = extracted_pow2 - f8e4m3_max_pow2
-    scale_unbiased = torch.clamp(
-        scale_unbiased, -e8m0_exponent_bias, e8m0_exponent_bias + 1
-    )
-    scale_biased = (scale_unbiased + e8m0_exponent_bias).to(torch.uint8)
+    if _HAS_INLINE_ASM and _SM100 and descale.is_cuda and (
+        torch.compiler.is_compiling() or is_fake(descale)
+    ):
+        # cvt.rp.ue8m0x2.f32 packs two e8m0 results into a uint16; feed 0.0 as the high byte and
+        # descale as the low byte, then keep the low byte. Handles NaN/Inf->255 in hardware.
+        scale_biased = inline_asm_elementwise(
+            descale.to(torch.float32),
+            asm_str="cvt.rp.ue8m0x2.f32 $0, 0.0, $1;",
+            constraints="=h,r",
+            dtype=torch.uint16,
+        ).to(torch.uint8)
+        return scale_biased.view(torch.float8_e8m0fnu)
+
+    descale_int32 = descale.view(torch.int32)
+    biased_exponent = (descale_int32 >> 23) & 0xFF
+    mantissa = descale_int32 & 0x7FFFFF
+    # normal fp32 rounds up when any mantissa bit is set; for fp32 subnormals (biased_exp == 0),
+    # e8m0 byte 0 is 2^-127, so only values above that round to 1.
+    needs_round_up = torch.where(biased_exponent == 0, mantissa > 0x400000, mantissa != 0)
+    scale_biased = biased_exponent + needs_round_up.to(torch.int32)
     scale_biased = torch.where(
-        torch.isnan(max_abs), torch.full_like(scale_biased, e8m0_nan), scale_biased
-    )
+        torch.isfinite(descale), scale_biased, e8m0_nan
+    ).to(torch.uint8)
     return scale_biased.view(torch.float8_e8m0fnu)
 
 
@@ -521,19 +534,19 @@ def _e8m0_to_fp32(scale):
     return torch.clamp(scale_fp32, min=2.0**-126)
 
 
-def mxfp8_floor_f(x, **kwargs):
+def mxfp8_f(x, **kwargs):
     *lead, last = x.shape
     x_b = x.reshape(*lead, last // 32, 32)
     amax = x_b.abs().amax(dim=-1, keepdim=True)
-    scale_e8m0 = _amax_to_e8m0_floor(amax)
+    scale_e8m0 = _amax_to_e8m0_rceil(amax)
     # cast: reconstruct the fp32 pow2 factor from the e8m0 scale, then divide.
     qdata = (x_b.to(torch.float32) / _e8m0_to_fp32(scale_e8m0)).to(torch.float8_e4m3fn)
     return qdata.reshape(*lead, last), scale_e8m0.squeeze(-1)
 
 
-def mxfp8_floor_dq_f(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    # not a dataclass field -- used inside _mxfp8_floor_correctness, and importable
-    # directly by consumers (e.g. flex_tile_map's mxfp8_floor_swizzle_dq_f/MXFP8_BIAS) that
+def mxfp8_dq_f(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    # not a dataclass field -- used inside _mxfp8_correctness, and importable
+    # directly by consumers (e.g. flex_tile_map's mxfp8_swizzle_dq_f/MXFP8_BIAS) that
     # need the inverse.
     M, N = q.shape
     nb = N // 32
@@ -541,40 +554,40 @@ def mxfp8_floor_dq_f(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     return (q.float().reshape(M, nb, 32) * s).reshape(M, N)
 
 
-def _mxfp8_floor_correctness(
+def _mxfp8_correctness(
     inputs: Tuple[torch.Tensor, ...], outputs: Tuple[torch.Tensor, torch.Tensor]
 ) -> None:
     """Assert dequant(outputs) recovers `x` with SQNR above threshold. The e8m0 pow2 scale
     is coarser than fp32, so the threshold is lower than the fp8 recipes' (20 dB)."""
     (x,) = inputs
     qdata, scale = outputs
-    x_hat = mxfp8_floor_dq_f(qdata, scale)
+    x_hat = mxfp8_dq_f(qdata, scale)
     sqnr = _compute_error(x.float(), x_hat.float())
     threshold = 15.0
-    assert sqnr > threshold, f"mxfp8_floor: sqnr={sqnr.item():.2f} dB below {threshold} dB"
+    assert sqnr > threshold, f"mxfp8: sqnr={sqnr.item():.2f} dB below {threshold} dB"
 
 
-Mxfp8FloorGold = QuantCastSingleKernelGold(
-    pt_ref_fn=mxfp8_floor_f,
-    correctness_fn=_mxfp8_floor_correctness,
+Mxfp8Gold = QuantCastSingleKernelGold(
+    pt_ref_fn=mxfp8_f,
+    correctness_fn=_mxfp8_correctness,
     example_input_fn=lambda M, K: (torch.randn(M, K, dtype=torch.bfloat16, device="cuda"),),
     perf_description="(1,32) block",
 )
 
 
 # ---------------------------------------------------------------------------
-# Golden recipe: mxfp8 FLOOR, reduced across M (32x1 blocks), transposed output.
-# Same math as mxfp8_floor_f but the 1x32 e8m0 block runs down M; mirrors deepseek_1x128_dim_m_f.
+# Golden recipe: mxfp8, reduced across M (32x1 blocks), transposed output.
+# Same math as mxfp8_f but the 1x32 e8m0 block runs down M; mirrors deepseek_1x128_dim_m_f.
 # ---------------------------------------------------------------------------
-def mxfp8_floor_dim_m_f(x, **kwargs):
-    """dim-M mxfp8 floor: reshape rows into 32-blocks and reduce down M (dim1 of the block view),
+def mxfp8_dim_m_f(x, **kwargs):
+    """dim-M mxfp8: reshape rows into 32-blocks and reduce down M (dim1 of the block view),
     then write both outputs transposed-contiguous (pair with OutputKind.SWAP_TILE_INDEX on both).
-    Inlined from mxfp8_floor_f reducing the other axis, like deepseek_1x128_dim_m_f relative to
+    Inlined from mxfp8_f reducing the other axis, like deepseek_1x128_dim_m_f relative to
     deepseek_1x128_f."""
     M, N = x.shape
     x_b = x.reshape(M // 32, 32, N)
     amax = x_b.abs().amax(dim=1, keepdim=True)  # (M//32, 1, N), reduce down M
-    scale_e8m0 = _amax_to_e8m0_floor(amax)  # (M//32, 1, N)
+    scale_e8m0 = _amax_to_e8m0_rceil(amax)  # (M//32, 1, N)
     qdata = (
         (x_b.to(torch.float32) / _e8m0_to_fp32(scale_e8m0)).to(torch.float8_e4m3fn).reshape(M, N)
     )
@@ -582,86 +595,86 @@ def mxfp8_floor_dim_m_f(x, **kwargs):
     return qdata.t().contiguous(), scale_e8m0.squeeze(1).t().contiguous()  # (N, M), (N, M//32)
 
 
-def _mxfp8_floor_dim_m_correctness(
+def _mxfp8_dim_m_correctness(
     inputs: Tuple[torch.Tensor, ...], outputs: Tuple[torch.Tensor, torch.Tensor]
 ) -> None:
-    """dequant works in the (N, M) transposed frame (mxfp8_floor_dq_f reduces the last dim in
+    """dequant works in the (N, M) transposed frame (mxfp8_dq_f reduces the last dim in
     32-blocks); transpose back before comparing to `x`."""
     (x,) = inputs
     qdata, scale = outputs
-    x_hat = mxfp8_floor_dq_f(qdata, scale).t()
+    x_hat = mxfp8_dq_f(qdata, scale).t()
     sqnr = _compute_error(x.float(), x_hat.float())
     threshold = 15.0
-    assert sqnr > threshold, f"mxfp8_floor_dim_m: sqnr={sqnr.item():.2f} dB below {threshold} dB"
+    assert sqnr > threshold, f"mxfp8_dim_m: sqnr={sqnr.item():.2f} dB below {threshold} dB"
 
 
-Mxfp8FloorDimMGold = QuantCastSingleKernelGold(
-    pt_ref_fn=mxfp8_floor_dim_m_f,
-    correctness_fn=_mxfp8_floor_dim_m_correctness,
+Mxfp8DimMGold = QuantCastSingleKernelGold(
+    pt_ref_fn=mxfp8_dim_m_f,
+    correctness_fn=_mxfp8_dim_m_correctness,
     example_input_fn=lambda M, K: (torch.randn(M, K, dtype=torch.bfloat16, device="cuda"),),
     perf_description="(32,1) block, t-contig",
 )
 
 
 # ---------------------------------------------------------------------------
-# mxfp8 FLOOR in BOTH directions in one pass. Reads x as-is and reduces it two ways -- dim-K (1x32
+# mxfp8 in BOTH directions in one pass. Reads x as-is and reduces it two ways -- dim-K (1x32
 # blocks along columns) and dim-M (32x1 blocks along rows) -- returning FOUR outputs. Models a fused
-# kernel that reads x once and emits both the rowwise (dim-K) and transposed (dim-M) mxfp8-floor
-# quantizations. The mxfp8 analog of deepseek_1x128_dim_km_f (block 32, e8m0 FLOOR scales, divide).
+# kernel that reads x once and emits both the rowwise (dim-K) and transposed (dim-M) mxfp8
+# quantizations. The mxfp8 analog of deepseek_1x128_dim_km_f (block 32, e8m0 scales, divide).
 # ---------------------------------------------------------------------------
-def mxfp8_floor_dim_km_f(x, **kwargs):
+def mxfp8_dim_km_f(x, **kwargs):
     """One pass over x, reducing in both directions. Returns
     (qdata_k (M,N), scale_k (M,N//32), qdata_m (N,M), scale_m (N,M//32)) with e8m0 scales:
-    dim-K matches mxfp8_floor_f, dim-M matches mxfp8_floor_dim_m_f (transposed outputs).
+    dim-K matches mxfp8_f, dim-M matches mxfp8_dim_m_f (transposed outputs).
     Requires M % 32 == 0 and N % 32 == 0.
     """
     M, N = x.shape
     xf = x.to(torch.float32)  # read x once; both reshapes below are views of this buffer
     # dim-K: 1x32 blocks along the last dim
     xk = xf.reshape(M, N // 32, 32)
-    sk = _amax_to_e8m0_floor(xk.abs().amax(dim=-1, keepdim=True))
+    sk = _amax_to_e8m0_rceil(xk.abs().amax(dim=-1, keepdim=True))
     qk = (xk / _e8m0_to_fp32(sk)).to(torch.float8_e4m3fn).reshape(M, N)
     # dim-M: 32x1 blocks along rows (reduce over the 32 within-block rows)
     xm = xf.reshape(M // 32, 32, N)
-    sm = _amax_to_e8m0_floor(xm.abs().amax(dim=1, keepdim=True))
+    sm = _amax_to_e8m0_rceil(xm.abs().amax(dim=1, keepdim=True))
     qm = (xm / _e8m0_to_fp32(sm)).to(torch.float8_e4m3fn).reshape(M, N)
-    # dim-M outputs in transposed (N,M)/(N,M//32) layout (matches Mxfp8FloorDimMGold);
+    # dim-M outputs in transposed (N,M)/(N,M//32) layout (matches Mxfp8DimMGold);
     # .t().contiguous() is applied to OUTPUTS only, never to the input.
     return qk, sk.squeeze(-1), qm.t().contiguous(), sm.squeeze(1).t().contiguous()
 
 
-def _mxfp8_floor_dim_km_correctness(
+def _mxfp8_dim_km_correctness(
     inputs: Tuple[torch.Tensor, ...],
     outputs: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
 ) -> None:
     """Both quantizations must dequant back to `x` with SQNR above threshold: the dim-K pair
-    directly, the dim-M pair in the transposed frame (reusing mxfp8_floor_dq_f, then .t())."""
+    directly, the dim-M pair in the transposed frame (reusing mxfp8_dq_f, then .t())."""
     (x,) = inputs
     qk, sk, qm, sm = outputs
-    sqnr_k = _compute_error(x.float(), mxfp8_floor_dq_f(qk, sk).float())
-    sqnr_m = _compute_error(x.float(), mxfp8_floor_dq_f(qm, sm).t().float())
+    sqnr_k = _compute_error(x.float(), mxfp8_dq_f(qk, sk).float())
+    sqnr_m = _compute_error(x.float(), mxfp8_dq_f(qm, sm).t().float())
     threshold = 15.0
     assert sqnr_k > threshold, (
-        f"mxfp8_floor_dim_km (dim-k): sqnr={sqnr_k.item():.2f} dB below {threshold} dB"
+        f"mxfp8_dim_km (dim-k): sqnr={sqnr_k.item():.2f} dB below {threshold} dB"
     )
     assert sqnr_m > threshold, (
-        f"mxfp8_floor_dim_km (dim-m): sqnr={sqnr_m.item():.2f} dB below {threshold} dB"
+        f"mxfp8_dim_km (dim-m): sqnr={sqnr_m.item():.2f} dB below {threshold} dB"
     )
 
 
-Mxfp8FloorDimKmGold = QuantCastSingleKernelGold(
-    pt_ref_fn=mxfp8_floor_dim_km_f,
-    correctness_fn=_mxfp8_floor_dim_km_correctness,
+Mxfp8DimKmGold = QuantCastSingleKernelGold(
+    pt_ref_fn=mxfp8_dim_km_f,
+    correctness_fn=_mxfp8_dim_km_correctness,
     example_input_fn=lambda M, K: (torch.randn(M, K, dtype=torch.bfloat16, device="cuda"),),
     perf_description="(1,32) dim-k + (32,1) dim-m, one pass, t-contig",
 )
 
 
 # ---------------------------------------------------------------------------
-# Golden recipe: mxfp8 FLOOR with square 32x32 blocks (one e8m0 scale per 32x32 block).
-# Block structure mirrors deepseek_128x128_f (32 instead of 128); scale logic is mxfp8_floor's.
+# Golden recipe: mxfp8 with square 32x32 blocks (one e8m0 scale per 32x32 block).
+# Block structure mirrors deepseek_128x128_f (32 instead of 128); scale logic is mxfp8's.
 # ---------------------------------------------------------------------------
-def mxfp8_32x32_floor_f(x, **kwargs):
+def mxfp8_32x32_f(x, **kwargs):
     *lead, d1, d2 = x.shape
     n1, n2 = d1 // 32, d2 // 32
     x_b = (
@@ -671,7 +684,7 @@ def mxfp8_32x32_floor_f(x, **kwargs):
         .reshape(*lead, n1, n2, 32 * 32)
     )
     amax = x_b.abs().amax(dim=-1, keepdim=True)  # (..., n1, n2, 1)
-    scale_e8m0 = _amax_to_e8m0_floor(amax)  # e8m0, (..., n1, n2, 1)
+    scale_e8m0 = _amax_to_e8m0_rceil(amax)  # e8m0, (..., n1, n2, 1)
     qdata_b = (x_b.to(torch.float32) / _e8m0_to_fp32(scale_e8m0)).to(torch.float8_e4m3fn)
     qdata = (
         qdata_b.reshape(*lead, n1, n2, 32, 32)
@@ -682,7 +695,7 @@ def mxfp8_32x32_floor_f(x, **kwargs):
     return qdata, scale_e8m0.squeeze(-1)  # scale (M//32, N//32)
 
 
-def mxfp8_32x32_floor_dq_f(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+def mxfp8_32x32_dq_f(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     # inverse: un-block the e8m0 scale over the 32x32 grid (mirrors deepseek_128x128_dq_f).
     M, N = q.shape
     n1, n2 = M // 32, N // 32
@@ -690,31 +703,31 @@ def mxfp8_32x32_floor_dq_f(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor
     return (q.float().reshape(n1, 32, n2, 32) * s).reshape(M, N)
 
 
-def _mxfp8_32x32_floor_correctness(
+def _mxfp8_32x32_correctness(
     inputs: Tuple[torch.Tensor, ...], outputs: Tuple[torch.Tensor, torch.Tensor]
 ) -> None:
     """Assert dequant(outputs) recovers `x` with SQNR above threshold. e8m0 pow2 scale is coarse,
-    so the threshold matches mxfp8_floor's (15 dB), not the fp8 recipes' (20 dB)."""
+    so the threshold matches mxfp8's (15 dB), not the fp8 recipes' (20 dB)."""
     (x,) = inputs
     qdata, scale = outputs
-    x_hat = mxfp8_32x32_floor_dq_f(qdata, scale)
+    x_hat = mxfp8_32x32_dq_f(qdata, scale)
     sqnr = _compute_error(x.float(), x_hat.float())
     threshold = 15.0
-    assert sqnr > threshold, f"mxfp8_32x32_floor: sqnr={sqnr.item():.2f} dB below {threshold} dB"
+    assert sqnr > threshold, f"mxfp8_32x32: sqnr={sqnr.item():.2f} dB below {threshold} dB"
 
 
-Mxfp832x32FloorGold = QuantCastSingleKernelGold(
-    pt_ref_fn=mxfp8_32x32_floor_f,
-    correctness_fn=_mxfp8_32x32_floor_correctness,
+Mxfp832x32Gold = QuantCastSingleKernelGold(
+    pt_ref_fn=mxfp8_32x32_f,
+    correctness_fn=_mxfp8_32x32_correctness,
     example_input_fn=lambda M, K: (torch.randn(M, K, dtype=torch.bfloat16, device="cuda"),),
     perf_description="(32,32) block",
 )
 
 
 # ---------------------------------------------------------------------------
-# Golden recipe: mxfp8 FLOOR with swizzled (NVIDIA 32x4x4 blocked) scale.
+# Golden recipe: mxfp8 with swizzled (NVIDIA 32x4x4 blocked) scale.
 #
-# Same quantization as mxfp8_floor_f, but the e8m0 scale is emitted in the blocked layout
+# Same quantization as mxfp8_f, but the e8m0 scale is emitted in the blocked layout
 # `_scaled_mm` consumes. The swizzle is a LOCAL, tile-invariant transform when tiles are
 # whole 128x128 hp units (= 128x4 e8m0 tiles): each 128x4 scale tile swizzles independently
 # into a 32x16 block. The scale is returned as the 4D block grid `(n_row_blocks,
@@ -775,98 +788,98 @@ def _from_blocked_4d(blocked, rows, cols):
     return x.reshape(rows, cols)
 
 
-def mxfp8_floor_swizzle_f(x, **kwargs):
-    qdata, scale_e8m0 = mxfp8_floor_f(x)
+def mxfp8_swizzle_f(x, **kwargs):
+    qdata, scale_e8m0 = mxfp8_f(x)
     return qdata, _to_blocked_4d(scale_e8m0)
 
 
-def mxfp8_floor_swizzle_dq_f(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    # not a dataclass field -- used inside _mxfp8_floor_swizzle_correctness, and importable
+def mxfp8_swizzle_dq_f(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    # not a dataclass field -- used inside _mxfp8_swizzle_correctness, and importable
     # directly by consumers that need the inverse. Un-swizzle the 4D block grid back to
     # (M, N//32) e8m0, then dequant as mxfp8.
     M, N = q.shape
     rows, cols = M, N // 32
     scale_e8m0 = _from_blocked_4d(scale, rows, cols)
-    return mxfp8_floor_dq_f(q, scale_e8m0)
+    return mxfp8_dq_f(q, scale_e8m0)
 
 
-def _mxfp8_floor_swizzle_correctness(
+def _mxfp8_swizzle_correctness(
     inputs: Tuple[torch.Tensor, ...], outputs: Tuple[torch.Tensor, torch.Tensor]
 ) -> None:
     """Assert dequant(outputs) recovers `x` with SQNR above threshold."""
     (x,) = inputs
     qdata, scale = outputs
-    x_hat = mxfp8_floor_swizzle_dq_f(qdata, scale)
+    x_hat = mxfp8_swizzle_dq_f(qdata, scale)
     sqnr = _compute_error(x.float(), x_hat.float())
     threshold = 15.0
-    assert sqnr > threshold, f"mxfp8_floor_swizzle: sqnr={sqnr.item():.2f} dB below {threshold} dB"
+    assert sqnr > threshold, f"mxfp8_swizzle: sqnr={sqnr.item():.2f} dB below {threshold} dB"
 
 
-Mxfp8FloorSwizzleGold = QuantCastSingleKernelGold(
-    pt_ref_fn=mxfp8_floor_swizzle_f,
-    correctness_fn=_mxfp8_floor_swizzle_correctness,
+Mxfp8SwizzleGold = QuantCastSingleKernelGold(
+    pt_ref_fn=mxfp8_swizzle_f,
+    correctness_fn=_mxfp8_swizzle_correctness,
     example_input_fn=lambda M, K: (torch.randn(M, K, dtype=torch.bfloat16, device="cuda"),),
     perf_description="(1,32) block, swizzle",
 )
 
 
 # ---------------------------------------------------------------------------
-# Golden recipe: mxfp8 FLOOR reduced across M (32x1 blocks), transposed output, with the e8m0
-# scale in the swizzled (NVIDIA 32x4x4 blocked) layout. Combines mxfp8_floor_dim_m_f (dim-M
+# Golden recipe: mxfp8 reduced across M (32x1 blocks), transposed output, with the e8m0
+# scale in the swizzled (NVIDIA 32x4x4 blocked) layout. Combines mxfp8_dim_m_f (dim-M
 # reduction -> transposed (N, M) qdata + (N, M//32) scale) with the _to_blocked_4d swizzle applied
-# to that transposed scale -- i.e. mxfp8_floor_swizzle_f in the dim-M / transposed frame.
+# to that transposed scale -- i.e. mxfp8_swizzle_f in the dim-M / transposed frame.
 # ---------------------------------------------------------------------------
-def mxfp8_floor_dim_m_swizzle_f(x, **kwargs):
-    qdata, scale_e8m0 = mxfp8_floor_dim_m_f(x)  # (N, M), (N, M//32)
+def mxfp8_dim_m_swizzle_f(x, **kwargs):
+    qdata, scale_e8m0 = mxfp8_dim_m_f(x)  # (N, M), (N, M//32)
     return qdata, _to_blocked_4d(scale_e8m0)
 
 
-def mxfp8_floor_dim_m_swizzle_dq_f(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+def mxfp8_dim_m_swizzle_dq_f(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     # not a dataclass field -- inverse for the correctness check / consumers. `q` is (N, M) in
     # the transposed dim-M frame, so its 32-blocks run along the last (M) axis; reuse
-    # mxfp8_floor_swizzle_dq_f, which un-swizzles the 4D scale grid and dequants last-dim 32-blocks.
-    return mxfp8_floor_swizzle_dq_f(q, scale)
+    # mxfp8_swizzle_dq_f, which un-swizzles the 4D scale grid and dequants last-dim 32-blocks.
+    return mxfp8_swizzle_dq_f(q, scale)
 
 
-def _mxfp8_floor_dim_m_swizzle_correctness(
+def _mxfp8_dim_m_swizzle_correctness(
     inputs: Tuple[torch.Tensor, ...], outputs: Tuple[torch.Tensor, torch.Tensor]
 ) -> None:
-    """dequant works in the (N, M) transposed frame (like _mxfp8_floor_dim_m_correctness); transpose
+    """dequant works in the (N, M) transposed frame (like _mxfp8_dim_m_correctness); transpose
     back before comparing to `x`."""
     (x,) = inputs
     qdata, scale = outputs
-    x_hat = mxfp8_floor_dim_m_swizzle_dq_f(qdata, scale).t()
+    x_hat = mxfp8_dim_m_swizzle_dq_f(qdata, scale).t()
     sqnr = _compute_error(x.float(), x_hat.float())
     threshold = 15.0
     assert sqnr > threshold, (
-        f"mxfp8_floor_dim_m_swizzle: sqnr={sqnr.item():.2f} dB below {threshold} dB"
+        f"mxfp8_dim_m_swizzle: sqnr={sqnr.item():.2f} dB below {threshold} dB"
     )
 
 
-Mxfp8FloorDimMSwizzleGold = QuantCastSingleKernelGold(
-    pt_ref_fn=mxfp8_floor_dim_m_swizzle_f,
-    correctness_fn=_mxfp8_floor_dim_m_swizzle_correctness,
+Mxfp8DimMSwizzleGold = QuantCastSingleKernelGold(
+    pt_ref_fn=mxfp8_dim_m_swizzle_f,
+    correctness_fn=_mxfp8_dim_m_swizzle_correctness,
     example_input_fn=lambda M, K: (torch.randn(M, K, dtype=torch.bfloat16, device="cuda"),),
     perf_description="(32,1) block, t-contig, swizzle",
 )
 
 
 # ---------------------------------------------------------------------------
-# Golden recipe: mxfp8 FLOOR in BOTH directions (one pass), with BOTH e8m0 scales in the swizzled
-# (NVIDIA 32x4x4 blocked) layout. Combines mxfp8_floor_dim_km_f (dim-K -> qk (M,N) + sk (M,N//32);
+# Golden recipe: mxfp8 in BOTH directions (one pass), with BOTH e8m0 scales in the swizzled
+# (NVIDIA 32x4x4 blocked) layout. Combines mxfp8_dim_km_f (dim-K -> qk (M,N) + sk (M,N//32);
 # dim-M -> qm (N,M) + sm (N,M//32), transposed) with the _to_blocked_4d swizzle applied to each of
-# the two scales -- i.e. mxfp8_floor_swizzle_f (dim-K frame) and mxfp8_floor_dim_m_swizzle_f (dim-M /
+# the two scales -- i.e. mxfp8_swizzle_f (dim-K frame) and mxfp8_dim_m_swizzle_f (dim-M /
 # transposed frame) fused into one pass. Qdata is unchanged; only the two scale layouts differ.
 # ---------------------------------------------------------------------------
-def mxfp8_floor_dim_km_swizzle_f(x, **kwargs):
+def mxfp8_dim_km_swizzle_f(x, **kwargs):
     """One pass over x, both directions, both scales swizzled. Returns
     (qk (M,N), sk_blocked, qm (N,M), sm_blocked) where sk/sm are the 4D block grids
     `(nrb, ncb, 32, 16)` of sk (M,N//32) / sm (N,M//32)."""
-    qk, sk, qm, sm = mxfp8_floor_dim_km_f(x)
+    qk, sk, qm, sm = mxfp8_dim_km_f(x)
     return qk, _to_blocked_4d(sk), qm, _to_blocked_4d(sm)
 
 
-def _mxfp8_floor_dim_km_swizzle_correctness(
+def _mxfp8_dim_km_swizzle_correctness(
     inputs: Tuple[torch.Tensor, ...],
     outputs: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
 ) -> None:
@@ -874,20 +887,20 @@ def _mxfp8_floor_dim_km_swizzle_correctness(
     scale grid: the dim-K pair directly, the dim-M pair in the transposed frame (then .t())."""
     (x,) = inputs
     qk, sk, qm, sm = outputs
-    sqnr_k = _compute_error(x.float(), mxfp8_floor_swizzle_dq_f(qk, sk).float())
-    sqnr_m = _compute_error(x.float(), mxfp8_floor_swizzle_dq_f(qm, sm).t().float())
+    sqnr_k = _compute_error(x.float(), mxfp8_swizzle_dq_f(qk, sk).float())
+    sqnr_m = _compute_error(x.float(), mxfp8_swizzle_dq_f(qm, sm).t().float())
     threshold = 15.0
     assert sqnr_k > threshold, (
-        f"mxfp8_floor_dim_km_swizzle (dim-k): sqnr={sqnr_k.item():.2f} dB below {threshold} dB"
+        f"mxfp8_dim_km_swizzle (dim-k): sqnr={sqnr_k.item():.2f} dB below {threshold} dB"
     )
     assert sqnr_m > threshold, (
-        f"mxfp8_floor_dim_km_swizzle (dim-m): sqnr={sqnr_m.item():.2f} dB below {threshold} dB"
+        f"mxfp8_dim_km_swizzle (dim-m): sqnr={sqnr_m.item():.2f} dB below {threshold} dB"
     )
 
 
-Mxfp8FloorDimKmSwizzleGold = QuantCastSingleKernelGold(
-    pt_ref_fn=mxfp8_floor_dim_km_swizzle_f,
-    correctness_fn=_mxfp8_floor_dim_km_swizzle_correctness,
+Mxfp8DimKmSwizzleGold = QuantCastSingleKernelGold(
+    pt_ref_fn=mxfp8_dim_km_swizzle_f,
+    correctness_fn=_mxfp8_dim_km_swizzle_correctness,
     example_input_fn=lambda M, K: (torch.randn(M, K, dtype=torch.bfloat16, device="cuda"),),
     perf_description="(1,32) dim-k + (32,1) dim-m, one pass, t-contig, swizzle",
 )
@@ -1040,7 +1053,7 @@ Nvfp4GsSwizzleGold = QuantCastSingleKernelGold(
 #
 # Identical two-level nvfp4 quantization to nvfp4_gs_swizzle_f, but the per-16-element e4m3 inner
 # scale is returned in its natural (M, N//16) row-major layout instead of the NVIDIA blocked/
-# swizzled 4D grid (the nvfp4 analog of mxfp8_floor vs mxfp8_floor_swizzle). Dropping the swizzle
+# swizzled 4D grid (the nvfp4 analog of mxfp8 vs mxfp8_swizzle). Dropping the swizzle
 # makes the scale a plain 2D block-scale -- trivially tile-invariant, no _to_blocked_4d. The outer
 # scale is still a GLOBAL amax, computed outside flex_tile_map (`nvfp4_gs_scale`) as a REPLICATE aux.
 # ---------------------------------------------------------------------------
@@ -1194,7 +1207,7 @@ Nvfp4BlockedOuterGold = QuantCastSingleKernelGold(
 
 
 # ---------------------------------------------------------------------------
-# Golden recipe: mxfp8 FLOOR with an elementwise bias added before quant.
+# Golden recipe: mxfp8 with an elementwise bias added before quant.
 #
 # `bias` is the same shape as the input -> AuxKind.TILE with divisor (1, 1): the framework
 # partitions it exactly like the input (one bias element per input element). `f` just adds it
@@ -1202,7 +1215,7 @@ Nvfp4BlockedOuterGold = QuantCastSingleKernelGold(
 # ---------------------------------------------------------------------------
 def mxfp8_bias_f(x, bias, **kwargs):
     """Tile-invariant `f`: add an elementwise `bias` (AuxKind.TILE, per-element) then mxfp8."""
-    return mxfp8_floor_f(x + bias.to(x.dtype))
+    return mxfp8_f(x + bias.to(x.dtype))
 
 
 def _mxfp8_bias_correctness(
@@ -1446,19 +1459,19 @@ ALL_RECIPES = [
     ("fp8_rowwise_precalc_scale", RowwisePrecalcGold),
     ("fp8_colwise_precalc_scale", ColwisePrecalcGold),
     # 8-bit 1D, dim-k reduction
-    ("mxfp8_floor", Mxfp8FloorGold),
-    ("mxfp8_floor_swizzle", Mxfp8FloorSwizzleGold),
+    ("mxfp8", Mxfp8Gold),
+    ("mxfp8_swizzle", Mxfp8SwizzleGold),
     ("fp8_deepseek_1x128", Deepseek1x128Gold),
     # 8-bit 1D, dim-m reduction
-    ("mxfp8_floor_dim_m", Mxfp8FloorDimMGold),
-    ("mxfp8_floor_dim_m_swizzle", Mxfp8FloorDimMSwizzleGold),
+    ("mxfp8_dim_m", Mxfp8DimMGold),
+    ("mxfp8_dim_m_swizzle", Mxfp8DimMSwizzleGold),
     ("fp8_deepseek_1x128_dim_m", Deepseek1x128DimMGold),
     # 8-bit 1D, dim-km reduction 
-    ("mxfp8_floor_dim_km", Mxfp8FloorDimKmGold),
-    ("mxfp8_floor_dim_km_swizzle", Mxfp8FloorDimKmSwizzleGold),
+    ("mxfp8_dim_km", Mxfp8DimKmGold),
+    ("mxfp8_dim_km_swizzle", Mxfp8DimKmSwizzleGold),
     ("fp8_deepseek_1x128_dim_km", Deepseek1x128DimKmGold),
     # 8-bit 2D
-    ("mxfp8_32x32_floor", Mxfp832x32FloorGold),
+    ("mxfp8_32x32", Mxfp832x32Gold),
     ("fp8_deepseek_128x128", Deepseek128x128Gold),
     # 8-bit rowwise/colwise
     ("fp8_rowwise", RowwiseFp8Gold),

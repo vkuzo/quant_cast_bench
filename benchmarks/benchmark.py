@@ -24,7 +24,7 @@ B200_PEAK_BW_GBPS = 8000.0  # 8 TB/s
 # Recipes excluded from the benchmark entirely -- not relevant here (they still run in the
 # gold tests). Filtered out before the sweep, so they never appear in the results table.
 _BENCH_SKIP = {
-    "mxfp8_floor",
+    "mxfp8",
     "nvfp4_blocked_outer",
     "mxfp8_bias",
     "fp8_rowwise_precalc_scale",
@@ -175,15 +175,15 @@ def main(
         from quant_cast_bench.flex_tile_map.recipes import RECIPES_V2
         # wired through the TRITON_TEMPLATE backend: the in-fragment group-reduction casts. Two
         # dim-M variants (transposed outputs), single-input, no aux -- deepseek 1x128 (128-row group,
-        # fp32 scale) and mxfp8-floor 1x32 (32-row group, e8m0 scale) -- each with its own template
+        # fp32 scale) and mxfp8 1x32 (32-row group, e8m0 scale) -- each with its own template
         # (group baked in), selected by the group width in inductor_lowering._DIM_M_TEMPLATES. Plus
         # mxfp8 32x32 (block_2d: one e8m0 scale per 32x32 square block, no transpose) via
-        # template_mxfp8_32x32_floor.py.jinja, and nvfp4 (dim-K, 1x16 along columns, no transpose):
+        # template_mxfp8_32x32.py.jinja, and nvfp4 (dim-K, 1x16 along columns, no transpose):
         # a REPLICATE aux (per-tensor outer scale), fp4-packed qdata + e4m3 scale, via
         # template_nvfp4.py.jinja. The pointwise relu path was
         # removed -- a pointwise `f` no longer has a template lowering (it raises NotImplementedError),
         # so it's benchmarked via regular Inductor (`--mode compile`).
-        _WIRED = {"fp8_deepseek_1x128_dim_m", "mxfp8_floor_dim_m", "mxfp8_32x32_floor", "nvfp4"}
+        _WIRED = {"fp8_deepseek_1x128_dim_m", "mxfp8_dim_m", "mxfp8_32x32", "nvfp4"}
         recipes_all = [(n, r) for n, r in RECIPES_V2 if n in _WIRED]
     else:
         recipes_all = ALL_RECIPES

@@ -27,8 +27,8 @@ _MAX_MISMATCH_FRAC = 0.01
 _REQUIRES_SM100 = frozenset({
     "nvfp4",
     "nvfp4_swizzle",
-    "mxfp8_floor_dim_m",
-    "mxfp8_floor_dim_m_swizzle",
+    "mxfp8_dim_m",
+    "mxfp8_dim_m_swizzle",
 })
 
 

@@ -1,4 +1,4 @@
-{# mxfp8 FLOOR 32x32 block template: one e8m0 scale per 32x32 SQUARE block (amax over the whole
+{# mxfp8 32x32 block template: one e8m0 scale per 32x32 SQUARE block (amax over the whole
    1024-element block), fp8 qdata the same shape as the input. Unlike the dim-M/dim-K templates
    this reduces over BOTH dims (a 2D block), NO transpose. The emitter body:
      - reshapes x_var (BLOCK_M, BLOCK_N) -> (BLOCK_M//32, 32, BLOCK_N//32, 32), swaps the two middle
