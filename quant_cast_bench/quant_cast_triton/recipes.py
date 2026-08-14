@@ -509,7 +509,7 @@ FP8_COLWISE = QuantCastTritonRecipe.from_gold(ColwiseFp8Gold, triton_fn=fp8_colw
 
 
 # ---------------------------------------------------------------------------
-# e8m0 device helpers (mxfp8). Exact ports of _amax_to_e8m0 / _e8m0_to_fp32 (recipes.py)
+# e8m0 device helpers (mxfp8). Exact ports of _amax_to_e8m0 / _e8m0_scale_to_reciprocal_fp32 (recipes.py)
 # so the scale matches the reference bit-for-bit. e8m0 is stored as its uint8 biased-exponent
 # byte (the wrapper .view()s it as float8_e8m0fnu).
 # ---------------------------------------------------------------------------
@@ -545,10 +545,11 @@ def _amax_to_e8m0_cvt(amax):
 
 
 @triton.jit
-def _e8m0_to_fp32_tl(biased):
-    # biased: int32 e8m0 exponent -> fp32 pow2 factor, clamped to the smallest normal.
-    fp = (biased << 23).to(tl.float32, bitcast=True)
-    return tl.maximum(fp, 2.0**-126)
+def _e8m0_to_reciprocal_fp32_tl(biased):
+    # biased: int32 e8m0 exponent -> fp32 reciprocal pow2 factor 2^(127-e), matching the gold
+    # _e8m0_scale_to_reciprocal_fp32 (reciprocal biased exponent = 254 - e). The cast multiplies
+    # data by this (torchao _to_mx_rceil) instead of dividing by the reconstructed scale.
+    return ((254 - biased) << 23).to(tl.float32, bitcast=True)
 
 
 # ---------------------------------------------------------------------------
@@ -566,8 +567,8 @@ def _mxfp8_kernel(x_ptr, y_ptr, s_ptr, M, N, sxm, sxn, sym, syn, ssm, ssn, BM: t
     x = tl.load(x_ptr + offs_m[:, None] * sxm + offs_n[None, :] * sxn, mask=mask).to(tl.float32)
     amax = tl.max(tl.abs(x), axis=1)  # (BM,) -- mxfp8 does NOT clamp amax
     biased = _amax_to_e8m0_tl(amax)
-    sfp = _e8m0_to_fp32_tl(biased)
-    y = (x / sfp[:, None]).to(tl.float8e4nv)
+    rcp = _e8m0_to_reciprocal_fp32_tl(biased)
+    y = (x * rcp[:, None]).to(tl.float8e4nv)
     tl.store(y_ptr + offs_m[:, None] * sym + offs_n[None, :] * syn, y, mask=mask)
     tl.store(s_ptr + offs_m * ssm + pid_b * ssn, biased.to(tl.uint8), mask=m_mask)
 
@@ -613,8 +614,8 @@ def _mxfp8_32x32_kernel(x_ptr, y_ptr, s_ptr, M, N, sxm, sxn, sym, syn, ssm, ssn,
     xr = tl.reshape(x, (32, CB, 32))
     amax = tl.max(tl.max(tl.abs(xr), axis=2), axis=0)  # (CB,): within-block cols, then 32 rows
     biased = _amax_to_e8m0_tl(amax)  # (CB,)
-    sfp = _e8m0_to_fp32_tl(biased)
-    y = tl.reshape((xr / sfp[None, :, None]).to(tl.float8e4nv), (32, CB * 32))
+    rcp = _e8m0_to_reciprocal_fp32_tl(biased)
+    y = tl.reshape((xr * rcp[None, :, None]).to(tl.float8e4nv), (32, CB * 32))
     tl.store(y_ptr + offs_m[:, None] * sym + offs_n[None, :] * syn, y, mask=n_mask[None, :])
     s_cols = pid_cb * CB + tl.arange(0, CB)
     tl.store(s_ptr + pid_rb * ssm + s_cols * ssn, biased.to(tl.uint8), mask=s_cols < (N // 32))
@@ -674,8 +675,8 @@ def _mxfp8_dim_m_kernel(
     xr = tl.reshape(x, (RB, 32, BN))
     amax = tl.max(tl.abs(xr), axis=1)  # (RB, BN): per (row-block, col)
     biased = _amax_to_e8m0_cvt(amax)  # (RB, BN); hardware cvt.rp e8m0
-    sfp = _e8m0_to_fp32_tl(biased)
-    y = tl.reshape((xr / sfp[:, None, :]).to(tl.float8e4nv), (RB * 32, BN))  # (128, BN)
+    rcp = _e8m0_to_reciprocal_fp32_tl(biased)
+    y = tl.reshape((xr * rcp[:, None, :]).to(tl.float8e4nv), (RB * 32, BN))  # (128, BN)
     # transposed qdata store into (N, M): out[n, m] = y[m_in_tile, n]; 128-wide contiguous per row.
     out_off = offs_n[:, None] * sym + offs_m[None, :] * syn
     tl.store(y_ptr + out_off, tl.trans(y), mask=n_mask[:, None])
@@ -731,8 +732,8 @@ def _mxfp8_dim_m_swizzle_kernel(
     xr = tl.reshape(x, (RB, 32, BN))
     amax = tl.max(tl.abs(xr), axis=1)  # (RB, BN): per (row-block, col)
     biased = _amax_to_e8m0_cvt(amax)  # (RB, BN); hardware cvt.rp e8m0
-    sfp = _e8m0_to_fp32_tl(biased)
-    y = tl.reshape((xr / sfp[:, None, :]).to(tl.float8e4nv), (RB * 32, BN))  # (128, BN)
+    rcp = _e8m0_to_reciprocal_fp32_tl(biased)
+    y = tl.reshape((xr * rcp[:, None, :]).to(tl.float8e4nv), (RB * 32, BN))  # (128, BN)
     # transposed qdata store into (N, M): out[n, m] = y[m_in_tile, n]; 128-wide contiguous per row.
     out_off = offs_n[:, None] * sym + offs_m[None, :] * syn
     tl.store(y_ptr + out_off, tl.trans(y), mask=n_mask[:, None])
@@ -806,14 +807,14 @@ def _mxfp8_dim_km_kernel(
     # dim-K: 1x32 blocks along columns -> (BM, CB, 32), reduce the 32. mxfp8 does NOT clamp amax.
     xk = tl.reshape(x, (BM, CB, 32))
     bk = _amax_to_e8m0_tl(tl.max(tl.abs(xk), axis=2))  # (BM, CB) per (row, col-block)
-    yk = tl.reshape((xk / _e8m0_to_fp32_tl(bk)[:, :, None]).to(tl.float8e4nv), (BM, BN))
+    yk = tl.reshape((xk * _e8m0_to_reciprocal_fp32_tl(bk)[:, :, None]).to(tl.float8e4nv), (BM, BN))
     tl.store(yk_ptr + offs_m[:, None] * sykm + offs_n[None, :] * sykn, yk)
     sk_cols = pid_n * CB + tl.arange(0, CB)
     tl.store(sk_ptr + offs_m[:, None] * sskm + sk_cols[None, :] * sskn, bk.to(tl.uint8))
     # dim-M: 32x1 blocks along rows -> (RB, 32, BN), reduce the 32; transposed store.
     xm = tl.reshape(x, (RB, 32, BN))
     bm = _amax_to_e8m0_tl(tl.max(tl.abs(xm), axis=1))  # (RB, BN) per (row-block, col)
-    ym = tl.reshape((xm / _e8m0_to_fp32_tl(bm)[:, None, :]).to(tl.float8e4nv), (BM, BN))
+    ym = tl.reshape((xm * _e8m0_to_reciprocal_fp32_tl(bm)[:, None, :]).to(tl.float8e4nv), (BM, BN))
     # out[n, m] = ym[row, col] with n=offs_n[col], m=offs_m[row] -> store tl.trans(ym) into (N, M).
     tl.store(ym_ptr + offs_n[:, None] * symn + offs_m[None, :] * symm, tl.trans(ym))
     sm_cols = pid_m * RB + tl.arange(0, RB)
@@ -867,7 +868,7 @@ def _mxfp8_dim_km_swizzle_kernel(
     # dim-K: 1x32 blocks along columns -> (BM, CB, 32), reduce the 32.
     xk = tl.reshape(x, (BM, CB, 32))
     bk = _amax_to_e8m0_tl(tl.max(tl.abs(xk), axis=2))  # (BM, CB) per (row, col-block)
-    yk = tl.reshape((xk / _e8m0_to_fp32_tl(bk)[:, :, None]).to(tl.float8e4nv), (BM, BN))
+    yk = tl.reshape((xk * _e8m0_to_reciprocal_fp32_tl(bk)[:, :, None]).to(tl.float8e4nv), (BM, BN))
     tl.store(yk_ptr + offs_m[:, None] * sykm + offs_n[None, :] * sykn, yk)
     # swizzled sk store: scale (M, N//32); pre-swizzle position row = m (over M), col-block (over N//32).
     row_k = offs_m[:, None]                              # (BM, 1)
@@ -878,7 +879,7 @@ def _mxfp8_dim_km_swizzle_kernel(
     # dim-M: 32x1 blocks along rows -> (RB, 32, BN), reduce the 32; transposed store.
     xm = tl.reshape(x, (RB, 32, BN))
     bm = _amax_to_e8m0_tl(tl.max(tl.abs(xm), axis=1))  # (RB, BN) per (row-block, col)
-    ym = tl.reshape((xm / _e8m0_to_fp32_tl(bm)[:, None, :]).to(tl.float8e4nv), (BM, BN))
+    ym = tl.reshape((xm * _e8m0_to_reciprocal_fp32_tl(bm)[:, None, :]).to(tl.float8e4nv), (BM, BN))
     tl.store(ym_ptr + offs_n[:, None] * symn + offs_m[None, :] * symm, tl.trans(ym))
     # swizzled sm store: scale (N, M//32) transposed; pre-swizzle row = n (over N), col = 32-row-block.
     row_m = offs_n[None, :]                              # (1, BN)
@@ -943,8 +944,8 @@ def _mxfp8_swizzle_kernel(x_ptr, y_ptr, s_ptr, n_groups, NGC, NCB, GBLOCK: tl.co
     x = tl.load(x_ptr + off, mask=g_mask[:, None]).to(tl.float32)
     amax = tl.max(tl.abs(x), axis=1)  # (GBLOCK,)
     biased = _amax_to_e8m0_tl(amax)
-    sfp = _e8m0_to_fp32_tl(biased)
-    y = (x / sfp[:, None]).to(tl.float8e4nv)
+    rcp = _e8m0_to_reciprocal_fp32_tl(biased)
+    y = (x * rcp[:, None]).to(tl.float8e4nv)
     tl.store(y_ptr + off, y, mask=g_mask[:, None])
     # swizzled scale store: pre-swizzle position row = g // NGC, col = g % NGC
     row = g // NGC

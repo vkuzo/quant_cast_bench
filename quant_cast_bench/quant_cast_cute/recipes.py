@@ -697,19 +697,21 @@ def _cvt_rp_ue8m0x2_f32(hi, lo, *, loc=None, ip=None):
 
 
 # ---------------------------------------------------------------------------
-# e8m0 RCEIL helper (device): amax (f32 scalar) -> (sfp, biased_uint8). Replicates gold's
-# _amax_to_e8m0_rceil + _e8m0_to_fp32: descale = amax / 448 rounded UP to a power of two via the
-# hardware `cvt.rp.ue8m0x2.f32` (round toward +inf), then reconstruct the exact fp32 pow2 factor
-# by shifting the biased exponent back into the fp32 exponent field. `biased` is the e8m0 byte.
+# e8m0 RCEIL helper (device): amax (f32 scalar) -> (rcp, biased_uint8). Replicates gold's
+# _amax_to_e8m0_rceil + _e8m0_scale_to_reciprocal_fp32: descale = amax / 448 rounded UP to a power
+# of two via the hardware `cvt.rp.ue8m0x2.f32` (round toward +inf), then reconstruct the fp32
+# RECIPROCAL pow2 factor 2^(127-e) (reciprocal biased exponent = 254 - e) by shifting it into the
+# fp32 exponent field. The cast multiplies data by `rcp` (torchao `_to_mx_rceil`). `biased` is the
+# e8m0 byte.
 # ---------------------------------------------------------------------------
 @cute.jit
 def _e8m0(amax):
     descale = amax * cutlass.Float32(1.0 / 448.0)
     biased = cutlass.Int32(_cvt_rp_ue8m0x2_f32(descale, descale))
     ib = cute.make_rmem_tensor(cute.make_layout(1), cutlass.Int32)
-    ib[0] = biased << 23
+    ib[0] = (cutlass.Int32(254) - biased) << 23
     fb = cute.recast_tensor(ib, dtype=cutlass.Float32)
-    return cutlass.max(fb[0], cutlass.Float32(2.0 ** -126)), biased
+    return fb[0], biased
 
 
 # ---------------------------------------------------------------------------
@@ -732,9 +734,9 @@ def _mxfp8_kernel(gX: cute.Tensor, gY: cute.Tensor, gScale: cute.Tensor,
     cute.copy(cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gX.element_type), thrX, frgX)
     v = frgX.load().to(cutlass.Float32)
     amax = cutlass.max(v, -v).reduce(cute.ReductionOp.MAX, cutlass.Float32(0.0), 0)
-    sfp, biased = _e8m0(amax)
+    rcp, biased = _e8m0(amax)
     frgY = cute.make_rmem_tensor(cute.get(tv_layout, mode=[1]), gY.element_type)
-    frgY.store((v / sfp).to(gY.element_type))
+    frgY.store((v * rcp).to(gY.element_type))
     cute.copy(cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gY.element_type), frgY, thrY)
     frgS = cute.make_rmem_tensor(cute.make_layout(1), gScale.element_type)
     frgS[0] = biased.to(gScale.element_type)
@@ -856,9 +858,9 @@ def _mxfp8_dim_m_kernel(atom_in: cute.CopyAtom, ten_in: cute.Tensor, atom_out: c
             frgIn[r] = sIN[it][r, col].to(cutlass.Float32)   # column read (warp-coalesced)
         v = frgIn.load()
         amax = cute.where(v < 0, -v, v).reduce(cute.ReductionOp.MAX, cutlass.Float32(0.0), 0)
-        sfp, biased = _e8m0(amax)
+        rcp, biased = _e8m0(amax)
         frgOut = cute.make_rmem_tensor(cute.make_layout(32), cutlass.Float8E4M3FN)
-        frgOut.store((v * (1.0 / sfp)).to(cutlass.Float8E4M3FN))  # reciprocal-mul, not 32 divs
+        frgOut.store((v * rcp).to(cutlass.Float8E4M3FN))  # reciprocal-mul (rcp = 1/scale, pow2)
         for r in cutlass.range_constexpr(32):
             sOUT[col, it * 32 + r] = frgOut[r]               # contiguous run = the transpose
         scales[(n0 + col) * mblk + (m0 // 32 + it)] = biased.to(scales.element_type)
@@ -967,9 +969,9 @@ def _mxfp8_dim_m_swizzle_kernel(atom_in: cute.CopyAtom, ten_in: cute.Tensor, ato
             frgIn[r] = sIN[it][r, col].to(cutlass.Float32)   # column read (warp-coalesced)
         v = frgIn.load()
         amax = cute.where(v < 0, -v, v).reduce(cute.ReductionOp.MAX, cutlass.Float32(0.0), 0)
-        sfp, biased = _e8m0(amax)
+        rcp, biased = _e8m0(amax)
         frgOut = cute.make_rmem_tensor(cute.make_layout(32), cutlass.Float8E4M3FN)
-        frgOut.store((v * (1.0 / sfp)).to(cutlass.Float8E4M3FN))  # reciprocal-mul, not 32 divs
+        frgOut.store((v * rcp).to(cutlass.Float8E4M3FN))  # reciprocal-mul (rcp = 1/scale, pow2)
         for r in cutlass.range_constexpr(32):
             sOUT[col, it * 32 + r] = frgOut[r]               # contiguous run = the transpose
         mcol = m0 // 32 + it                                 # 32-row-block index over M//32
@@ -1039,7 +1041,8 @@ MXFP8_DIM_M_SWIZZLE = QuantCastCuteRecipe.from_gold(
 #     DIRECTLY to gmem with a 128-bit vectorized copy (adjacent threads = adjacent col-blocks of the
 #     same row -> coalesced). Keeping qk out of smem is what lifted this from 52% to 57%: it frees
 #     16 KB -> +1 CTA/SM (occupancy 37.5% -> 50%) and drops the dim-K transpose-store bank conflicts.
-# Both scale bytes scatter straight to gmem. e8m0 is pow2 so v*(1/sfp) == v/sfp bit-exactly. This
+# Both scale bytes scatter straight to gmem. The e8m0 helper returns the reciprocal (rcp = 1/scale,
+# itself a pow2), so quant is a single vector `v * rcp` -- bit-exact vs dividing by the scale. This
 # replaces a naive 32x32-tile / 1-warp kernel (18.9%, instruction-bound on 32 serial warp-reduces +
 # per-element stores). ~57% of B200 peak at 16384 (beats triton 47.1%, nears standalone dim_m 60.3%).
 # The remaining ceiling is L1/TEX (ncu ~82%): the dim-K row reads are >=16-way bank-conflicted because
@@ -1109,9 +1112,9 @@ def _mxfp8_dim_km_kernel(atom_in: cute.CopyAtom, ten_in: cute.Tensor,
                 frgM[r] = sIN[r0 + r, col].to(cutlass.Float32)   # column read (down the tile)
             vm = frgM.load()
             amax_m = cute.where(vm < 0, -vm, vm).reduce(cute.ReductionOp.MAX, cutlass.Float32(0.0), 0)
-            sfp_m, biased_m = _e8m0(amax_m)
+            rcp_m, biased_m = _e8m0(amax_m)
             frgOm = cute.make_rmem_tensor(cute.make_layout(32), cutlass.Float8E4M3FN)
-            frgOm.store((vm * (1.0 / sfp_m)).to(cutlass.Float8E4M3FN))
+            frgOm.store((vm * rcp_m).to(cutlass.Float8E4M3FN))    # reciprocal-mul (rcp = 1/scale, pow2)
             for r in cutlass.range_constexpr(32):
                 sOUTm[col, r0 + r] = frgOm[r]                     # contiguous run = the transpose
             sm[(n0 + col) * mblk + (m0 // 32 + rb)] = biased_m.to(sm.element_type)
@@ -1128,9 +1131,9 @@ def _mxfp8_dim_km_kernel(atom_in: cute.CopyAtom, ten_in: cute.Tensor,
                 frgK[c] = sIN[row, c0 + c].to(cutlass.Float32)    # row read (along the tile)
             vk = frgK.load()
             amax_k = cute.where(vk < 0, -vk, vk).reduce(cute.ReductionOp.MAX, cutlass.Float32(0.0), 0)
-            sfp_k, biased_k = _e8m0(amax_k)
+            rcp_k, biased_k = _e8m0(amax_k)
             frgOk = cute.make_rmem_tensor(cute.make_layout(32), cutlass.Float8E4M3FN)
-            frgOk.store((vk * (1.0 / sfp_k)).to(cutlass.Float8E4M3FN))
+            frgOk.store((vk * rcp_k).to(cutlass.Float8E4M3FN))    # reciprocal-mul (rcp = 1/scale, pow2)
             off = cute.assume((m0 + row) * N + (n0 + c0), divby=32)
             gk = cute.make_tensor(mK.iterator + off, cute.make_layout(32))
             cute.copy(st_k, frgOk, gk)
@@ -1239,9 +1242,9 @@ def _mxfp8_dim_km_swizzle_kernel(atom_in: cute.CopyAtom, ten_in: cute.Tensor,
                 frgM[r] = sIN[r0 + r, col].to(cutlass.Float32)   # column read (down the tile)
             vm = frgM.load()
             amax_m = cute.where(vm < 0, -vm, vm).reduce(cute.ReductionOp.MAX, cutlass.Float32(0.0), 0)
-            sfp_m, biased_m = _e8m0(amax_m)
+            rcp_m, biased_m = _e8m0(amax_m)
             frgOm = cute.make_rmem_tensor(cute.make_layout(32), cutlass.Float8E4M3FN)
-            frgOm.store((vm * (1.0 / sfp_m)).to(cutlass.Float8E4M3FN))
+            frgOm.store((vm * rcp_m).to(cutlass.Float8E4M3FN))    # reciprocal-mul (rcp = 1/scale, pow2)
             for r in cutlass.range_constexpr(32):
                 sOUTm[col, r0 + r] = frgOm[r]                     # contiguous run = the transpose
             # swizzled sm store: row = n0+col (over N), col = m0//32+rb (over M//32)
@@ -1261,9 +1264,9 @@ def _mxfp8_dim_km_swizzle_kernel(atom_in: cute.CopyAtom, ten_in: cute.Tensor,
                 frgK[c] = sIN[row, c0 + c].to(cutlass.Float32)    # row read (along the tile)
             vk = frgK.load()
             amax_k = cute.where(vk < 0, -vk, vk).reduce(cute.ReductionOp.MAX, cutlass.Float32(0.0), 0)
-            sfp_k, biased_k = _e8m0(amax_k)
+            rcp_k, biased_k = _e8m0(amax_k)
             frgOk = cute.make_rmem_tensor(cute.make_layout(32), cutlass.Float8E4M3FN)
-            frgOk.store((vk * (1.0 / sfp_k)).to(cutlass.Float8E4M3FN))
+            frgOk.store((vk * rcp_k).to(cutlass.Float8E4M3FN))    # reciprocal-mul (rcp = 1/scale, pow2)
             off = cute.assume((m0 + row) * N + (n0 + c0), divby=32)
             gk = cute.make_tensor(mK.iterator + off, cute.make_layout(32))
             cute.copy(st_k, frgOk, gk)
@@ -1344,9 +1347,10 @@ MXFP8_DIM_KM_SWIZZLE = QuantCastCuteRecipe.from_gold(
 #     amax -> e8m0 scale; each lane quantizes its column (vectorized f32->fp8) into sOUT;
 #     lane0 writes the e8m0 byte;
 #   - TMA S2G stores sOUT into the (TM,TN) tile of the row-major output.
-# TWO decisive findings (both took the kernel from ~38% -> 70%): (1) `v / sfp` on a 32-wide vector
-# emits 32 per-element DIVISIONS (168M insts, 38%); `inv = 1/sfp; v * inv` is bit-exact for a pow2
-# e8m0 scale and cuts to 95M insts (matches deepseek) -> 70%. (2) WARPS=8 (not 4): smem caps
+# TWO decisive findings (both took the kernel from ~38% -> 70%): (1) dividing `v / scale` on a
+# 32-wide vector emits 32 per-element DIVISIONS (168M insts, 38%); the e8m0 helper instead returns
+# the reciprocal (rcp = 1/scale, a pow2), so `v * rcp` is bit-exact and cuts to 95M insts (matches
+# deepseek) -> 70%. (2) WARPS=8 (not 4): smem caps
 # occupancy at 4 CTAs/SM regardless of thread count, so 8 warps/CTA doubles resident warps to hide
 # the TMA-load latency (long_scoreboard-bound). Tried but REJECTED: a direct coalesced fp8 GLOBAL
 # store (drop sOUT smem, halve footprint, raise occupancy) -> only 50.5%; TMA store of the whole
@@ -1412,14 +1416,13 @@ def _mxfp8_32x32_kernel(atom_in: cute.CopyAtom, ten_in: cute.Tensor, atom_out: c
         v = frg.load()
         local = cute.where(v < 0, -v, v).reduce(cute.ReductionOp.MAX, cutlass.Float32(0.0), 0)
         amax = cute.arch.warp_reduction_max(local)       # across the 32 columns -> whole-block amax
-        sfp, biased = _e8m0(amax)
-        inv = 1.0 / sfp                                   # pow2 scale: v*(1/sfp) is bit-exact vs v/sfp
+        rcp, biased = _e8m0(amax)                         # rcp = 1/scale (pow2), reciprocal-mul below
         if lane == 0:
             gbr = bidx * _M32_BR + br
             gbc = bidy * _M32_BC + bc
             scales[gbr * ncb + gbc] = biased.to(scales.element_type)
         frgOut = cute.make_rmem_tensor(cute.make_layout(32), cutlass.Float8E4M3FN)
-        frgOut.store((v * inv).to(cutlass.Float8E4M3FN))  # reciprocal-mul, not 32 per-element divs
+        frgOut.store((v * rcp).to(cutlass.Float8E4M3FN))  # reciprocal-mul, not 32 per-element divs
         for i in cutlass.range_constexpr(32):
             sOUT[r0 + i, c0] = frgOut[i]
 
@@ -1563,9 +1566,9 @@ def _mxfp8_swizzle_kernel(gX: cute.Tensor, gY: cute.Tensor, sflat: cute.Tensor,
                         cutlass.Float32))
                     v = blk.load()
                     amax = cutlass.max(v, -v).reduce(cute.ReductionOp.MAX, cutlass.Float32(0.0), 0)
-                    sfp, biased = _e8m0(amax)
+                    rcp, biased = _e8m0(amax)
                     frgY = cute.make_rmem_tensor(blk_layout, gY.element_type)
-                    frgY.store((v * (1.0 / sfp)).to(gY.element_type))  # pow2 scale -> bit-identical
+                    frgY.store((v * rcp).to(gY.element_type))          # reciprocal-mul (rcp = 1/scale, pow2)
                     offq = cute.assume(row * N + gc * 32, divby=32)
                     cute.copy(st_atom, frgY,
                               cute.make_tensor(gY.iterator + offq, blk_layout))

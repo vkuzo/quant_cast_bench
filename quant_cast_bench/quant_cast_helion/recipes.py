@@ -57,11 +57,11 @@ def _amax_to_e8m0_biased(amax):
     return biased_exponent + needs_round_up.to(torch.int32)  # biased exponent, int32
 
 
-def _e8m0_biased_to_fp32(biased):
-    """biased e8m0 exponent (int32 tile) -> fp32 pow2 factor. Ports the gold `_e8m0_to_fp32`
-    inverse cast: shift the biased exponent back into the fp32 exponent field."""
-    scale_fp32 = (biased << _F32_MBITS).view(torch.float32)
-    return torch.clamp(scale_fp32, min=2.0**-126)
+def _e8m0_biased_to_reciprocal_fp32(biased):
+    """biased e8m0 exponent (int32 tile) -> fp32 reciprocal pow2 factor 2^(127-e). Ports the gold
+    `_e8m0_scale_to_reciprocal_fp32` (reciprocal biased exponent = 254 - e): shift that into the
+    fp32 exponent field. The cast multiplies data by this (torchao `_to_mx_rceil`)."""
+    return ((254 - biased) << _F32_MBITS).view(torch.float32)
 
 
 @dataclass(frozen=True)
@@ -227,8 +227,8 @@ def _mxfp8_dim_m_kernel(
         x_blk = xv[tile_rb, :, tile_n].to(torch.float32)  # (t_rb, 32, t_n)
         amax = torch.amax(torch.abs(x_blk), dim=1)  # (t_rb, t_n); reduce down the 32 block rows
         biased = _amax_to_e8m0_biased(amax)  # (t_rb, t_n) int32 e8m0 exponent
-        sfp = _e8m0_biased_to_fp32(biased)  # (t_rb, t_n) fp32 pow2 factor
-        y = (x_blk / sfp[:, None, :]).to(torch.float8_e4m3fn)  # (t_rb, 32, t_n)
+        rcp = _e8m0_biased_to_reciprocal_fp32(biased)  # (t_rb, t_n) fp32 reciprocal pow2 factor
+        y = (x_blk * rcp[:, None, :]).to(torch.float8_e4m3fn)  # (t_rb, 32, t_n)
         scale_u8[tile_n, tile_rb] = biased.to(torch.uint8).permute(1, 0)  # (t_n, t_rb)
         qv[tile_n, tile_rb, :] = y.permute(2, 0, 1)  # (t_n, t_rb, 32)
 
@@ -298,8 +298,8 @@ def _mxfp8_dim_m_swizzle_kernel(
         x_blk = xv[tile_cb, :, :, tile_nb, :].to(torch.float32)  # (tcb,4,32,tnb,128)
         amax = torch.amax(torch.abs(x_blk), dim=2)  # (tcb,4,tnb,128); reduce the 32 M-rows (w32)
         biased = _amax_to_e8m0_biased(amax)  # (tcb,4,tnb,128) int32 e8m0 exponent
-        sfp = _e8m0_biased_to_fp32(biased)  # (tcb,4,tnb,128) fp32 pow2 factor
-        y = (x_blk / sfp[:, :, None, :, :]).to(torch.float8_e4m3fn)  # (tcb,4,32,tnb,128)
+        rcp = _e8m0_biased_to_reciprocal_fp32(biased)  # (tcb,4,tnb,128) fp32 reciprocal pow2 factor
+        y = (x_blk * rcp[:, :, None, :, :]).to(torch.float8_e4m3fn)  # (tcb,4,32,tnb,128)
         qv[tile_nb, :, tile_cb, :, :] = y.permute(3, 4, 0, 1, 2)  # -> (tnb,128,tcb,4,32)
         # swizzle: split n128 -> (a, b); reorder [Cb,c4,Nb,a,b] -> blocked atom [Nb,Cb,b,a,c4].
         biased_r = biased.reshape(biased.shape[0], biased.shape[1], biased.shape[2], 4, 32)
@@ -364,8 +364,8 @@ def _mxfp8_32x32_kernel(
         # leading 32.
         amax = torch.amax(torch.amax(torch.abs(x_blk), dim=3), dim=1)  # (t_rb, t_cb)
         biased = _amax_to_e8m0_biased(amax)  # (t_rb, t_cb) int32 e8m0 exponent
-        sfp = _e8m0_biased_to_fp32(biased)  # (t_rb, t_cb) fp32 pow2 factor
-        y = (x_blk / sfp[:, None, :, None]).to(torch.float8_e4m3fn)  # (t_rb, 32, t_cb, 32)
+        rcp = _e8m0_biased_to_reciprocal_fp32(biased)  # (t_rb, t_cb) fp32 reciprocal pow2 factor
+        y = (x_blk * rcp[:, None, :, None]).to(torch.float8_e4m3fn)  # (t_rb, 32, t_cb, 32)
         qv[tile_rb, :, tile_cb, :] = y
         scale_u8[tile_rb, tile_cb] = biased.to(torch.uint8)
 
@@ -488,15 +488,15 @@ def _mxfp8_dim_km_kernel(
         # dim-K: reduce the trailing 32 (the block's columns) -> scale per (row m, col-block cb).
         amax_k = torch.amax(abs_blk, dim=3)  # (t_rb, 32, t_cb) = [rb, r32, cb]
         biased_k = _amax_to_e8m0_biased(amax_k)  # int32 e8m0 exponent
-        sfp_k = _e8m0_biased_to_fp32(biased_k)  # fp32 pow2 factor
-        y_k = (x_blk / sfp_k[:, :, :, None]).to(torch.float8_e4m3fn)  # (t_rb, 32, t_cb, 32)
+        rcp_k = _e8m0_biased_to_reciprocal_fp32(biased_k)  # fp32 reciprocal pow2 factor
+        y_k = (x_blk * rcp_k[:, :, :, None]).to(torch.float8_e4m3fn)  # (t_rb, 32, t_cb, 32)
         qkv[tile_rb, :, tile_cb, :] = y_k
         skv[tile_rb, :, tile_cb] = biased_k.to(torch.uint8)
         # dim-M: reduce the leading 32 (the block's rows) -> scale per (row-block rb, col n).
         amax_m = torch.amax(abs_blk, dim=1)  # (t_rb, t_cb, 32) = [rb, cb, c32]
         biased_m = _amax_to_e8m0_biased(amax_m)  # int32 e8m0 exponent
-        sfp_m = _e8m0_biased_to_fp32(biased_m)  # fp32 pow2 factor
-        y_m = (x_blk / sfp_m[:, None, :, :]).to(torch.float8_e4m3fn)  # (t_rb, 32, t_cb, 32)
+        rcp_m = _e8m0_biased_to_reciprocal_fp32(biased_m)  # fp32 reciprocal pow2 factor
+        y_m = (x_blk * rcp_m[:, None, :, :]).to(torch.float8_e4m3fn)  # (t_rb, 32, t_cb, 32)
         # store transposed: (N, M) frame is [cb, c32, rb, r32]; permute the block accordingly.
         qmv[tile_cb, :, tile_rb, :] = y_m.permute(2, 3, 0, 1)  # -> (t_cb, 32, t_rb, 32)
         smv[tile_cb, :, tile_rb] = biased_m.to(torch.uint8).permute(1, 2, 0)  # -> (t_cb, 32, t_rb)
@@ -580,16 +580,16 @@ def _mxfp8_dim_km_swizzle_kernel(
         # dim-K: reduce b (the within-32-col index) -> scale per (row m, col-block kb).
         amax_k = torch.amax(abs_blk, dim=5)  # (tcb,4,32,tnb,4) = [Cb,c4,w32,Nb,a]
         biased_k = _amax_to_e8m0_biased(amax_k)
-        sfp_k = _e8m0_biased_to_fp32(biased_k)
-        y_k = (x_blk / sfp_k[:, :, :, :, :, None]).to(torch.float8_e4m3fn)  # broadcast over b
+        rcp_k = _e8m0_biased_to_reciprocal_fp32(biased_k)
+        y_k = (x_blk * rcp_k[:, :, :, :, :, None]).to(torch.float8_e4m3fn)  # broadcast over b
         qkv[tile_cb, :, :, tile_nb, :, :] = y_k
         # swizzled dim-K scale: [Cb,c4,w32,Nb,a] -> blocked_k [Cb,Nb,w32,c4,a]
         scale5k[tile_cb, tile_nb, :, :, :] = biased_k.permute(0, 3, 2, 1, 4).to(torch.uint8)
         # dim-M: reduce w32 (the within-32-row index) -> scale per (row-block rb, col n).
         amax_m = torch.amax(abs_blk, dim=2)  # (tcb,4,tnb,4,32) = [Cb,c4,Nb,a,b]
         biased_m = _amax_to_e8m0_biased(amax_m)
-        sfp_m = _e8m0_biased_to_fp32(biased_m)
-        y_m = (x_blk / sfp_m[:, :, None, :, :, :]).to(torch.float8_e4m3fn)  # broadcast over w32
+        rcp_m = _e8m0_biased_to_reciprocal_fp32(biased_m)
+        y_m = (x_blk * rcp_m[:, :, None, :, :, :]).to(torch.float8_e4m3fn)  # broadcast over w32
         qmv[tile_nb, :, :, tile_cb, :, :] = y_m.permute(3, 4, 5, 0, 1, 2)  # -> [Nb,a,b,Cb,c4,w32]
         # swizzled dim-M scale: [Cb,c4,Nb,a,b] -> blocked_m [Nb,Cb,b,a,c4]
         scale5m[tile_nb, tile_cb, :, :, :] = biased_m.permute(2, 0, 4, 3, 1).to(torch.uint8)
@@ -1170,8 +1170,8 @@ def _mxfp8_swizzle_kernel(
         x_blk = xv[tile_nb, :, :, tile_cb, :, :].to(torch.float32)  # (tnb,4,32,tcb,4,32)
         amax = torch.amax(torch.abs(x_blk), dim=5)  # (tnb,4,32,tcb,4); reduce the 32 columns (g32)
         biased = _amax_to_e8m0_biased(amax)  # (tnb,4,32,tcb,4) int32 e8m0 exponent
-        sfp = _e8m0_biased_to_fp32(biased)  # (tnb,4,32,tcb,4) fp32 pow2 factor
-        y = (x_blk / sfp[:, :, :, :, :, None]).to(torch.float8_e4m3fn)  # broadcast over g32
+        rcp = _e8m0_biased_to_reciprocal_fp32(biased)  # (tnb,4,32,tcb,4) fp32 reciprocal pow2 factor
+        y = (x_blk * rcp[:, :, :, :, :, None]).to(torch.float8_e4m3fn)  # broadcast over g32
         qv[tile_nb, :, :, tile_cb, :, :] = y
         # swizzle: [Nb,a,b,Cb,c] -> blocked atom [Nb,Cb,b,a,c].
         scale5[tile_nb, tile_cb, :, :, :] = biased.permute(0, 3, 2, 1, 4).to(torch.uint8)
