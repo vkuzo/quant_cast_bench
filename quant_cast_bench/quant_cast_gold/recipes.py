@@ -528,10 +528,33 @@ def _amax_to_e8m0_rceil(amax):
 
 
 def _e8m0_to_fp32(scale):
-    # inverse of the e8m0 cast: e8m0 biased exponent -> fp32 pow2 factor.
+    # inverse of the e8m0 cast: e8m0 biased exponent -> fp32 pow2 factor. Used by dequant.
     biased_i32 = scale.contiguous().view(torch.uint8).to(torch.int32)
     scale_fp32 = (biased_i32 << 23).view(torch.float32)
     return torch.clamp(scale_fp32, min=2.0**-126)
+
+
+def _e8m0_scale_to_reciprocal_fp32(scale_e8m0):
+    """e8m0 block scale -> its fp32 reciprocal pow2 factor, matching torchao's
+    `_e8m0_scale_to_reciprocal_fp32`: the reciprocal biased exponent is `2*bias - biased`
+    (bias 127), whose bits shift into the fp32 exponent field, with e8m0 byte 0 -> the fp32
+    subnormal 2^-127 and the NaN byte -> a NaN. The forward cast multiplies the data by this
+    reciprocal (torchao's `_to_mx_rceil`) rather than dividing by the reconstructed scale.
+
+    This is torchao's pre-2.14 bit-math branch, numerically identical to its 2.14 branch which
+    instead does `reciprocal_biased.view(float8_e8m0fnu).to(float32)` (a real e8m0->fp32 cast).
+    We use the bit-math, not the cast, because the flex/Inductor path FX-traces this gold and its
+    emitter maps `aten.to` straight to `TritonOverrides.to_dtype` -- it never runs Inductor's
+    lowering pass, so it misses the e8m0->fp32 lowering (pytorch #190593) that makes the cast
+    correct there. A raw e8m0->fp32 `to_dtype` comes out a hair off (off-by-one-ulp fp8 output).
+    The bit-math stays in int ops + one bitcast + `where`s, all of which the emitter lowers (the
+    old divide path used the same `<<23`-into-the-exponent bitcast)."""
+    biased = scale_e8m0.contiguous().view(torch.uint8).to(torch.int32)
+    reciprocal_biased = (2 * 127 - biased) & 0xFF
+    reciprocal_bits = reciprocal_biased << 23
+    reciprocal_bits = torch.where(reciprocal_biased == 0, 0x00400000, reciprocal_bits)
+    reciprocal_bits = torch.where(reciprocal_biased == 255, 0x7F800001, reciprocal_bits)
+    return reciprocal_bits.view(torch.float32)
 
 
 def mxfp8_f(x, **kwargs):
@@ -539,8 +562,8 @@ def mxfp8_f(x, **kwargs):
     x_b = x.reshape(*lead, last // 32, 32)
     amax = x_b.abs().amax(dim=-1, keepdim=True)
     scale_e8m0 = _amax_to_e8m0_rceil(amax)
-    # cast: reconstruct the fp32 pow2 factor from the e8m0 scale, then divide.
-    qdata = (x_b.to(torch.float32) / _e8m0_to_fp32(scale_e8m0)).to(torch.float8_e4m3fn)
+    # cast: multiply by the fp32 reciprocal of the e8m0 scale (matches torchao _to_mx_rceil).
+    qdata = (x_b.to(torch.float32) * _e8m0_scale_to_reciprocal_fp32(scale_e8m0)).to(torch.float8_e4m3fn)
     return qdata.reshape(*lead, last), scale_e8m0.squeeze(-1)
 
 
@@ -589,7 +612,9 @@ def mxfp8_dim_m_f(x, **kwargs):
     amax = x_b.abs().amax(dim=1, keepdim=True)  # (M//32, 1, N), reduce down M
     scale_e8m0 = _amax_to_e8m0_rceil(amax)  # (M//32, 1, N)
     qdata = (
-        (x_b.to(torch.float32) / _e8m0_to_fp32(scale_e8m0)).to(torch.float8_e4m3fn).reshape(M, N)
+        (x_b.to(torch.float32) * _e8m0_scale_to_reciprocal_fp32(scale_e8m0))
+        .to(torch.float8_e4m3fn)
+        .reshape(M, N)
     )
     # write outputs transposed locally; the framework's SWAP_TILE_INDEX handles the grid swap.
     return qdata.t().contiguous(), scale_e8m0.squeeze(1).t().contiguous()  # (N, M), (N, M//32)
@@ -620,7 +645,7 @@ Mxfp8DimMGold = QuantCastSingleKernelGold(
 # mxfp8 in BOTH directions in one pass. Reads x as-is and reduces it two ways -- dim-K (1x32
 # blocks along columns) and dim-M (32x1 blocks along rows) -- returning FOUR outputs. Models a fused
 # kernel that reads x once and emits both the rowwise (dim-K) and transposed (dim-M) mxfp8
-# quantizations. The mxfp8 analog of deepseek_1x128_dim_km_f (block 32, e8m0 scales, divide).
+# quantizations. The mxfp8 analog of deepseek_1x128_dim_km_f (block 32, e8m0 scales, reciprocal-mul).
 # ---------------------------------------------------------------------------
 def mxfp8_dim_km_f(x, **kwargs):
     """One pass over x, reducing in both directions. Returns
@@ -633,11 +658,11 @@ def mxfp8_dim_km_f(x, **kwargs):
     # dim-K: 1x32 blocks along the last dim
     xk = xf.reshape(M, N // 32, 32)
     sk = _amax_to_e8m0_rceil(xk.abs().amax(dim=-1, keepdim=True))
-    qk = (xk / _e8m0_to_fp32(sk)).to(torch.float8_e4m3fn).reshape(M, N)
+    qk = (xk * _e8m0_scale_to_reciprocal_fp32(sk)).to(torch.float8_e4m3fn).reshape(M, N)
     # dim-M: 32x1 blocks along rows (reduce over the 32 within-block rows)
     xm = xf.reshape(M // 32, 32, N)
     sm = _amax_to_e8m0_rceil(xm.abs().amax(dim=1, keepdim=True))
-    qm = (xm / _e8m0_to_fp32(sm)).to(torch.float8_e4m3fn).reshape(M, N)
+    qm = (xm * _e8m0_scale_to_reciprocal_fp32(sm)).to(torch.float8_e4m3fn).reshape(M, N)
     # dim-M outputs in transposed (N,M)/(N,M//32) layout (matches Mxfp8DimMGold);
     # .t().contiguous() is applied to OUTPUTS only, never to the input.
     return qk, sk.squeeze(-1), qm.t().contiguous(), sm.squeeze(1).t().contiguous()
@@ -685,7 +710,7 @@ def mxfp8_32x32_f(x, **kwargs):
     )
     amax = x_b.abs().amax(dim=-1, keepdim=True)  # (..., n1, n2, 1)
     scale_e8m0 = _amax_to_e8m0_rceil(amax)  # e8m0, (..., n1, n2, 1)
-    qdata_b = (x_b.to(torch.float32) / _e8m0_to_fp32(scale_e8m0)).to(torch.float8_e4m3fn)
+    qdata_b = (x_b.to(torch.float32) * _e8m0_scale_to_reciprocal_fp32(scale_e8m0)).to(torch.float8_e4m3fn)
     qdata = (
         qdata_b.reshape(*lead, n1, n2, 32, 32)
         .transpose(-3, -2)
