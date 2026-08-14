@@ -46,12 +46,12 @@ def _read_template(name: str) -> str:
 # ---- reduction path (FxTritonEmitter -> dim-M template) --------------------
 
 # dim-M templates, keyed by the reduction group width detected in `f`. Each is a hand-written
-# template with the group baked in (128 for deepseek 1x128, 32 for mxfp8-floor 1x32); they will be
+# template with the group baked in (128 for deepseek 1x128, 32 for mxfp8 1x32); they will be
 # unified into one group-parameterized template later (see future_ideas.md). To wire a new
 # group-reduction recipe, add its template file + group here.
 _DIM_M_TEMPLATES = {
     128: "template_deepseek_dim_m.py.jinja",
-    32: "template_mxfp8_floor_dim_m.py.jinja",
+    32: "template_mxfp8_dim_m.py.jinja",
 }
 
 
@@ -159,7 +159,7 @@ def _lower_mxfp8_32x32(x, body, group, qdata_dtype, scale_dtype):
     M, N = x.get_size()[0], x.get_size()[1]
     if group != 32:
         raise NotImplementedError(f"mxfp8 32x32 template expects a 32x32 block, got {group}")
-    name, src = _splice_body(body, "template_mxfp8_32x32_floor.py.jinja")
+    name, src = _splice_body(body, "template_mxfp8_32x32.py.jinja")
     qdata_layout = FixedLayout(device, qdata_dtype, [M, N], stride=[N, 1])
     scale = empty_strided([M // 32, N // 32], [N // 32, 1], dtype=scale_dtype, device=device)
     configs = [

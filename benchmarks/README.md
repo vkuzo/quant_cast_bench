@@ -13,7 +13,7 @@ python benchmarks/benchmark.py --mode compile
 
 # optional: single shape / single recipe
 python benchmarks/benchmark.py --mode triton --M 16384 --K 16384
-python benchmarks/benchmark.py --mode triton --recipe_name_filter mxfp8_floor_dim_m
+python benchmarks/benchmark.py --mode triton --recipe_name_filter mxfp8_dim_m
 ```
 
 Default shape is `(M, K) = (16384, 16384)`. Assumes a B200 (peak 8 TB/s).
@@ -31,15 +31,15 @@ recipe                            gpu_time_ms    gbps    pct_peak  perf_descript
 ------------------------------  -------------  ------  ----------  --------------------------------------------------------
 relu (baseline)                        0.1791  5993.7       74.9%
 fp8_tensorwise_precalc_scale           0.1429  5636.6       70.5%  elementwise
-mxfp8_floor_swizzle                    0.1300  6259.2       78.2%  (1,32) block, swizzle
+mxfp8_swizzle                    0.1300  6259.2       78.2%  (1,32) block, swizzle
 fp8_deepseek_1x128                     0.1318  6174.0       77.2%  (1,128) block
-mxfp8_floor_dim_m                      0.5800  1402.9       17.5%  (32,1) block, t-contig
-mxfp8_floor_dim_m_swizzle              0.5517  1475.0       18.4%  (32,1) block, t-contig, swizzle
+mxfp8_dim_m                      0.5800  1402.9       17.5%  (32,1) block, t-contig
+mxfp8_dim_m_swizzle              0.5517  1475.0       18.4%  (32,1) block, t-contig, swizzle
 fp8_deepseek_1x128_dim_m               0.2495  3261.8       40.8%  (128,1) block, t-contig
-mxfp8_floor_dim_km                     0.7116  1532.5       19.2%  (1,32) dim-k + (32,1) dim-m, one pass, t-contig
-mxfp8_floor_dim_km_swizzle             0.6845  1593.1       19.9%  (1,32) dim-k + (32,1) dim-m, one pass, t-contig, swizzle
+mxfp8_dim_km                     0.7116  1532.5       19.2%  (1,32) dim-k + (32,1) dim-m, one pass, t-contig
+mxfp8_dim_km_swizzle             0.6845  1593.1       19.9%  (1,32) dim-k + (32,1) dim-m, one pass, t-contig, swizzle
 fp8_deepseek_1x128_dim_km              0.3805  2866.1       35.8%  (1,128) dim-k + (128,1) dim-m, one pass, t-contig
-mxfp8_32x32_floor                      0.3789  2126.0       26.6%  (32,32) block
+mxfp8_32x32                      0.3789  2126.0       26.6%  (32,32) block
 fp8_deepseek_128x128                   0.2269  3548.9       44.4%  (128,128) block
 fp8_rowwise                            0.1224  6580.4       82.3%  (1,-1) block
 fp8_colwise                            0.3928  2050.6       25.6%  (-1,1) block, t-contig
@@ -59,15 +59,15 @@ recipe                            gpu_time_ms    gbps    pct_peak  perf_descript
 ------------------------------  -------------  ------  ----------  --------------------------------------------------------
 relu (baseline)                        0.1791  5994.4       74.9%
 fp8_tensorwise_precalc_scale           0.1422  5663.9       70.8%  elementwise
-mxfp8_floor_swizzle                    0.1248  6521.8       81.5%  (1,32) block, swizzle
+mxfp8_swizzle                    0.1248  6521.8       81.5%  (1,32) block, swizzle
 fp8_deepseek_1x128                     0.1341  6067.9       75.8%  (1,128) block
-mxfp8_floor_dim_m                      0.1687  4822.2       60.3%  (32,1) block, t-contig
-mxfp8_floor_dim_m_swizzle              0.1399  5816.3       72.7%  (32,1) block, t-contig, swizzle
+mxfp8_dim_m                      0.1687  4822.2       60.3%  (32,1) block, t-contig
+mxfp8_dim_m_swizzle              0.1399  5816.3       72.7%  (32,1) block, t-contig, swizzle
 fp8_deepseek_1x128_dim_m               0.1418  5738.6       71.7%  (128,1) block, t-contig
-mxfp8_floor_dim_km                     0.2879  3787.5       47.3%  (1,32) dim-k + (32,1) dim-m, one pass, t-contig
-mxfp8_floor_dim_km_swizzle             0.2929  3722.8       46.5%  (1,32) dim-k + (32,1) dim-m, one pass, t-contig, swizzle
+mxfp8_dim_km                     0.2879  3787.5       47.3%  (1,32) dim-k + (32,1) dim-m, one pass, t-contig
+mxfp8_dim_km_swizzle             0.2929  3722.8       46.5%  (1,32) dim-k + (32,1) dim-m, one pass, t-contig, swizzle
 fp8_deepseek_1x128_dim_km              0.2355    4631       57.9%  (1,128) dim-k + (128,1) dim-m, one pass, t-contig
-mxfp8_32x32_floor                      0.1287  6260.6       78.3%  (32,32) block
+mxfp8_32x32                      0.1287  6260.6       78.3%  (32,32) block
 fp8_deepseek_128x128                   0.1306  6166.1       77.1%  (128,128) block
 fp8_rowwise                            0.1291  6237.9       78.0%  (1,-1) block
 fp8_colwise                            0.2178  3698.1       46.2%  (-1,1) block, t-contig
@@ -82,7 +82,7 @@ fp32_to_bf16_sr_global_offsets         0.2582  6238.1       78.0%  tile-invarian
 
 * `fp8_tensorwise_precalc_scale` (85.8%) — vectorized 128-bit copy atoms (`num_bits_per_copy` +
   `assumed_align=16`) hit DRAM speed-of-light.
-* `mxfp8_floor_swizzle` (78.7%) — one e8m0-floor scale per 1×32 block, scattered to the swizzled 4D
+* `mxfp8_swizzle` (78.7%) — one e8m0 scale per 1×32 block, scattered to the swizzled 4D
   `(nrb, ncb, 32, 16)` scale grid. The **warp-per-row ("wpr") mapping** (ported from
   `_nvfp4_swizzle_kernel`) is what lifts it from the old 1-D-flatten kernel's ~67% to match triton
   (77.5%): warp `w` owns row `bidy*WARPS+w`; its 32 lanes + a `grid.x` column split (XSPLIT) + ILP
@@ -101,31 +101,31 @@ fp32_to_bf16_sr_global_offsets         0.2582  6238.1       78.0%  tile-invarian
   per-block reduction forces the full 32-wide f32 vector live (48 reg/thread → ~48% occupancy, vs
   the 29 reg / 80% occ of the pure-elementwise tensorwise), which caps it near the triton parity
   (75.7%); DRAM is ~76%, near the practical ceiling.
-* `mxfp8_floor_dim_m` (60.3%) — warp-specialized **TMA**: TMA-load a (64,256) tile, reduce 32-row
-  blocks per column to the e8m0-floor scale, quantize, transpose in the register→smem write, and
+* `mxfp8_dim_m` (60.3%) — warp-specialized **TMA**: TMA-load a (64,256) tile, reduce 32-row
+  blocks per column to the e8m0 scale, quantize, transpose in the register→smem write, and
   TMA-store the (256,64) tile to the row-major (N,M) output. Beats the triton kernel (60.1%) and
   approaches the CUDA SOL (67.7%). See [`quant_cast_cute/recipes.py`](../quant_cast_bench/quant_cast_cute/recipes.py).
-* `mxfp8_floor_dim_m_swizzle` (72.3%) — identical to `mxfp8_floor_dim_m` (same TMA load → per-column
-  e8m0-floor reduce → transposed register→smem write → TMA store), except the e8m0 byte is scattered
+* `mxfp8_dim_m_swizzle` (72.3%) — identical to `mxfp8_dim_m` (same TMA load → per-column
+  e8m0 reduce → transposed register→smem write → TMA store), except the e8m0 byte is scattered
   into the NVIDIA-swizzled 4D `(nrb, ncb, 32, 16)` scale grid (acting on the transposed-frame scale
-  `(N, M//32)`) instead of the plain 2D buffer, using the same flatten as `mxfp8_floor_swizzle`.
+  `(N, M//32)`) instead of the plain 2D buffer, using the same flatten as `mxfp8_swizzle`.
   **Surprisingly it's ~10 pts *faster* than the plain kernel (62.1%), not equal**: the qdata TMA
   pipeline is byte-identical, so the only difference is the scale store — and the plain `(N, M//32)`
   store is a strided scatter (adjacent columns/threads write `M//32`-apart addresses), whereas the
   swizzled write packs neighboring rows/blocks into compact, coalesced offsets, relieving the scale
   store rather than costing anything. The swizzle row-part (`row_base`) is loop-invariant per thread,
   so it's hoisted out of the 32-row-block loop. Also beats triton (71.8%).
-* `fp8_deepseek_1x128_dim_m` (61.7%) — the same TMA path as `mxfp8_floor_dim_m`, with a 128-row
+* `fp8_deepseek_1x128_dim_m` (61.7%) — the same TMA path as `mxfp8_dim_m`, with a 128-row
   block (not 32) and an fp32 `amax/448` scale (not an e8m0 byte). TMA-load a (128,128) tile, each
   thread scans its 128-row column for the amax in four 32-wide chunks (vector reduce, only 32 f32
   live → low registers), then re-reads to quantize and write the transposed contiguous run into
   sOUT for the TMA store. Tile is (128,128)/4 warps: a (128,256) tile needs 96 KB smem → only 2
   CTAs/SM, which halved bandwidth (38.7%); dropping to (128,128) restores 48 KB/4 CTAs → 61.7%,
-  matching `mxfp8_floor_dim_m`'s footprint. Beats the triton dim-M kernel and approaches its
+  matching `mxfp8_dim_m`'s footprint. Beats the triton dim-M kernel and approaches its
   compile-mode SOL. (Replaces the old scalar `x.t()` path at ~7%.)
 * `fp8_deepseek_1x128_dim_km` (41.2%) — the one-pass both-directions deepseek cast (dim-K `qk (M,N)`
   + `sk (M,N//128)`; dim-M `qm (N,M)` + `sm (N,M//128)`, transposed), the fp32-scale/128-block analog
-  of `mxfp8_floor_dim_km`. Same fused TMA template: TMA-load one (128,128) tile, reduce both ways —
+  of `mxfp8_dim_km`. Same fused TMA template: TMA-load one (128,128) tile, reduce both ways —
   dim-M writes the transposed run into sOUT for a TMA store; dim-K keeps `x`'s layout so it quantizes
   in-register and stores each 32-chunk **directly to gmem** with a 128-bit copy. Beats compile
   (35.8%) but sits **below the 1×32 sibling (57.4%) and triton (57.8%)**, for two reasons ncu makes
@@ -144,7 +144,7 @@ fp32_to_bf16_sr_global_offsets         0.2582  6238.1       78.0%  tile-invarian
   conflict → 4.3%, worse than the old kernel); switching to a *strided* assignment (thread `t` owns
   `{t + i·THREADS}`) so consecutive lanes hit consecutive banks lifts it to 70.1%. 128 threads/CTA
   beat 256/512 (higher VPT → more memory-level parallelism per thread).
-* `mxfp8_32x32_floor` (70.8%) — one e8m0-floor scale per 32×32 block; non-transposing, so the same
+* `mxfp8_32x32` (70.8%) — one e8m0 scale per 32×32 block; non-transposing, so the same
   TMA path as `fp8_deepseek_128x128`. A 32×32 block = 1024 elems = a full warp (32 lanes × 32 rows),
   so **one warp owns one block** and the block amax is a single `warp_reduction_max` — no cross-warp
   scratch. A 128×128 TMA tile holds 16 blocks; 8 warps each loop over 2 of them (lane `l` owns
@@ -170,7 +170,7 @@ fp32_to_bf16_sr_global_offsets         0.2582  6238.1       78.0%  tile-invarian
   pass 1 TMA-loads (128,256) tiles, each thread reduces its column's rows in smem to a partial amax,
   then `atomic_max_float32` into a (N,) scratch (combining across the M-grid); pass 2 TMA-loads
   (64,256) tiles, quantizes each column with the precomputed `amax/448` scale, transposes in the
-  register→smem write (like `mxfp8_floor_dim_m`), and TMA-stores the (256,64) tile. The TMA engine
+  register→smem write (like `mxfp8_dim_m`), and TMA-stores the (256,64) tile. The TMA engine
   streams the strided tiles at DRAM speed — a hand-rolled strided row-segment read of x caps the amax
   pass at ~42% (152 µs) vs TMA's ~67% (93 µs). Beats triton (43.8%) and compile (25.6%). The ~51%
   ceiling is structural: a full-column amax forces reading x *twice* and, unlike rowwise, the quant
@@ -198,10 +198,10 @@ fp32_to_bf16_sr_global_offsets         0.2582  6238.1       78.0%  tile-invarian
   the ceiling: the *linear* scale layout hits ~70% on the same kernel, but our recipe needs the
   blocked swizzle.) (`nvfp4_blocked_outer` keeps the naive kernel — it wasn't the target.)
 
-* `mxfp8_floor_dim_km` (57.4%) — the one-pass both-directions mxfp8-floor cast: read `x` once and
+* `mxfp8_dim_km` (57.4%) — the one-pass both-directions mxfp8 cast: read `x` once and
   emit four outputs, dim-K (`qk (M,N)` + `sk (M,N//32)`, 1×32 blocks along columns) and dim-M
   (`qm (N,M)` + `sm (N,M//32)`, 32×1 blocks down rows, transposed). The **fused TMA BM×BN template**
-  (mirrors `mxfp8_floor_dim_m`): TMA-load one (64,256) row-major tile into smem, read it once and
+  (mirrors `mxfp8_dim_m`): TMA-load one (64,256) row-major tile into smem, read it once and
   reduce BOTH ways, then emit the two quantized tiles. dim-M (the binding half): each of the
   TM·TN/32 (col, 32-row-block) groups reads its 32 rows *down* a column, e8m0-scales, quantizes, and
   writes the run into an sOUT laid out (TN,TM) — the transpose is the register→smem write — for a TMA
@@ -209,7 +209,7 @@ fp32_to_bf16_sr_global_offsets         0.2582  6238.1       78.0%  tile-invarian
   group reads its 32 *along* a row, and since `qk` keeps `x`'s layout it quantizes in-register and
   stores the contiguous 32-run **directly to gmem with a 128-bit vectorized copy** (adjacent threads
   = adjacent col-blocks → coalesced). Went **18.9% → 57.4%** (naive 32×32/1-warp kernel → this),
-  beating triton (47.1%) and nearing the standalone `mxfp8_floor_dim_m` (60.3%). Keeping `qk` out of
+  beating triton (47.1%) and nearing the standalone `mxfp8_dim_m` (60.3%). Keeping `qk` out of
   smem was worth +5 pts alone (52% → 57%): it frees 16 KB → +1 CTA/SM (occupancy 37.5% → 50%) and
   drops the dim-K transpose-store bank conflicts. **The remaining ceiling is L1/TEX (ncu ~82%)**: the
   dim-K row reads are ≥16-way bank-conflicted because a 32-col bf16 block is exactly 16 banks wide,
@@ -218,11 +218,11 @@ fp32_to_bf16_sr_global_offsets         0.2582  6238.1       78.0%  tile-invarian
   tile (XOR swizzle, as CUTLASS GEMM uses) that *also* keeps the dim-M column reads conflict-free —
   the real next step, left as future work.
 
-* `mxfp8_floor_dim_km_swizzle` (62.1%) — same one-pass both-directions cast as `mxfp8_floor_dim_km`
+* `mxfp8_dim_km_swizzle` (62.1%) — same one-pass both-directions cast as `mxfp8_dim_km`
   (byte-identical TMA load, dim-M transposed store, dim-K direct-to-gmem store), except **both** e8m0
   scales are scattered into the swizzled 4D `(nrb, ncb, 32, 16)` grid: `sk (M, N//32)` (pre-swizzle
   row = m, col = 32-col-block over N//32) and the transposed `sm (N, M//32)` (pre-swizzle row = n,
-  col = 32-row-block over M//32). Like `mxfp8_floor_dim_m_swizzle`, the swizzle is *faster* than the
+  col = 32-row-block over M//32). Like `mxfp8_dim_m_swizzle`, the swizzle is *faster* than the
   plain kernel (57.4% → 62.1%, +4.7 pts) — the qdata paths are unchanged, so the win is entirely the
   two scale stores: the plain `(M, N//32)` / `(N, M//32)` writes are strided scatters (adjacent
   threads land `N//32` / `M//32` apart), whereas the swizzled writes pack neighboring rows/blocks into
@@ -277,15 +277,15 @@ recipe                            gpu_time_ms    gbps    pct_peak  perf_descript
 ------------------------------  -------------  ------  ----------  -------------------------------------------------
 relu (baseline)                        0.1792  5993.5       74.9%
 fp8_tensorwise_precalc_scale            0.117  6885.3       86.1%  elementwise
-mxfp8_floor_swizzle                     0.133  6117.5       76.5%  (1,32) block, swizzle
+mxfp8_swizzle                     0.133  6117.5       76.5%  (1,32) block, swizzle
 fp8_deepseek_1x128                     0.1327  6131.8       76.7%  (1,128) block
-mxfp8_floor_dim_m                      0.1598  5090.8       63.6%  (32,1) block, t-contig
-mxfp8_floor_dim_m_swizzle              0.1377  5910.1       73.9%  (32,1) block, t-contig, swizzle
+mxfp8_dim_m                      0.1598  5090.8       63.6%  (32,1) block, t-contig
+mxfp8_dim_m_swizzle              0.1377  5910.1       73.9%  (32,1) block, t-contig, swizzle
 fp8_deepseek_1x128_dim_m               0.1633  4983.3       62.3%  (128,1) block, t-contig
-mxfp8_floor_dim_km                     0.2387    4569       57.1%  (1,32) dim-k + (32,1) dim-m, one pass, t-contig
-mxfp8_floor_dim_km_swizzle             0.2187  4987.5       62.3%  (1,32) dim-k + (32,1) dim-m, one pass, t-contig, swizzle
+mxfp8_dim_km                     0.2387    4569       57.1%  (1,32) dim-k + (32,1) dim-m, one pass, t-contig
+mxfp8_dim_km_swizzle             0.2187  4987.5       62.3%  (1,32) dim-k + (32,1) dim-m, one pass, t-contig, swizzle
 fp8_deepseek_1x128_dim_km               0.328  3324.3       41.5%  (1,128) dim-k + (128,1) dim-m, one pass, t-contig
-mxfp8_32x32_floor                      0.1408  5721.8       71.5%  (32,32) block
+mxfp8_32x32                      0.1408  5721.8       71.5%  (32,32) block
 fp8_deepseek_128x128                   0.1415  5690.7       71.1%  (128,128) block
 fp8_rowwise                            0.1248  6452.2       80.7%  (1,-1) block
 fp8_colwise                            0.2179  3696.3       46.2%  (-1,1) block, t-contig
@@ -310,19 +310,19 @@ recipe                      gpu_time_ms    gbps    pct_peak  perf_description
 ------------------------  -------------  ------  ----------  -----------------------------------
 relu (baseline)                  0.1791  5994.6       74.9%
 fp8_deepseek_1x128_dim_m          0.142  5731.9       71.7%  (128,1) block, t-contig
-mxfp8_floor_dim_m                0.1909  4261.5       53.3%  (32,1) block, t-contig
-mxfp8_32x32_floor                0.1285    6267       78.3%  (32,32) block
+mxfp8_dim_m                0.1909  4261.5       53.3%  (32,1) block, t-contig
+mxfp8_32x32                0.1285    6267       78.3%  (32,32) block
 nvfp4                            0.1376  4998.3       62.5%  (1,16) block, fp4 qdata, no swizzle
 ```
 
-* `mxfp8_32x32_floor` (76.6%) — the block_2d template (`template_mxfp8_32x32_floor.py.jinja`): the
+* `mxfp8_32x32` (76.6%) — the block_2d template (`template_mxfp8_32x32.py.jinja`): the
   traced `f` splits both dims into 32×32 blocks (a rank-4 reshape + a `permute` swapping the two
   middle axes), flattens each block to 1024 elements, reduces the whole-block amax to an e8m0 scale,
   then un-blocks the fp8 qdata back to `(M, N)` — no transpose. It matches the bespoke `--mode
   triton` kernel (77.0%) and beats the CuTeDSL kernel (70.4%): a non-transposing block cast is
   exactly what Triton's default blocking handles well, so the emitted 4D `tl.reshape`/`tl.trans`
   register shuffles cost nothing over a straight elementwise store.
-* The dim-M rows (`fp8_deepseek_1x128_dim_m` 68.3%, `mxfp8_floor_dim_m` 50.1%) and `nvfp4` (61.7%)
+* The dim-M rows (`fp8_deepseek_1x128_dim_m` 68.3%, `mxfp8_dim_m` 50.1%) and `nvfp4` (61.7%)
   are in the same ballpark as their bespoke `--mode triton` counterparts (70.1% / 56.9% / 64.5%):
   the emitter reproduces the hand kernels' structure and the template autotunes its own block sizes,
   so the residual gaps are config/autotune spread rather than a fundamental backend penalty.
@@ -336,15 +336,15 @@ recipe                        gpu_time_ms    gbps    pct_peak  perf_description
 --------------------------  -------------  ------  ----------  --------------------------------------------------------
 relu (baseline)                    0.1791  5993.9       74.9%
 fp8_tensorwise_precalc_scale       0.1179  6827.5       85.3%  elementwise
-mxfp8_floor_swizzle                0.1280  6354.8       79.4%  (1,32) block, swizzle
+mxfp8_swizzle                0.1280  6354.8       79.4%  (1,32) block, swizzle
 fp8_deepseek_1x128                 0.1165  6982.2       87.3%  (1,128) block
-mxfp8_floor_dim_m                  0.1842  4416.7       55.2%  (32,1) block, t-contig
-mxfp8_floor_dim_m_swizzle          0.2787  2920.1       36.5%  (32,1) block, t-contig, swizzle
+mxfp8_dim_m                  0.1842  4416.7       55.2%  (32,1) block, t-contig
+mxfp8_dim_m_swizzle          0.2787  2920.1       36.5%  (32,1) block, t-contig, swizzle
 fp8_deepseek_1x128_dim_m           0.1522  5344.6       66.8%  (128,1) block, t-contig
-mxfp8_floor_dim_km                 0.5481  1989.8       24.9%  (1,32) dim-k + (32,1) dim-m, one pass, t-contig
-mxfp8_floor_dim_km_swizzle         0.5024  2170.8       27.1%  (1,32) dim-k + (32,1) dim-m, one pass, t-contig, swizzle
+mxfp8_dim_km                 0.5481  1989.8       24.9%  (1,32) dim-k + (32,1) dim-m, one pass, t-contig
+mxfp8_dim_km_swizzle         0.5024  2170.8       27.1%  (1,32) dim-k + (32,1) dim-m, one pass, t-contig, swizzle
 fp8_deepseek_1x128_dim_km          0.2908  3750.4       46.9%  (1,128) dim-k + (128,1) dim-m, one pass, t-contig
-mxfp8_32x32_floor                  0.1927  4179.4       52.2%  (32,32) block
+mxfp8_32x32                  0.1927  4179.4       52.2%  (32,32) block
 fp8_deepseek_128x128               0.1320  6103.5       76.3%  (128,128) block
 nvfp4                              0.3288    2092       26.1%  (1,16) block, fp4 qdata, no swizzle
 nvfp4_swizzle                        0.23  2990.5       37.4%  (1,16) block, fp4 qdata, swizzle
@@ -353,7 +353,7 @@ fp32_to_bf16_sr                    0.2458  6553.1       81.9%  elementwise SR, t
 ```
 
 * `fp8_tensorwise_precalc_scale` (85.3%, above the relu ceiling), `fp8_deepseek_1x128` (87.3%) and
-  `mxfp8_floor_swizzle` (79.4%) are the **three non-transposing casts optimized per the full
+  `mxfp8_swizzle` (79.4%) are the **three non-transposing casts optimized per the full
   process** (correctness with `autotune_effort="none"`, then a `autotune_effort="full"` search at
   16384², then the winning config hardcoded), so unlike the correctness-first rows below these are
   actually tuned — all three land at or above their bespoke triton/cute siblings. `fp8_tensorwise`
@@ -363,7 +363,7 @@ fp32_to_bf16_sr                    0.2458  6553.1       81.9%  elementwise SR, t
   `reduction_loops=[None]`; the full search needed `HELION_AUTOTUNE_IGNORE_ERRORS=1` to *prune* (not
   abort on) one candidate that miscompiled (`flatten_loops` + a reduction over a flattened
   accumulator), and the result beats triton/cute/compile (75.8/76.7/77.2%).
-* `mxfp8_floor_swizzle` (79.4%) is the one of the three where **autotune could not find a config**:
+* `mxfp8_swizzle` (79.4%) is the one of the three where **autotune could not find a config**:
   the default `[32, 32]` config overflows triton's 1,048,576-element per-tensor cap while computing
   the autotune baseline (this kernel tiles the block-*count* dims, so the per-program tile numel is
   `block₀·block₁·16384`), so a custom `autotune_baseline_fn` was supplied — after which the search
@@ -371,7 +371,7 @@ fp32_to_bf16_sr                    0.2458  6553.1       81.9%  elementwise SR, t
   the task's fallback clause it was pinned to a manual `block_sizes=[1, 1]` (one 128×128 block/program),
   which is bit-exact and still reaches 79.4% — matching triton (81.5%) and edging cute (76.5%). This is
   the same block-count-dim tiling constraint the correctness-first swizzle rows below run into.
-* `fp8_deepseek_1x128_dim_m` (66.8%, i.e. ~89% of this run's relu ceiling) and `mxfp8_floor_dim_m`
+* `fp8_deepseek_1x128_dim_m` (66.8%, i.e. ~89% of this run's relu ceiling) and `mxfp8_dim_m`
   (55.2%) both do the dim-M reduction with an **in-kernel transposed store** — view the input as
   `(rb, group, N)` and the `(N, M)` output as `(N, rb, group)`, then store `y.permute(...)` inside
   the kernel (Helion lowers the register permute like `tl.trans`), which is ~4× faster than writing
@@ -379,7 +379,7 @@ fp32_to_bf16_sr                    0.2458  6553.1       81.9%  elementwise SR, t
   128-row reduction persistent via `reduction_loops=[None]` so `x` is loaded once, not 3×; the
   autotuner's timing was too noisy to trust here). They land in the same ballpark as their bespoke
   `--mode triton` counterparts once the depressed baseline is accounted for.
-* `mxfp8_floor_dim_m_swizzle` (36.7%) is `mxfp8_floor_dim_m` with the e8m0 scale scattered **directly
+* `mxfp8_dim_m_swizzle` (36.7%) is `mxfp8_dim_m` with the e8m0 scale scattered **directly
   into the NVIDIA 32×4×4 swizzled block grid in-kernel** (not stored plain then swizzled in a
   wrapper). To make the swizzled store a plain index, it tiles over the *block-count* dims so the
   tile indices are the block ordinals, which forces the within-block 32/128 axes into 5D register
@@ -388,35 +388,35 @@ fp32_to_bf16_sr                    0.2458  6553.1       81.9%  elementwise SR, t
   pinned to `block_sizes=[1, 1]` (one 128×128 block/program). That correctness-first tile is why the
   bandwidth trails the plain dim-M kernel and the triton/cute swizzle versions (72.7% / 73.9%);
   raising the block sizes is the perf follow-up.
-* `mxfp8_floor_dim_km` (24.9%) does **both** mxfp8-floor reductions in one pass over `x` and emits four
+* `mxfp8_dim_km` (24.9%) does **both** mxfp8 reductions in one pass over `x` and emits four
   outputs — the dim-K pair `(M, N)` / `(M, N//32)` in the natural frame *and* the dim-M pair `(N, M)` /
   `(N, M//32)` transposed. It reuses the 32×32 block-grid view `(rb, 32, cb, 32)` and takes both
   reductions off the one loaded block (reduce the trailing 32 for dim-K, the leading 32 for dim-M),
-  so like `mxfp8_32x32_floor` it's pinned to `block_sizes=[1, 1]`. `autotune_effort="none"` is *not*
+  so like `mxfp8_32x32` it's pinned to `block_sizes=[1, 1]`. `autotune_effort="none"` is *not*
   usable here (tested): the default heuristic scales the register tile by `block²·32·32`, which didn't
   compile at 512² in 10 min and would overflow the 1,048,576 per-tensor cap at this shape. The low
   bandwidth is expected — it's one read of `x` but ~2× the output writes (four tensors) on the
   correctness-first tile.
-* `mxfp8_floor_dim_km_swizzle` (27.1%) is `mxfp8_floor_dim_km` with **both** e8m0 scales scattered
+* `mxfp8_dim_km_swizzle` (27.1%) is `mxfp8_dim_km` with **both** e8m0 scales scattered
   directly into the NVIDIA 32×4×4 swizzled block grid in-kernel (qdata is byte-identical). To make
   both swizzled stores plain 5D indices it tiles over the 128×128 block grid and views `x` with both
   within-128 axes fully split (M-rows into `(c4, w32)`, N-cols into `(a, b)`), so one 6D loaded block
   feeds both reductions and both scale stores via pure permutes — no in-kernel reshape across a tiled
   axis (unlike the dim-M-only swizzle kernel). Same `block_sizes=[1, 1]` pin / autotune-none overflow
-  as the other dim-km kernels. It's actually a hair *faster* than the plain `mxfp8_floor_dim_km`
+  as the other dim-km kernels. It's actually a hair *faster* than the plain `mxfp8_dim_km`
   (24.9%), consistent with the swizzled scale store beating the plain strided one seen elsewhere.
 * `fp8_deepseek_1x128_dim_km` (46.9%) is the deepseek analog — same one-pass four-output structure as
-  `mxfp8_floor_dim_km` but 128×128 blocks with an fp32 `amax/448` reciprocal scale instead of e8m0
+  `mxfp8_dim_km` but 128×128 blocks with an fp32 `amax/448` reciprocal scale instead of e8m0
   bit-math. It's ~2× the bandwidth of the mxfp8 dim-km (24.9%) because 128-blocks write 4× fewer scale
   values than 32-blocks (and in larger contiguous chunks). Pinned `block_sizes=[1, 1]` for the same
   reason as the others.
-* `mxfp8_32x32_floor` (52.2%) is deliberately pinned to a **tiny `block_sizes=[1, 1]`** (one 32×32
+* `mxfp8_32x32` (52.2%) is deliberately pinned to a **tiny `block_sizes=[1, 1]`** (one 32×32
   block per program). The kernel views `x` as 4D `(rb, 32, cb, 32)` and tiles only `[rb, cb]`, so the
   block sizes multiply the untiled 32×32 register tile — the default heuristic's `[16, 16]`
   materializes a 1 MB fp32 tile per program that takes ptxas ~18 s to compile cold. `[1, 1]` keeps it
   at 4 KB → ~0.5 s cold compile. That fast-debug tile is the reason the bandwidth is low here (raise
   `block_sizes` or switch to `autotune_effort="full"` if this kernel's perf becomes the point).
-* `fp8_deepseek_128x128` (76.3%) is the deepseek square-block analog of `mxfp8_32x32_floor` — same
+* `fp8_deepseek_128x128` (76.3%) is the deepseek square-block analog of `mxfp8_32x32` — same
   in-place `(rb, 128, cb, 128)` block view but 128×128 blocks with an fp32 `amax/448` reciprocal scale.
   It sits right at the relu ceiling (74.9%, and edges past it run-to-run): 128×128 blocks write the
   fewest scale values of any recipe here (one fp32 per 16384 elements) and there's no transpose, so
@@ -528,13 +528,13 @@ fp32_to_bf16_sr                    0.2458  6553.1       81.9%  elementwise SR, t
   `fp8_deepseek_1x128_dim_m` (~68%) rather than the standalone dim-K (~76%), because the transposed
   dim-M store is the binding cost — dim-K rides the already-loaded tile essentially for free.
 
-* `mxfp8_floor_dim_km` (compile ~19.1%, triton ~47.1%) — the mxfp8-floor analog of the above (1×32
+* `mxfp8_dim_km` (compile ~19.1%, triton ~47.1%) — the mxfp8 analog of the above (1×32
   dim-K + 32×1 dim-M, e8m0 scales). Same story under compile: inductor generates **3 kernels reading
   `x` 3×** (dim-K fused reduce+quantize; dim-M amax reduction; dim-M quantize+transpose). The
   hand-written Triton kernel does the single pass. A first fixed **32×32 tile** version only reached
   ~30.9% (the transposed dim-M store is only 32-wide, poorly coalesced, and each program does little
   work); switching to **blocked tiles** (autotuned `RB` 32-row blocks × `BN` cols, reshape per
-  direction — the same lever that fixed `mxfp8_floor_dim_m`) widens the dim-M store and raises
+  direction — the same lever that fixed `mxfp8_dim_m`) widens the dim-M store and raises
   occupancy, reaching **47.1%**. Still below deepseek's dim_km (57.8%) because the 32-block
   granularity means 4× as many e8m0 scales (M/32 vs M/128) plus the per-scale e8m0 bit-math, and the
   transposed dim-M store remains the binding cost.
@@ -618,7 +618,7 @@ keys its hand-written Philox on each element's global flat index (`counter = f >
 the tile shape — it was tile-invariant from the start, so the "global offsets" recipe just reuses it
 (there is no separate tile-local cute kernel to contrast against, unlike the Triton pair).
 
-## Why `mxfp8_floor_dim_m` (59.9%) is slower than `fp8_deepseek_1x128_dim_m` (71.2%)
+## Why `mxfp8_dim_m` (59.9%) is slower than `fp8_deepseek_1x128_dim_m` (71.2%)
 
 Both are the same shape of kernel — load a bf16 tile, reduce down M per column, scale, `.to(fp8)`,
 transposed store — and both are memory-bound. The gap is entirely about **register pressure**, which
@@ -642,7 +642,7 @@ ncu at a matched 128-row tile (`RB=4, BN=64`):
 | mxfp8 (forced small tile) | 69 | 40.5% | 21.3 | 57–60% |
 | mxfp8 at deepseek's tile | 121–127 | 23.3% | 16.0 | 39–44% |
 
-The register cost is **structural, not the e8m0 math**: replacing the manual e8m0-floor bit
+The register cost is **structural, not the e8m0 math**: replacing the manual e8m0 bit
 extraction with the hardware `cvt.rz.satfinite.ue8m0x2.f32` instruction (see the mxfp8 kernel) only
 freed ~6 registers (127→121) and moved the number 57.9% → 59.9% — the bulk of the pressure is the
 fp32 working tile plus the `(RB,32,BN)` reshape and `tl.trans` transpose staging, plus holding 4×
@@ -651,7 +651,7 @@ shared-memory transpose to decouple store coalescing from tile height), not chea
 
 ## cuteDSL notes
 
-### How `mxfp8_floor_swizzle` was optimized (67.6% → 78.7%, matching triton)
+### How `mxfp8_swizzle` was optimized (67.6% → 78.7%, matching triton)
 
 The original cute kernel used the tensorwise vectorized-copy recipe (1-D flatten, 128 thr/CTA, each
 thread owns one contiguous 1×32 block, 128-bit ld/st) and plateaued at ~67.6%. ncu on that kernel
@@ -665,7 +665,7 @@ owns a fixed row, so the row-dependent swizzle term `row_base` is computed **onc
 amortized over every 1×32 block the lane visits (only the cheap `+(gc//4)*512 + gc%4` remains
 per-block), and all 128-bit loads for the ILP group are issued first for memory-level parallelism.
 Tuned WARPS=2, XSPLIT=4, ILP=4. That alone took it to 78.7%, edging triton (77.5%) — no TMA or smem
-staging needed. See `_mxfp8_floor_swizzle_kernel` in
+staging needed. See `_mxfp8_swizzle_kernel` in
 [`quant_cast_cute/recipes.py`](../quant_cast_bench/quant_cast_cute/recipes.py).
 
 Two dead ends ruled out along the way (don't repeat), both on the old 1-D-flatten kernel:

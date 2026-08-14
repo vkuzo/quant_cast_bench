@@ -352,7 +352,7 @@ class FxTritonEmitter:
         return self.cse.generate(expr, dtype=dtype)
 
     def _lower_bitcast(self, node: torch.fx.Node):
-        # `x.view(dtype)` REINTERPRETS the bits (e.g. fp32<->int32, uint8<->e8m0) -- the mxfp8-floor
+        # `x.view(dtype)` REINTERPRETS the bits (e.g. fp32<->int32, uint8<->e8m0) -- the mxfp8
         # e8m0 scale math extracts the exponent via int bit-ops then bitcasts back. Triton spells
         # this `x.to(triton_dtype, bitcast=True)`; TritonOverrides.to_dtype_bitcast needs the source
         # dtype (unlike the value-preserving to_dtype, here src_dtype is mandatory).

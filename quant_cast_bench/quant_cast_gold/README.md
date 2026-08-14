@@ -145,11 +145,11 @@ orientation; `—` means "none / no".
 | `fp8_tensorwise_precalc_scale`     | x     | (-1, -1)        | —   | —       | —   | true |
 | `fp8_rowwise_precalc_scale`        | x     | (1, -1)         | —   | —       | —   | true |
 | `fp8_colwise_precalc_scale`        | x     | (-1, 1)         | —   | —       | —   | true |
-| `mxfp8_floor`                      | x     | (1, 32)         | —   | —       | —   | — |
-| `mxfp8_floor_swizzle`              | x     | (1, 32)         | —   | swizzle | —   | — |
-| `mxfp8_floor_dim_m`                | x.t() | (32, 1)         | —   | —       | —   | — |
-| `mxfp8_floor_dim_km`               | both  | (1,32)+(32,1)   | —   | —       | —   | — |
-| `mxfp8_32x32_floor`                | x     | (32, 32)        | —   | —       | —   | — |
+| `mxfp8`                      | x     | (1, 32)         | —   | —       | —   | — |
+| `mxfp8_swizzle`              | x     | (1, 32)         | —   | swizzle | —   | — |
+| `mxfp8_dim_m`                | x.t() | (32, 1)         | —   | —       | —   | — |
+| `mxfp8_dim_km`               | both  | (1,32)+(32,1)   | —   | —       | —   | — |
+| `mxfp8_32x32`                | x     | (32, 32)        | —   | —       | —   | — |
 | `fp8_deepseek_1x128`               | x     | (1, 128)        | —   | —       | —   | — |
 | `fp8_deepseek_1x128_dim_m`         | x.t() | (128, 1)        | —   | —       | —   | — |
 | `fp8_deepseek_1x128_dim_km`        | both  | (1,128)+(128,1) | —   | —       | —   | — |
@@ -194,7 +194,7 @@ Notes:
 
 ## Recipe families
 
-fp8 elementwise (tensorwise / rowwise / colwise precalc-scale), mxfp8-floor (1×32, plus swizzle,
+fp8 elementwise (tensorwise / rowwise / colwise precalc-scale), mxfp8 (1×32, plus swizzle,
 dim-m, 32×32, and the one-pass dim-k+dim-m combo), deepseek fp8 (1×128, 128×128, dim-m, and the
 one-pass dim-k+dim-m combo), rowwise/colwise fp8, nvfp4 (1×16 with swizzled scale), the randomized
 Hadamard transform, and fp32→bf16 stochastic rounding. See `ALL_RECIPES` for the full list.

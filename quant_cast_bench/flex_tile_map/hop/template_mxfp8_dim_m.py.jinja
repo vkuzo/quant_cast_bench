@@ -1,4 +1,4 @@
-{# Group-reduction Triton template, dim-M variant (mxfp8 FLOOR 32x1 dim_m).
+{# Group-reduction Triton template, dim-M variant (mxfp8 32x1 dim_m).
 
    Structurally identical to template_deepseek_dim_m.py.jinja but the row-group is 32 (not 128) and
    the second output is an e8m0 (uint8) scale rather than an fp32 one. The dim-M recipe reduces DOWN

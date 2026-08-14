@@ -28,8 +28,8 @@ from quant_cast_bench.flex_tile_map.api import (
 from quant_cast_bench.flex_tile_map.recipes import (
     DEEPSEEK_1X128,
     DEEPSEEK_1X128_DIM_M,
-    MXFP8_FLOOR,
-    MXFP8_FLOOR_SWIZZLE,
+    MXFP8,
+    MXFP8_SWIZZLE,
     RECIPES_V2,
     SR_BF16,
     SR_BF16_GLOBAL,
@@ -37,8 +37,8 @@ from quant_cast_bench.flex_tile_map.recipes import (
 from quant_cast_bench.quant_cast_gold.recipes import (
     debug_relu_f,
     deepseek_1x128_dim_m_f,
-    mxfp8_32x32_floor_f,
-    mxfp8_floor_dim_m_f,
+    mxfp8_32x32_f,
+    mxfp8_dim_m_f,
     nvfp4_gs_f,
     nvfp4_gs_scale,
 )
@@ -203,18 +203,18 @@ def test_triton_template_deepseek_dim_m_non_square_compiled():
     assert torch.equal(s, sr)
 
 
-def test_triton_template_mxfp8_floor_dim_m_compiled():
-    # mxfp8-floor dim-M: same transposed group-reduction shape as deepseek, but a 32-row group and
+def test_triton_template_mxfp8_dim_m_compiled():
+    # mxfp8 dim-M: same transposed group-reduction shape as deepseek, but a 32-row group and
     # an e8m0 (uint8) power-of-two scale. Exercises the emitter's e8m0 exponent extraction --
     # view.dtype bitcast, bitwise shift/and, isnan, where, full -- and the group-32 template
-    # (template_mxfp8_floor_dim_m.py.jinja), selected via the group-keyed template dispatch.
+    # (template_mxfp8_dim_m.py.jinja), selected via the group-keyed template dispatch.
     torch.manual_seed(0)
     x = torch.randn(256, 256, dtype=torch.bfloat16, device="cuda")
 
-    qr, sr = mxfp8_floor_dim_m_f(x)  # eager reference (whole tensor, transposed outputs)
+    qr, sr = mxfp8_dim_m_f(x)  # eager reference (whole tensor, transposed outputs)
 
     compiled = torch.compile(flex_tile_map)
-    q, s = compiled(x, mxfp8_floor_dim_m_f, _backend=FlexTileMapBackend.TRITON_TEMPLATE)
+    q, s = compiled(x, mxfp8_dim_m_f, _backend=FlexTileMapBackend.TRITON_TEMPLATE)
 
     assert q.shape == (256, 256) and q.dtype == torch.float8_e4m3fn
     assert s.shape == (256, 256 // 32) and s.dtype == torch.float8_e8m0fnu
@@ -254,18 +254,18 @@ def test_triton_template_nvfp4_compiled():
     assert qdata_equal(s, sr)
 
 
-def test_triton_template_mxfp8_32x32_floor_compiled():
-    # mxfp8-floor 32x32 exercises the emitter's block_2d path: the traced `f` splits BOTH dims into
+def test_triton_template_mxfp8_32x32_compiled():
+    # mxfp8 32x32 exercises the emitter's block_2d path: the traced `f` splits BOTH dims into
     # 32x32 blocks (a rank-4 reshape + permute swapping the two middle axes), flattens each block to
     # 1024 elements, reduces the whole-block amax to an e8m0 scale, then un-blocks the fp8 qdata back
     # to the input shape -- NO transpose. Outputs: fp8 qdata (M, N) + e8m0 scale (M//32, N//32).
     torch.manual_seed(0)
     x = torch.randn(256, 256, dtype=torch.bfloat16, device="cuda")
 
-    qr, sr = mxfp8_32x32_floor_f(x)  # eager reference (whole tensor)
+    qr, sr = mxfp8_32x32_f(x)  # eager reference (whole tensor)
 
     compiled = torch.compile(flex_tile_map)
-    q, s = compiled(x, mxfp8_32x32_floor_f, _backend=FlexTileMapBackend.TRITON_TEMPLATE)
+    q, s = compiled(x, mxfp8_32x32_f, _backend=FlexTileMapBackend.TRITON_TEMPLATE)
 
     assert q.shape == (256, 256) and q.dtype == torch.float8_e4m3fn
     assert s.shape == (256 // 32, 256 // 32) and s.dtype == torch.float8_e8m0fnu
@@ -329,12 +329,12 @@ def test_valid_tile_size_fn_unsatisfiable_raises_then_pad_fixes():
 def test_pad_ref_shapes_swizzle():
     # ragged 200x300 padded to (128,128)-multiple -> (256, 384); swizzle grid nrb=2, ncb=3.
     torch.manual_seed(0)
-    (x,) = MXFP8_FLOOR_SWIZZLE.example_input_fn(200, 300)
+    (x,) = MXFP8_SWIZZLE.example_input_fn(200, 300)
     qdata, scale = flex_tile_map(
         x,
-        MXFP8_FLOOR_SWIZZLE.pt_ref_fn,
+        MXFP8_SWIZZLE.pt_ref_fn,
         pad_input_to_multiple_of=(128, 128),
-        valid_tile_size_fn=MXFP8_FLOOR_SWIZZLE.valid_tile_size_fn,
+        valid_tile_size_fn=MXFP8_SWIZZLE.valid_tile_size_fn,
     )
     assert qdata.shape == (256, 384)
     assert scale.shape == (2, 3, 32, 16)
@@ -343,11 +343,11 @@ def test_pad_ref_shapes_swizzle():
 @pytest.mark.parametrize(
     "recipe, pad_to",
     [
-        (MXFP8_FLOOR, (1, 32)),
-        (MXFP8_FLOOR_SWIZZLE, (128, 128)),
+        (MXFP8, (1, 32)),
+        (MXFP8_SWIZZLE, (128, 128)),
         (DEEPSEEK_1X128, (1, 128)),
     ],
-    ids=["mxfp8_floor", "mxfp8_floor_swizzle", "fp8_deepseek_1x128"],
+    ids=["mxfp8", "mxfp8_swizzle", "fp8_deepseek_1x128"],
 )
 def test_pad_backends_match(recipe, pad_to):
     # padded ragged input: MANUAL_TILE must match INDUCTOR bit-exact (padding happens before
@@ -369,13 +369,13 @@ def test_pad_backends_match(recipe, pad_to):
 def test_pad_matches_manual_pad():
     # padding inside the API == padding the input outside it, then running the recipe.
     torch.manual_seed(0)
-    (x,) = MXFP8_FLOOR.example_input_fn(200, 300)
-    kernel = MXFP8_FLOOR.pt_ref_fn
+    (x,) = MXFP8.example_input_fn(200, 300)
+    kernel = MXFP8.pt_ref_fn
     qdata, scale = flex_tile_map(
         x,
         kernel,
         pad_input_to_multiple_of=(1, 32),
-        valid_tile_size_fn=MXFP8_FLOOR.valid_tile_size_fn,
+        valid_tile_size_fn=MXFP8.valid_tile_size_fn,
     )
     # manual pad: 200 stays (mult of 1), 300 -> 320 (mult of 32); high-edge zero pad.
     x_padded = F.pad(x, (0, _ceil_to(300, 32) - 300, 0, 0))

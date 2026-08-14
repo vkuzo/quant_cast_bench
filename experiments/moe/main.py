@@ -20,7 +20,7 @@ H100 (SM90). So we EMULATE it -- dequantize the mxfp8 tensors back to bf16 and c
 e8m0 scales, so the cuBLAS blocked/swizzled scale layout the real op requires is intentionally NOT
 built here; it will be added when we move to SM100.
 
-The e8m0 cast primitive already lives in this repo's gold recipes (`mxfp8_floor_f`) and is reused
+The e8m0 cast primitive already lives in this repo's gold recipes (`mxfp8_f`) and is reused
 here rather than re-derived.
 """
 
@@ -30,12 +30,12 @@ import sys
 import torch
 
 # Reuse this repo's plain-PyTorch mxfp8 primitives rather than re-deriving them:
-#   mxfp8_floor_f : 1x32 mxfp8 cast of the last dim -> (e4m3 qdata, e8m0 FLOOR pow2 scale)
+#   mxfp8_f : 1x32 mxfp8 cast of the last dim -> (e4m3 qdata, e8m0 pow2 scale)
 #   _compute_error: SQNR in dB
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from quant_cast_bench.quant_cast_gold.recipes import (  # noqa: E402
     _compute_error,
-    mxfp8_floor_f,
+    mxfp8_f,
 )
 
 BLOCK_SIZE = 32
@@ -49,7 +49,7 @@ def quantize_2d_act(act: torch.Tensor):
         act_scale: `(total_M, K // 32)` e8m0 (float8_e8m0fnu), naive (unswizzled) layout.
     """
     assert act.ndim == 2, "act must be 2D"
-    act_fp8, act_scale = mxfp8_floor_f(act)  # blocks the last dim (K)
+    act_fp8, act_scale = mxfp8_f(act)  # blocks the last dim (K)
     return act_fp8, act_scale
 
 
@@ -65,8 +65,8 @@ def quantize_3d_weight(mat2: torch.Tensor):
                  32 values along K, as `_emulated_mxfp8_..._2d_3d` expects.
     """
     assert mat2.ndim == 3, "mat2 must be 3D (E, K, N)"
-    w_t = mat2.transpose(-2, -1).contiguous()  # (E, N, K), so mxfp8_floor_f blocks along K
-    q_t, scale = mxfp8_floor_f(w_t)  # q_t (E, N, K), scale (E, N, K//32)
+    w_t = mat2.transpose(-2, -1).contiguous()  # (E, N, K), so mxfp8_f blocks along K
+    q_t, scale = mxfp8_f(w_t)  # q_t (E, N, K), scale (E, N, K//32)
     w_fp8 = q_t.transpose(-2, -1).contiguous()  # (E, K, N)
     w_scale = scale.transpose(-2, -1).contiguous()  # (E, K//32, N)
     return w_fp8, w_scale
@@ -84,8 +84,8 @@ def quantize_3d_along_dim1(x: torch.Tensor):
         scale: `(E, D0 // 32, D1)` e8m0 (float8_e8m0fnu).
     """
     assert x.ndim == 3, "x must be 3D (E, D0, D1)"
-    x_t = x.transpose(-2, -1).contiguous()  # (E, D1, D0), so mxfp8_floor_f blocks along D0
-    q_t, scale_t = mxfp8_floor_f(x_t)  # q_t (E, D1, D0), scale_t (E, D1, D0//32)
+    x_t = x.transpose(-2, -1).contiguous()  # (E, D1, D0), so mxfp8_f blocks along D0
+    q_t, scale_t = mxfp8_f(x_t)  # q_t (E, D1, D0), scale_t (E, D1, D0//32)
     qdata = q_t.transpose(-2, -1).contiguous()  # (E, D0, D1)
     scale = scale_t.transpose(-2, -1).contiguous()  # (E, D0//32, D1)
     return qdata, scale

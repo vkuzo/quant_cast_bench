@@ -20,10 +20,10 @@ from quant_cast_bench.quant_cast_gold.recipes import (
     Deepseek128x128Gold,
     Float8TensorwiseGold,
     HadamardRht,
-    Mxfp832x32FloorGold,
-    Mxfp8FloorDimMGold,
-    Mxfp8FloorGold,
-    Mxfp8FloorSwizzleGold,
+    Mxfp832x32Gold,
+    Mxfp8DimMGold,
+    Mxfp8Gold,
+    Mxfp8SwizzleGold,
     Mxfp8BiasGold,
     Nvfp4BlockedOuterGold,
     Nvfp4GsGold,
@@ -134,25 +134,25 @@ COLWISE_PRECALC = RecipeV2.from_gold(
     output_kinds=(OutputKind.SWAP_TILE_INDEX,),
 )
 # reduction (1x32) checked on `actual`.
-MXFP8_FLOOR = RecipeV2.from_gold(
-    Mxfp8FloorGold,
+MXFP8 = RecipeV2.from_gold(
+    Mxfp8Gold,
     valid_tile_size_fn=lambda ts, a, p: a[1] % 32 == 0,
 )
 # dim-M mxfp8: 1x32 reduction runs down M (a[0] % 32), outputs written transposed (grid swap).
-MXFP8_FLOOR_DIM_M = RecipeV2.from_gold(
-    Mxfp8FloorDimMGold,
+MXFP8_DIM_M = RecipeV2.from_gold(
+    Mxfp8DimMGold,
     valid_tile_size_fn=lambda ts, a, p: a[0] % 32 == 0,
     output_kinds=(OutputKind.SWAP_TILE_INDEX, OutputKind.SWAP_TILE_INDEX),
 )
 # mxfp8 with square 32x32 blocks: each block is independent, so a tile just needs whole blocks
 # on both dims (checked on `actual`). No swizzle, no transpose.
-MXFP8_32X32_FLOOR = RecipeV2.from_gold(
-    Mxfp832x32FloorGold,
+MXFP8_32X32 = RecipeV2.from_gold(
+    Mxfp832x32Gold,
     valid_tile_size_fn=lambda ts, a, p: a[0] % 32 == 0 and a[1] % 32 == 0,
 )
 # reduction (1x32) checked on `actual`; swizzle atom (128x128) checked on `padded` (edge-exempt).
-MXFP8_FLOOR_SWIZZLE = RecipeV2.from_gold(
-    Mxfp8FloorSwizzleGold,
+MXFP8_SWIZZLE = RecipeV2.from_gold(
+    Mxfp8SwizzleGold,
     valid_tile_size_fn=lambda ts, a, p: a[1] % 32 == 0 and p[0] % 128 == 0 and p[1] % 128 == 0,
 )
 # Tensorwise recipe: the per-tensor scale (built by Float8TensorwiseGold.example_input_fn) is a
@@ -185,7 +185,7 @@ NVFP4_BLOCKED_OUTER = RecipeV2.from_gold(
     valid_tile_size_fn=lambda ts, a, p: a[1] % 16 == 0 and p[0] % 128 == 0 and p[1] % 64 == 0,
     aux_kinds=(AuxKind.TILE,),
 )
-# mxfp8 FLOOR with an elementwise bias (same shape as input) added before quant, passed as an
+# mxfp8 with an elementwise bias (same shape as input) added before quant, passed as an
 # AuxKind.TILE aux with divisor (1, 1). Mxfp8BiasGold.example_input_fn supplies a fixed ones-tensor
 # bias (it isn't derived from `x`); Mxfp8BiasGold's correctness_fn only checks shape/dtype.
 MXFP8_BIAS = RecipeV2.from_gold(
@@ -232,10 +232,10 @@ RECIPES_V2 = [
     ("fp8_colwise", COLWISE_FP8),
     ("fp8_rowwise_precalc_scale", ROWWISE_PRECALC),
     ("fp8_colwise_precalc_scale", COLWISE_PRECALC),
-    ("mxfp8_floor", MXFP8_FLOOR),
-    ("mxfp8_floor_dim_m", MXFP8_FLOOR_DIM_M),
-    ("mxfp8_32x32_floor", MXFP8_32X32_FLOOR),
-    ("mxfp8_floor_swizzle", MXFP8_FLOOR_SWIZZLE),
+    ("mxfp8", MXFP8),
+    ("mxfp8_dim_m", MXFP8_DIM_M),
+    ("mxfp8_32x32", MXFP8_32X32),
+    ("mxfp8_swizzle", MXFP8_SWIZZLE),
     ("fp8_tensorwise_precalc_scale", FLOAT8_TENSORWISE),
     ("nvfp4", NVFP4),
     ("nvfp4_swizzle", NVFP4_GS_SWIZZLE),
