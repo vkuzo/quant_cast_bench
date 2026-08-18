@@ -30,6 +30,7 @@ already live in this repo's gold recipes and are reused here rather than re-deri
 
 import os
 import sys
+from enum import StrEnum
 
 import torch
 
@@ -44,6 +45,15 @@ from quant_cast_bench.quant_cast_gold.recipes import (  # noqa: E402
 )
 
 BLOCK_SIZE = 32
+
+
+class QuantOrientation(StrEnum):
+    # Mirrors experiments/mxfp8_api/api.py: how the 1x32 block maps onto a token operand. For grouped
+    # token tensors this also fixes the blocked-scale layout: NATURAL -> M-groups, TRANSPOSED ->
+    # K-groups. Defined locally to keep this experiment self-contained.
+    NATURAL = "natural"          # block along the last dim (contraction), qdata (M, C), M-groups scale
+    TRANSPOSED = "transposed"    # block along the token dim M, qdata (C, M), K-groups scale
+    BOTH = "both"                # fused: emit the NATURAL pair then the TRANSPOSED pair
 
 
 def quantize_2d_act(act: torch.Tensor):
@@ -301,13 +311,16 @@ def _pad_token_groups(inputs: torch.Tensor, group_offsets: torch.Tensor, alignme
 def _unpad_token_groups(
     padded_inputs: torch.Tensor,
     group_offsets: torch.Tensor,
-    padded_start_offsets: torch.Tensor,
-    num_tokens: int,
+    padded_offsets: torch.Tensor,
 ) -> torch.Tensor:
     """Inverse of `_pad_token_groups`: gather each group's original-size chunk back into a
-    `(num_tokens, dim)` tensor. Port of torchao's `torch_unpad_token_groups`."""
+    `(num_tokens, dim)` tensor. Port of torchao's `torch_unpad_token_groups`. The padded start rows
+    and the original token count are both recovered from `padded_offsets` + `group_offsets`, so the
+    grouped cast only has to hand back `padded_offsets`."""
     zero = torch.zeros(1, dtype=group_offsets.dtype, device=group_offsets.device)
     group_sizes = torch.diff(group_offsets, prepend=zero)
+    padded_start_offsets = padded_offsets - torch.diff(padded_offsets, prepend=zero)
+    num_tokens = int(group_offsets[-1])
     chunks = [
         padded_inputs[start : start + size]
         for start, size in zip(padded_start_offsets.tolist(), group_sizes.tolist())
@@ -386,6 +399,89 @@ def _to_blocked_2d_k_groups(x_scales: torch.Tensor, group_offs: torch.Tensor) ->
     return blocked_scales
 
 
+def quantize_to_mxfp8_grouped(
+    input: torch.Tensor,  # (total_M, C)
+    offs: torch.Tensor,
+    orientation: QuantOrientation = QuantOrientation.NATURAL,
+):
+    """One-shot mxfp8 cast of a grouped token operand for the real `torch._scaled_grouped_mm`, the
+    grouped analog of the dense `experiments/mxfp8_api/api.py::quantize_to_mxfp8`. Composes this
+    module's existing helpers (token-group pad -> `mxfp8_f` -> blocked-scale swizzle); no new math.
+
+    `orientation` is the only knob and it drives everything: NATURAL blocks the 1x32 along the last
+    (contraction) dim and emits the M-groups blocked scale; TRANSPOSED blocks along the token dim M
+    and emits the K-groups blocked scale (scale offsets = padded_offs // BLOCK_SIZE, internal). BOTH
+    emits both pairs from a single padded read -- this is the fusion-visible case a future kernel would
+    collapse into one pass. (A fuller superset -- scaling_type / swizzle_type / rounding_mode -- would
+    mirror the dense API; only orientation is needed here today.)
+
+    qdata is always returned row-major/contiguous; the caller composes the mat2 `.transpose(-2, -1)`
+    view at the GEMM call site. `padded_offs` (token space) is returned for the op's `offs=` and for
+    `_unpad_token_groups`; the padded start rows and original token count are recoverable from it.
+
+    Returns:
+        NATURAL:    `(q (Mp, C),  scale_blocked_m_groups, padded_offs)`
+        TRANSPOSED: `(q (C,  Mp), scale_blocked_k_groups, padded_offs)`
+        BOTH:       `(q_natural (Mp, C), scale_blocked_m_groups,
+                      q_transposed (C, Mp), scale_blocked_k_groups, padded_offs)`
+    """
+    padded, _, padded_offs = _pad_token_groups(input, offs)
+
+    if orientation in (QuantOrientation.NATURAL, QuantOrientation.BOTH):
+        q_nat, s_nat = quantize_2d_act(padded)  # (Mp, C), 1x32 along C
+        sb_nat = _to_blocked_2d_m_groups(s_nat, padded_offs)
+    if orientation in (QuantOrientation.TRANSPOSED, QuantOrientation.BOTH):
+        q_t, s_t = quantize_2d_act(padded.transpose(-2, -1).contiguous())  # (C, Mp), 1x32 along M
+        sb_t = _to_blocked_2d_k_groups(s_t, padded_offs // BLOCK_SIZE)
+
+    if orientation == QuantOrientation.NATURAL:
+        return q_nat, sb_nat, padded_offs
+    if orientation == QuantOrientation.TRANSPOSED:
+        return q_t, sb_t, padded_offs
+    return q_nat, sb_nat, q_t, sb_t, padded_offs
+
+
+def quantize_to_mxfp8_3d(
+    input: torch.Tensor,  # (E, R, C)
+    orientation: QuantOrientation = QuantOrientation.NATURAL,
+):
+    """Batched (per-expert) mxfp8 cast of a 3d weight stack `(E, R, C)` for the real
+    `torch._scaled_grouped_mm` -- the 3d analog of the dense `experiments/mxfp8_api::quantize_to_mxfp8`.
+    Unlike `quantize_to_mxfp8_grouped`, the expert axis is a plain batch dim with NO offsets (each
+    expert is a full dense matrix), so this stays a separate weight-only path. Composes this module's
+    `mxfp8_f` + `_to_blocked_per_group_3d`; no new math.
+
+    `orientation` picks the blocked axis: NATURAL blocks the 1x32 along the last dim C (qdata `(E,R,C)`,
+    scale `(E,R,C//32)`); TRANSPOSED blocks along R (qdata `(E,C,R)`). BOTH emits both pairs from one
+    read -- the fusion-visible case: for a `weight_t (E,K,N)` stack, NATURAL is the dgrad-B cast (block
+    along N) and TRANSPOSED is the fwd-B cast (block along K), so BOTH yields both weight casts a
+    forward+backward step needs in a single pass.
+
+    qdata is returned row-major/contiguous; the caller composes the mat2 `.transpose(-2, -1)` view at
+    the GEMM call site.
+
+    Returns:
+        NATURAL:    `(q (E,R,C), scale_blocked)`
+        TRANSPOSED: `(q (E,C,R), scale_blocked)`
+        BOTH:       `(q_natural (E,R,C), scale_blocked_natural,
+                      q_transposed (E,C,R), scale_blocked_transposed)`
+    """
+    assert input.ndim == 3, "input must be 3D (E, R, C)"
+
+    if orientation in (QuantOrientation.NATURAL, QuantOrientation.BOTH):
+        q_nat, s_nat = mxfp8_f(input.contiguous())  # (E,R,C), 1x32 along C
+        sb_nat = _to_blocked_per_group_3d(s_nat)
+    if orientation in (QuantOrientation.TRANSPOSED, QuantOrientation.BOTH):
+        q_t, s_t = mxfp8_f(input.transpose(-2, -1).contiguous())  # (E,C,R), 1x32 along R
+        sb_t = _to_blocked_per_group_3d(s_t)
+
+    if orientation == QuantOrientation.NATURAL:
+        return q_nat, sb_nat
+    if orientation == QuantOrientation.TRANSPOSED:
+        return q_t, sb_t
+    return q_nat, sb_nat, q_t, sb_t
+
+
 def mxfp8_fwd_real(
     act: torch.Tensor,  # (M, K)
     weight_t: torch.Tensor,  # (E, K, N)
@@ -394,19 +490,18 @@ def mxfp8_fwd_real(
 ) -> torch.Tensor:
     """Forward: `out = grouped_mm(act, weight_t)` via the real `torch._scaled_grouped_mm`. Returns
     `(M, N)`. Mirrors torchao's `_compute_fwd_sm100` (with token-group padding)."""
-    num_tokens = act.shape[0]
-    padded_act, padded_start_offs, padded_offs = _pad_token_groups(act, offs)
-    act_fp8, act_scale = quantize_2d_act(padded_act)  # (Mp,K), (Mp,K//32)
-    act_scale_blocked = _to_blocked_2d_m_groups(act_scale, padded_offs)
-    # Quantize the weight along K (the contraction dim) into a (E,N,K) row-major buffer, then pass its
-    # transpose (E,K,N) -- the real op requires mat2 to be a transposed (column-major) view.
-    w_e4m3, w_scale = mxfp8_f(weight_t.transpose(-2, -1).contiguous())  # (E,N,K), (E,N,K//32)
-    w_scale_blocked = _to_blocked_per_group_3d(w_scale)  # per-expert (N, K//32)
+    # Activation: block 1x32 along K (the contraction dim) -> M-groups blocked scale.
+    act_fp8, act_scale_blocked, padded_offs = quantize_to_mxfp8_grouped(
+        act, offs, QuantOrientation.NATURAL
+    )
+    # Weight cast blocked 1x32 along K (the fwd contraction dim): TRANSPOSED gives a (E,N,K) row-major
+    # buffer whose transpose (E,K,N) is the column-major mat2 view the real op requires.
+    w_e4m3, w_scale_blocked = quantize_to_mxfp8_3d(weight_t, QuantOrientation.TRANSPOSED)  # (E,N,K)
     out = torch._scaled_grouped_mm(
         act_fp8, w_e4m3.transpose(-2, -1), act_scale_blocked, w_scale_blocked,
         offs=padded_offs, out_dtype=out_dtype,
     )
-    return _unpad_token_groups(out, offs, padded_start_offs, num_tokens)
+    return _unpad_token_groups(out, offs, padded_offs)
 
 
 def mxfp8_bwd_real(
@@ -430,38 +525,29 @@ def mxfp8_bwd_real(
       * both `torch._scaled_grouped_mm` calls share `padded_offs` (and the dgrad call reuses the
         row-cast of `grad_output`), so a fused backward would quantize `grad_output` just once.
     """
-    num_tokens = grad_output.shape[0]
-
-    # --- token-group padding (once per operand, shared by the GEMMs below) ---
-    padded_go, go_start_offs, padded_offs = _pad_token_groups(grad_output, offs)
-    scale_offs = padded_offs // BLOCK_SIZE
-    padded_ia, _, _ = _pad_token_groups(input_act, offs)
-
-    # --- grad_output casts: row-orientation (dgrad) + transposed-orientation (wgrad).
-    # FUSION: these two are a single both-orientation cast of `padded_go`.
-    go_fp8, go_scale = quantize_2d_act(padded_go)  # (Mp,N), 1x32 along N -> dgrad
-    go_t_fp8, go_t_scale = quantize_2d_act(padded_go.transpose(-2, -1).contiguous())  # (N,Mp) -> wgrad
-    go_scale_blocked = _to_blocked_2d_m_groups(go_scale, padded_offs)
-    go_t_scale_blocked = _to_blocked_2d_k_groups(go_t_scale, scale_offs)
+    # --- grad_output cast in BOTH orientations (one padded read): row-orientation feeds dgrad
+    # (1x32 along N, M-groups scale), transposed-orientation feeds wgrad (1x32 along M, K-groups
+    # scale). This single call is exactly the fused both-orientation cast a kernel would collapse. ---
+    go_fp8, go_scale_blocked, go_t_fp8, go_t_scale_blocked, padded_offs = quantize_to_mxfp8_grouped(
+        grad_output, offs, QuantOrientation.BOTH
+    )
 
     # === dgrad: grad_input = grouped_mm(grad_output, weight) ===
-    # Weight in its natural (E,N,K) orientation blocked 1x32 along N (the dgrad contraction dim).
-    # weight_t is (E,K,N) with N last, so mxfp8_f blocks along N directly; the transpose gives the
-    # (E,N,K) column-major view the real op requires for mat2.
-    q_kn, scale_kn = mxfp8_f(weight_t.contiguous())  # (E,K,N), (E,K,N//32)
+    # Weight blocked 1x32 along N (the dgrad contraction dim). weight_t is (E,K,N) with N last, so
+    # NATURAL blocks along N directly; the transpose gives the (E,N,K) column-major mat2 view.
+    q_kn, w_scale_blocked = quantize_to_mxfp8_3d(weight_t, QuantOrientation.NATURAL)  # (E,K,N)
     w_e4m3 = q_kn.transpose(-2, -1)  # (E,N,K) column-major view
-    w_scale_blocked = _to_blocked_per_group_3d(scale_kn)  # per-expert (K, N//32)
     grad_input = torch._scaled_grouped_mm(
         go_fp8, w_e4m3, go_scale_blocked, w_scale_blocked, offs=padded_offs, out_dtype=out_dtype
     )
-    grad_input = _unpad_token_groups(grad_input, offs, go_start_offs, num_tokens)
+    grad_input = _unpad_token_groups(grad_input, offs, padded_offs)
 
     # === wgrad: grad_weight_t = per-group grad_output^T @ input_act ===
-    # Both operands transposed so the group-partitioned contraction dim M is last, blocked 1x32 along
-    # M (K-groups scale layout, scale offsets = offs//32). M being contracted, the result needs no
-    # unpadding.
-    ia_t_fp8, ia_t_scale = quantize_2d_act(padded_ia.transpose(-2, -1).contiguous())  # (K, Mp)
-    ia_t_scale_blocked = _to_blocked_2d_k_groups(ia_t_scale, scale_offs)
+    # input_act transposed so the group-partitioned contraction dim M is last, blocked 1x32 along M
+    # (K-groups scale layout). M being contracted, the result needs no unpadding.
+    ia_t_fp8, ia_t_scale_blocked, _ = quantize_to_mxfp8_grouped(
+        input_act, offs, QuantOrientation.TRANSPOSED
+    )
     grad_weight = torch._scaled_grouped_mm(
         go_t_fp8,
         ia_t_fp8.transpose(-2, -1),
