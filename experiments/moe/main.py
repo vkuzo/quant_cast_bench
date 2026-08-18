@@ -11,17 +11,21 @@ where `weight_t = weight.transpose(-2, -1)` (`weight` is the natural `(E, N, K)`
 
 This module holds the plain-PyTorch (no triton/cute/cuda, no torchao) recipe for the mxfp8 MoE
 casts: quantize each operand to e4m3 data + e8m0 (power-of-two, block size 32) scales along the
-appropriate contraction axis, then compute the grouped GEMM.
+appropriate contraction axis, then compute the grouped GEMM. It offers two paths, both plain
+PyTorch and torchao-free:
 
-Emulation: the real mxfp8 `torch._scaled_grouped_mm` is SM100-only, and we currently run on an
-H100 (SM90). So we EMULATE it -- dequantize the mxfp8 tensors back to bf16 and call plain
-`torch._grouped_mm` -- mirroring torchao's `_emulated_mxfp8_scaled_grouped_mm_2d_{3d,2d}`
-(torchao/prototype/moe_training/mxfp8_grouped_mm.py). Emulation consumes the naive (unswizzled)
-e8m0 scales, so the cuBLAS blocked/swizzled scale layout the real op requires is intentionally NOT
-built here; it will be added when we move to SM100.
+  * Emulated: dequantize the mxfp8 tensors back to bf16 and call plain `torch._grouped_mm`,
+    mirroring torchao's `_emulated_mxfp8_scaled_grouped_mm_2d_{3d,2d}`. Consumes the naive
+    (unswizzled) e8m0 scales.
+  * Real: call the actual mxfp8 `torch._scaled_grouped_mm`, mirroring torchao's
+    `_compute_{fwd,dgrad,wgrad}_sm100` (torchao/prototype/moe_training/mxfp8_grouped_mm.py). This
+    requires (a) the e8m0 scales in the NVIDIA blocked/swizzled tcgen05 layout (per-group padded to
+    128 rows / 4 cols) and (b) token groups padded to a multiple of the block size so every group is
+    block-aligned; the M-dim outputs are unpadded afterward. `torch._scaled_grouped_mm` is SM100-only
+    -- this box is SM100 (`torch.cuda.get_device_capability() == (10, 0)`), so the real op runs here.
 
-The e8m0 cast primitive already lives in this repo's gold recipes (`mxfp8_f`) and is reused
-here rather than re-derived.
+The e8m0 cast primitive (`mxfp8_f`) and the pure-PyTorch blocked-scale swizzle (`_to_blocked_4d`)
+already live in this repo's gold recipes and are reused here rather than re-derived.
 """
 
 import os
@@ -35,6 +39,7 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from quant_cast_bench.quant_cast_gold.recipes import (  # noqa: E402
     _compute_error,
+    _to_blocked_4d,
     mxfp8_f,
 )
 
@@ -250,6 +255,259 @@ class MXFP8GroupedMM(torch.autograd.Function):
 def mxfp8_grouped_mm(input_act, weight_t, offs, out_dtype=torch.bfloat16):
     """Differentiable emulated mxfp8 grouped GEMM: `out = grouped_mm(input_act, weight_t)`."""
     return MXFP8GroupedMM.apply(input_act, weight_t, offs, out_dtype)
+
+
+# ===========================================================================
+# Real (non-emulated) path: call the actual SM100 `torch._scaled_grouped_mm`.
+#
+# The qdata and `offs` are identical to the emulated path; the two differences are that the real op
+# needs (a) the e8m0 scales in the NVIDIA blocked/swizzled tcgen05 layout and (b) token groups padded
+# to a multiple of the block size. The blocked-scale helpers below are pure-PyTorch ports of torchao's
+# `torch_to_blocked_*` (kernels/mxfp8/quant.py), substituting this repo's `_to_blocked_4d` for
+# torchao's `to_blocked` (bit-identical flat buffer). The pad/unpad helpers port torchao's
+# `torch_{pad,unpad}_token_groups`.
+# ===========================================================================
+def _ceil_div(a, b):
+    return (a + b - 1) // b
+
+
+def _pad_token_groups(inputs: torch.Tensor, group_offsets: torch.Tensor, alignment: int = BLOCK_SIZE):
+    """Pad each token group's rows up to a multiple of `alignment` with zeros so every group is
+    block-aligned. Port of torchao's `torch_pad_token_groups`. Over-allocates the output to the
+    upper bound `num_tokens + num_groups * alignment` (matching torchao's kernel).
+
+    Returns:
+        padded_tokens:        `(upper_bound, dim)` zero-padded tokens.
+        padded_start_offsets: `(num_groups,)` int start row of each group after padding.
+        padded_offsets:       `(num_groups,)` int32 end offsets after padding.
+    """
+    inputs = inputs.contiguous()
+    num_tokens, dim = inputs.shape
+    num_groups = group_offsets.shape[0]
+    zero = torch.zeros(1, dtype=group_offsets.dtype, device=group_offsets.device)
+    group_sizes = torch.diff(group_offsets, prepend=zero)
+    padded_sizes = _ceil_div(group_sizes, alignment) * alignment
+    padded_offsets = torch.cumsum(padded_sizes, 0, dtype=torch.int32)
+    padded_start_offsets = padded_offsets - padded_sizes
+
+    output_rows = _ceil_div(num_tokens + num_groups * alignment, alignment) * alignment
+    padded_tokens = inputs.new_zeros(output_rows, dim)
+    chunks = inputs.split(group_sizes.tolist(), dim=0)
+    for chunk, padded_start in zip(chunks, padded_start_offsets.tolist()):
+        padded_tokens[padded_start : padded_start + chunk.shape[0]] = chunk
+    return padded_tokens, padded_start_offsets, padded_offsets
+
+
+def _unpad_token_groups(
+    padded_inputs: torch.Tensor,
+    group_offsets: torch.Tensor,
+    padded_start_offsets: torch.Tensor,
+    num_tokens: int,
+) -> torch.Tensor:
+    """Inverse of `_pad_token_groups`: gather each group's original-size chunk back into a
+    `(num_tokens, dim)` tensor. Port of torchao's `torch_unpad_token_groups`."""
+    zero = torch.zeros(1, dtype=group_offsets.dtype, device=group_offsets.device)
+    group_sizes = torch.diff(group_offsets, prepend=zero)
+    chunks = [
+        padded_inputs[start : start + size]
+        for start, size in zip(padded_start_offsets.tolist(), group_sizes.tolist())
+    ]
+    unpadded = torch.cat(chunks, dim=0)
+    assert unpadded.shape[0] == num_tokens, f"unpad got {unpadded.shape[0]}, expected {num_tokens}"
+    return unpadded
+
+
+def _to_blocked_2d_m_groups(x_scales: torch.Tensor, group_offs: torch.Tensor) -> torch.Tensor:
+    """Blocked scale layout for 2d scales grouped along rows (the token dim M). Port of torchao's
+    `torch_to_blocked_2d_M_groups`: each group's scales are swizzled with `_to_blocked_4d` and written
+    at a running row offset, each group padded to a multiple of 128 rows."""
+    assert x_scales.ndim == 2, "x_scales must be 2D"
+    total_M, scale_cols = x_scales.shape
+    num_groups = group_offs.shape[0]
+    blocked_scales = x_scales.new_zeros(total_M + num_groups * 128, scale_cols)
+    group_start_idx = 0
+    prev_start_row = 0
+    for group_end_idx in group_offs.tolist():
+        group_size = group_end_idx - group_start_idx
+        if group_size == 0:
+            continue
+        group_blocked = _to_blocked_4d(x_scales[group_start_idx:group_end_idx]).reshape(-1, scale_cols)
+        group_rows_padded = _ceil_div(group_size, 128) * 128
+        blocked_scales[prev_start_row : prev_start_row + group_rows_padded] = group_blocked
+        prev_start_row += group_blocked.shape[0]
+        group_start_idx = group_end_idx
+    return blocked_scales
+
+
+def _to_blocked_per_group_3d(scales: torch.Tensor) -> torch.Tensor:
+    """Blocked scale layout for a 3d weight `(E, rows, cols)`: swizzle each expert's 2d scale with
+    `_to_blocked_4d` and flatten. Port of torchao's `torch_to_blocked_per_group_3d`. Returns
+    `(E, flat_len)`."""
+    assert scales.ndim == 3, "scales must be 3D (E, rows, cols)"
+    per_expert = [_to_blocked_4d(scales[i]).reshape(-1) for i in range(scales.shape[0])]
+    return torch.stack(per_expert, dim=0).contiguous()
+
+
+def _to_blocked_2d_k_groups(x_scales: torch.Tensor, group_offs: torch.Tensor) -> torch.Tensor:
+    """Blocked scale layout for 2d scales grouped along cols (the contraction dim, in scale space).
+    Port of torchao's `torch_to_blocked_2d_K_groups`: rows padded to 128, each group's cols padded to
+    4; per (128,4) scale tile the swizzled (512,) block is scattered into the flat output at a running
+    column offset."""
+    assert x_scales.ndim == 2, "x_scales must be 2D"
+    M, total_K = x_scales.shape
+    padded_M = _ceil_div(M, 128) * 128
+    num_groups = group_offs.shape[0]
+    blocked_scales = x_scales.new_zeros(padded_M, total_K + num_groups * 4)
+    blocked_flat = blocked_scales.view(-1)
+    stride_per_block = 128 * 4  # 512, a swizzled (128,4) scale tile
+    num_row_blocks = _ceil_div(M, 128)
+    group_start_idx = 0
+    prev_start_col = 0
+    for group_end_idx in group_offs.tolist():
+        group_size = group_end_idx - group_start_idx
+        if group_size == 0:
+            continue
+        cols_after_padding = _ceil_div(group_size, 4) * 4
+        num_col_blocks = cols_after_padding // 4
+        group_blocked = _to_blocked_4d(x_scales[:, group_start_idx:group_end_idx]).reshape(
+            num_row_blocks, num_col_blocks, -1
+        )
+        base = prev_start_col * padded_M
+        for row_block in range(num_row_blocks):
+            for col_block in range(num_col_blocks):
+                offset = (
+                    base
+                    + row_block * num_col_blocks * stride_per_block
+                    + col_block * stride_per_block
+                )
+                blocked_flat[offset : offset + stride_per_block] = group_blocked[row_block, col_block]
+        prev_start_col += cols_after_padding
+        group_start_idx = group_end_idx
+    return blocked_scales
+
+
+def mxfp8_fwd_real(
+    act: torch.Tensor,  # (M, K)
+    weight_t: torch.Tensor,  # (E, K, N)
+    offs: torch.Tensor,
+    out_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Forward: `out = grouped_mm(act, weight_t)` via the real `torch._scaled_grouped_mm`. Returns
+    `(M, N)`. Mirrors torchao's `_compute_fwd_sm100` (with token-group padding)."""
+    num_tokens = act.shape[0]
+    padded_act, padded_start_offs, padded_offs = _pad_token_groups(act, offs)
+    act_fp8, act_scale = quantize_2d_act(padded_act)  # (Mp,K), (Mp,K//32)
+    act_scale_blocked = _to_blocked_2d_m_groups(act_scale, padded_offs)
+    # Quantize the weight along K (the contraction dim) into a (E,N,K) row-major buffer, then pass its
+    # transpose (E,K,N) -- the real op requires mat2 to be a transposed (column-major) view.
+    w_e4m3, w_scale = mxfp8_f(weight_t.transpose(-2, -1).contiguous())  # (E,N,K), (E,N,K//32)
+    w_scale_blocked = _to_blocked_per_group_3d(w_scale)  # per-expert (N, K//32)
+    out = torch._scaled_grouped_mm(
+        act_fp8, w_e4m3.transpose(-2, -1), act_scale_blocked, w_scale_blocked,
+        offs=padded_offs, out_dtype=out_dtype,
+    )
+    return _unpad_token_groups(out, offs, padded_start_offs, num_tokens)
+
+
+def mxfp8_bwd_real(
+    grad_output: torch.Tensor,  # (M, N)
+    input_act: torch.Tensor,  # (M, K)
+    weight_t: torch.Tensor,  # (E, K, N)
+    offs: torch.Tensor,
+    out_dtype: torch.dtype = torch.bfloat16,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Backward for the real mxfp8 grouped GEMM. Computes BOTH gradients from one entry point:
+      * dgrad: `grad_input = grouped_mm(grad_output, weight)` (2d-3d), returns `(M, K)`;
+      * wgrad: per-group `grad_output^T @ input_act` (2d-2d), returns `grad_weight_t (E, K, N)`.
+    Mirrors torchao's `_compute_dgrad_sm100` + `_compute_wgrad_sm100`.
+
+    Kept as one function so the work shared between the two GEMMs (currently separate PyTorch ops) is
+    visible as kernel-fusion opportunities:
+      * `grad_output` is padded once and feeds both GEMMs, but in two orientations -- dgrad wants it
+        row-cast `(Mp, N)` (1x32 along N), wgrad wants it transposed-cast `(N, Mp)` (1x32 along M).
+        Those two casts of one tensor are exactly a fused both-orientation (dim_km) mxfp8 cast: a
+        single kernel could emit both qdata+scale pairs from one read of `padded_go`.
+      * both `torch._scaled_grouped_mm` calls share `padded_offs` (and the dgrad call reuses the
+        row-cast of `grad_output`), so a fused backward would quantize `grad_output` just once.
+    """
+    num_tokens = grad_output.shape[0]
+
+    # --- token-group padding (once per operand, shared by the GEMMs below) ---
+    padded_go, go_start_offs, padded_offs = _pad_token_groups(grad_output, offs)
+    scale_offs = padded_offs // BLOCK_SIZE
+    padded_ia, _, _ = _pad_token_groups(input_act, offs)
+
+    # --- grad_output casts: row-orientation (dgrad) + transposed-orientation (wgrad).
+    # FUSION: these two are a single both-orientation cast of `padded_go`.
+    go_fp8, go_scale = quantize_2d_act(padded_go)  # (Mp,N), 1x32 along N -> dgrad
+    go_t_fp8, go_t_scale = quantize_2d_act(padded_go.transpose(-2, -1).contiguous())  # (N,Mp) -> wgrad
+    go_scale_blocked = _to_blocked_2d_m_groups(go_scale, padded_offs)
+    go_t_scale_blocked = _to_blocked_2d_k_groups(go_t_scale, scale_offs)
+
+    # === dgrad: grad_input = grouped_mm(grad_output, weight) ===
+    # Weight in its natural (E,N,K) orientation blocked 1x32 along N (the dgrad contraction dim).
+    # weight_t is (E,K,N) with N last, so mxfp8_f blocks along N directly; the transpose gives the
+    # (E,N,K) column-major view the real op requires for mat2.
+    q_kn, scale_kn = mxfp8_f(weight_t.contiguous())  # (E,K,N), (E,K,N//32)
+    w_e4m3 = q_kn.transpose(-2, -1)  # (E,N,K) column-major view
+    w_scale_blocked = _to_blocked_per_group_3d(scale_kn)  # per-expert (K, N//32)
+    grad_input = torch._scaled_grouped_mm(
+        go_fp8, w_e4m3, go_scale_blocked, w_scale_blocked, offs=padded_offs, out_dtype=out_dtype
+    )
+    grad_input = _unpad_token_groups(grad_input, offs, go_start_offs, num_tokens)
+
+    # === wgrad: grad_weight_t = per-group grad_output^T @ input_act ===
+    # Both operands transposed so the group-partitioned contraction dim M is last, blocked 1x32 along
+    # M (K-groups scale layout, scale offsets = offs//32). M being contracted, the result needs no
+    # unpadding.
+    ia_t_fp8, ia_t_scale = quantize_2d_act(padded_ia.transpose(-2, -1).contiguous())  # (K, Mp)
+    ia_t_scale_blocked = _to_blocked_2d_k_groups(ia_t_scale, scale_offs)
+    grad_weight = torch._scaled_grouped_mm(
+        go_t_fp8,
+        ia_t_fp8.transpose(-2, -1),
+        go_t_scale_blocked,
+        ia_t_scale_blocked,
+        offs=padded_offs,
+        out_dtype=out_dtype,
+    )  # (E, N, K)
+
+    # The op leaves an empty group's output slice uninitialized (stale memory), but a group with no
+    # tokens contributes exactly zero weight gradient -- zero those experts to match the reference.
+    # TODO fix this in core
+    group_sizes = torch.diff(padded_offs, prepend=padded_offs.new_zeros(1))
+    grad_weight[group_sizes == 0] = 0
+
+    grad_weight_t = grad_weight.transpose(-2, -1)  # (E, K, N), matching weight_t
+
+    return grad_input, grad_weight_t
+
+
+class MXFP8GroupedMMReal(torch.autograd.Function):
+    """Differentiable real mxfp8 2d-3d grouped GEMM for MoE training. Same structure as
+    `MXFP8GroupedMM`, but forward/backward call the `*_real` GEMMs (real `torch._scaled_grouped_mm`
+    with blocked scales + token-group padding) instead of the emulated ones."""
+
+    @staticmethod
+    def forward(ctx, input_act, weight_t, offs, out_dtype=torch.bfloat16):
+        assert input_act.ndim == 2, "input_act must be 2D (M, K)"
+        assert weight_t.ndim == 3, "weight_t must be 3D (E, K, N)"
+        out = mxfp8_fwd_real(input_act, weight_t, offs, out_dtype=out_dtype)
+        ctx.save_for_backward(input_act, weight_t, offs)
+        ctx.out_dtype = out_dtype
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        input_act, weight_t, offs = ctx.saved_tensors
+        grad_input, grad_weight_t = mxfp8_bwd_real(
+            grad_output, input_act, weight_t, offs, out_dtype=ctx.out_dtype
+        )
+        return grad_input, grad_weight_t, None, None
+
+
+def mxfp8_grouped_mm_real(input_act, weight_t, offs, out_dtype=torch.bfloat16):
+    """Differentiable real mxfp8 grouped GEMM: `out = grouped_mm(input_act, weight_t)`."""
+    return MXFP8GroupedMMReal.apply(input_act, weight_t, offs, out_dtype)
 
 
 # Re-exported so tests / consumers share one SQNR definition with the gold recipes.
