@@ -152,37 +152,14 @@ def quantize_to_mxfp8_grouped(
     rounding_mode: RoundingMode = RoundingMode.RTNE,
     random_key: Tensor | None = None,
 ) -> tuple[Tensor, Tensor, Tensor] | tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-    """One-shot mxfp8 cast of a grouped token operand for the real `torch._scaled_grouped_mm`, the
-    grouped analog of the dense `quantize_to_mxfp8` above. Composes the `moe_utils` helpers
-    (token-group pad -> `mxfp8_f` -> blocked-scale swizzle); no new math. Pure-PyTorch reference; a
-    fused triton/cute kernel can later drop in behind this seam.
-
-    Mirrors the dense `quantize_to_mxfp8` interface; the one extra argument is `offs` (int32 group-end
-    offsets in token space), and all the knobs are keyword-only. Unlike the dense cast, `swizzle_type`
-    defaults to SWIZZLE_32_4_4: the grouped op requires blocked/swizzled scales, so there is no
-    NO_SWIZZLE grouped variant. Only the combination actually implemented today runs; anything else
-    raises (see below). No new features are wired here relative to the previous orientation-only cast.
-
-    Supported arguments:
-      * scaling_type: BlockWise1x32 only.
-      * orientation: NATURAL blocks the 1x32 along the last (contraction) dim and emits the M-groups
-        blocked scale; TRANSPOSED blocks along the token dim M and emits the K-groups blocked scale
-        (scale offsets = padded_offs // BLOCK_SIZE, internal); BOTH emits both pairs from a single
-        padded read -- the fusion-visible case a future kernel would collapse into one pass.
-      * swizzle_type: SWIZZLE_32_4_4 only.
-      * pad_input_to_next_multiple_of: must be None (NOT IMPLEMENTED).
-      * rounding_mode: RTNE only (STOCHASTIC NOT IMPLEMENTED).
-      * random_key: must be None (NOT IMPLEMENTED).
-
-    qdata is always returned row-major/contiguous; the caller composes the mat2 `.transpose(-2, -1)`
-    view at the GEMM call site. `padded_offs` (token space) is returned for the op's `offs=` and for
-    unpadding; the padded start rows and original token count are recoverable from it.
-
-    Returns:
-        NATURAL:    `(q (Mp, C),  scale_blocked_m_groups, padded_offs)`
-        TRANSPOSED: `(q (C,  Mp), scale_blocked_k_groups, padded_offs)`
-        BOTH:       `(q_natural (Mp, C), scale_blocked_m_groups,
-                      q_transposed (C, Mp), scale_blocked_k_groups, padded_offs)`
+    """
+    Differences from quantize_to_mxfp8:
+    * adds an `offs` argument
+    * swizzling is per-token-group
+    * semantics of `pad_input_to_next_multiple_of` are per-token-group for the first 
+      dimension (maybe this should be named differently)
+    * one extra output tensor (padded_offsets), if token-group padding is on
+      TODO(change output type to reflect ^)
     """
     if pad_input_to_next_multiple_of is not None:
         raise NotImplementedError("pad_input_to_next_multiple_of is not implemented yet")
@@ -229,38 +206,11 @@ def quantize_to_mxfp8_batched(
     rounding_mode: RoundingMode = RoundingMode.RTNE,
     random_key: Tensor | None = None,
 ) -> tuple[Tensor, Tensor] | tuple[Tensor, Tensor, Tensor, Tensor]:
-    """Batched (per-expert) mxfp8 cast of a 3d weight stack `(E, N, K)` for the real
-    `torch._scaled_grouped_mm` -- the batched analog of the dense `quantize_to_mxfp8` above. Unlike
-    `quantize_to_mxfp8_grouped`, the expert axis is a plain batch dim with NO offsets (each expert is
-    a full dense matrix), so this stays a separate weight-only path and takes no `offs`. Composes
-    `mxfp8_f` + `_to_blocked_per_group_3d`; no new math.
-
-    Mirrors the dense `quantize_to_mxfp8` interface exactly (same args, all knobs keyword-only), only
-    over a 3d input. As with `quantize_to_mxfp8_grouped`, `swizzle_type` defaults to SWIZZLE_32_4_4:
-    the grouped op requires blocked/swizzled scales, so there is no NO_SWIZZLE batched variant. Only
-    the combination actually implemented today runs; anything else raises. No new features are wired
-    here relative to the previous orientation-only cast.
-
-    Supported arguments:
-      * scaling_type: BlockWise1x32 only.
-      * orientation: NATURAL blocks the 1x32 along the last dim K (qdata `(E,N,K)`, scale `(E,N,K//32)`);
-        TRANSPOSED blocks along N (qdata `(E,K,N)`); BOTH emits both pairs from one read -- the
-        fusion-visible case: for a `weight_t (E,K,N)` stack (last dim N), NATURAL is the dgrad-B cast
-        (block along N) and TRANSPOSED is the fwd-B cast (block along K), so BOTH yields both weight
-        casts a forward+backward step needs in a single pass.
-      * swizzle_type: SWIZZLE_32_4_4 only.
-      * pad_input_to_next_multiple_of: must be None (NOT IMPLEMENTED).
-      * rounding_mode: RTNE only (STOCHASTIC NOT IMPLEMENTED).
-      * random_key: must be None (NOT IMPLEMENTED).
-
-    qdata is returned row-major/contiguous; the caller composes the mat2 `.transpose(-2, -1)` view at
-    the GEMM call site.
-
-    Returns:
-        NATURAL:    `(q (E,N,K), scale_blocked)`
-        TRANSPOSED: `(q (E,K,N), scale_blocked)`
-        BOTH:       `(q_natural (E,N,K), scale_blocked_natural,
-                      q_transposed (E,K,N), scale_blocked_transposed)`
+    """
+    Differences from quantize_to_mxfp8:
+    * input shape is 3d (E, N, K) instead of 2d (M, K)
+    * scaling type never applies to the E dimension, only to N and K
+    * swizzling is per-expert
     """
     assert input.dim() == 3, "input must be 3D (E, N, K)"
     if pad_input_to_next_multiple_of is not None:
