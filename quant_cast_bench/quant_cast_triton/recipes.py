@@ -23,6 +23,8 @@ from quant_cast_bench.quant_cast_gold.recipes import (
     Deepseek128x128Gold,
     Float8TensorwiseGold,
     HadamardRht,
+    Mxfp832x32DimKMSwizzleGold,
+    Mxfp832x32DimMSwizzleGold,
     Mxfp832x32Gold,
     Mxfp832x32SwizzleGold,
     Mxfp8DimKmGold,
@@ -718,6 +720,89 @@ MXFP8_32X32_SWIZZLE = QuantCastTritonRecipe.from_gold(
 
 
 # ---------------------------------------------------------------------------
+# mxfp8 32x32 dim-M / transposed swizzle: same square-block quant as _mxfp8_32x32_swizzle_kernel
+# (one e8m0 scale per 32x32 block, via the (32, CB, 32) double-max reduction), but the outputs are
+# written in the dim-M / transposed frame -- qdata (N, M) and the scale into the NVIDIA-swizzled 4D
+# block grid of the TRANSPOSED (N, M//32) scale. The block is square, so the scale VALUES are
+# identical to _mxfp8_32x32_swizzle_kernel; only the output layout changes. Mirrors
+# mxfp8_32x32_dim_m_swizzle_f. The per-block scale is expanded over the 32 columns of its col-block
+# (which become 32 transposed rows over N), and its swizzle pre-position is (row = n in [0, N),
+# col = 32-row-block index in [0, M//32)) -- reusing _mxfp8_dim_m_swizzle_kernel's flat formula.
+# Requires M%32==0 and N%32==0. The scale grid spans the PADDED extents (rows N->nrb*128, cols
+# M//32->ncb*4) so every slot of the (nrb, ncb, 32, 16) buffer is written -- real e8m0 bytes or
+# literal 0 (matching gold's zero-pad) -- letting the wrapper use torch.empty. Grid:
+# (ncb*4, cdiv(nrb*128, CB*32)).
+# ---------------------------------------------------------------------------
+@triton.autotune(configs=_MXFP8_32X32_CONFIGS, key=["M", "N"])
+@triton.jit
+def _mxfp8_32x32_dim_m_swizzle_kernel(
+    x_ptr, y_ptr, s_ptr, M, N, sxm, sxn, sym, syn, NCB, NRB, CB: tl.constexpr
+):
+    pid_rb = tl.program_id(0)  # single 32-row block (= transposed scale col, over the padded ncb*4)
+    pid_cb = tl.program_id(1)  # group of CB 32-col blocks (= transposed scale rows, over padded nrb*128)
+    offs_m = pid_rb * 32 + tl.arange(0, 32)
+    offs_n = pid_cb * (CB * 32) + tl.arange(0, CB * 32)
+    m_mask = offs_m < M
+    n_mask = offs_n < N
+    x = tl.load(
+        x_ptr + offs_m[:, None] * sxm + offs_n[None, :] * sxn,
+        mask=m_mask[:, None] & n_mask[None, :], other=0.0,
+    ).to(tl.float32)  # (32, CB*32); padded rows/cols read as 0
+    xr = tl.reshape(x, (32, CB, 32))
+    amax = tl.max(tl.max(tl.abs(xr), axis=2), axis=0)  # (CB,): within-block cols, then 32 rows
+    biased = _amax_to_e8m0_tl(amax)  # (CB,)
+    rcp = _e8m0_to_reciprocal_fp32_tl(biased)
+    y = tl.reshape((xr * rcp[None, :, None]).to(tl.float8e4nv), (32, CB * 32))  # (32, CB*32)
+    # transposed qdata store into (N, M): out[n, m] = y[m_in_tile, n_in_tile]. qdata is exactly
+    # (N, M) with no padding, so gate on both real transposed-row (offs_n < N) and real col (offs_m < M).
+    out_off = offs_n[:, None] * sym + offs_m[None, :] * syn
+    tl.store(y_ptr + out_off, tl.trans(y), mask=n_mask[:, None] & m_mask[None, :])
+    # swizzled scale store into the 4D grid (nrb, ncb, 32, 16). Pre-swizzle position in the transposed
+    # frame: row = n (over N), col = pid_rb (this program's single 32-row-block, over M//32). The one
+    # block scale is expanded over the 32 transposed rows of each col-block -- biased[cb] to every
+    # offs_n in that col-block. Padded transposed rows (n >= N) / cols (pid_rb >= M//32) are written 0.
+    row = offs_n                                    # (CB*32,)  transposed row over N
+    br = row // 128
+    r128 = row % 128
+    a = r128 // 32
+    b = r128 % 32
+    bc = pid_rb // 4                                # col = pid_rb (32-row-block index)
+    c4 = pid_rb % 4
+    flat = ((br * NCB + bc) * 32 + b) * 16 + (a * 4 + c4)  # (CB*32,)
+    # biased is (CB,); expand each col-block's scale over its 32 transposed rows -> (CB*32,).
+    biased_exp = tl.reshape(tl.broadcast_to(biased[:, None], (CB, 32)), (CB * 32,))
+    s_bytes = tl.where(n_mask & (pid_rb < (M // 32)), biased_exp.to(tl.uint8), 0)
+    # mask is OOB-safety only (offs_n >= NRB*128 -> br >= NRB -> out-of-buffer flat); padded rows in
+    # [N, NRB*128) are valid buffer positions and get the 0 written above.
+    tl.store(s_ptr + flat, s_bytes, mask=offs_n < (NRB * 128))
+
+
+def mxfp8_32x32_dim_m_swizzle_triton(x, **kwargs):
+    assert x.is_contiguous() and x.dim() == 2
+    M, N = x.shape
+    assert M % 32 == 0 and N % 32 == 0, "mxfp8_32x32_dim_m_swizzle kernel needs M%32==0 and N%32==0"
+    y = torch.empty((N, M), dtype=torch.float8_e4m3fn, device=x.device)
+    nrb = (N + 127) // 128            # transposed rows = N
+    ncb = ((M // 32) + 3) // 4        # transposed cols = M//32 (padded up to a multiple of 4)
+    # torch.empty (not zeros): the kernel writes every slot of the padded (nrb, ncb, 32, 16) grid
+    # itself -- real e8m0 bytes plus literal 0 for the padded transposed rows [N, nrb*128) and cols.
+    s_u8 = torch.empty(nrb, ncb, 32, 16, dtype=torch.uint8, device=x.device)
+    # grid dim0 = ncb*4 tiles the transposed scale col (32-row-block index) over [0, ncb*4) exactly;
+    # dim1 covers the padded transposed rows (nrb*128), not just N -- so every swizzle slot is visited
+    # exactly once. offs_m may overshoot M (masked on the qdata store).
+    grid = lambda meta: (ncb * 4, triton.cdiv(nrb * 128, meta["CB"] * 32))  # noqa: E731
+    _mxfp8_32x32_dim_m_swizzle_kernel[grid](
+        x, y, s_u8, M, N, x.stride(0), x.stride(1), y.stride(0), y.stride(1), ncb, nrb,
+    )
+    return y, s_u8.view(torch.float8_e8m0fnu)
+
+
+MXFP8_32X32_DIM_M_SWIZZLE = QuantCastTritonRecipe.from_gold(
+    Mxfp832x32DimMSwizzleGold, triton_fn=mxfp8_32x32_dim_m_swizzle_triton
+)
+
+
+# ---------------------------------------------------------------------------
 # mxfp8 dim-M: 32-row blocks down M, one e8m0 scale per (32-row-block, col); transposed
 # outputs (N, M) / (N, M//32). Mirrors mxfp8_dim_m_f.
 # Perf: process RB 32-row blocks x BN cols per program; reshape (RB*32, BN) -> (RB, 32, BN) and
@@ -1058,6 +1143,101 @@ def mxfp8_dim_km_swizzle_triton(x, **kwargs):
 
 MXFP8_DIM_KM_SWIZZLE = QuantCastTritonRecipe.from_gold(
     Mxfp8DimKmSwizzleGold, triton_fn=mxfp8_dim_km_swizzle_triton
+)
+
+
+# ---------------------------------------------------------------------------
+# mxfp8 32x32 both directions, one pass, with BOTH e8m0 scales in the swizzled 4D (nrb, ncb, 32, 16)
+# grid. The block is SQUARE, so the quantization + single per-block scale are shared: one (RB, CB)
+# scale (amax over each 32x32 block via the (RB, 32, CB, 32) double-max), one qdata reused for both
+# the dim-K (M,N) store and the dim-M (N,M) transposed store. Only the two scale layouts differ --
+# the same block scale expanded over its 32 rows (dim-K: sk (M, N//32)) or 32 cols then transposed
+# (dim-M: sm (N, M//32)), each scattered to its swizzled slot (reusing _mxfp8_dim_km_swizzle_kernel's
+# flat formulas). Mirrors mxfp8_32x32_dim_km_swizzle_f. Requires M%32==0, N%32==0. Both swizzle grids
+# allocate with torch.empty: the grid spans the PADDED extents Mpad=ceil(M/128)*128,
+# Npad=ceil(N/128)*128 so every slot of both buffers is written (real e8m0 bytes or literal 0).
+# ---------------------------------------------------------------------------
+@triton.autotune(configs=_DIM_KM_CONFIGS, key=["M", "N"])
+@triton.jit
+def _mxfp8_32x32_dim_km_swizzle_kernel(
+    x_ptr, yk_ptr, sk_ptr, ym_ptr, sm_ptr, M, N,
+    sxm, sxn, sykm, sykn, symn, symm, NCB_K, NCB_M,
+    BN: tl.constexpr, RB: tl.constexpr,
+):
+    BM: tl.constexpr = RB * 32   # rows in the tile
+    CB: tl.constexpr = BN // 32  # 32-col blocks in the tile
+    pid_m = tl.program_id(0)     # row-block group (BM rows), over Mpad
+    pid_n = tl.program_id(1)     # col group (BN cols), over Npad
+    offs_m = pid_m * BM + tl.arange(0, BM)
+    offs_n = pid_n * BN + tl.arange(0, BN)
+    m_real = offs_m < M
+    n_real = offs_n < N
+    x = tl.load(
+        x_ptr + offs_m[:, None] * sxm + offs_n[None, :] * sxn,
+        mask=m_real[:, None] & n_real[None, :], other=0.0,
+    ).to(tl.float32)  # (BM, BN); padded rows/cols read as 0
+    # one scale per 32x32 block: reshape (RB, 32, CB, 32) and reduce both within-block dims. M%32==0
+    # and N%32==0 -> each block is wholly real or wholly padded, so a real block's amax never mixes 0.
+    xr = tl.reshape(x, (RB, 32, CB, 32))
+    b = _amax_to_e8m0_tl(tl.max(tl.max(tl.abs(xr), axis=3), axis=1))  # (RB, CB) per block
+    rcp = _e8m0_to_reciprocal_fp32_tl(b)
+    q = tl.reshape((xr * rcp[:, None, :, None]).to(tl.float8e4nv), (BM, BN))  # shared qdata
+    # dim-K store: qdata (M, N) as-is.
+    tl.store(yk_ptr + offs_m[:, None] * sykm + offs_n[None, :] * sykn, q,
+             mask=m_real[:, None] & n_real[None, :])
+    # dim-M store: qdata transposed into (N, M).
+    tl.store(ym_ptr + offs_n[:, None] * symn + offs_m[None, :] * symm, tl.trans(q),
+             mask=n_real[:, None] & m_real[None, :])
+    # swizzled sk store: scale (M, N//32), block scale expanded over its 32 rows -> (BM, CB). Pre-swizzle
+    # row = m (over M), col = 32-col-block (over N//32). Padded slots (m >= M or col-block >= N//32) -> 0.
+    b_exp_k = tl.reshape(tl.broadcast_to(b[:, None, :], (RB, 32, CB)), (BM, CB))
+    row_k = offs_m[:, None]                              # (BM, 1)
+    col_k = (pid_n * CB + tl.arange(0, CB))[None, :]     # (1, CB)
+    r128k = row_k % 128
+    flat_k = (((row_k // 128) * NCB_K + col_k // 4) * 32 + r128k % 32) * 16 + (r128k // 32 * 4 + col_k % 4)
+    real_k = m_real[:, None] & (col_k < (N // 32))
+    tl.store(sk_ptr + flat_k, tl.where(real_k, b_exp_k.to(tl.uint8), 0))
+    # swizzled sm store: scale (N, M//32) transposed, block scale expanded over its 32 cols -> (RB, BN).
+    # Pre-swizzle row = n (over N), col = 32-row-block (over M//32). Padded slots -> 0.
+    b_exp_m = tl.reshape(tl.broadcast_to(b[:, :, None], (RB, CB, 32)), (RB, BN))
+    row_m = offs_n[None, :]                              # (1, BN)
+    col_m = (pid_m * RB + tl.arange(0, RB))[:, None]     # (RB, 1)
+    r128m = row_m % 128
+    flat_m = (((row_m // 128) * NCB_M + col_m // 4) * 32 + r128m % 32) * 16 + (r128m // 32 * 4 + col_m % 4)
+    real_m = (offs_n[None, :] < N) & (col_m < (M // 32))
+    tl.store(sm_ptr + flat_m, tl.where(real_m, b_exp_m.to(tl.uint8), 0))
+
+
+def mxfp8_32x32_dim_km_swizzle_triton(x, **kwargs):
+    assert x.is_contiguous() and x.dim() == 2
+    M, N = x.shape
+    assert M % 32 == 0 and N % 32 == 0, \
+        "mxfp8_32x32_dim_km_swizzle kernel needs M%32==0 and N%32==0"
+    yk = torch.empty_like(x, dtype=torch.float8_e4m3fn)                    # (M, N)
+    ym = torch.empty(N, M, dtype=torch.float8_e4m3fn, device=x.device)    # (N, M) transposed
+    # sk: (M, N//32) swizzled; sm: (N, M//32) swizzled. torch.empty (not zeros): the kernel writes
+    # every slot of both padded (nrb, ncb, 32, 16) grids itself (real e8m0 bytes or literal 0).
+    nrb_k = (M + 127) // 128
+    nrb_m = (N + 127) // 128
+    ncb_k = ((N // 32) + 3) // 4
+    ncb_m = ((M // 32) + 3) // 4
+    sk = torch.empty(nrb_k, ncb_k, 32, 16, dtype=torch.uint8, device=x.device)
+    sm = torch.empty(nrb_m, ncb_m, 32, 16, dtype=torch.uint8, device=x.device)
+    # grid spans the padded extents (multiples of 128, hence of every RB*32 and BN), so every swizzle
+    # slot is visited exactly once.
+    mpad = nrb_k * 128
+    npad = nrb_m * 128
+    grid = lambda meta: (triton.cdiv(mpad, meta["RB"] * 32), triton.cdiv(npad, meta["BN"]))  # noqa: E731
+    _mxfp8_32x32_dim_km_swizzle_kernel[grid](
+        x, yk, sk, ym, sm, M, N,
+        x.stride(0), x.stride(1), yk.stride(0), yk.stride(1),
+        ym.stride(0), ym.stride(1), ncb_k, ncb_m,
+    )
+    return yk, sk.view(torch.float8_e8m0fnu), ym, sm.view(torch.float8_e8m0fnu)
+
+
+MXFP8_32X32_DIM_KM_SWIZZLE = QuantCastTritonRecipe.from_gold(
+    Mxfp832x32DimKMSwizzleGold, triton_fn=mxfp8_32x32_dim_km_swizzle_triton
 )
 
 
@@ -1542,6 +1722,8 @@ ALL_RECIPES = [
     # 8-bit 2D
     ("mxfp8_32x32", MXFP8_32X32),
     ("mxfp8_32x32_swizzle", MXFP8_32X32_SWIZZLE),
+    ("mxfp8_32x32_dim_m_swizzle", MXFP8_32X32_DIM_M_SWIZZLE),
+    ("mxfp8_32x32_dim_km_swizzle", MXFP8_32X32_DIM_KM_SWIZZLE),
     ("fp8_deepseek_128x128", FP8_DEEPSEEK_128X128),
     # 8-bit rowwise/colwise
     ("fp8_rowwise", FP8_ROWWISE),
