@@ -884,6 +884,54 @@ Mxfp832x32DimKMSwizzleGold = QuantCastSingleKernelGold(
     perf_description="(32,32) block, one pass, t-contig, swizzle",
 )
 
+# ---------------------------------------------------------------------------
+# Golden recipe: same as Mxfp832x32DimKMSwizzleGold, but WITHOUT the dim-M qdata. On Blackwell
+# torch._scaled_mm accepts the second operand in row-major, so we only ever need the dim-K qdata
+# (M,N); the dim-M frame contributes only its swizzled scale. So this emits three outputs -- one
+# qdata (M,N) plus both swizzled scales (dim-K -> (M, N//32), dim-M -> (N, M//32)) -- saving the
+# transposed-qdata write of the full dim_km variant. The block is square so the single per-block
+# e8m0 scale is shared between the two frames.
+# ---------------------------------------------------------------------------
+def mxfp8_32x32_qdata_dim_k_scale_dim_km_swizzle_f(x, **kwargs):
+    """One pass over x with square 32x32 blocks: dim-K qdata + both swizzled scales (no dim-M
+    qdata). Returns (qk (M,N), sk_blocked, sm_blocked) where sk/sm are the 4D block grids
+    `(nrb, ncb, 32, 16)` of the block scale expanded to (M, N//32) / (N, M//32)."""
+    qdata, scale_e8m0 = mxfp8_32x32_f(x)  # (M, N), (M//32, N//32)
+    # dim-K frame: expand the per-block scale over its 32 rows -> (M, N//32).
+    sk = _to_blocked_4d(scale_e8m0.repeat_interleave(32, dim=0))
+    # dim-M frame: expand over its 32 columns -> (M//32, N), transpose to (N, M//32).
+    sm = _to_blocked_4d(scale_e8m0.repeat_interleave(32, dim=1).t().contiguous())
+    return qdata, sk, sm
+
+
+def _mxfp8_32x32_qdata_dim_k_scale_dim_km_swizzle_correctness(
+    inputs: Tuple[torch.Tensor, ...],
+    outputs: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+) -> None:
+    """The dim-K qdata dequants back to `x` under both scales: directly with sk, and -- since the
+    block is square and the qdata is shared -- in the transposed frame with sm (then .t())."""
+    (x,) = inputs
+    qk, sk, sm = outputs
+    sqnr_k = _compute_error(x.float(), mxfp8_swizzle_dq_f(qk, sk).float())
+    sqnr_m = _compute_error(x.float(), mxfp8_swizzle_dq_f(qk.t().contiguous(), sm).t().float())
+    threshold = 15.0
+    assert sqnr_k > threshold, (
+        f"mxfp8_32x32_qdata_dim_k_scale_dim_km_swizzle (dim-k): "
+        f"sqnr={sqnr_k.item():.2f} dB below {threshold} dB"
+    )
+    assert sqnr_m > threshold, (
+        f"mxfp8_32x32_qdata_dim_k_scale_dim_km_swizzle (dim-m): "
+        f"sqnr={sqnr_m.item():.2f} dB below {threshold} dB"
+    )
+
+
+Mxfp832x32QdataDimKScaleDimKMSwizzleGold = QuantCastSingleKernelGold(
+    pt_ref_fn=mxfp8_32x32_qdata_dim_k_scale_dim_km_swizzle_f,
+    correctness_fn=_mxfp8_32x32_qdata_dim_k_scale_dim_km_swizzle_correctness,
+    example_input_fn=lambda M, K: (torch.randn(M, K, dtype=torch.bfloat16, device="cuda"),),
+    perf_description="(32,32) block, one pass, dim-k qdata + km scales, swizzle",
+)
+
 
 # ---------------------------------------------------------------------------
 # Golden recipe: mxfp8 with swizzled (NVIDIA 32x4x4 blocked) scale.
@@ -1636,6 +1684,10 @@ ALL_RECIPES = [
     ("mxfp8_32x32_swizzle", Mxfp832x32SwizzleGold),
     ("mxfp8_32x32_dim_m_swizzle", Mxfp832x32DimMSwizzleGold),
     ("mxfp8_32x32_dim_km_swizzle", Mxfp832x32DimKMSwizzleGold),
+    (
+        "mxfp8_32x32_qdata_dim_k_scale_dim_km_swizzle",
+        Mxfp832x32QdataDimKScaleDimKMSwizzleGold,
+    ),
     ("fp8_deepseek_128x128", Deepseek128x128Gold),
     # 8-bit rowwise/colwise
     ("fp8_rowwise", RowwiseFp8Gold),

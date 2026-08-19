@@ -26,6 +26,7 @@ from quant_cast_bench.quant_cast_gold.recipes import (
     Mxfp832x32DimKMSwizzleGold,
     Mxfp832x32DimMSwizzleGold,
     Mxfp832x32Gold,
+    Mxfp832x32QdataDimKScaleDimKMSwizzleGold,
     Mxfp832x32SwizzleGold,
     Mxfp8DimKmGold,
     Mxfp8DimKmSwizzleGold,
@@ -1242,6 +1243,96 @@ MXFP8_32X32_DIM_KM_SWIZZLE = QuantCastTritonRecipe.from_gold(
 
 
 # ---------------------------------------------------------------------------
+# mxfp8 32x32 like _mxfp8_32x32_dim_km_swizzle_kernel, but WITHOUT the dim-M qdata store: on
+# Blackwell torch._scaled_mm takes the second operand row-major, so only the dim-K qdata (M,N) is
+# needed and the dim-M frame contributes only its swizzled scale. Same square-block quantization
+# (one (RB, CB) scale per 32x32 block, one shared qdata) -> three outputs: qk (M,N), sk (M, N//32)
+# swizzled, sm (N, M//32) swizzled. Dropping the transposed-qdata write is the whole point (less
+# store traffic). Mirrors mxfp8_32x32_qdata_dim_k_scale_dim_km_swizzle_f. Requires M%32==0, N%32==0.
+# Both swizzle grids allocate with torch.empty: the grid spans the PADDED extents so every slot is
+# written (real e8m0 bytes or literal 0).
+# ---------------------------------------------------------------------------
+@triton.autotune(configs=_DIM_KM_CONFIGS, key=["M", "N"])
+@triton.jit
+def _mxfp8_32x32_qdata_dim_k_scale_dim_km_swizzle_kernel(
+    x_ptr, yk_ptr, sk_ptr, sm_ptr, M, N,
+    sxm, sxn, sykm, sykn, NCB_K, NCB_M,
+    BN: tl.constexpr, RB: tl.constexpr,
+):
+    BM: tl.constexpr = RB * 32   # rows in the tile
+    CB: tl.constexpr = BN // 32  # 32-col blocks in the tile
+    pid_m = tl.program_id(0)     # row-block group (BM rows), over Mpad
+    pid_n = tl.program_id(1)     # col group (BN cols), over Npad
+    offs_m = pid_m * BM + tl.arange(0, BM)
+    offs_n = pid_n * BN + tl.arange(0, BN)
+    m_real = offs_m < M
+    n_real = offs_n < N
+    x = tl.load(
+        x_ptr + offs_m[:, None] * sxm + offs_n[None, :] * sxn,
+        mask=m_real[:, None] & n_real[None, :], other=0.0,
+    ).to(tl.float32)  # (BM, BN); padded rows/cols read as 0
+    # one scale per 32x32 block: reshape (RB, 32, CB, 32) and reduce both within-block dims. M%32==0
+    # and N%32==0 -> each block is wholly real or wholly padded, so a real block's amax never mixes 0.
+    xr = tl.reshape(x, (RB, 32, CB, 32))
+    b = _amax_to_e8m0_tl(tl.max(tl.max(tl.abs(xr), axis=3), axis=1))  # (RB, CB) per block
+    rcp = _e8m0_to_reciprocal_fp32_tl(b)
+    q = tl.reshape((xr * rcp[:, None, :, None]).to(tl.float8e4nv), (BM, BN))  # dim-K qdata only
+    # dim-K store: qdata (M, N) as-is. No dim-M qdata store.
+    tl.store(yk_ptr + offs_m[:, None] * sykm + offs_n[None, :] * sykn, q,
+             mask=m_real[:, None] & n_real[None, :])
+    # swizzled sk store: scale (M, N//32), block scale expanded over its 32 rows -> (BM, CB). Pre-swizzle
+    # row = m (over M), col = 32-col-block (over N//32). Padded slots (m >= M or col-block >= N//32) -> 0.
+    b_exp_k = tl.reshape(tl.broadcast_to(b[:, None, :], (RB, 32, CB)), (BM, CB))
+    row_k = offs_m[:, None]                              # (BM, 1)
+    col_k = (pid_n * CB + tl.arange(0, CB))[None, :]     # (1, CB)
+    r128k = row_k % 128
+    flat_k = (((row_k // 128) * NCB_K + col_k // 4) * 32 + r128k % 32) * 16 + (r128k // 32 * 4 + col_k % 4)
+    real_k = m_real[:, None] & (col_k < (N // 32))
+    tl.store(sk_ptr + flat_k, tl.where(real_k, b_exp_k.to(tl.uint8), 0))
+    # swizzled sm store: scale (N, M//32) transposed, block scale expanded over its 32 cols -> (RB, BN).
+    # Pre-swizzle row = n (over N), col = 32-row-block (over M//32). Padded slots -> 0.
+    b_exp_m = tl.reshape(tl.broadcast_to(b[:, :, None], (RB, CB, 32)), (RB, BN))
+    row_m = offs_n[None, :]                              # (1, BN)
+    col_m = (pid_m * RB + tl.arange(0, RB))[:, None]     # (RB, 1)
+    r128m = row_m % 128
+    flat_m = (((row_m // 128) * NCB_M + col_m // 4) * 32 + r128m % 32) * 16 + (r128m // 32 * 4 + col_m % 4)
+    real_m = (offs_n[None, :] < N) & (col_m < (M // 32))
+    tl.store(sm_ptr + flat_m, tl.where(real_m, b_exp_m.to(tl.uint8), 0))
+
+
+def mxfp8_32x32_qdata_dim_k_scale_dim_km_swizzle_triton(x, **kwargs):
+    assert x.is_contiguous() and x.dim() == 2
+    M, N = x.shape
+    assert M % 32 == 0 and N % 32 == 0, \
+        "mxfp8_32x32_qdata_dim_k_scale_dim_km_swizzle kernel needs M%32==0 and N%32==0"
+    yk = torch.empty_like(x, dtype=torch.float8_e4m3fn)                    # (M, N)
+    # sk: (M, N//32) swizzled; sm: (N, M//32) swizzled. torch.empty (not zeros): the kernel writes
+    # every slot of both padded (nrb, ncb, 32, 16) grids itself (real e8m0 bytes or literal 0).
+    nrb_k = (M + 127) // 128
+    nrb_m = (N + 127) // 128
+    ncb_k = ((N // 32) + 3) // 4
+    ncb_m = ((M // 32) + 3) // 4
+    sk = torch.empty(nrb_k, ncb_k, 32, 16, dtype=torch.uint8, device=x.device)
+    sm = torch.empty(nrb_m, ncb_m, 32, 16, dtype=torch.uint8, device=x.device)
+    # grid spans the padded extents (multiples of 128, hence of every RB*32 and BN), so every swizzle
+    # slot is visited exactly once.
+    mpad = nrb_k * 128
+    npad = nrb_m * 128
+    grid = lambda meta: (triton.cdiv(mpad, meta["RB"] * 32), triton.cdiv(npad, meta["BN"]))  # noqa: E731
+    _mxfp8_32x32_qdata_dim_k_scale_dim_km_swizzle_kernel[grid](
+        x, yk, sk, sm, M, N,
+        x.stride(0), x.stride(1), yk.stride(0), yk.stride(1), ncb_k, ncb_m,
+    )
+    return yk, sk.view(torch.float8_e8m0fnu), sm.view(torch.float8_e8m0fnu)
+
+
+MXFP8_32X32_QDATA_DIM_K_SCALE_DIM_KM_SWIZZLE = QuantCastTritonRecipe.from_gold(
+    Mxfp832x32QdataDimKScaleDimKMSwizzleGold,
+    triton_fn=mxfp8_32x32_qdata_dim_k_scale_dim_km_swizzle_triton,
+)
+
+
+# ---------------------------------------------------------------------------
 # mxfp8 1x32 with the e8m0 scale written directly into the NVIDIA-swizzled 4D block grid
 # (nrb, ncb, 32, 16). Same quant as mxfp8; the scale for pre-swizzle position (row, col)
 # lands at flat offset ((br*ncb+bc)*32 + b)*16 + (a*4+c4), where br=row//128, r128=row%128,
@@ -1724,6 +1815,10 @@ ALL_RECIPES = [
     ("mxfp8_32x32_swizzle", MXFP8_32X32_SWIZZLE),
     ("mxfp8_32x32_dim_m_swizzle", MXFP8_32X32_DIM_M_SWIZZLE),
     ("mxfp8_32x32_dim_km_swizzle", MXFP8_32X32_DIM_KM_SWIZZLE),
+    (
+        "mxfp8_32x32_qdata_dim_k_scale_dim_km_swizzle",
+        MXFP8_32X32_QDATA_DIM_K_SCALE_DIM_KM_SWIZZLE,
+    ),
     ("fp8_deepseek_128x128", FP8_DEEPSEEK_128X128),
     # 8-bit rowwise/colwise
     ("fp8_rowwise", FP8_ROWWISE),

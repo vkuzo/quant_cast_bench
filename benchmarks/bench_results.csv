@@ -46,6 +46,8 @@ mxfp8_32x32_dim_m_swizzle,compile,0.4190,1942.1,24.28
 mxfp8_32x32_dim_m_swizzle,triton,0.1515,5372.5,67.16
 mxfp8_32x32_dim_km_swizzle,compile,0.5637,1934.6,24.18
 mxfp8_32x32_dim_km_swizzle,triton,0.1890,5769.4,72.12
+mxfp8_32x32_qdata_dim_k_scale_dim_km_swizzle,compile,0.3871,2123.9,26.55
+mxfp8_32x32_qdata_dim_k_scale_dim_km_swizzle,triton,0.1367,6015.9,75.20
 fp8_deepseek_128x128,compile,0.2269,3548.9,44.36
 fp8_deepseek_128x128,triton,0.1306,6166.1,77.08
 fp8_deepseek_128x128,cute,0.1415,5690.7,71.13
