@@ -35,25 +35,23 @@ _REQUIRES_SM100 = frozenset({
 # Shapes each recipe is run at. (512, 512) is the aligned baseline every recipe supports. The two
 # ragged shapes force the swizzle kernels' scale-grid padding (M%128!=0 and/or N%128!=0), which the
 # aligned shapes never exercise -- the kernels allocate that grid with torch.empty and must write 0
-# into every padded slot themselves. 96x160 pads BOTH M and N (for the recipes that allow M%32
-# alignment: mxfp8_32x32_swizzle, mxfp8_swizzle, mxfp8_dim_km_swizzle); 128x160 keeps M%128==0 (as
-# the dim-M transpose kernels require) while padding the transposed-row (N) direction, covering
-# mxfp8_dim_m_swizzle.
+# into every padded slot themselves. Both 96x160 and 128x160 pad M and/or N for every mxfp8 recipe
+# that allows M%32/N%32 alignment (mxfp8_32x32_swizzle, mxfp8_swizzle, mxfp8_dim_m, mxfp8_dim_m_swizzle,
+# mxfp8_dim_km, mxfp8_dim_km_swizzle); 128x160 additionally keeps M%128==0 while padding only N.
 _SHAPES = [(512, 512), (96, 160), (128, 160)]
 
 # Recipes whose input construction / gold / kernel needs stricter alignment than a given ragged
-# shape provides, so they're skipped for that shape. deepseek needs N%128==0; the dim-M/dim-KM
-# kernels need M%128==0 (dim-KM also N%128==0); nvfp4 needs N%64==0; nvfp4_blocked_outer needs
-# M%128==0 and N%128==0. (512, 512) supports every recipe, so it has no blocklist.
+# shape provides, so they're skipped for that shape. deepseek needs N%128==0; nvfp4 needs N%64==0;
+# nvfp4_blocked_outer needs M%128==0 and N%128==0. (The mxfp8 dim-M/dim-KM kernels only need M%32==0
+# and N%32==0, so they run at both ragged shapes.) (512, 512) supports every recipe -- no blocklist.
 _SHAPE_UNSUPPORTED = {
     (96, 160): frozenset({
         "fp8_deepseek_1x128", "fp8_deepseek_1x128_dim_m", "fp8_deepseek_1x128_dim_km",
-        "fp8_deepseek_128x128", "mxfp8_dim_m", "mxfp8_dim_m_swizzle", "mxfp8_dim_km",
-        "nvfp4", "nvfp4_swizzle", "nvfp4_blocked_outer",
+        "fp8_deepseek_128x128", "nvfp4", "nvfp4_swizzle", "nvfp4_blocked_outer",
     }),
     (128, 160): frozenset({
         "fp8_deepseek_1x128", "fp8_deepseek_1x128_dim_km", "fp8_deepseek_128x128",
-        "mxfp8_dim_km", "nvfp4", "nvfp4_swizzle", "nvfp4_blocked_outer",
+        "nvfp4", "nvfp4_swizzle", "nvfp4_blocked_outer",
     }),
 }
 
