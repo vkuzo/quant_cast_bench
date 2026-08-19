@@ -727,7 +727,8 @@ MXFP8_32X32_SWIZZLE = QuantCastTritonRecipe.from_gold(
 # TMA/load parallelism = occupancy (see the tma_occupancy_not_pipelining note), NOT from wider
 # coalesced stores -- shrinking the tile *worsens* store coalescing yet nearly doubles BW (RB=1
 # BN=64 W=1 -> 69 reg/thread, 40% warps active, 57% DRAM). So we autotune RB (not fix it) and
-# include few-warp configs. Requires M % 128 == 0. Grid: (M // (RB*32), cdiv(N, BN)).
+# include few-warp configs. Requires M % 32 == 0. Grid: (cdiv(M, RB*32), cdiv(N, BN)) -- both dims
+# are ragged (m_mask/n_mask), so padded rows read 0 and padded scale block-cols aren't written.
 # ---------------------------------------------------------------------------
 _DIM_M_CONFIGS = [
     triton.Config({"BN": bn, "RB": rb}, num_warps=w)
@@ -740,16 +741,22 @@ _DIM_M_CONFIGS = [
 @triton.autotune(configs=_DIM_M_CONFIGS, key=["M", "N"])
 @triton.jit
 def _mxfp8_dim_m_kernel(
-    x_ptr, y_ptr, s_ptr, M, N, sxm, sxn, sym, syn, ssm, ssn, BN: tl.constexpr, RB: tl.constexpr
+    x_ptr, y_ptr, s_ptr, M, N, sxm, sxn, sym, syn, ssm, ssn,
+    BN: tl.constexpr, RB: tl.constexpr, MRAG: tl.constexpr,
 ):
     pid_rb = tl.program_id(0)
     pid_n = tl.program_id(1)
     offs_m = pid_rb * (RB * 32) + tl.arange(0, RB * 32)  # 128 rows
     offs_n = pid_n * BN + tl.arange(0, BN)
+    m_mask = offs_m < M
     n_mask = offs_n < N
+    # M%128==0 (MRAG False) -> the row grid divides M exactly for every RB and M//32 is a multiple of
+    # RB, so the m_mask/s_cols masks are all-true; drop them (n_mask alone, as the aligned kernel did)
+    # to keep the unpredicated codegen. n_mask stays always (BN=256 can overshoot even when N%128==0).
     x = tl.load(
-        x_ptr + offs_m[:, None] * sxm + offs_n[None, :] * sxn, mask=n_mask[None, :]
-    ).to(tl.float32)  # (128, BN)
+        x_ptr + offs_m[:, None] * sxm + offs_n[None, :] * sxn,
+        mask=(m_mask[:, None] & n_mask[None, :]) if MRAG else n_mask[None, :], other=0.0,
+    ).to(tl.float32)  # (RB*32, BN); padded rows (offs_m >= M) read as 0
     xr = tl.reshape(x, (RB, 32, BN))
     amax = tl.max(tl.abs(xr), axis=1)  # (RB, BN): per (row-block, col)
     biased = _amax_to_e8m0_cvt(amax)  # (RB, BN); hardware cvt.rp e8m0
@@ -757,25 +764,27 @@ def _mxfp8_dim_m_kernel(
     y = tl.reshape((xr * rcp[:, None, :]).to(tl.float8e4nv), (RB * 32, BN))  # (128, BN)
     # transposed qdata store into (N, M): out[n, m] = y[m_in_tile, n]; 128-wide contiguous per row.
     out_off = offs_n[:, None] * sym + offs_m[None, :] * syn
-    tl.store(y_ptr + out_off, tl.trans(y), mask=n_mask[:, None])
-    # transposed scale store into (N, M//32): out_scale[n, pid_rb*RB + rb] = biased[rb, n]
+    tl.store(y_ptr + out_off, tl.trans(y),
+             mask=(n_mask[:, None] & m_mask[None, :]) if MRAG else n_mask[:, None])
+    # transposed scale store into (N, M//32): out_scale[n, pid_rb*RB + rb] = biased[rb, n]. The (N, M//32)
+    # buffer is exactly sized, so no zeroing: just skip padded block-cols (s_cols >= M//32).
     s_cols = pid_rb * RB + tl.arange(0, RB)
     tl.store(
         s_ptr + offs_n[:, None] * ssm + s_cols[None, :] * ssn, tl.trans(biased.to(tl.uint8)),
-        mask=n_mask[:, None],
+        mask=(n_mask[:, None] & (s_cols < (M // 32))[None, :]) if MRAG else n_mask[:, None],
     )
 
 
 def mxfp8_dim_m_triton(x, **kwargs):
     assert x.is_contiguous() and x.dim() == 2
     M, N = x.shape
-    assert M % 128 == 0, "mxfp8_dim_m fast kernel needs M%128==0"
+    assert M % 32 == 0, "mxfp8_dim_m fast kernel needs M%32==0"
     y = torch.empty((N, M), dtype=torch.float8_e4m3fn, device=x.device)
     s_u8 = torch.empty((N, M // 32), dtype=torch.uint8, device=x.device)
-    grid = lambda meta: (M // (meta["RB"] * 32), triton.cdiv(N, meta["BN"]))  # noqa: E731
+    grid = lambda meta: (triton.cdiv(M, meta["RB"] * 32), triton.cdiv(N, meta["BN"]))  # noqa: E731
     _mxfp8_dim_m_kernel[grid](
         x, y, s_u8, M, N, x.stride(0), x.stride(1), y.stride(0), y.stride(1),
-        s_u8.stride(0), s_u8.stride(1),
+        s_u8.stride(0), s_u8.stride(1), MRAG=(M % 128 != 0),
     )
     return y, s_u8.view(torch.float8_e8m0fnu)
 
@@ -791,8 +800,10 @@ MXFP8_DIM_M = QuantCastTritonRecipe.from_gold(
 # scale store changes -- instead of a transposed (N, M//32) 2D write it scatters each block's e8m0
 # byte to its swizzled slot. The swizzle acts on the TRANSPOSED-frame scale (N, M//32): the
 # pre-swizzle position is (row = n in [0, N), col = 32-row-block index in [0, M//32)), so it reuses
-# _mxfp8_swizzle_kernel's flat formula. Mirrors mxfp8_dim_m_swizzle_f. Requires
-# M % 128 == 0. Grid: (M // (RB*32), cdiv(N, BN)).
+# _mxfp8_swizzle_kernel's flat formula. Mirrors mxfp8_dim_m_swizzle_f. Requires M % 32 == 0. The
+# scale grid spans the PADDED col extent Mpad=ceil(M/128)*128 so every slot of the (nrb, ncb, 32, 16)
+# buffer is written -- real e8m0 bytes or literal 0 for padded rows/cols (matching gold's zero-pad).
+# Grid: (Mpad // (RB*32), cdiv(NRB*128, BN)).
 # ---------------------------------------------------------------------------
 @triton.autotune(configs=_DIM_M_CONFIGS, key=["M", "N"])
 @triton.jit
@@ -803,22 +814,24 @@ def _mxfp8_dim_m_swizzle_kernel(
     pid_n = tl.program_id(1)  # over the padded transposed rows (NRB*128), not just N
     offs_m = pid_rb * (RB * 32) + tl.arange(0, RB * 32)  # 128 rows
     offs_n = pid_n * BN + tl.arange(0, BN)
+    m_mask = offs_m < M
     n_mask = offs_n < N
     x = tl.load(
-        x_ptr + offs_m[:, None] * sxm + offs_n[None, :] * sxn, mask=n_mask[None, :], other=0.0
-    ).to(tl.float32)  # (RB*32, BN); padded transposed rows (offs_n >= N) read as 0
+        x_ptr + offs_m[:, None] * sxm + offs_n[None, :] * sxn,
+        mask=m_mask[:, None] & n_mask[None, :], other=0.0,
+    ).to(tl.float32)  # (RB*32, BN); padded rows (offs_m >= M) and transposed rows (offs_n >= N) read as 0
     xr = tl.reshape(x, (RB, 32, BN))
     amax = tl.max(tl.abs(xr), axis=1)  # (RB, BN): per (row-block, col)
     biased = _amax_to_e8m0_cvt(amax)  # (RB, BN); hardware cvt.rp e8m0
     rcp = _e8m0_to_reciprocal_fp32_tl(biased)
     y = tl.reshape((xr * rcp[:, None, :]).to(tl.float8e4nv), (RB * 32, BN))  # (128, BN)
     # transposed qdata store into (N, M): out[n, m] = y[m_in_tile, n]; 128-wide contiguous per row.
-    # y is exactly (N, M) (no padding), so only real transposed rows (offs_n < N) are written.
+    # y is exactly (N, M) (no padding), so only real slots (offs_n < N and offs_m < M) are written.
     out_off = offs_n[:, None] * sym + offs_m[None, :] * syn
-    tl.store(y_ptr + out_off, tl.trans(y), mask=n_mask[:, None])
+    tl.store(y_ptr + out_off, tl.trans(y), mask=n_mask[:, None] & m_mask[None, :])
     # swizzled scale store into the 4D grid (nrb, ncb, 32, 16). Pre-swizzle position in the
-    # transposed frame: row = n (over N), col = 32-row-block index (over M//32, always real since
-    # M%128==0). biased is (RB, BN). Padded transposed rows (n >= N) are written with literal 0 to
+    # transposed frame: row = n (over N), col = 32-row-block index (over M//32). biased is (RB, BN).
+    # Padded transposed rows (n >= N) and padded cols (col >= M//32) are written with literal 0 to
     # match gold's zero-pad.
     row = offs_n[None, :]                             # (1, BN)  transposed row
     col = (pid_rb * RB + tl.arange(0, RB))[:, None]   # (RB, 1)  32-row-block index
@@ -829,7 +842,7 @@ def _mxfp8_dim_m_swizzle_kernel(
     bc = col // 4
     c4 = col % 4
     flat = ((br * NCB + bc) * 32 + b) * 16 + (a * 4 + c4)  # (RB, BN)
-    s_bytes = tl.where(n_mask[None, :], biased.to(tl.uint8), 0)
+    s_bytes = tl.where(n_mask[None, :] & (col < (M // 32)), biased.to(tl.uint8), 0)
     # mask is OOB-safety only (offs_n >= NRB*128 -> br >= NRB -> out-of-buffer flat); padded rows in
     # [N, NRB*128) are valid buffer positions and get the 0 written above.
     tl.store(s_ptr + flat, s_bytes, mask=(offs_n < (NRB * 128))[None, :])
@@ -838,15 +851,18 @@ def _mxfp8_dim_m_swizzle_kernel(
 def mxfp8_dim_m_swizzle_triton(x, **kwargs):
     assert x.is_contiguous() and x.dim() == 2
     M, N = x.shape
-    assert M % 128 == 0, "mxfp8_dim_m_swizzle fast kernel needs M%128==0"
+    assert M % 32 == 0, "mxfp8_dim_m_swizzle fast kernel needs M%32==0"
     y = torch.empty((N, M), dtype=torch.float8_e4m3fn, device=x.device)
     nrb = (N + 127) // 128            # transposed rows = N
-    ncb = ((M // 32) + 3) // 4        # transposed cols = M//32 (M%128==0 -> exact M//128)
+    ncb = ((M // 32) + 3) // 4        # transposed cols = M//32 (padded up to a multiple of 4)
     # torch.empty (not zeros): the kernel writes every slot of the padded (nrb, ncb, 32, 16) grid
-    # itself -- real e8m0 bytes plus literal 0 for the padded transposed rows [N, nrb*128).
+    # itself -- real e8m0 bytes plus literal 0 for the padded transposed rows [N, nrb*128) and cols.
     s_u8 = torch.empty(nrb, ncb, 32, 16, dtype=torch.uint8, device=x.device)
-    # grid dim1 covers the padded transposed rows (nrb*128), not just N, so every slot is written.
-    grid = lambda meta: (M // (meta["RB"] * 32), triton.cdiv(nrb * 128, meta["BN"]))  # noqa: E731
+    # grid dim0 spans the padded col extent Mpad (multiple of 128, hence of every RB*32) so the
+    # 32-row-block col index tiles [0, ncb*4) exactly; dim1 covers the padded transposed rows
+    # (nrb*128), not just N -- so every swizzle slot is visited exactly once.
+    mpad = ((M + 127) // 128) * 128
+    grid = lambda meta: (mpad // (meta["RB"] * 32), triton.cdiv(nrb * 128, meta["BN"]))  # noqa: E731
     _mxfp8_dim_m_swizzle_kernel[grid](
         x, y, s_u8, M, N, x.stride(0), x.stride(1), y.stride(0), y.stride(1), ncb, nrb,
     )
@@ -863,10 +879,12 @@ MXFP8_DIM_M_SWIZZLE = QuantCastTritonRecipe.from_gold(
 # and reduces it both ways: dim-K = 1x32 blocks along columns (reshape (BM, BN//32, 32), reduce the
 # 32), dim-M = 32x1 blocks along rows (reshape (RB, 32, BN), reduce the 32). Emits 4 outputs: qdata_k
 # (M,N)/scale_k (M,N//32) like mxfp8, and qdata_m (N,M)/scale_m (N,M//32) like mxfp8_dim_m
-# (transposed store). Uses the bit-math e8m0 (bit-exact vs gold). Requires M%128==0 and N%128==0.
+# (transposed store). Uses the bit-math e8m0 (bit-exact vs gold). Requires M%32==0 and N%32==0.
 # Perf: like mxfp8_dim_m, the transposed dim-M store is the binding cost -- taller tiles (larger
 # RB) widen its contiguous runs, wider BN raises work/occupancy; autotune RB/BN/num_warps to trade
-# off (the fixed 32x32 version only reached ~31%). Grid: (M // (RB*32), N // BN).
+# off (the fixed 32x32 version only reached ~31%). Grid: (cdiv(M, RB*32), cdiv(N, BN)) -- both dims
+# ragged (m_mask/n_mask); the plain 2D scale buffers are exactly sized, so padded scale block-cols
+# are just skipped (no zeroing needed).
 # ---------------------------------------------------------------------------
 _DIM_KM_CONFIGS = [
     triton.Config({"BN": bn, "RB": rb}, num_warps=w)
@@ -881,7 +899,7 @@ _DIM_KM_CONFIGS = [
 def _mxfp8_dim_km_kernel(
     x_ptr, yk_ptr, sk_ptr, ym_ptr, sm_ptr, M, N,
     sxm, sxn, sykm, sykn, sskm, sskn, symn, symm, ssmn, ssmm,
-    BN: tl.constexpr, RB: tl.constexpr,
+    BN: tl.constexpr, RB: tl.constexpr, RAGGED: tl.constexpr,
 ):
     BM: tl.constexpr = RB * 32   # rows in the tile
     CB: tl.constexpr = BN // 32  # 32-col blocks in the tile
@@ -889,37 +907,54 @@ def _mxfp8_dim_km_kernel(
     pid_n = tl.program_id(1)     # col group (BN cols)
     offs_m = pid_m * BM + tl.arange(0, BM)
     offs_n = pid_n * BN + tl.arange(0, BN)
-    x = tl.load(x_ptr + offs_m[:, None] * sxm + offs_n[None, :] * sxn).to(tl.float32)  # (BM, BN)
+    m_mask = offs_m < M
+    n_mask = offs_n < N
+    # M%128==0 and N%128==0 (RAGGED False) -> the grid divides M,N exactly for every RB,BN and M//32,
+    # N//32 are multiples of RB,CB, so every mask below is all-true. Pass mask=None (unpredicated,
+    # matching the aligned kernel's codegen); only when RAGGED do we predicate the ragged edges.
+    x = tl.load(
+        x_ptr + offs_m[:, None] * sxm + offs_n[None, :] * sxn,
+        mask=(m_mask[:, None] & n_mask[None, :]) if RAGGED else None,
+        other=0.0 if RAGGED else None,  # Triton forbids `other` without a mask
+    ).to(tl.float32)  # (BM, BN); padded rows/cols read as 0. M%32==0/N%32==0 -> each 32-block is
+    # wholly real or wholly padded, so a real block's amax never mixes in a padded 0.
     # dim-K: 1x32 blocks along columns -> (BM, CB, 32), reduce the 32. mxfp8 does NOT clamp amax.
     xk = tl.reshape(x, (BM, CB, 32))
     bk = _amax_to_e8m0_tl(tl.max(tl.abs(xk), axis=2))  # (BM, CB) per (row, col-block)
     yk = tl.reshape((xk * _e8m0_to_reciprocal_fp32_tl(bk)[:, :, None]).to(tl.float8e4nv), (BM, BN))
-    tl.store(yk_ptr + offs_m[:, None] * sykm + offs_n[None, :] * sykn, yk)
+    tl.store(yk_ptr + offs_m[:, None] * sykm + offs_n[None, :] * sykn, yk,
+             mask=(m_mask[:, None] & n_mask[None, :]) if RAGGED else None)
+    # sk (M, N//32) is exactly sized -> no zeroing; skip padded rows and block-cols (>= N//32).
     sk_cols = pid_n * CB + tl.arange(0, CB)
-    tl.store(sk_ptr + offs_m[:, None] * sskm + sk_cols[None, :] * sskn, bk.to(tl.uint8))
+    tl.store(sk_ptr + offs_m[:, None] * sskm + sk_cols[None, :] * sskn, bk.to(tl.uint8),
+             mask=(m_mask[:, None] & (sk_cols < (N // 32))[None, :]) if RAGGED else None)
     # dim-M: 32x1 blocks along rows -> (RB, 32, BN), reduce the 32; transposed store.
     xm = tl.reshape(x, (RB, 32, BN))
     bm = _amax_to_e8m0_tl(tl.max(tl.abs(xm), axis=1))  # (RB, BN) per (row-block, col)
     ym = tl.reshape((xm * _e8m0_to_reciprocal_fp32_tl(bm)[:, None, :]).to(tl.float8e4nv), (BM, BN))
     # out[n, m] = ym[row, col] with n=offs_n[col], m=offs_m[row] -> store tl.trans(ym) into (N, M).
-    tl.store(ym_ptr + offs_n[:, None] * symn + offs_m[None, :] * symm, tl.trans(ym))
+    tl.store(ym_ptr + offs_n[:, None] * symn + offs_m[None, :] * symm, tl.trans(ym),
+             mask=(n_mask[:, None] & m_mask[None, :]) if RAGGED else None)
+    # sm (N, M//32) is exactly sized -> no zeroing; skip padded rows and block-cols (>= M//32).
     sm_cols = pid_m * RB + tl.arange(0, RB)
-    tl.store(sm_ptr + offs_n[:, None] * ssmn + sm_cols[None, :] * ssmm, tl.trans(bm.to(tl.uint8)))
+    tl.store(sm_ptr + offs_n[:, None] * ssmn + sm_cols[None, :] * ssmm, tl.trans(bm.to(tl.uint8)),
+             mask=(n_mask[:, None] & (sm_cols < (M // 32))[None, :]) if RAGGED else None)
 
 
 def mxfp8_dim_km_triton(x, **kwargs):
     assert x.is_contiguous() and x.dim() == 2
     M, N = x.shape
-    assert M % 128 == 0 and N % 128 == 0, "mxfp8_dim_km kernel needs M%128==0 and N%128==0"
+    assert M % 32 == 0 and N % 32 == 0, "mxfp8_dim_km kernel needs M%32==0 and N%32==0"
     yk = torch.empty_like(x, dtype=torch.float8_e4m3fn)                    # (M, N)
     sk = torch.empty(M, N // 32, dtype=torch.uint8, device=x.device)
     ym = torch.empty(N, M, dtype=torch.float8_e4m3fn, device=x.device)    # (N, M) transposed
     sm = torch.empty(N, M // 32, dtype=torch.uint8, device=x.device)
-    grid = lambda meta: (M // (meta["RB"] * 32), N // meta["BN"])  # noqa: E731
+    grid = lambda meta: (triton.cdiv(M, meta["RB"] * 32), triton.cdiv(N, meta["BN"]))  # noqa: E731
     _mxfp8_dim_km_kernel[grid](
         x, yk, sk, ym, sm, M, N,
         x.stride(0), x.stride(1), yk.stride(0), yk.stride(1), sk.stride(0), sk.stride(1),
         ym.stride(0), ym.stride(1), sm.stride(0), sm.stride(1),
+        RAGGED=(M % 128 != 0 or N % 128 != 0),
     )
     return yk, sk.view(torch.float8_e8m0fnu), ym, sm.view(torch.float8_e8m0fnu)
 
