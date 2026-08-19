@@ -19,6 +19,7 @@ from experiments.mxfp8_api.moe_utils import (  # noqa: E402
 )
 from quant_cast_bench.quant_cast_gold.recipes import mxfp8_f  # noqa: E402
 from quant_cast_bench.quant_cast_triton.recipes import (  # noqa: E402
+    mxfp8_32x32_qdata_dim_k_scale_dim_km_swizzle_triton,
     mxfp8_32x32_triton,
     mxfp8_dim_km_swizzle_triton,
     mxfp8_dim_km_triton,
@@ -45,12 +46,16 @@ class ScalingType(IntEnum):
 
 class QuantOrientation(StrEnum):
     # Maps the ScalingType block onto the incoming tensor's dims and sets the output layout. Output is
-    # always contiguous. For asymmetric blocks (1x32), NATURAL vs TRANSPOSED are genuinely different
-    # quantizations (rowwise vs colwise -- different elements share an amax); for a square block
-    # (32x32) they are the same values in a transposed layout. BOTH emits both in one fused pass.
-    NATURAL = "natural"          # block maps to (M, N) as given
-    TRANSPOSED = "transposed"    # block maps to the (N, M) view; qdata/scale written transposed-contig
-    BOTH = "both"                # fused: emit the NATURAL pair, then the TRANSPOSED pair (4 outputs)
+    # always contiguous.
+
+    # block maps to (M, N) as given
+    NATURAL = "natural"          
+    # block maps to the (N, M) view; qdata/scale written transposed-contig
+    TRANSPOSED = "transposed"    
+    # fused: emit the NATURAL pair, then the TRANSPOSED pair (4 outputs)
+    BOTH = "both"                
+    # only needed for square scaling types and on hardware (such as Blackwell) where the second argument of a scaled gemm can be row-major
+    BOTH_SCALES_NATURAL_QDATA = "both_scales_natural_qdata" 
 
 
 class RoundingMode(StrEnum):
@@ -78,12 +83,16 @@ def quantize_to_mxfp8(
         NATURAL maps the scaling_type to (M, N)
         TRANSPOSED maps it to the (N, M) view and writes the outputs transposed-contiguous
         BOTH runs both in one fused pass
+        BOTH_SCALES_NATURAL_QDATA square blocks only, outputs dim-k qdata and both scales
       swizzle_type: NO_SWIZZLE or SWIZZLE_32_4_4
       pad_input_to_next_multiple_of: per-input-dimension zero-padding fused into the cast
       rounding_mode: RTNE or STOCHASTIC
       random_key: entropy source for stochastic rounding
 
-    Returns 2 tensors (qdata, scale) for NATURAL/TRANSPOSED, or 4 tensors (qk, sk, qm, sm) for BOTH.
+    Returns:
+        2 tensors (qdata, scale) for NATURAL or TRANSPOSED
+        4 tensors (qk, sk, qm, sm) for BOTH
+        3 tensors (qk, sk, sm) for BOTH_SCALES_NATURAL_QDATA
     """
     assert input.dim() == 2, f"only 2D input supported for now, got {input.dim()}D"
     assert input.is_contiguous(), "input must be contiguous"
@@ -113,13 +122,22 @@ def quantize_to_mxfp8(
         assert input.shape[0] % 32 == 0, f"first dim must be a multiple of 32, got {input.shape[0]}"
         assert input.shape[1] % 32 == 0, f"last dim must be a multiple of 32, got {input.shape[1]}"
         return mxfp8_32x32_triton(input)
+    if spec == (
+        ScalingType.BlockWise32x32,
+        QuantOrientation.BOTH_SCALES_NATURAL_QDATA,
+        SwizzleType.SWIZZLE_32_4_4,
+    ):
+        assert input.shape[0] % 32 == 0, f"first dim must be a multiple of 32, got {input.shape[0]}"
+        assert input.shape[1] % 32 == 0, f"last dim must be a multiple of 32, got {input.shape[1]}"
+        return mxfp8_32x32_qdata_dim_k_scale_dim_km_swizzle_triton(input)
 
     raise ValueError(
         f"unsupported (scaling_type, orientation, swizzle_type)={spec!r}; supported: "
         "(BlockWise1x32, NATURAL, NO_SWIZZLE|SWIZZLE_32_4_4), "
         "(BlockWise1x32, TRANSPOSED, NO_SWIZZLE|SWIZZLE_32_4_4), "
         "(BlockWise1x32, BOTH, NO_SWIZZLE|SWIZZLE_32_4_4), "
-        "(BlockWise32x32, NATURAL, NO_SWIZZLE)"
+        "(BlockWise32x32, NATURAL, NO_SWIZZLE), "
+        "(BlockWise32x32, BOTH_SCALES_NATURAL_QDATA, SWIZZLE_32_4_4)"
     )
 
 
@@ -176,6 +194,13 @@ def quantize_to_mxfp8_grouped(
         raise ValueError(
             f"unsupported (scaling_type, swizzle_type)=({scaling_type!r}, {swizzle_type!r}); "
             "quantize_to_mxfp8_grouped supports only (BlockWise1x32, SWIZZLE_32_4_4)"
+        )
+    if orientation not in (
+        QuantOrientation.NATURAL, QuantOrientation.TRANSPOSED, QuantOrientation.BOTH
+    ):
+        raise ValueError(
+            f"orientation={orientation!r} is not supported by quantize_to_mxfp8_grouped; "
+            "supported: NATURAL, TRANSPOSED, BOTH"
         )
 
     padded, _, padded_offs = _pad_token_groups(input, offs)
@@ -248,6 +273,13 @@ def quantize_to_mxfp8_batched(
         raise ValueError(
             f"unsupported (scaling_type, swizzle_type)=({scaling_type!r}, {swizzle_type!r}); "
             "quantize_to_mxfp8_batched supports only (BlockWise1x32, SWIZZLE_32_4_4)"
+        )
+    if orientation not in (
+        QuantOrientation.NATURAL, QuantOrientation.TRANSPOSED, QuantOrientation.BOTH
+    ):
+        raise ValueError(
+            f"orientation={orientation!r} is not supported by quantize_to_mxfp8_batched; "
+            "supported: NATURAL, TRANSPOSED, BOTH"
         )
 
     if orientation in (QuantOrientation.NATURAL, QuantOrientation.BOTH):
