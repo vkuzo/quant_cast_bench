@@ -24,6 +24,7 @@ from quant_cast_bench.quant_cast_gold.recipes import (
     Float8TensorwiseGold,
     HadamardRht,
     Mxfp832x32Gold,
+    Mxfp832x32SwizzleGold,
     Mxfp8DimKmGold,
     Mxfp8DimKmSwizzleGold,
     Mxfp8DimMGold,
@@ -636,6 +637,69 @@ def mxfp8_32x32_triton(x, **kwargs):
 
 MXFP8_32X32 = QuantCastTritonRecipe.from_gold(
     Mxfp832x32Gold, triton_fn=mxfp8_32x32_triton
+)
+
+
+# ---------------------------------------------------------------------------
+# mxfp8 32x32 with the e8m0 scale expanded along M (each 32x32-block scale repeated over its
+# 32 rows -> a (M, N//32) grid) and written into the NVIDIA-swizzled 4D block grid
+# (nrb, ncb, 32, 16). Same quant + 2D qdata store as _mxfp8_32x32_kernel; only the scale store
+# changes: instead of one byte per (32-row-block, col) it scatters that byte to all 32 rows of
+# the block, each at its swizzled slot (reusing _mxfp8_swizzle_kernel's flat formula). Mirrors
+# mxfp8_32x32_swizzle_f. Grid: (M // 32, cdiv(N, CB*32)).
+# ---------------------------------------------------------------------------
+@triton.autotune(configs=_MXFP8_32X32_CONFIGS, key=["M", "N"])
+@triton.jit
+def _mxfp8_32x32_swizzle_kernel(x_ptr, y_ptr, s_ptr, M, N, sxm, sxn, sym, syn, NCB, CB: tl.constexpr):
+    pid_rb = tl.program_id(0)  # 32-row block
+    pid_cb = tl.program_id(1)  # group of CB 32-col blocks
+    offs_m = pid_rb * 32 + tl.arange(0, 32)
+    offs_n = pid_cb * (CB * 32) + tl.arange(0, CB * 32)
+    n_mask = offs_n < N
+    x = tl.load(
+        x_ptr + offs_m[:, None] * sxm + offs_n[None, :] * sxn, mask=n_mask[None, :], other=0.0
+    ).to(tl.float32)  # (32, CB*32)
+    xr = tl.reshape(x, (32, CB, 32))
+    amax = tl.max(tl.max(tl.abs(xr), axis=2), axis=0)  # (CB,): within-block cols, then 32 rows
+    biased = _amax_to_e8m0_tl(amax)  # (CB,)
+    rcp = _e8m0_to_reciprocal_fp32_tl(biased)
+    y = tl.reshape((xr * rcp[None, :, None]).to(tl.float8e4nv), (32, CB * 32))
+    tl.store(y_ptr + offs_m[:, None] * sym + offs_n[None, :] * syn, y, mask=n_mask[None, :])
+    # swizzled scale store: the single block scale is expanded over all 32 rows of the block, so
+    # each (row = offs_m, col = 32-col-block) pair gets the same biased[cb] byte at its swizzled
+    # slot. Pre-swizzle position row = offs_m (0..M), col = pid_cb*CB + cb (0..N//32).
+    row = offs_m[:, None]                                # (32, 1)
+    col = (pid_cb * CB + tl.arange(0, CB))[None, :]      # (1, CB)
+    br = row // 128
+    r128 = row % 128
+    a = r128 // 32
+    b = r128 % 32
+    bc = col // 4
+    c4 = col % 4
+    flat = ((br * NCB + bc) * 32 + b) * 16 + (a * 4 + c4)  # (32, CB)
+    s_bytes = tl.broadcast_to(biased.to(tl.uint8)[None, :], (32, CB))
+    tl.store(s_ptr + flat, s_bytes, mask=(col < (N // 32)))
+
+
+def mxfp8_32x32_swizzle_triton(x, **kwargs):
+    assert x.is_contiguous() and x.dim() == 2
+    M, N = x.shape
+    y = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    ngc = N // 32  # 32-groups per row (scale cols)
+    nrb = (M + 127) // 128
+    ncb = (ngc + 3) // 4
+    # zero-filled so any padded (row/col beyond the real grid) positions match gold's zeros.
+    # TODO(future): do not zero pad here
+    s_u8 = torch.zeros(nrb, ncb, 32, 16, dtype=torch.uint8, device=x.device)
+    grid = lambda meta: (M // 32, triton.cdiv(N, meta["CB"] * 32))  # noqa: E731
+    _mxfp8_32x32_swizzle_kernel[grid](
+        x, y, s_u8, M, N, x.stride(0), x.stride(1), y.stride(0), y.stride(1), ncb,
+    )
+    return y, s_u8.view(torch.float8_e8m0fnu)
+
+
+MXFP8_32X32_SWIZZLE = QuantCastTritonRecipe.from_gold(
+    Mxfp832x32SwizzleGold, triton_fn=mxfp8_32x32_swizzle_triton
 )
 
 
@@ -1381,6 +1445,7 @@ ALL_RECIPES = [
     ("fp8_deepseek_1x128_dim_km", FP8_DEEPSEEK_1X128_DIM_KM),
     # 8-bit 2D
     ("mxfp8_32x32", MXFP8_32X32),
+    ("mxfp8_32x32_swizzle", MXFP8_32X32_SWIZZLE),
     ("fp8_deepseek_128x128", FP8_DEEPSEEK_128X128),
     # 8-bit rowwise/colwise
     ("fp8_rowwise", FP8_ROWWISE),
