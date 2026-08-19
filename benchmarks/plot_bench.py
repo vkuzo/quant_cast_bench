@@ -59,7 +59,7 @@ _GROUP_SIZES = [
     ("8-bit dim-k", 2),
     ("8-bit dim-m", 3),
     ("8-bit dim-km", 3),
-    ("8-bit square", 2),
+    ("8-bit square", 5),
     ("other", None),  # None = all remaining rows
 ]
 _HERE = os.path.dirname(os.path.abspath(__file__))

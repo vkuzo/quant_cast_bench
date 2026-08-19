@@ -40,6 +40,12 @@ mxfp8_32x32,triton,0.1287,6260.6,78.26
 mxfp8_32x32,cute,0.1408,5721.8,71.52
 mxfp8_32x32,flex_tile_map_triton,0.1285,6267.0,78.34
 mxfp8_32x32,helion,0.1927,4179.4,52.24
+mxfp8_32x32_swizzle,compile,0.3817,2131.5,26.64
+mxfp8_32x32_swizzle,triton,0.1338,6081.9,76.02
+mxfp8_32x32_dim_m_swizzle,compile,0.4190,1942.1,24.28
+mxfp8_32x32_dim_m_swizzle,triton,0.1515,5372.5,67.16
+mxfp8_32x32_dim_km_swizzle,compile,0.5637,1934.6,24.18
+mxfp8_32x32_dim_km_swizzle,triton,0.1890,5769.4,72.12
 fp8_deepseek_128x128,compile,0.2269,3548.9,44.36
 fp8_deepseek_128x128,triton,0.1306,6166.1,77.08
 fp8_deepseek_128x128,cute,0.1415,5690.7,71.13

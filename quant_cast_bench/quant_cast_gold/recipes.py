@@ -794,6 +794,96 @@ Mxfp832x32SwizzleGold = QuantCastSingleKernelGold(
     perf_description="(32,32) block, swizzle",
 )
 
+# ---------------------------------------------------------------------------
+# Golden recipe: mxfp8 with square 32x32 blocks (as Mxfp832x32SwizzleGold), but the output is
+# dim-M / transposed -- qdata (N, M) and the per-block e8m0 scale expanded along N (each block
+# scale repeated over its 32 columns) then transposed to a (N, M//32) grid and swizzled into the
+# NVIDIA 32x4x4 blocked layout. The quantization is identical to mxfp8_32x32_swizzle_f (the block
+# is square, so which axis we expand over doesn't change the scale value); only the output layout
+# changes -- it's mxfp8_32x32_swizzle_f in the dim-M / transposed frame.
+# ---------------------------------------------------------------------------
+def mxfp8_32x32_dim_m_swizzle_f(x, **kwargs):
+    qdata, scale_e8m0 = mxfp8_32x32_f(x)  # (M, N), (M//32, N//32)
+    # expand the per-block scale over its 32 columns -> (M//32, N), then transpose to the dim-M
+    # frame (N, M//32) so it matches the transposed qdata's last-dim 32-blocks.
+    scale_expanded = scale_e8m0.repeat_interleave(32, dim=1).t().contiguous()  # (N, M//32)
+    return qdata.t().contiguous(), _to_blocked_4d(scale_expanded)
+
+
+def mxfp8_32x32_dim_m_swizzle_dq_f(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    # not a dataclass field -- inverse for the correctness check / consumers. `q` is (N, M) in the
+    # transposed dim-M frame with 32-blocks along the last (M) axis; reuse mxfp8_swizzle_dq_f, which
+    # un-swizzles the 4D scale grid and dequants last-dim 32-blocks.
+    return mxfp8_swizzle_dq_f(q, scale)
+
+
+def _mxfp8_32x32_dim_m_swizzle_correctness(
+    inputs: Tuple[torch.Tensor, ...], outputs: Tuple[torch.Tensor, torch.Tensor]
+) -> None:
+    """dequant works in the (N, M) transposed frame; transpose back before comparing to `x`."""
+    (x,) = inputs
+    qdata, scale = outputs
+    x_hat = mxfp8_32x32_dim_m_swizzle_dq_f(qdata, scale).t()
+    sqnr = _compute_error(x.float(), x_hat.float())
+    threshold = 15.0
+    assert sqnr > threshold, (
+        f"mxfp8_32x32_dim_m_swizzle: sqnr={sqnr.item():.2f} dB below {threshold} dB"
+    )
+
+
+Mxfp832x32DimMSwizzleGold = QuantCastSingleKernelGold(
+    pt_ref_fn=mxfp8_32x32_dim_m_swizzle_f,
+    correctness_fn=_mxfp8_32x32_dim_m_swizzle_correctness,
+    example_input_fn=lambda M, K: (torch.randn(M, K, dtype=torch.bfloat16, device="cuda"),),
+    perf_description="(32,32) block, t-contig, swizzle",
+)
+
+# ---------------------------------------------------------------------------
+# Golden recipe: mxfp8 with square 32x32 blocks, emitting BOTH the dim-K and dim-M swizzled
+# outputs in one pass. The block is square, so the quantization (and the single per-block e8m0
+# scale) is SHARED: the two qdata outputs are the same values in the dim-K (M,N) and dim-M / trans
+# (N,M) frames, and the two scales are that one block scale expanded along M (dim-K -> (M, N//32))
+# or along N then transposed (dim-M -> (N, M//32)), each swizzled. It's mxfp8_32x32_swizzle_f and
+# mxfp8_32x32_dim_m_swizzle_f fused into one pass (cf. mxfp8_dim_km_swizzle_f for the 1D-block case).
+# ---------------------------------------------------------------------------
+def mxfp8_32x32_dim_km_swizzle_f(x, **kwargs):
+    """One pass over x with square 32x32 blocks, both frames, both scales swizzled. Returns
+    (qk (M,N), sk_blocked, qm (N,M), sm_blocked) where sk/sm are the 4D block grids
+    `(nrb, ncb, 32, 16)` of the block scale expanded to (M, N//32) / (N, M//32)."""
+    qdata, scale_e8m0 = mxfp8_32x32_f(x)  # (M, N), (M//32, N//32)
+    # dim-K frame: expand the per-block scale over its 32 rows -> (M, N//32).
+    sk = _to_blocked_4d(scale_e8m0.repeat_interleave(32, dim=0))
+    # dim-M frame: expand over its 32 columns -> (M//32, N), transpose to (N, M//32).
+    sm = _to_blocked_4d(scale_e8m0.repeat_interleave(32, dim=1).t().contiguous())
+    return qdata, sk, qdata.t().contiguous(), sm
+
+
+def _mxfp8_32x32_dim_km_swizzle_correctness(
+    inputs: Tuple[torch.Tensor, ...],
+    outputs: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+) -> None:
+    """Both quantizations dequant back to `x` with SQNR above threshold, each un-swizzling its 4D
+    scale grid: the dim-K pair directly, the dim-M pair in the transposed frame (then .t())."""
+    (x,) = inputs
+    qk, sk, qm, sm = outputs
+    sqnr_k = _compute_error(x.float(), mxfp8_swizzle_dq_f(qk, sk).float())
+    sqnr_m = _compute_error(x.float(), mxfp8_swizzle_dq_f(qm, sm).t().float())
+    threshold = 15.0
+    assert sqnr_k > threshold, (
+        f"mxfp8_32x32_dim_km_swizzle (dim-k): sqnr={sqnr_k.item():.2f} dB below {threshold} dB"
+    )
+    assert sqnr_m > threshold, (
+        f"mxfp8_32x32_dim_km_swizzle (dim-m): sqnr={sqnr_m.item():.2f} dB below {threshold} dB"
+    )
+
+
+Mxfp832x32DimKMSwizzleGold = QuantCastSingleKernelGold(
+    pt_ref_fn=mxfp8_32x32_dim_km_swizzle_f,
+    correctness_fn=_mxfp8_32x32_dim_km_swizzle_correctness,
+    example_input_fn=lambda M, K: (torch.randn(M, K, dtype=torch.bfloat16, device="cuda"),),
+    perf_description="(32,32) block, one pass, t-contig, swizzle",
+)
+
 
 # ---------------------------------------------------------------------------
 # Golden recipe: mxfp8 with swizzled (NVIDIA 32x4x4 blocked) scale.
@@ -1544,6 +1634,8 @@ ALL_RECIPES = [
     # 8-bit 2D
     ("mxfp8_32x32", Mxfp832x32Gold),
     ("mxfp8_32x32_swizzle", Mxfp832x32SwizzleGold),
+    ("mxfp8_32x32_dim_m_swizzle", Mxfp832x32DimMSwizzleGold),
+    ("mxfp8_32x32_dim_km_swizzle", Mxfp832x32DimKMSwizzleGold),
     ("fp8_deepseek_128x128", Deepseek128x128Gold),
     # 8-bit rowwise/colwise
     ("fp8_rowwise", RowwiseFp8Gold),
