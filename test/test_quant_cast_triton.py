@@ -32,14 +32,44 @@ _REQUIRES_SM100 = frozenset({
 })
 
 
+# Shapes each recipe is run at. (512, 512) is the aligned baseline every recipe supports. The two
+# ragged shapes force the swizzle kernels' scale-grid padding (M%128!=0 and/or N%128!=0), which the
+# aligned shapes never exercise -- the kernels allocate that grid with torch.empty and must write 0
+# into every padded slot themselves. 96x160 pads BOTH M and N (for the recipes that allow M%32
+# alignment: mxfp8_32x32_swizzle, mxfp8_swizzle, mxfp8_dim_km_swizzle); 128x160 keeps M%128==0 (as
+# the dim-M transpose kernels require) while padding the transposed-row (N) direction, covering
+# mxfp8_dim_m_swizzle.
+_SHAPES = [(512, 512), (96, 160), (128, 160)]
+
+# Recipes whose input construction / gold / kernel needs stricter alignment than a given ragged
+# shape provides, so they're skipped for that shape. deepseek needs N%128==0; the dim-M/dim-KM
+# kernels need M%128==0 (dim-KM also N%128==0); nvfp4 needs N%64==0; nvfp4_blocked_outer needs
+# M%128==0 and N%128==0. (512, 512) supports every recipe, so it has no blocklist.
+_SHAPE_UNSUPPORTED = {
+    (96, 160): frozenset({
+        "fp8_deepseek_1x128", "fp8_deepseek_1x128_dim_m", "fp8_deepseek_1x128_dim_km",
+        "fp8_deepseek_128x128", "mxfp8_dim_m", "mxfp8_dim_m_swizzle", "mxfp8_dim_km",
+        "nvfp4", "nvfp4_swizzle", "nvfp4_blocked_outer",
+    }),
+    (128, 160): frozenset({
+        "fp8_deepseek_1x128", "fp8_deepseek_1x128_dim_km", "fp8_deepseek_128x128",
+        "mxfp8_dim_km", "nvfp4", "nvfp4_swizzle", "nvfp4_blocked_outer",
+    }),
+}
+
+
+@pytest.mark.parametrize("shape", _SHAPES, ids=[f"{m}x{n}" for m, n in _SHAPES])
 @pytest.mark.parametrize("name, recipe", ALL_RECIPES, ids=[n for n, _ in ALL_RECIPES])
-def test_triton_matches_reference(name, recipe):
+def test_triton_matches_reference(name, recipe, shape):
     # the Triton kernel should reproduce the gold reference bit-for-bit (identical fp32 math + RNE
     # cast). example_input_fn builds the full positional inputs (x, *aux).
     if name in _REQUIRES_SM100 and torch.cuda.get_device_capability() != (10, 0):
         pytest.skip(f"{name} emits Blackwell-only PTX; requires cuda capability 10.0")
+    if name in _SHAPE_UNSUPPORTED.get(shape, ()):
+        pytest.skip(f"{name} needs stricter alignment than shape {shape[0]}x{shape[1]} provides")
+    M, N = shape
     torch.manual_seed(0)
-    inputs = recipe.example_input_fn(512, 512)
+    inputs = recipe.example_input_fn(M, N)
 
     # flex_tile_map framework kwargs naming the tile's global origin + parent row stride. The test
     # runs the whole tensor as one tile, so origin = (0, 0) and num_col = full width. These are needed
