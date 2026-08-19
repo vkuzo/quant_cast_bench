@@ -43,6 +43,7 @@ mxfp8_32x32                      0.3789  2126.0       26.6%  (32,32) block
 mxfp8_32x32_swizzle              0.3817  2131.5       26.6%  (32,32) block, swizzle
 mxfp8_32x32_dim_m_swizzle        0.4190  1942.1       24.3%  (32,32) block, t-contig, swizzle
 mxfp8_32x32_dim_km_swizzle       0.5637  1934.6       24.2%  (32,32) block, one pass, t-contig, swizzle
+mxfp8_32x32_qdata_dim_k_scale_dim_km_swizzle  0.3871  2123.9       26.5%  (32,32) block, one pass, dim-k qdata + km scales, swizzle
 fp8_deepseek_128x128                   0.2269  3548.9       44.4%  (128,128) block
 fp8_rowwise                            0.1224  6580.4       82.3%  (1,-1) block
 fp8_colwise                            0.3928  2050.6       25.6%  (-1,1) block, t-contig
@@ -74,6 +75,7 @@ mxfp8_32x32                      0.1287  6260.6       78.3%  (32,32) block
 mxfp8_32x32_swizzle              0.1338  6081.9       76.0%  (32,32) block, swizzle
 mxfp8_32x32_dim_m_swizzle        0.1515  5372.5       67.2%  (32,32) block, t-contig, swizzle
 mxfp8_32x32_dim_km_swizzle       0.1890  5769.4       72.1%  (32,32) block, one pass, t-contig, swizzle
+mxfp8_32x32_qdata_dim_k_scale_dim_km_swizzle  0.1367  6015.9       75.2%  (32,32) block, one pass, dim-k qdata + km scales, swizzle
 fp8_deepseek_128x128                   0.1306  6166.1       77.1%  (128,128) block
 fp8_rowwise                            0.1291  6237.9       78.0%  (1,-1) block
 fp8_colwise                            0.2178  3698.1       46.2%  (-1,1) block, t-contig
