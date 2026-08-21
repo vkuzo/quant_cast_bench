@@ -27,6 +27,7 @@ from quant_cast_bench.quant_cast_triton.recipes import (  # noqa: E402
     mxfp8_dim_m_triton,
     mxfp8_swizzle_triton,
     mxfp8_triton,
+    nvfp4_swizzle_triton,
 )
 
 
@@ -63,10 +64,13 @@ class RoundingMode(StrEnum):
 
 class InnerScaleCalc(StrEnum):
     # The per-block ("inner") scale strategy: fixes BOTH the scale dtype and the amax->scale
-    # computation. E8M0_RCEIL = float8_e8m0fnu (power-of-two) scale via reciprocal-multiply with
-    # RCEIL rounding. (Room here later for e.g. floor, or an e4m3 inner scale + fp32 outer/global
-    # level for nvfp4.)
+    # computation.
+    #   E8M0_RCEIL -- float8_e8m0fnu (power-of-two) scale via reciprocal-multiply with RCEIL
+    #     rounding (mxfp8; no outer scale).
+    #   E4M3_NVFP4 -- float8_e4m3fn inner scale computed relative to a per-tensor fp32 OUTER scale
+    #     (nvfp4 two-level scaling); requires the caller to pass the precomputed `outer_scale`.
     E8M0_RCEIL = "e8m0_rceil"
+    E4M3_NVFP4 = "e4m3_nvfp4"
 
 
 def quantize_tensor(
@@ -79,6 +83,7 @@ def quantize_tensor(
     swizzle_type: SwizzleType = SwizzleType.SWIZZLE_32_4_4,
     rounding_mode: RoundingMode = RoundingMode.RTNE,
     random_key: Tensor | None = None,
+    outer_scale: Tensor | None = None,
 ) -> tuple[Tensor, Tensor]:
     """Quantize `input` to a block-scaled low-precision format in one orientation: `qdata_dtype` qdata
     + one `inner_scale_calc` scale per block.
@@ -88,29 +93,55 @@ def quantize_tensor(
 
     Args:
       input: 2D input tensor (bf16 or fp32) of shape (M, K), or 3D of shape (E, M, K).
-      qdata_dtype: qdata element format (only torch.float8_e4m3fn today).
+      qdata_dtype: qdata element format -- torch.float8_e4m3fn (mxfp8) or torch.float4_e2m1fn_x2
+        (nvfp4, 2D only).
       inner_scale_calc: per-block scale strategy -- fixes the scale dtype and the amax->scale
-        computation (only InnerScaleCalc.E8M0_RCEIL today).
-      scaling_type: only BlockWise1x32 and BlockWise32x32
+        computation. InnerScaleCalc.E8M0_RCEIL (mxfp8) or InnerScaleCalc.E4M3_NVFP4 (nvfp4).
+      scaling_type: BlockWise1x32 / BlockWise32x32 (mxfp8), or BlockWise1x16 (nvfp4)
       orientation: how scaling_type maps onto (M, K) and how the output is laid out.
         NATURAL maps the scaling_type to (M, K)
         TRANSPOSED maps it to the (K, M) view and writes the outputs transposed-contiguous
       swizzle_type: NO_SWIZZLE or SWIZZLE_32_4_4. Note that for 3d inputs, swizzle is applied per-expert.
       rounding_mode: RTNE or STOCHASTIC
       random_key: entropy source for stochastic rounding
+      outer_scale: precomputed per-tensor fp32 outer scale, required for nvfp4 (float4_e2m1fn_x2)
+        two-level scaling; must be None otherwise.
 
     Returns:
         2 tensors (qdata, scale)
     """
     assert input.dim() in (2, 3), f"only 2D or 3D input supported, got {input.dim()}D"
-    assert qdata_dtype == torch.float8_e4m3fn, f"only float8_e4m3fn qdata supported, got {qdata_dtype}"
-    assert inner_scale_calc == InnerScaleCalc.E8M0_RCEIL, (
-        f"only InnerScaleCalc.E8M0_RCEIL supported, got {inner_scale_calc!r}"
-    )
     if rounding_mode == RoundingMode.STOCHASTIC:
         raise NotImplementedError("rounding_mode=STOCHASTIC is not implemented yet")
     if random_key is not None:
         raise NotImplementedError("random_key (stochastic rounding) is not implemented yet")
+
+    # nvfp4: fp4 (e2m1) qdata + a float8_e4m3fn inner scale computed relative to a per-tensor fp32
+    # OUTER scale (two-level scaling). The outer scale is a global amax reduction, so the caller
+    # precomputes it and passes it in. Dense 2D only for now.
+    if qdata_dtype == torch.float4_e2m1fn_x2:
+        assert inner_scale_calc == InnerScaleCalc.E4M3_NVFP4, (
+            f"float4_e2m1fn_x2 qdata requires inner_scale_calc=E4M3_NVFP4, got {inner_scale_calc!r}"
+        )
+        assert input.dim() == 2, "nvfp4 quantization is only supported for 2D input"
+        assert outer_scale is not None, "nvfp4 quantization requires a precomputed outer_scale"
+        assert input.is_contiguous(), "input must be contiguous"
+        spec = (scaling_type, orientation, swizzle_type)
+        if spec == (ScalingType.BlockWise1x16, QuantOrientation.NATURAL, SwizzleType.SWIZZLE_32_4_4):
+            return nvfp4_swizzle_triton(input, outer_scale)
+        raise ValueError(
+            f"unsupported (scaling_type, orientation, swizzle_type)={spec!r} for nvfp4 "
+            "(float4_e2m1fn_x2); supported: (BlockWise1x16, NATURAL, SWIZZLE_32_4_4)"
+        )
+
+    # mxfp8: float8_e4m3fn qdata + e8m0 rceil inner scale; no outer scale.
+    assert qdata_dtype == torch.float8_e4m3fn, (
+        f"only float8_e4m3fn or float4_e2m1fn_x2 qdata supported, got {qdata_dtype}"
+    )
+    assert inner_scale_calc == InnerScaleCalc.E8M0_RCEIL, (
+        f"only InnerScaleCalc.E8M0_RCEIL supported for float8_e4m3fn, got {inner_scale_calc!r}"
+    )
+    assert outer_scale is None, "outer_scale is only used by nvfp4 (float4_e2m1fn_x2) quantization"
 
     if input.dim() == 3:
         # Per-expert (E, N, K) batching is a separate code path from the 2D casts below: each of the
@@ -168,6 +199,7 @@ def quantize_tensor_bidirectional(
     skip_transposed_qdata: bool = False,
     rounding_mode: RoundingMode = RoundingMode.RTNE,
     random_key: Tensor | None = None,
+    outer_scale: Tensor | None = None,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor] | tuple[Tensor, Tensor, Tensor]:
     """Fused dual-orientation cast: quantize `input` to a block-scaled low-precision format in BOTH
     the natural and transposed orientations in one pass. The single-orientation cast is
@@ -195,6 +227,7 @@ def quantize_tensor_bidirectional(
     assert inner_scale_calc == InnerScaleCalc.E8M0_RCEIL, (
         f"only InnerScaleCalc.E8M0_RCEIL supported, got {inner_scale_calc!r}"
     )
+    assert outer_scale is None, "outer_scale is not supported by quantize_tensor_bidirectional yet"
     if rounding_mode == RoundingMode.STOCHASTIC:
         raise NotImplementedError("rounding_mode=STOCHASTIC is not implemented yet")
     if random_key is not None:
@@ -251,6 +284,7 @@ def quantize_tensor_grouped(
     swizzle_type: SwizzleType = SwizzleType.SWIZZLE_32_4_4,
     rounding_mode: RoundingMode = RoundingMode.RTNE,
     random_key: Tensor | None = None,
+    outer_scale: Tensor | None = None,
 ) -> tuple[Tensor, Tensor]:
     """Single-orientation grouped cast to a block-scaled low-precision format. For the fused
     dual-orientation cast use `quantize_tensor_grouped_bidirectional`.
@@ -272,6 +306,7 @@ def quantize_tensor_grouped(
     assert inner_scale_calc == InnerScaleCalc.E8M0_RCEIL, (
         f"only InnerScaleCalc.E8M0_RCEIL supported, got {inner_scale_calc!r}"
     )
+    assert outer_scale is None, "outer_scale is not supported by quantize_tensor_grouped yet"
     if rounding_mode == RoundingMode.STOCHASTIC:
         raise NotImplementedError("rounding_mode=STOCHASTIC is not implemented yet")
     if random_key is not None:
@@ -308,6 +343,7 @@ def quantize_tensor_grouped_bidirectional(
     skip_transposed_qdata: bool = False,
     rounding_mode: RoundingMode = RoundingMode.RTNE,
     random_key: Tensor | None = None,
+    outer_scale: Tensor | None = None,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     """Fused dual-orientation grouped cast: quantize `input` to a block-scaled low-precision format in
     BOTH the natural and transposed orientations in one read. The single-orientation cast is
@@ -323,6 +359,9 @@ def quantize_tensor_grouped_bidirectional(
     assert qdata_dtype == torch.float8_e4m3fn, f"only float8_e4m3fn qdata supported, got {qdata_dtype}"
     assert inner_scale_calc == InnerScaleCalc.E8M0_RCEIL, (
         f"only InnerScaleCalc.E8M0_RCEIL supported, got {inner_scale_calc!r}"
+    )
+    assert outer_scale is None, (
+        "outer_scale is not supported by quantize_tensor_grouped_bidirectional yet"
     )
     if rounding_mode == RoundingMode.STOCHASTIC:
         raise NotImplementedError("rounding_mode=STOCHASTIC is not implemented yet")

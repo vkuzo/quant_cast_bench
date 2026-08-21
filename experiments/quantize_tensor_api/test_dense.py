@@ -6,6 +6,7 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from api import (  # noqa: E402
+    InnerScaleCalc,
     QuantOrientation,
     RoundingMode,
     ScalingType,
@@ -25,6 +26,8 @@ from quant_cast_bench.quant_cast_gold.recipes import (  # noqa: E402
     mxfp8_dim_m_swizzle_f,
     mxfp8_f,
     mxfp8_swizzle_f,
+    nvfp4_gs_scale,
+    nvfp4_gs_swizzle_f,
 )
 
 SHAPES = [(64, 32), (256, 512)]
@@ -185,6 +188,55 @@ def test_32x32_both_scales_natural_qdata_matches_gold_bitwise(M, N, dtype):
     assert sk.dtype == torch.float8_e8m0fnu
     assert sm.dtype == torch.float8_e8m0fnu
     assert qk.shape == (M, N)
+
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and torch.cuda.get_device_capability() == (10, 0)),
+    reason="nvfp4 kernel emits Blackwell-only PTX (cvt.e2m1x2.f32); requires SM100",
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("M,N", SHAPES_128)  # nvfp4 kernel needs M%128==0 and N%64==0
+def test_nvfp4_matches_gold(M, N, dtype):
+    torch.manual_seed(0)
+    x = torch.randn(M, N, dtype=dtype, device="cuda")
+    # nvfp4 is two-level: the per-tensor fp32 outer scale is a global reduction the caller precomputes.
+    outer_scale = nvfp4_gs_scale(x)
+    q, s = quantize_tensor(
+        x,
+        qdata_dtype=torch.float4_e2m1fn_x2,
+        inner_scale_calc=InnerScaleCalc.E4M3_NVFP4,
+        scaling_type=ScalingType.BlockWise1x16,
+        orientation=QuantOrientation.NATURAL,
+        swizzle_type=SwizzleType.SWIZZLE_32_4_4,
+        outer_scale=outer_scale,
+    )
+    q_ref, s_ref = nvfp4_gs_swizzle_f(x, outer_scale)
+    assert q.dtype == torch.float4_e2m1fn_x2
+    assert s.dtype == torch.float8_e4m3fn  # nvfp4 inner scale is e4m3 (not e8m0)
+    assert q.shape == (M, N // 2)  # two fp4 codes packed per byte
+    # The e4m3 inner scale is identical fp32 reduction math -> byte-exact. The fp4 qdata is byte-exact
+    # in the common case, but the kernel's hardware cvt.e2m1x2.f32 and the gold's fp32 path can pick
+    # different RNE tie-breaks on the coarse fp4 grid, so tolerate a tiny mismatch fraction (matching
+    # test/test_quant_cast_triton.py's convention for the fp4 casts).
+    assert torch.equal(s.view(torch.uint8), s_ref.view(torch.uint8)), "scale differs from gold"
+    qdata_mismatch = (q.view(torch.uint8) != q_ref.view(torch.uint8)).float().mean().item()
+    assert qdata_mismatch < 0.01, f"qdata differs from gold in {qdata_mismatch:.3%} of bytes (RNE ties)"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+def test_nvfp4_input_guards():
+    x = torch.randn(256, 512, device="cuda")
+    with pytest.raises(AssertionError):  # fp4 qdata needs the NVFP4 inner scale calc
+        quantize_tensor(x, qdata_dtype=torch.float4_e2m1fn_x2, outer_scale=nvfp4_gs_scale(x))
+    with pytest.raises(AssertionError):  # nvfp4 requires a precomputed outer_scale
+        quantize_tensor(
+            x,
+            qdata_dtype=torch.float4_e2m1fn_x2,
+            inner_scale_calc=InnerScaleCalc.E4M3_NVFP4,
+            scaling_type=ScalingType.BlockWise1x16,
+        )
+    with pytest.raises(AssertionError):  # outer_scale is nvfp4-only, not valid for mxfp8
+        quantize_tensor(x, outer_scale=nvfp4_gs_scale(x))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
