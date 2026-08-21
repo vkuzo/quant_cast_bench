@@ -195,8 +195,6 @@ def test_input_guards():
         quantize_to_mxfp8(torch.randn(64, 48, device="cuda"))
     with pytest.raises(AssertionError):  # not contiguous
         quantize_to_mxfp8(torch.randn(64, 64, device="cuda").t())
-    with pytest.raises(NotImplementedError):  # padding not implemented yet
-        quantize_to_mxfp8(torch.randn(64, 64, device="cuda"), pad_input_to_next_multiple_of=(128, 32))
     with pytest.raises(NotImplementedError):  # stochastic rounding not implemented yet
         quantize_to_mxfp8(torch.randn(64, 64, device="cuda"), rounding_mode=RoundingMode.STOCHASTIC)
     with pytest.raises(NotImplementedError):  # random_key (SR) not implemented yet
@@ -238,34 +236,17 @@ def test_unsupported_combo_raises():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
-def test_grouped_padding_contract():
-    # offs already 32-aligned so the padded and unpadded qdata are the same size here; K a multiple
-    # of 128 so the M-groups blocked-scale layout (4-col atoms) is exact.
+def test_grouped_return_arity():
+    # offs are 32-aligned (groups are block-aligned; the caller owns any padding) and K a multiple of
+    # 128 so the M-groups blocked-scale layout (4-col atoms) is exact.
     x = torch.randn(64, 128, dtype=torch.bfloat16, device="cuda")
     offs = torch.tensor([32, 64], dtype=torch.int32, device="cuda")
 
-    # None -> no padding, 2-tuple (no padded_offs).
-    out = quantize_to_mxfp8_grouped(x, offs, orientation=QuantOrientation.NATURAL)
-    assert len(out) == 2
-
-    # (32, None) -> pad token groups to the 32-elem block, 3-tuple with padded_offs.
-    q, sb, padded_offs = quantize_to_mxfp8_grouped(
-        x, offs, orientation=QuantOrientation.NATURAL, pad_input_to_next_multiple_of=(32, None)
-    )
-    assert torch.equal(padded_offs % 32, torch.zeros_like(padded_offs))
-
-    # bidirectional mirrors the same contract: 4-tuple without padding, 5-tuple with (32, None).
+    # single-orientation grouped cast always returns (qdata, blocked_scale).
+    assert len(quantize_to_mxfp8_grouped(x, offs, orientation=QuantOrientation.NATURAL)) == 2
+    assert len(quantize_to_mxfp8_grouped(x, offs, orientation=QuantOrientation.TRANSPOSED)) == 2
+    # bidirectional returns both pairs: (q_nat, sb_nat, q_t, sb_t).
     assert len(quantize_to_mxfp8_grouped_bidirectional(x, offs)) == 4
-    assert len(
-        quantize_to_mxfp8_grouped_bidirectional(x, offs, pad_input_to_next_multiple_of=(32, None))
-    ) == 5
-
-    # any other padding request is unsupported.
-    for bad in [(64, None), (32, 32), (16, None)]:
-        with pytest.raises(NotImplementedError):
-            quantize_to_mxfp8_grouped(x, offs, pad_input_to_next_multiple_of=bad)
-        with pytest.raises(NotImplementedError):
-            quantize_to_mxfp8_grouped_bidirectional(x, offs, pad_input_to_next_multiple_of=bad)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")

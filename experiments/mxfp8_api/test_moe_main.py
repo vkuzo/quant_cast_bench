@@ -15,11 +15,13 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from experiments.mxfp8_api.moe_main import (  # noqa: E402
+    _unpad_token_groups,
     compute_error,
     mxfp8_bwd_real,
     mxfp8_fwd_real,
     mxfp8_grouped_mm_real,
 )
+from experiments.mxfp8_api.moe_utils import _pad_token_groups  # noqa: E402
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
@@ -57,7 +59,10 @@ def test_mxfp8_forward_2d_3d_real():
     weight_t = weight.transpose(-2, -1)  # (E, K, N)
 
     ref = torch._grouped_mm(act, weight_t, offs=offs, out_dtype=torch.bfloat16)
-    out = mxfp8_fwd_real(act, weight_t, offs)
+    # mxfp8_fwd_real operates purely in padded space; the caller owns pad in / unpad out.
+    padded_act, _, padded_offs = _pad_token_groups(act, offs)
+    padded_out = mxfp8_fwd_real(padded_act, weight_t, padded_offs)
+    out = _unpad_token_groups(padded_out, offs, padded_offs)
 
     sqnr = compute_error(ref.float(), out.float())
     assert sqnr > 20.0, f"mxfp8 real forward 2d-3d: sqnr={sqnr.item():.2f} dB too low"
@@ -83,7 +88,13 @@ def test_mxfp8_backward_2d_real():
         grad_output.transpose(-2, -1), input_act, offs=offs, out_dtype=torch.bfloat16
     ).transpose(-2, -1)
 
-    grad_input, grad_weight_t = mxfp8_bwd_real(grad_output, input_act, weight_t, offs)
+    # mxfp8_bwd_real operates purely in padded space; the caller owns pad in / unpad out (in the
+    # autograd Function the padded input_act is carried over from forward, but grad_output and
+    # input_act share `offs` so both land on the same padded offsets).
+    padded_go, _, padded_offs = _pad_token_groups(grad_output, offs)
+    padded_ia, _, _ = _pad_token_groups(input_act, offs)
+    padded_grad_input, grad_weight_t = mxfp8_bwd_real(padded_go, padded_ia, weight_t, padded_offs)
+    grad_input = _unpad_token_groups(padded_grad_input, offs, padded_offs)
 
     din_sqnr = compute_error(grad_input_ref.float(), grad_input.float())
     dw_sqnr = compute_error(grad_weight_t_ref.float(), grad_weight_t.float())

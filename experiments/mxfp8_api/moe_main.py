@@ -16,10 +16,11 @@ rows / 4 cols) and (b) token groups padded to a multiple of the block size so ev
 block-aligned; the M-dim outputs are unpadded afterward. `torch._scaled_grouped_mm` is SM100-only --
 this box is SM100 (`torch.cuda.get_device_capability() == (10, 0)`), so the real op runs here.
 
-The token/weight quant casts (pad + blocked-scale swizzle) live in `api.py`
-(`quantize_to_mxfp8_grouped` / `quantize_to_mxfp8` with a 3D per-expert input) over `moe_utils`; only
-the M-dim unpad of the finished output stays here, as it's a GEMM-output step, not a cast. The plain-PyTorch emulated
-(dequantize-and-matmul) companion path lives in `moe_emulated.py`.
+The token/weight quant casts (blocked-scale swizzle) live in `api.py`
+(`quantize_to_mxfp8_grouped` / `quantize_to_mxfp8` with a 3D per-expert input) over `moe_utils`; the
+token-group padding (`_pad_token_groups`) and the M-dim unpad of the finished output stay here, as
+they're GEMM-shape steps that must agree across the co-operands of each GEMM, not casts. The
+plain-PyTorch emulated (dequantize-and-matmul) companion path lives in `moe_emulated.py`.
 """
 
 import os
@@ -34,15 +35,16 @@ from experiments.mxfp8_api.api import (  # noqa: E402
     quantize_to_mxfp8_grouped,
     quantize_to_mxfp8_grouped_bidirectional,
 )
+from experiments.mxfp8_api.moe_utils import _pad_token_groups  # noqa: E402
 from quant_cast_bench.quant_cast_gold.recipes import _compute_error  # noqa: E402
 
 
 # ===========================================================================
 # Real (non-emulated) path: call the actual SM100 `torch._scaled_grouped_mm`.
 #
-# The token/weight casts (pad + swizzle) live in `api.py` (`quantize_to_mxfp8_grouped` /
-# `quantize_to_mxfp8` with a 3D per-expert input) over the `moe_utils` helpers; only the M-dim unpad
-# of the finished output stays here, as it's a GEMM-output step, not a cast.
+# The token/weight casts (swizzle) live in `api.py` (`quantize_to_mxfp8_grouped` /
+# `quantize_to_mxfp8` with a 3D per-expert input) over the `moe_utils` helpers; the token-group
+# padding and the M-dim unpad of the finished output stay here, as they're GEMM-shape steps, not casts.
 # ===========================================================================
 def _unpad_token_groups(
     padded_inputs: torch.Tensor,
@@ -52,7 +54,7 @@ def _unpad_token_groups(
     """Inverse of `_pad_token_groups`: gather each group's original-size chunk back into a
     `(num_tokens, dim)` tensor. Port of torchao's `torch_unpad_token_groups`. The padded start rows
     and the original token count are both recovered from `padded_offsets` + `group_offsets`, so the
-    grouped cast only has to hand back `padded_offsets`."""
+    caller only has to keep the `padded_offsets` from `_pad_token_groups`."""
     zero = torch.zeros(1, dtype=group_offsets.dtype, device=group_offsets.device)
     group_sizes = torch.diff(group_offsets, prepend=zero)
     padded_start_offsets = padded_offsets - torch.diff(padded_offsets, prepend=zero)
@@ -67,57 +69,59 @@ def _unpad_token_groups(
 
 
 def mxfp8_fwd_real(
-    act: torch.Tensor,  # (M, K)
+    padded_act: torch.Tensor,  # (Mp, K), token groups already block-aligned
     weight_t: torch.Tensor,  # (E, K, N)
-    offs: torch.Tensor,
+    padded_offs: torch.Tensor,  # padded group-end offsets matching `padded_act`
     out_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
-    """Forward: `out = grouped_mm(act, weight_t)` via the real `torch._scaled_grouped_mm`. Returns
-    `(M, N)`. Mirrors torchao's `_compute_fwd_sm100` (with token-group padding)."""
+    """Forward: `out = grouped_mm(act, weight_t)` via the real `torch._scaled_grouped_mm`. Returns the
+    padded output `(Mp, N)`. Mirrors torchao's `_compute_fwd_sm100`. Both the token-group padding of
+    the input and the M-dim unpad of this output are the caller's job (`MXFP8GroupedMMReal`), so this
+    function operates purely in padded space."""
     # Activation: block 1x32 along K (the contraction dim) -> M-groups blocked scale.
-    act_fp8, act_scale_blocked, padded_offs = quantize_to_mxfp8_grouped(
-        act, offs, orientation=QuantOrientation.NATURAL, pad_input_to_next_multiple_of=(32, None)
+    act_fp8, act_scale_blocked = quantize_to_mxfp8_grouped(
+        padded_act, padded_offs, orientation=QuantOrientation.NATURAL
     )
     # Weight cast blocked 1x32 along K (the fwd contraction dim): TRANSPOSED gives a (E,N,K) row-major
     # buffer whose transpose (E,K,N) is the column-major mat2 view the real op requires.
     w_e4m3, w_scale_blocked = quantize_to_mxfp8(
         weight_t, orientation=QuantOrientation.TRANSPOSED
     )  # (E,N,K)
-    out = torch._scaled_grouped_mm(
+    return torch._scaled_grouped_mm(
         act_fp8, w_e4m3.transpose(-2, -1), act_scale_blocked, w_scale_blocked,
         offs=padded_offs, out_dtype=out_dtype,
     )
-    return _unpad_token_groups(out, offs, padded_offs)
 
 
 def mxfp8_bwd_real(
-    grad_output: torch.Tensor,  # (M, N)
-    input_act: torch.Tensor,  # (M, K)
+    padded_grad_output: torch.Tensor,  # (Mp, N), token groups already block-aligned
+    padded_input_act: torch.Tensor,  # (Mp, K), the padded fwd activation reused for wgrad
     weight_t: torch.Tensor,  # (E, K, N)
-    offs: torch.Tensor,
+    padded_offs: torch.Tensor,  # padded group-end offsets matching both padded operands
     out_dtype: torch.dtype = torch.bfloat16,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Backward for the real mxfp8 grouped GEMM. Computes BOTH gradients from one entry point:
-      * dgrad: `grad_input = grouped_mm(grad_output, weight)` (2d-3d), returns `(M, K)`;
+      * dgrad: `grad_input = grouped_mm(grad_output, weight)` (2d-3d), returns padded `(Mp, K)`;
       * wgrad: per-group `grad_output^T @ input_act` (2d-2d), returns `grad_weight_t (E, K, N)`.
-    Mirrors torchao's `_compute_dgrad_sm100` + `_compute_wgrad_sm100`.
+    Mirrors torchao's `_compute_dgrad_sm100` + `_compute_wgrad_sm100`. Token-group padding of the
+    inputs and the M-dim unpad of `grad_input` are the caller's job (`MXFP8GroupedMMReal`), so this
+    operates purely in padded space; `padded_input_act` is the padded fwd activation carried over so
+    wgrad doesn't re-pad it. (wgrad's output has M contracted away, so it is never padded.)
 
     Kept as one function so the work shared between the two GEMMs (currently separate PyTorch ops) is
     visible as kernel-fusion opportunities:
-      * `grad_output` is padded once and feeds both GEMMs, but in two orientations -- dgrad wants it
-        row-cast `(Mp, N)` (1x32 along N), wgrad wants it transposed-cast `(N, Mp)` (1x32 along M).
-        Those two casts of one tensor are exactly a fused both-orientation (dim_km) mxfp8 cast: a
-        single kernel could emit both qdata+scale pairs from one read of `padded_go`.
+      * `grad_output` feeds both GEMMs, but in two orientations -- dgrad wants it row-cast `(Mp, N)`
+        (1x32 along N), wgrad wants it transposed-cast `(N, Mp)` (1x32 along M). Those two casts of
+        one tensor are exactly a fused both-orientation (dim_km) mxfp8 cast: a single kernel could
+        emit both qdata+scale pairs from one read of `padded_grad_output`.
       * both `torch._scaled_grouped_mm` calls share `padded_offs` (and the dgrad call reuses the
         row-cast of `grad_output`), so a fused backward would quantize `grad_output` just once.
     """
-    # --- grad_output cast in BOTH orientations (one padded read): row-orientation feeds dgrad
-    # (1x32 along N, M-groups scale), transposed-orientation feeds wgrad (1x32 along M, K-groups
-    # scale). This single call is exactly the fused both-orientation cast a kernel would collapse. ---
-    go_fp8, go_scale_blocked, go_t_fp8, go_t_scale_blocked, padded_offs = (
-        quantize_to_mxfp8_grouped_bidirectional(
-            grad_output, offs, pad_input_to_next_multiple_of=(32, None)
-        )
+    # --- grad_output cast in BOTH orientations (one read): row-orientation feeds dgrad (1x32 along N,
+    # M-groups scale), transposed-orientation feeds wgrad (1x32 along M, K-groups scale). This single
+    # call is exactly the fused both-orientation cast a kernel would collapse. ---
+    go_fp8, go_scale_blocked, go_t_fp8, go_t_scale_blocked = (
+        quantize_to_mxfp8_grouped_bidirectional(padded_grad_output, padded_offs)
     )
 
     # === dgrad: grad_input = grouped_mm(grad_output, weight) ===
@@ -129,14 +133,14 @@ def mxfp8_bwd_real(
     w_e4m3 = q_kn.transpose(-2, -1)  # (E,N,K) column-major view
     grad_input = torch._scaled_grouped_mm(
         go_fp8, w_e4m3, go_scale_blocked, w_scale_blocked, offs=padded_offs, out_dtype=out_dtype
-    )
-    grad_input = _unpad_token_groups(grad_input, offs, padded_offs)
+    )  # (Mp, K), padded; the caller unpads.
 
     # === wgrad: grad_weight_t = per-group grad_output^T @ input_act ===
     # input_act transposed so the group-partitioned contraction dim M is last, blocked 1x32 along M
-    # (K-groups scale layout). M being contracted, the result needs no unpadding.
-    ia_t_fp8, ia_t_scale_blocked, _ = quantize_to_mxfp8_grouped(
-        input_act, offs, orientation=QuantOrientation.TRANSPOSED, pad_input_to_next_multiple_of=(32, None)
+    # (K-groups scale layout). M being contracted, the result needs no unpadding. `padded_input_act`
+    # is the fwd activation already padded to `padded_offs`, reused here instead of re-padding.
+    ia_t_fp8, ia_t_scale_blocked = quantize_to_mxfp8_grouped(
+        padded_input_act, padded_offs, orientation=QuantOrientation.TRANSPOSED
     )
     grad_weight = torch._scaled_grouped_mm(
         go_t_fp8,
@@ -167,17 +171,25 @@ class MXFP8GroupedMMReal(torch.autograd.Function):
     def forward(ctx, input_act, weight_t, offs, out_dtype=torch.bfloat16):
         assert input_act.ndim == 2, "input_act must be 2D (M, K)"
         assert weight_t.ndim == 3, "weight_t must be 3D (E, K, N)"
-        out = mxfp8_fwd_real(input_act, weight_t, offs, out_dtype=out_dtype)
-        ctx.save_for_backward(input_act, weight_t, offs)
+        # Pad token groups to the block size once here; the padded activation and its offsets are
+        # saved for backward, so wgrad reuses them instead of re-padding input_act. grad_output is
+        # produced fresh in backward, so it's the only tensor still padded there (same `offs`, so it
+        # lands on this same `padded_offs`).
+        padded_act, _, padded_offs = _pad_token_groups(input_act, offs)
+        padded_out = mxfp8_fwd_real(padded_act, weight_t, padded_offs, out_dtype=out_dtype)
+        out = _unpad_token_groups(padded_out, offs, padded_offs)
+        ctx.save_for_backward(padded_act, weight_t, offs, padded_offs)
         ctx.out_dtype = out_dtype
         return out
 
     @staticmethod
     def backward(ctx, grad_output):
-        input_act, weight_t, offs = ctx.saved_tensors
-        grad_input, grad_weight_t = mxfp8_bwd_real(
-            grad_output, input_act, weight_t, offs, out_dtype=ctx.out_dtype
+        padded_act, weight_t, offs, padded_offs = ctx.saved_tensors
+        padded_grad_output, _, _ = _pad_token_groups(grad_output, offs)
+        padded_grad_input, grad_weight_t = mxfp8_bwd_real(
+            padded_grad_output, padded_act, weight_t, padded_offs, out_dtype=ctx.out_dtype
         )
+        grad_input = _unpad_token_groups(padded_grad_input, offs, padded_offs)
         return grad_input, grad_weight_t, None, None
 
 
