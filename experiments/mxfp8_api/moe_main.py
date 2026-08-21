@@ -76,7 +76,7 @@ def mxfp8_fwd_real(
     `(M, N)`. Mirrors torchao's `_compute_fwd_sm100` (with token-group padding)."""
     # Activation: block 1x32 along K (the contraction dim) -> M-groups blocked scale.
     act_fp8, act_scale_blocked, padded_offs = quantize_to_mxfp8_grouped(
-        act, offs, orientation=QuantOrientation.NATURAL
+        act, offs, orientation=QuantOrientation.NATURAL, pad_input_to_next_multiple_of=(32, None)
     )
     # Weight cast blocked 1x32 along K (the fwd contraction dim): TRANSPOSED gives a (E,N,K) row-major
     # buffer whose transpose (E,K,N) is the column-major mat2 view the real op requires.
@@ -115,7 +115,9 @@ def mxfp8_bwd_real(
     # (1x32 along N, M-groups scale), transposed-orientation feeds wgrad (1x32 along M, K-groups
     # scale). This single call is exactly the fused both-orientation cast a kernel would collapse. ---
     go_fp8, go_scale_blocked, go_t_fp8, go_t_scale_blocked, padded_offs = (
-        quantize_to_mxfp8_grouped_bidirectional(grad_output, offs)
+        quantize_to_mxfp8_grouped_bidirectional(
+            grad_output, offs, pad_input_to_next_multiple_of=(32, None)
+        )
     )
 
     # === dgrad: grad_input = grouped_mm(grad_output, weight) ===
@@ -134,7 +136,7 @@ def mxfp8_bwd_real(
     # input_act transposed so the group-partitioned contraction dim M is last, blocked 1x32 along M
     # (K-groups scale layout). M being contracted, the result needs no unpadding.
     ia_t_fp8, ia_t_scale_blocked, _ = quantize_to_mxfp8_grouped(
-        input_act, offs, orientation=QuantOrientation.TRANSPOSED
+        input_act, offs, orientation=QuantOrientation.TRANSPOSED, pad_input_to_next_multiple_of=(32, None)
     )
     grad_weight = torch._scaled_grouped_mm(
         go_t_fp8,

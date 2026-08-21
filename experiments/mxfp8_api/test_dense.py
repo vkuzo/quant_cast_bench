@@ -12,6 +12,7 @@ from api import (  # noqa: E402
     SwizzleType,
     quantize_to_mxfp8,
     quantize_to_mxfp8_bidirectional,
+    quantize_to_mxfp8_grouped,
     quantize_to_mxfp8_grouped_bidirectional,
 )
 
@@ -234,6 +235,37 @@ def test_unsupported_combo_raises():
             swizzle_type=SwizzleType.NO_SWIZZLE,
             skip_transposed_qdata=True,
         )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+def test_grouped_padding_contract():
+    # offs already 32-aligned so the padded and unpadded qdata are the same size here; K a multiple
+    # of 128 so the M-groups blocked-scale layout (4-col atoms) is exact.
+    x = torch.randn(64, 128, dtype=torch.bfloat16, device="cuda")
+    offs = torch.tensor([32, 64], dtype=torch.int32, device="cuda")
+
+    # None -> no padding, 2-tuple (no padded_offs).
+    out = quantize_to_mxfp8_grouped(x, offs, orientation=QuantOrientation.NATURAL)
+    assert len(out) == 2
+
+    # (32, None) -> pad token groups to the 32-elem block, 3-tuple with padded_offs.
+    q, sb, padded_offs = quantize_to_mxfp8_grouped(
+        x, offs, orientation=QuantOrientation.NATURAL, pad_input_to_next_multiple_of=(32, None)
+    )
+    assert torch.equal(padded_offs % 32, torch.zeros_like(padded_offs))
+
+    # bidirectional mirrors the same contract: 4-tuple without padding, 5-tuple with (32, None).
+    assert len(quantize_to_mxfp8_grouped_bidirectional(x, offs)) == 4
+    assert len(
+        quantize_to_mxfp8_grouped_bidirectional(x, offs, pad_input_to_next_multiple_of=(32, None))
+    ) == 5
+
+    # any other padding request is unsupported.
+    for bad in [(64, None), (32, 32), (16, None)]:
+        with pytest.raises(NotImplementedError):
+            quantize_to_mxfp8_grouped(x, offs, pad_input_to_next_multiple_of=bad)
+        with pytest.raises(NotImplementedError):
+            quantize_to_mxfp8_grouped_bidirectional(x, offs, pad_input_to_next_multiple_of=bad)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")

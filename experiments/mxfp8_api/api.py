@@ -153,7 +153,7 @@ def quantize_to_mxfp8_bidirectional(
     pad_input_to_next_multiple_of: tuple[int, int] | None = None,
     rounding_mode: RoundingMode = RoundingMode.RTNE,
     random_key: Tensor | None = None,
-) -> tuple[Tensor, Tensor, Tensor] | tuple[Tensor, Tensor, Tensor, Tensor]:
+) -> tuple[Tensor, Tensor, Tensor, Tensor] | tuple[Tensor, Tensor, Tensor]:
     """Fused dual-orientation mxfp8 cast: quantize `input` in BOTH the natural and transposed
     orientations in one pass. The single-orientation cast is `quantize_to_mxfp8`.
 
@@ -227,10 +227,10 @@ def quantize_to_mxfp8_grouped(
     scaling_type: ScalingType = ScalingType.BlockWise1x32,
     orientation: QuantOrientation = QuantOrientation.NATURAL,
     swizzle_type: SwizzleType = SwizzleType.SWIZZLE_32_4_4,
-    pad_input_to_next_multiple_of: tuple[int, int] | None = None,
+    pad_input_to_next_multiple_of: tuple[int | None, int | None] | None = None,
     rounding_mode: RoundingMode = RoundingMode.RTNE,
     random_key: Tensor | None = None,
-) -> tuple[Tensor, Tensor, Tensor]:
+) -> tuple[Tensor, Tensor] | tuple[Tensor, Tensor, Tensor]:
     """Single-orientation grouped mxfp8 cast. For the fused dual-orientation cast use
     `quantize_to_mxfp8_grouped_bidirectional`.
 
@@ -238,13 +238,15 @@ def quantize_to_mxfp8_grouped(
     * 2d tensors of shape (M, K) only
     * adds an `offs` argument
     * swizzling is per-token-group
-    * semantics of `pad_input_to_next_multiple_of` are per-token-group for the first
-      dimension (maybe this should be named differently)
-    * one extra output tensor (padded_offsets), if token-group padding is on
-      TODO(change output type to reflect ^)
+    * `pad_input_to_next_multiple_of` is per-token-group along the token (first) dim. Only None (no
+      padding) or (32, None) (pad each token group's rows up to the 32-elem block) is supported.
+    * when token-group padding is on, one extra output tensor (padded_offsets) is returned
     """
-    if pad_input_to_next_multiple_of is not None:
-        raise NotImplementedError("pad_input_to_next_multiple_of is not implemented yet")
+    if pad_input_to_next_multiple_of not in (None, (BLOCK_SIZE, None)):
+        raise NotImplementedError(
+            f"pad_input_to_next_multiple_of={pad_input_to_next_multiple_of!r} is not supported; "
+            "only None (no padding) or (32, None) (pad token groups to the 32-elem block)"
+        )
     if rounding_mode == RoundingMode.STOCHASTIC:
         raise NotImplementedError("rounding_mode=STOCHASTIC is not implemented yet")
     if random_key is not None:
@@ -260,13 +262,21 @@ def quantize_to_mxfp8_grouped(
             "supported: NATURAL, TRANSPOSED"
         )
 
-    padded, _, padded_offs = _pad_token_groups(input, offs)
+    pad = pad_input_to_next_multiple_of is not None
+    if pad:
+        padded, _, group_offs = _pad_token_groups(input, offs)
+    else:
+        padded, group_offs = input.contiguous(), offs
 
     if orientation == QuantOrientation.NATURAL:
-        q_nat, s_nat = quantize_2d_act(padded)  # (Mp, C), 1x32 along C
-        return q_nat, _to_blocked_2d_m_groups(s_nat, padded_offs), padded_offs
-    q_t, s_t = quantize_2d_act(padded.transpose(-2, -1).contiguous())  # (C, Mp), 1x32 along M
-    return q_t, _to_blocked_2d_k_groups(s_t, padded_offs // BLOCK_SIZE), padded_offs
+        q, s = quantize_2d_act(padded)  # (Mp, C), 1x32 along C
+        sb = _to_blocked_2d_m_groups(s, group_offs)
+    else:
+        q, s = quantize_2d_act(padded.transpose(-2, -1).contiguous())  # (C, Mp), 1x32 along M
+        sb = _to_blocked_2d_k_groups(s, group_offs // BLOCK_SIZE)
+
+    # padded_offsets is only meaningful (and only returned) when padding is on.
+    return (q, sb, group_offs) if pad else (q, sb)
 
 
 def quantize_to_mxfp8_grouped_bidirectional(
@@ -276,18 +286,23 @@ def quantize_to_mxfp8_grouped_bidirectional(
     scaling_type: ScalingType = ScalingType.BlockWise1x32,
     swizzle_type: SwizzleType = SwizzleType.SWIZZLE_32_4_4,
     skip_transposed_qdata: bool = False,
-    pad_input_to_next_multiple_of: tuple[int, int] | None = None,
+    pad_input_to_next_multiple_of: tuple[int | None, int | None] | None = None,
     rounding_mode: RoundingMode = RoundingMode.RTNE,
     random_key: Tensor | None = None,
-) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+) -> tuple[Tensor, Tensor, Tensor, Tensor] | tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
     """Fused dual-orientation grouped mxfp8 cast: quantize `input` in BOTH the natural and transposed
     orientations in one padded read. The single-orientation cast is `quantize_to_mxfp8_grouped`.
 
-    Returns the natural (dim-K) pair, the transposed (dim-M) pair, then padded_offsets:
-    (q_nat, sb_nat, q_t, sb_t, padded_offs).
+    `pad_input_to_next_multiple_of` matches `quantize_to_mxfp8_grouped`: only None (no padding) or
+    (32, None) (pad each token group's rows to the 32-elem block). Returns the natural (dim-K) pair
+    then the transposed (dim-M) pair (q_nat, sb_nat, q_t, sb_t), plus padded_offsets when padding is
+    on.
     """
-    if pad_input_to_next_multiple_of is not None:
-        raise NotImplementedError("pad_input_to_next_multiple_of is not implemented yet")
+    if pad_input_to_next_multiple_of not in (None, (BLOCK_SIZE, None)):
+        raise NotImplementedError(
+            f"pad_input_to_next_multiple_of={pad_input_to_next_multiple_of!r} is not supported; "
+            "only None (no padding) or (32, None) (pad token groups to the 32-elem block)"
+        )
     if rounding_mode == RoundingMode.STOCHASTIC:
         raise NotImplementedError("rounding_mode=STOCHASTIC is not implemented yet")
     if random_key is not None:
@@ -303,9 +318,16 @@ def quantize_to_mxfp8_grouped_bidirectional(
             "quantize_to_mxfp8_grouped_bidirectional supports only (BlockWise1x32, SWIZZLE_32_4_4)"
         )
 
-    padded, _, padded_offs = _pad_token_groups(input, offs)
+    pad = pad_input_to_next_multiple_of is not None
+    if pad:
+        padded, _, group_offs = _pad_token_groups(input, offs)
+    else:
+        padded, group_offs = input.contiguous(), offs
+
     q_nat, s_nat = quantize_2d_act(padded)  # (Mp, C), 1x32 along C
-    sb_nat = _to_blocked_2d_m_groups(s_nat, padded_offs)
+    sb_nat = _to_blocked_2d_m_groups(s_nat, group_offs)
     q_t, s_t = quantize_2d_act(padded.transpose(-2, -1).contiguous())  # (C, Mp), 1x32 along M
-    sb_t = _to_blocked_2d_k_groups(s_t, padded_offs // BLOCK_SIZE)
-    return q_nat, sb_nat, q_t, sb_t, padded_offs
+    sb_t = _to_blocked_2d_k_groups(s_t, group_offs // BLOCK_SIZE)
+
+    # padded_offsets is only meaningful (and only returned) when padding is on.
+    return (q_nat, sb_nat, q_t, sb_t, group_offs) if pad else (q_nat, sb_nat, q_t, sb_t)
