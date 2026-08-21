@@ -1318,18 +1318,24 @@ Nvfp4GsSwizzleGold = QuantCastSingleKernelGold(
 # scale is still a GLOBAL amax, computed outside flex_tile_map (`nvfp4_gs_scale`) as a REPLICATE aux.
 # ---------------------------------------------------------------------------
 def nvfp4_gs_f(x, outer_scale, **kwargs):
-    """Tile-invariant `f`: nvfp4 cast (per-tensor `outer_scale` aux), inner e4m3 scale returned in
-    plain (M, N//16) row-major layout (no swizzle)."""
+    """Tile-invariant `f`: nvfp4 cast, inner e4m3 scale returned in plain (M, N//16) row-major
+    layout (no swizzle). `outer_scale` is either a per-tensor scalar/(1,) or a per-token (M, 1);
+    per-tensor vs per-token then differs only by how that scale broadcasts against the
+    (*lead, last//16, 16) block view. A per-token (M, 1) needs an intra-block axis to line up with
+    the block view, so it is `unsqueeze(-1)`'d to (M, 1, 1); a per-tensor scalar/(1,) already
+    broadcasts and is left untouched (it must be -- in the flex_tile_map emitter it is a REPLICATE
+    scalar aux that can't be reshaped inside the traced graph)."""
     *lead, last = x.shape
     x_b = x.reshape(*lead, last // 16, 16)
+    outer = outer_scale.unsqueeze(-1) if outer_scale.ndim == 2 else outer_scale  # per-token -> block axis
     local_amax = x_b.abs().amax(dim=-1, keepdim=True)
     # inner e4m3 block scale, relative to the outer scale.
     inner = torch.clamp(
-        (local_amax.to(torch.float32) / F4_E2M1_MAX) / outer_scale,
+        (local_amax.to(torch.float32) / F4_E2M1_MAX) / outer,
         min=E4M3_EPS, max=F8E4M3_MAX,
     ).to(torch.float8_e4m3fn)
     # cast: divide by (outer * inner), clamp to fp4 range, pack two per byte.
-    reciprocal = (1.0 / outer_scale) / inner.to(torch.float32)
+    reciprocal = (1.0 / outer) / inner.to(torch.float32)
     data_scaled = torch.clamp(x_b.to(torch.float32) * reciprocal, -F4_E2M1_MAX, F4_E2M1_MAX)
     qdata_b = _f32_to_packed_fp4(data_scaled).view(torch.float4_e2m1fn_x2)
     qdata = qdata_b.reshape(*lead, last // 2)
@@ -1346,7 +1352,10 @@ def nvfp4_gs_dq_f(q: torch.Tensor, inner_scale: torch.Tensor, outer_scale: torch
     cols = N // 16  # number of 16-blocks per row (== inner scale cols)
     unpacked = f4_unpacked_to_f32(unpack_uint4(q.view(torch.uint8))).reshape(M, N)
     inner_fp32 = inner_scale.to(torch.float32).reshape(M, cols, 1)
-    return (unpacked.reshape(M, cols, 16) * inner_fp32 * outer_scale).reshape(M, N)
+    # outer_scale broadcasts against (M, cols, 16): a per-token (M, 1) is unsqueeze(-1)'d to the
+    # intra-block axis ((M, 1, 1)); a per-tensor scalar/(1,) already broadcasts. Matches nvfp4_gs_f.
+    outer = outer_scale.unsqueeze(-1) if outer_scale.ndim == 2 else outer_scale
+    return (unpacked.reshape(M, cols, 16) * inner_fp32 * outer).reshape(M, N)
 
 
 def _nvfp4_gs_correctness(
@@ -1372,6 +1381,36 @@ Nvfp4GsGold = QuantCastSingleKernelGold(
     correctness_fn=_nvfp4_gs_correctness,
     example_input_fn=_nvfp4_gs_inputs,
     perf_description="(1,16) block, fp4 qdata, no swizzle",
+)
+
+# ---------------------------------------------------------------------------
+# Golden recipe: nvfp4 with a PER-TOKEN outer scale (two-level), inner scale in PLAIN ROW-MAJOR
+# layout. Same two-level nvfp4 as nvfp4_gs_f -- in fact it reuses nvfp4_gs_f verbatim; the ONLY
+# difference is the shape of the outer scale. Per-tensor passes a scalar; per-token passes one
+# value per row, shaped (M, 1), broadcasting over K -- nvfp4_gs_f's `unsqueeze(-1)` lifts it to
+# (M, 1, 1) to broadcast against its (M, K//16, 16) block view. The outer scale is still computed
+# outside flex_tile_map (`nvfp4_gs_per_token_scale`); being per-row it lines up with the token dim
+# (an AuxKind.TILE aux split along rows), not a REPLICATE scalar.
+# ---------------------------------------------------------------------------
+def nvfp4_gs_per_token_scale(x):
+    """Per-token fp32 outer scale (per-row amax reduction; computed outside flex_tile_map). Returns
+    shape (M, 1): one value per token, broadcasting over K."""
+    row_amax = x.abs().to(torch.float32).amax(dim=-1, keepdim=True)  # (M, 1)
+    return row_amax / (F8E4M3_MAX * F4_E2M1_MAX)
+
+
+def _nvfp4_gs_per_token_inputs(M, K):
+    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+    return (x, nvfp4_gs_per_token_scale(x))
+
+
+# Reuses nvfp4_gs_f / _nvfp4_gs_correctness (which dequant via nvfp4_gs_dq_f): both broadcast the
+# outer scale, so the per-token (M,1,1) scale is the only thing that changes vs the per-tensor gold.
+Nvfp4GsPerTokenGold = QuantCastSingleKernelGold(
+    pt_ref_fn=nvfp4_gs_f,
+    correctness_fn=_nvfp4_gs_correctness,
+    example_input_fn=_nvfp4_gs_per_token_inputs,
+    perf_description="(1,16) block, fp4 qdata, no swizzle, per-token outer scale",
 )
 
 

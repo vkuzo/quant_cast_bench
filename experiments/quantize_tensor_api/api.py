@@ -17,7 +17,7 @@ from experiments.quantize_tensor_api.moe_utils import (  # noqa: E402
     _to_blocked_per_group_3d,
     quantize_2d_act,
 )
-from quant_cast_bench.quant_cast_gold.recipes import mxfp4_f, mxfp8_f  # noqa: E402
+from quant_cast_bench.quant_cast_gold.recipes import mxfp4_f, mxfp8_f, nvfp4_gs_f  # noqa: E402
 from quant_cast_bench.quant_cast_triton.recipes import (  # noqa: E402
     mxfp8_32x32_qdata_dim_k_scale_dim_km_swizzle_triton,
     mxfp8_32x32_triton,
@@ -104,8 +104,10 @@ def quantize_tensor(
       swizzle_type: NO_SWIZZLE or SWIZZLE_32_4_4. Note that for 3d inputs, swizzle is applied per-expert.
       rounding_mode: RTNE or STOCHASTIC
       random_key: entropy source for stochastic rounding
-      outer_scale: precomputed per-tensor fp32 outer scale, required for nvfp4 (float4_e2m1fn_x2)
-        two-level scaling; must be None otherwise.
+      outer_scale: precomputed fp32 outer scale, required for nvfp4 (float4_e2m1fn_x2) two-level
+        scaling; must be None otherwise. A per-tensor scalar selects per-tensor nvfp4 (swizzled
+        kernel); a per-token (M, 1) scale selects per-token nvfp4 (mapped to the gold reference,
+        no swizzle).
 
     Returns:
         2 tensors (qdata, scale)
@@ -135,10 +137,25 @@ def quantize_tensor(
         )
         assert outer_scale is not None, "nvfp4 quantization requires a precomputed outer_scale"
         spec = (scaling_type, orientation, swizzle_type)
+        # A per-token outer scale (one fp32 value per row, shape (M, 1)) instead of a per-tensor
+        # scalar selects the per-token nvfp4 variant. There's no Triton kernel for it yet, so map it
+        # to the gold reference (`nvfp4_gs_f`, plain row-major inner scale, no swizzle).
+        if outer_scale.ndim == 2:
+            assert outer_scale.shape == (input.shape[0], 1), (
+                f"per-token nvfp4 outer_scale must be (M, 1)=({input.shape[0]}, 1), got "
+                f"{tuple(outer_scale.shape)}"
+            )
+            if spec == (ScalingType.BlockWise1x16, QuantOrientation.NATURAL, SwizzleType.NO_SWIZZLE):
+                return nvfp4_gs_f(input, outer_scale)
+            raise ValueError(
+                f"unsupported (scaling_type, orientation, swizzle_type)={spec!r} for per-token nvfp4 "
+                "(float4_e2m1fn_x2, E4M3_NVFP4, (M, 1) outer_scale); supported: "
+                "(BlockWise1x16, NATURAL, NO_SWIZZLE)"
+            )
         if spec == (ScalingType.BlockWise1x16, QuantOrientation.NATURAL, SwizzleType.SWIZZLE_32_4_4):
             return nvfp4_swizzle_triton(input, outer_scale)
         raise ValueError(
-            f"unsupported (scaling_type, orientation, swizzle_type)={spec!r} for nvfp4 "
+            f"unsupported (scaling_type, orientation, swizzle_type)={spec!r} for per-tensor nvfp4 "
             "(float4_e2m1fn_x2); supported: (BlockWise1x16, NATURAL, SWIZZLE_32_4_4)"
         )
 

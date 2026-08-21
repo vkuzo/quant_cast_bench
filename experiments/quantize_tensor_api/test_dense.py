@@ -27,6 +27,8 @@ from quant_cast_bench.quant_cast_gold.recipes import (  # noqa: E402
     mxfp8_dim_m_swizzle_f,
     mxfp8_f,
     mxfp8_swizzle_f,
+    nvfp4_gs_f,
+    nvfp4_gs_per_token_scale,
     nvfp4_gs_scale,
     nvfp4_gs_swizzle_f,
 )
@@ -246,6 +248,35 @@ def test_nvfp4_matches_gold(M, N, dtype):
     assert torch.equal(s.view(torch.uint8), s_ref.view(torch.uint8)), "scale differs from gold"
     qdata_mismatch = (q.view(torch.uint8) != q_ref.view(torch.uint8)).float().mean().item()
     assert qdata_mismatch < 0.01, f"qdata differs from gold in {qdata_mismatch:.3%} of bytes (RNE ties)"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("M,N", SHAPES)
+def test_nvfp4_per_token_matches_gold_bitwise(M, N, dtype):
+    torch.manual_seed(0)
+    x = torch.randn(M, N, dtype=dtype, device="cuda")
+    # per-token nvfp4: the fp32 outer scale is per-row (M, 1) instead of a per-tensor scalar. No
+    # Triton kernel yet, so the API maps it straight to the gold reference (nvfp4_gs_f, no swizzle)
+    # -> byte-identical by construction. This runs eager on any CUDA device (bit-math fp4 path),
+    # unlike the SM100-gated per-tensor kernel test above.
+    outer_scale = nvfp4_gs_per_token_scale(x)
+    assert outer_scale.shape == (M, 1)
+    q, s = quantize_tensor(
+        x,
+        qdata_dtype=torch.float4_e2m1fn_x2,
+        inner_scale_calc=InnerScaleCalc.E4M3_NVFP4,
+        scaling_type=ScalingType.BlockWise1x16,
+        orientation=QuantOrientation.NATURAL,
+        swizzle_type=SwizzleType.NO_SWIZZLE,
+        outer_scale=outer_scale,
+    )
+    q_ref, s_ref = nvfp4_gs_f(x, outer_scale)
+    assert torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8)), "qdata differs from gold"
+    assert torch.equal(s.view(torch.uint8), s_ref.view(torch.uint8)), "scale differs from gold"
+    assert q.dtype == torch.float4_e2m1fn_x2
+    assert s.dtype == torch.float8_e4m3fn  # nvfp4 inner scale is e4m3 (not e8m0)
+    assert q.shape == (M, N // 2) and s.shape == (M, N // 16)  # 1x16 blocks, two fp4 codes per byte
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
