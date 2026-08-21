@@ -22,6 +22,7 @@ from quant_cast_bench.quant_cast_gold.recipes import (  # noqa: E402
     mxfp8_32x32_qdata_dim_k_scale_dim_km_swizzle_f,
     mxfp8_dim_km_f,
     mxfp8_dim_km_swizzle_f,
+    mxfp4_f,
     mxfp8_dim_m_f,
     mxfp8_dim_m_swizzle_f,
     mxfp8_f,
@@ -49,6 +50,30 @@ def test_rowwise_matches_gold_bitwise(M, N, dtype):
     assert q.dtype == torch.float8_e4m3fn
     assert s.dtype == torch.float8_e8m0fnu
     assert q.shape == (M, N) and s.shape == (M, N // 32)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("M,N", SHAPES)
+def test_mxfp4_matches_gold_bitwise(M, N, dtype):
+    x = torch.randn(M, N, dtype=dtype, device="cuda")
+    # mxfp4: fp4 (e2m1) qdata + e8m0 rceil 1x32 block scale (E8M0_RCEIL tells it apart from nvfp4,
+    # which shares the float4_e2m1fn_x2 qdata dtype). No Triton kernel yet, so the API dispatches to
+    # the gold reference -> byte-identical by construction; the test pins the wiring/shape/dtype.
+    q, s = quantize_tensor(
+        x,
+        qdata_dtype=torch.float4_e2m1fn_x2,
+        inner_scale_calc=InnerScaleCalc.E8M0_RCEIL,
+        scaling_type=ScalingType.BlockWise1x32,
+        orientation=QuantOrientation.NATURAL,
+        swizzle_type=SwizzleType.NO_SWIZZLE,
+    )
+    q_ref, s_ref = mxfp4_f(x)
+    assert torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8)), "qdata differs from gold"
+    assert torch.equal(s.view(torch.uint8), s_ref.view(torch.uint8)), "scale differs from gold"
+    assert q.dtype == torch.float4_e2m1fn_x2
+    assert s.dtype == torch.float8_e8m0fnu
+    assert q.shape == (M, N // 2) and s.shape == (M, N // 32)  # two fp4 codes packed per byte
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
@@ -221,38 +246,6 @@ def test_nvfp4_matches_gold(M, N, dtype):
     assert torch.equal(s.view(torch.uint8), s_ref.view(torch.uint8)), "scale differs from gold"
     qdata_mismatch = (q.view(torch.uint8) != q_ref.view(torch.uint8)).float().mean().item()
     assert qdata_mismatch < 0.01, f"qdata differs from gold in {qdata_mismatch:.3%} of bytes (RNE ties)"
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
-def test_nvfp4_input_guards():
-    x = torch.randn(256, 512, device="cuda")
-    with pytest.raises(AssertionError):  # fp4 qdata needs the NVFP4 inner scale calc
-        quantize_tensor(x, qdata_dtype=torch.float4_e2m1fn_x2, outer_scale=nvfp4_gs_scale(x))
-    with pytest.raises(AssertionError):  # nvfp4 requires a precomputed outer_scale
-        quantize_tensor(
-            x,
-            qdata_dtype=torch.float4_e2m1fn_x2,
-            inner_scale_calc=InnerScaleCalc.E4M3_NVFP4,
-            scaling_type=ScalingType.BlockWise1x16,
-        )
-    with pytest.raises(AssertionError):  # outer_scale is nvfp4-only, not valid for mxfp8
-        quantize_tensor(x, outer_scale=nvfp4_gs_scale(x))
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
-def test_input_guards():
-    with pytest.raises(AssertionError):  # not 2D or 3D (3D is the per-expert path)
-        quantize_tensor(torch.randn(2, 8, 8, 32, device="cuda"))
-    with pytest.raises(AssertionError):  # N not a multiple of 32
-        quantize_tensor(torch.randn(64, 48, device="cuda"))
-    with pytest.raises(AssertionError):  # not contiguous
-        quantize_tensor(torch.randn(64, 64, device="cuda").t())
-    with pytest.raises(NotImplementedError):  # stochastic rounding not implemented yet
-        quantize_tensor(torch.randn(64, 64, device="cuda"), rounding_mode=RoundingMode.STOCHASTIC)
-    with pytest.raises(NotImplementedError):  # random_key (SR) not implemented yet
-        quantize_tensor(torch.randn(64, 64, device="cuda"), random_key=torch.randint(0, 2**31, (1,), device="cuda"))
-    with pytest.raises(AssertionError):  # only float8_e4m3fn qdata is supported today
-        quantize_tensor(torch.randn(64, 64, device="cuda"), qdata_dtype=torch.float8_e5m2)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")

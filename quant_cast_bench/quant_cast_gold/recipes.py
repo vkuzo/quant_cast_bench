@@ -491,15 +491,16 @@ ColwisePrecalcGold = QuantCastSingleKernelGold(
 # the scale is `descale = amax / f8e4m3_max` rounded UP to a power of two, and the cast
 # reconstructs the pow2 factor by shifting the biased exponent back into the fp32 exponent field.
 # ---------------------------------------------------------------------------
-def _amax_to_e8m0_rceil(amax):
+def _amax_to_e8m0_rceil(amax, max_pos: float = torch.finfo(torch.float8_e4m3fn).max):
     """amax (any shape) -> e8m0 (float8_e8m0fnu) power-of-two block scale via RCEIL, matching
-    torchao's `_to_mx_rceil`: `descale = amax / f8e4m3_max`, then round descale UP to a power of
-    two (i.e. up to the next e8m0 biased exponent whenever its fp32 mantissa is nonzero). Shared by
-    the mxfp8 recipes. On SM100 under compile/fake, uses the hardware `cvt.rp.ue8m0x2.f32` (round
-    toward +inf) via the core `inline_asm_elementwise` HOP; otherwise the pure-PyTorch bit-math
-    round-up (mirrors torchao's `_f32_to_e8m0_rceil`)."""
+    torchao's `_to_mx_rceil`: `descale = amax / max_pos`, then round descale UP to a power of
+    two (i.e. up to the next e8m0 biased exponent whenever its fp32 mantissa is nonzero). `max_pos`
+    is the max representable value of the target element dtype -- 448.0 (f8e4m3, mxfp8) by default,
+    6.0 (F4_E2M1_MAX, mxfp4). Shared by the mxfp8/mxfp4 recipes. On SM100 under compile/fake, uses
+    the hardware `cvt.rp.ue8m0x2.f32` (round toward +inf) via the core `inline_asm_elementwise` HOP;
+    otherwise the pure-PyTorch bit-math round-up (mirrors torchao's `_f32_to_e8m0_rceil`)."""
     e8m0_nan = 255
-    descale = amax.to(torch.float32) * (1.0 / torch.finfo(torch.float8_e4m3fn).max)  # /448.0
+    descale = amax.to(torch.float32) * (1.0 / max_pos)
 
     if _HAS_INLINE_ASM and _SM100 and descale.is_cuda and (
         torch.compiler.is_compiling() or is_fake(descale)
@@ -595,6 +596,56 @@ Mxfp8Gold = QuantCastSingleKernelGold(
     correctness_fn=_mxfp8_correctness,
     example_input_fn=lambda M, K: (torch.randn(M, K, dtype=torch.bfloat16, device="cuda"),),
     perf_description="(1,32) block",
+)
+
+# ---------------------------------------------------------------------------
+# Golden recipe: mxfp4 (1x32 block). Same e8m0 RCEIL power-of-two block scale as mxfp8, but the
+# qdata is fp4 (e2m1) packed two-per-byte instead of e4m3. Mirrors torchao's `to_mx` with
+# elem_dtype=float4_e2m1fn_x2: `_to_mx_rceil` with max_pos=F4_E2M1_MAX (6.0), then
+# `pack_uint4(f32_to_f4_unpacked(...))`. Single-level scaling (no outer scale, unlike nvfp4).
+# ---------------------------------------------------------------------------
+def mxfp4_f(x, **kwargs):
+    *lead, last = x.shape
+    x_b = x.reshape(*lead, last // 32, 32)
+    amax = x_b.abs().amax(dim=-1, keepdim=True)
+    scale_e8m0 = _amax_to_e8m0_rceil(amax, max_pos=F4_E2M1_MAX)  # descale by 6.0, not 448.0
+    # cast: multiply by the fp32 reciprocal of the e8m0 scale (matches torchao _to_mx_rceil), then
+    # encode to fp4 (e2m1) and pack two codes per byte. f32_to_f4_unpacked saturates to +-6, so no
+    # explicit clamp is needed (matching torchao's fp4 RCEIL path).
+    data_lp = (x_b.to(torch.float32) * _e8m0_scale_to_reciprocal_fp32(scale_e8m0)).reshape(*lead, last)
+    qdata = _f32_to_packed_fp4(data_lp).view(torch.float4_e2m1fn_x2).reshape(*lead, last // 2)
+    return qdata, scale_e8m0.squeeze(-1)
+
+
+def mxfp4_dq_f(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    # inverse of mxfp4_f: unpack the two fp4 codes per byte to fp32, then apply the e8m0 pow2
+    # block scale (32 values share one scale). Importable by consumers needing the inverse.
+    M, half = q.shape
+    N = half * 2
+    nb = N // 32
+    unpacked = f4_unpacked_to_f32(unpack_uint4(q.view(torch.uint8))).reshape(M, nb, 32)
+    s = _e8m0_to_fp32(scale).reshape(M, nb, 1)
+    return (unpacked * s).reshape(M, N)
+
+
+def _mxfp4_correctness(
+    inputs: Tuple[torch.Tensor, ...], outputs: Tuple[torch.Tensor, torch.Tensor]
+) -> None:
+    """Assert dequant(outputs) recovers `x` with SQNR above threshold. mxfp4 is 4-bit with only a
+    pow2 (e8m0) block scale -- coarser than both fp8 and two-level nvfp4 -- so a lower floor."""
+    (x,) = inputs
+    qdata, scale = outputs
+    x_hat = mxfp4_dq_f(qdata, scale)
+    sqnr = _compute_error(x.float(), x_hat.float())
+    threshold = 10.0
+    assert sqnr > threshold, f"mxfp4: sqnr={sqnr.item():.2f} dB below {threshold} dB"
+
+
+Mxfp4Gold = QuantCastSingleKernelGold(
+    pt_ref_fn=mxfp4_f,
+    correctness_fn=_mxfp4_correctness,
+    example_input_fn=lambda M, K: (torch.randn(M, K, dtype=torch.bfloat16, device="cuda"),),
+    perf_description="(1,32) block, fp4 qdata",
 )
 
 

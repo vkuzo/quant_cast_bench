@@ -17,7 +17,7 @@ from experiments.quantize_tensor_api.moe_utils import (  # noqa: E402
     _to_blocked_per_group_3d,
     quantize_2d_act,
 )
-from quant_cast_bench.quant_cast_gold.recipes import mxfp8_f  # noqa: E402
+from quant_cast_bench.quant_cast_gold.recipes import mxfp4_f, mxfp8_f  # noqa: E402
 from quant_cast_bench.quant_cast_triton.recipes import (  # noqa: E402
     mxfp8_32x32_qdata_dim_k_scale_dim_km_swizzle_triton,
     mxfp8_32x32_triton,
@@ -116,16 +116,24 @@ def quantize_tensor(
     if random_key is not None:
         raise NotImplementedError("random_key (stochastic rounding) is not implemented yet")
 
-    # nvfp4: fp4 (e2m1) qdata + a float8_e4m3fn inner scale computed relative to a per-tensor fp32
-    # OUTER scale (two-level scaling). The outer scale is a global amax reduction, so the caller
-    # precomputes it and passes it in. Dense 2D only for now.
     if qdata_dtype == torch.float4_e2m1fn_x2:
-        assert inner_scale_calc == InnerScaleCalc.E4M3_NVFP4, (
-            f"float4_e2m1fn_x2 qdata requires inner_scale_calc=E4M3_NVFP4, got {inner_scale_calc!r}"
-        )
-        assert input.dim() == 2, "nvfp4 quantization is only supported for 2D input"
-        assert outer_scale is not None, "nvfp4 quantization requires a precomputed outer_scale"
+        assert input.dim() == 2, "fp4 quantization is only supported for 2D input"
         assert input.is_contiguous(), "input must be contiguous"
+        if inner_scale_calc == InnerScaleCalc.E8M0_RCEIL:
+            assert outer_scale is None, "mxfp4 (E8M0_RCEIL) is single-level; outer_scale must be None"
+            spec = (scaling_type, orientation, swizzle_type)
+            if spec == (ScalingType.BlockWise1x32, QuantOrientation.NATURAL, SwizzleType.NO_SWIZZLE):
+                assert input.shape[1] % 32 == 0, f"last dim must be a multiple of 32, got {input.shape[1]}"
+                return mxfp4_f(input)
+            raise ValueError(
+                f"unsupported (scaling_type, orientation, swizzle_type)={spec!r} for mxfp4 "
+                "(float4_e2m1fn_x2, E8M0_RCEIL); supported: (BlockWise1x32, NATURAL, NO_SWIZZLE)"
+            )
+        assert inner_scale_calc == InnerScaleCalc.E4M3_NVFP4, (
+            f"float4_e2m1fn_x2 qdata requires inner_scale_calc=E4M3_NVFP4 (nvfp4) or "
+            f"E8M0_RCEIL (mxfp4), got {inner_scale_calc!r}"
+        )
+        assert outer_scale is not None, "nvfp4 quantization requires a precomputed outer_scale"
         spec = (scaling_type, orientation, swizzle_type)
         if spec == (ScalingType.BlockWise1x16, QuantOrientation.NATURAL, SwizzleType.SWIZZLE_32_4_4):
             return nvfp4_swizzle_triton(input, outer_scale)
