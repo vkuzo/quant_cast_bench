@@ -32,6 +32,7 @@ from experiments.mxfp8_api.api import (  # noqa: E402
     QuantOrientation,
     quantize_to_mxfp8,
     quantize_to_mxfp8_grouped,
+    quantize_to_mxfp8_grouped_bidirectional,
 )
 from quant_cast_bench.quant_cast_gold.recipes import _compute_error  # noqa: E402
 
@@ -113,8 +114,8 @@ def mxfp8_bwd_real(
     # --- grad_output cast in BOTH orientations (one padded read): row-orientation feeds dgrad
     # (1x32 along N, M-groups scale), transposed-orientation feeds wgrad (1x32 along M, K-groups
     # scale). This single call is exactly the fused both-orientation cast a kernel would collapse. ---
-    go_fp8, go_scale_blocked, go_t_fp8, go_t_scale_blocked, padded_offs = quantize_to_mxfp8_grouped(
-        grad_output, offs, orientation=QuantOrientation.BOTH
+    go_fp8, go_scale_blocked, go_t_fp8, go_t_scale_blocked, padded_offs = (
+        quantize_to_mxfp8_grouped_bidirectional(grad_output, offs)
     )
 
     # === dgrad: grad_input = grouped_mm(grad_output, weight) ===
