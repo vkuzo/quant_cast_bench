@@ -1373,6 +1373,114 @@ Nvfp4GsSwizzle_DimK_DimMRHT_Gold = QuantCastSingleKernelGold(
     perf_description="(1,16) block, fp4 qdata, swizzle; dim-k (no RHT) + dim-m (RHT), two outer scales",
 )
 
+# ---------------------------------------------------------------------------
+# Golden recipe: same both-orientation nvfp4 (swizzled) forward activation cast as
+# Nvfp4GsSwizzle_DimK_DimMRHT_Gold, but the fp4 qdata cast uses STOCHASTIC ROUNDING (SR) in BOTH
+# directions instead of RNE -- torchao's `triton_rht_quantize_row_col` with stochastic_rounding=True.
+# Everything else (the per-tensor outer scales, the e4m3 inner scale, the RHT on the dim-m path, the
+# swizzled scale layout) is identical to the RNE gold. Still reference only (no kernel).
+#
+# The SR follows the SOFTWARE stochastic rounding in experiments/stochastic_rounding_api/api.py
+# (Rounding.STOCHASTIC's `_reference_impl`, NOT the NVIDIA cvt.rs hardware intrinsics): add a uniform
+# dither into the fp32 mantissa bits the target format discards, then truncate. fp4 (e2m1) keeps one
+# mantissa bit, so it drops 23 - 1 = 22 bits (vs that reference's 16 for bf16 / 20 for e4m3). The
+# reference draws its dither from `prng.bits`; this torch build has no `prng.bits`, so we draw an
+# equivalent uniform 22-bit dither from `prng.uniform` -- exactly as the repo's other SR golds do
+# (sr_bf16_f). SR is unbiased (E[SR(v)] = v), so the round-trip SQNR stays above the same 12 dB floor
+# as the RNE gold; the point of SR here is an unbiased grad cast, which the RNE gold cannot give.
+# ---------------------------------------------------------------------------
+def _f32_to_packed_fp4_sr(data_scaled, key):
+    """fp32 (already clamped to +-6) -> packed nvfp4 bytes (two e2m1 per byte, same layout as
+    `_f32_to_packed_fp4`) with STOCHASTIC rounding to the fp4 grid instead of RNE. Adds a uniform
+    22-bit dither into the discarded fp32 mantissa field, then truncates (the software-SR trick from
+    stochastic_rounding_api's STOCHASTIC `_reference_impl`, drop = 23 - 1 fp4 mantissa bit = 22). The
+    dither comes from `prng.uniform(key, ...)` (this build lacks `prng.bits`; same substitution as
+    sr_bf16_f). After the add-and-truncate the value already sits on the fp4 normal grid, so the
+    f32_to_f4_unpacked RNE below is a no-op for normals (subnormals, |scaled| < 1, double-round -- the
+    same approximation the e4m3 SR reference tolerates)."""
+    drop = 22  # 23 fp32 mantissa bits - 1 fp4 (e2m1) mantissa bit
+    u = prng.uniform(key, tuple(data_scaled.shape))
+    rand = (u * (1 << drop)).to(torch.int32)  # uniform int in [0, 2**22)
+    xi = (data_scaled.contiguous().view(torch.int32) + rand) & -(1 << drop)
+    x_sr = xi.view(torch.float32)
+    return pack_uint4(f32_to_f4_unpacked(x_sr))
+
+
+def nvfp4_gs_swizzle_sr_f(x, outer_scale, key, **kwargs):
+    """`nvfp4_gs_swizzle_f` but the fp4 qdata cast uses stochastic rounding (`_f32_to_packed_fp4_sr`,
+    keyed on `key`) instead of RNE. The e4m3 inner scale and its swizzle are unchanged. `key` is a
+    torch.func._random Philox key (explicit aux input)."""
+    *lead, last = x.shape
+    x_b = x.reshape(*lead, last // 16, 16)
+    local_amax = x_b.abs().amax(dim=-1, keepdim=True)
+    # inner e4m3 block scale, relative to the outer scale (identical to the RNE path).
+    inner = torch.clamp(
+        (local_amax.to(torch.float32) / F4_E2M1_MAX) / outer_scale,
+        min=E4M3_EPS, max=F8E4M3_MAX,
+    ).to(torch.float8_e4m3fn)
+    reciprocal = (1.0 / outer_scale) / inner.to(torch.float32)
+    data_scaled = torch.clamp(x_b.to(torch.float32) * reciprocal, -F4_E2M1_MAX, F4_E2M1_MAX)
+    qdata_b = _f32_to_packed_fp4_sr(data_scaled, key).view(torch.float4_e2m1fn_x2)  # SR, not RNE
+    qdata = qdata_b.reshape(*lead, last // 2)
+    inner_swizzled = _to_blocked_4d(inner.squeeze(-1))
+    return qdata, inner_swizzled
+
+
+def nvfp4_gs_swizzle_dim_k_dim_m_rht_sr_f(
+    x, outer_scale_k, outer_scale_m, rht, key_k, key_m, **kwargs
+):
+    """`nvfp4_gs_swizzle_dim_k_dim_m_rht_f` with stochastic rounding on both fp4 casts. dim-k is
+    plain SR nvfp4 (no RHT); dim-m applies the RHT to x.t() then SR-nvfp4s along M. `key_k`/`key_m`
+    are independent Philox keys (one per direction, so the two casts draw uncorrelated dither)."""
+    qk, sk = nvfp4_gs_swizzle_sr_f(x, outer_scale_k, key_k)  # dim-k: 1x16 along K, no RHT, SR
+    (x_t_rht,) = hadamard_rht_f(x.t().contiguous(), rht)
+    qm, sm = nvfp4_gs_swizzle_sr_f(x_t_rht, outer_scale_m, key_m)  # transposed (N, M//2) frame, SR
+    return qk, sk, qm, sm
+
+
+def _nvfp4_gs_swizzle_dim_k_dim_m_rht_sr_correctness(
+    inputs: Tuple[torch.Tensor, ...],
+    outputs: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+) -> None:
+    """Same SQNR check as the RNE gold: dequant each orientation (inverting the dim-m RHT with
+    rht.t()) and assert SQNR above the 12 dB fp4 floor. SR adds a little more quantization noise than
+    RNE but is unbiased, so the floor is unchanged."""
+    x, outer_scale_k, outer_scale_m, rht, _key_k, _key_m = inputs
+    qk, sk, qm, sm = outputs
+    x_hat_k = nvfp4_gs_swizzle_dq_f(qk, sk, outer_scale_k)  # (M, N) ~ x
+    x_t_rht_hat = nvfp4_gs_swizzle_dq_f(qm, sm, outer_scale_m)  # (N, M) ~ RHT(x.t())
+    N_, M_ = x_t_rht_hat.shape
+    x_hat_m = (x_t_rht_hat.reshape(N_, M_ // 16, 16) @ rht.t().float()).reshape(N_, M_).t()  # ~ x
+    threshold = 12.0
+    sqnr_k = _compute_error(x.float(), x_hat_k.float())
+    sqnr_m = _compute_error(x.float(), x_hat_m.float())
+    assert sqnr_k > threshold, f"nvfp4 dim-k (SR): sqnr={sqnr_k.item():.2f} dB below {threshold} dB"
+    assert sqnr_m > threshold, f"nvfp4 dim-m (RHT, SR): sqnr={sqnr_m.item():.2f} dB below {threshold} dB"
+
+
+def _nvfp4_gs_swizzle_dim_k_dim_m_rht_sr_inputs(M, K):
+    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+    sign = torch.tensor([1, -1] * 8, device=x.device, dtype=x.dtype)
+    rht = hadamard_rht_matrix(sign, x.device, x.dtype)
+    outer_scale_k = nvfp4_gs_scale(x)  # global amax over |x|
+    (x_t_rht,) = hadamard_rht_f(x.t().contiguous(), rht)
+    outer_scale_m = x_t_rht.abs().to(torch.float32).amax() / (F8E4M3_MAX * F4_E2M1_MAX)
+    # independent Philox keys for the two SR casts (dim-k over x, dim-m over RHT(x.t())).
+    key_k = prng.key(0, device=x.device)
+    key_m = prng.key(1, device=x.device)
+    return (x, outer_scale_k, outer_scale_m, rht, key_k, key_m)
+
+
+Nvfp4GsSwizzle_DimKSR_DimMRHTSR_Gold = QuantCastSingleKernelGold(
+    pt_ref_fn=nvfp4_gs_swizzle_dim_k_dim_m_rht_sr_f,
+    correctness_fn=_nvfp4_gs_swizzle_dim_k_dim_m_rht_sr_correctness,
+    example_input_fn=_nvfp4_gs_swizzle_dim_k_dim_m_rht_sr_inputs,
+    perf_description=(
+        "(1,16) block, fp4 qdata (stochastic rounding), swizzle; "
+        "dim-k (no RHT) + dim-m (RHT), two outer scales"
+    ),
+)
+
 
 # ---------------------------------------------------------------------------
 # Golden recipe: nvfp4 with global scale (two-level), inner scale in PLAIN ROW-MAJOR layout.
@@ -1852,6 +1960,7 @@ ALL_RECIPES = [
     ("nvfp4", Nvfp4GsGold),
     ("nvfp4_swizzle", Nvfp4GsSwizzleGold),
     ("nvfp4_swizzle_dim_k_dim_m_rht", Nvfp4GsSwizzle_DimK_DimMRHT_Gold),
+    ("nvfp4_swizzle_dim_k_sr_dim_m_rht_sr", Nvfp4GsSwizzle_DimKSR_DimMRHTSR_Gold),
     ("nvfp4_blocked_outer", Nvfp4BlockedOuterGold),
     # RHT
     ("bf16_rht", HadamardRht),
