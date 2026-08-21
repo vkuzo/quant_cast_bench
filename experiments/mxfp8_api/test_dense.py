@@ -182,8 +182,8 @@ def test_32x32_both_scales_natural_qdata_matches_gold_bitwise(M, N, dtype):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
 def test_input_guards():
-    with pytest.raises(AssertionError):  # not 2D
-        quantize_to_mxfp8(torch.randn(8, 8, 32, device="cuda"))
+    with pytest.raises(AssertionError):  # not 2D or 3D (3D is the per-expert path)
+        quantize_to_mxfp8(torch.randn(2, 8, 8, 32, device="cuda"))
     with pytest.raises(AssertionError):  # N not a multiple of 32
         quantize_to_mxfp8(torch.randn(64, 48, device="cuda"))
     with pytest.raises(AssertionError):  # not contiguous

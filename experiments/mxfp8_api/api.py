@@ -77,15 +77,15 @@ def quantize_to_mxfp8(
     """Quantize `input` to mxfp8: float8_e4m3fn qdata + one e8m0 scale per block.
 
     Args:
-      input: 2D input tensor (bf16 or fp32) of shape (M, N).
+      input: 2D input tensor (bf16 or fp32) of shape (M, K), or 3D of shape (E, M, K).
       scaling_type: only BlockWise1x32 and BlockWise32x32
-      orientation: how scaling_type maps onto (M, N) and how the output is laid out.
-        NATURAL maps the scaling_type to (M, N)
-        TRANSPOSED maps it to the (N, M) view and writes the outputs transposed-contiguous
+      orientation: how scaling_type maps onto (M, K) and how the output is laid out.
+        NATURAL maps the scaling_type to (M, K)
+        TRANSPOSED maps it to the (K, M) view and writes the outputs transposed-contiguous
         BOTH runs both in one fused pass
         BOTH_SCALES_NATURAL_QDATA square blocks only, outputs dim-k qdata and both scales
-      swizzle_type: NO_SWIZZLE or SWIZZLE_32_4_4
-      pad_input_to_next_multiple_of: per-input-dimension zero-padding fused into the cast
+      swizzle_type: NO_SWIZZLE or SWIZZLE_32_4_4. Note that for 3d inputs, swizzle is applied per-expert.
+      pad_input_to_next_multiple_of: per-input-dimension zero-padding for (M, K) fused into the cast
       rounding_mode: RTNE or STOCHASTIC
       random_key: entropy source for stochastic rounding
 
@@ -94,8 +94,7 @@ def quantize_to_mxfp8(
         4 tensors (qk, sk, qm, sm) for BOTH
         3 tensors (qk, sk, sm) for BOTH_SCALES_NATURAL_QDATA
     """
-    assert input.dim() == 2, f"only 2D input supported for now, got {input.dim()}D"
-    assert input.is_contiguous(), "input must be contiguous"
+    assert input.dim() in (2, 3), f"only 2D or 3D input supported, got {input.dim()}D"
     if pad_input_to_next_multiple_of is not None:
         raise NotImplementedError("pad_input_to_next_multiple_of is not implemented yet")
     if rounding_mode == RoundingMode.STOCHASTIC:
@@ -103,6 +102,35 @@ def quantize_to_mxfp8(
     if random_key is not None:
         raise NotImplementedError("random_key (stochastic rounding) is not implemented yet")
 
+    if input.dim() == 3:
+        # Per-expert (E, N, K) batching is a separate code path from the 2D casts below: each of the
+        # E slices is quantized independently (scaling never applies to the E dimension), swizzling is
+        # per-expert. The public entry point is merged but the computation is not.
+        if (scaling_type, swizzle_type) != (ScalingType.BlockWise1x32, SwizzleType.SWIZZLE_32_4_4):
+            raise ValueError(
+                f"unsupported (scaling_type, swizzle_type)=({scaling_type!r}, {swizzle_type!r}); "
+                "quantize_to_mxfp8 with 3D (E, N, K) input supports only (BlockWise1x32, SWIZZLE_32_4_4)"
+            )
+        if orientation not in (
+            QuantOrientation.NATURAL, QuantOrientation.TRANSPOSED, QuantOrientation.BOTH
+        ):
+            raise ValueError(
+                f"orientation={orientation!r} is not supported for 3D (E, N, K) quantize_to_mxfp8; "
+                "supported: NATURAL, TRANSPOSED, BOTH"
+            )
+        if orientation in (QuantOrientation.NATURAL, QuantOrientation.BOTH):
+            q_nat, s_nat = mxfp8_f(input.contiguous())  # (E,N,K), 1x32 along K
+            sb_nat = _to_blocked_per_group_3d(s_nat)
+        if orientation in (QuantOrientation.TRANSPOSED, QuantOrientation.BOTH):
+            q_t, s_t = mxfp8_f(input.transpose(-2, -1).contiguous())  # (E,K,N), 1x32 along N
+            sb_t = _to_blocked_per_group_3d(s_t)
+        if orientation == QuantOrientation.NATURAL:
+            return q_nat, sb_nat
+        if orientation == QuantOrientation.TRANSPOSED:
+            return q_t, sb_t
+        return q_nat, sb_nat, q_t, sb_t
+
+    assert input.is_contiguous(), "input must be contiguous"
     spec = (scaling_type, orientation, swizzle_type)
     if spec == (ScalingType.BlockWise1x32, QuantOrientation.NATURAL, SwizzleType.NO_SWIZZLE):
         assert input.shape[1] % 32 == 0, f"last dim must be a multiple of 32, got {input.shape[1]}"
@@ -154,6 +182,7 @@ def quantize_to_mxfp8_grouped(
 ) -> tuple[Tensor, Tensor, Tensor] | tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
     """
     Differences from quantize_to_mxfp8:
+    * 2d tensors of shape (M, K) only
     * adds an `offs` argument
     * swizzling is per-token-group
     * semantics of `pad_input_to_next_multiple_of` are per-token-group for the first 
@@ -194,53 +223,3 @@ def quantize_to_mxfp8_grouped(
     if orientation == QuantOrientation.TRANSPOSED:
         return q_t, sb_t, padded_offs
     return q_nat, sb_nat, q_t, sb_t, padded_offs
-
-
-def quantize_to_mxfp8_batched(
-    input: Tensor,  # (E, N, K)
-    *,
-    scaling_type: ScalingType = ScalingType.BlockWise1x32,
-    orientation: QuantOrientation = QuantOrientation.NATURAL,
-    swizzle_type: SwizzleType = SwizzleType.SWIZZLE_32_4_4,
-    pad_input_to_next_multiple_of: tuple[int, int] | None = None,
-    rounding_mode: RoundingMode = RoundingMode.RTNE,
-    random_key: Tensor | None = None,
-) -> tuple[Tensor, Tensor] | tuple[Tensor, Tensor, Tensor, Tensor]:
-    """
-    Differences from quantize_to_mxfp8:
-    * input shape is 3d (E, N, K) instead of 2d (M, K)
-    * scaling type never applies to the E dimension, only to N and K
-    * swizzling is per-expert
-    """
-    assert input.dim() == 3, "input must be 3D (E, N, K)"
-    if pad_input_to_next_multiple_of is not None:
-        raise NotImplementedError("pad_input_to_next_multiple_of is not implemented yet")
-    if rounding_mode == RoundingMode.STOCHASTIC:
-        raise NotImplementedError("rounding_mode=STOCHASTIC is not implemented yet")
-    if random_key is not None:
-        raise NotImplementedError("random_key (stochastic rounding) is not implemented yet")
-    if (scaling_type, swizzle_type) != (ScalingType.BlockWise1x32, SwizzleType.SWIZZLE_32_4_4):
-        raise ValueError(
-            f"unsupported (scaling_type, swizzle_type)=({scaling_type!r}, {swizzle_type!r}); "
-            "quantize_to_mxfp8_batched supports only (BlockWise1x32, SWIZZLE_32_4_4)"
-        )
-    if orientation not in (
-        QuantOrientation.NATURAL, QuantOrientation.TRANSPOSED, QuantOrientation.BOTH
-    ):
-        raise ValueError(
-            f"orientation={orientation!r} is not supported by quantize_to_mxfp8_batched; "
-            "supported: NATURAL, TRANSPOSED, BOTH"
-        )
-
-    if orientation in (QuantOrientation.NATURAL, QuantOrientation.BOTH):
-        q_nat, s_nat = mxfp8_f(input.contiguous())  # (E,N,K), 1x32 along K
-        sb_nat = _to_blocked_per_group_3d(s_nat)
-    if orientation in (QuantOrientation.TRANSPOSED, QuantOrientation.BOTH):
-        q_t, s_t = mxfp8_f(input.transpose(-2, -1).contiguous())  # (E,K,N), 1x32 along N
-        sb_t = _to_blocked_per_group_3d(s_t)
-
-    if orientation == QuantOrientation.NATURAL:
-        return q_nat, sb_nat
-    if orientation == QuantOrientation.TRANSPOSED:
-        return q_t, sb_t
-    return q_nat, sb_nat, q_t, sb_t

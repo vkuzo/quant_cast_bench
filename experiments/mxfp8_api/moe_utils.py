@@ -1,6 +1,6 @@
-"""Plain-PyTorch helpers shared by the mxfp8 MoE grouped/batched casts in `api.py`.
+"""Plain-PyTorch helpers shared by the mxfp8 MoE grouped/per-expert casts in `api.py`.
 
-These are the low-level pieces `quantize_to_mxfp8_grouped` and `quantize_to_mxfp8_batched` compose:
+These are the low-level pieces `quantize_to_mxfp8_grouped` and `quantize_to_mxfp8` (3D per-expert path) compose:
 the 1x32 e8m0 cast wrapper, token-group padding, and the NVIDIA blocked/swizzled tcgen05 scale
 layouts (2D M-groups / 2D K-groups for token operands, per-expert 3D for weights). All are
 pure-PyTorch ports of torchao's `kernels/mxfp8/quant.py`, substituting this repo's `_to_blocked_4d`

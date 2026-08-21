@@ -17,8 +17,8 @@ block-aligned; the M-dim outputs are unpadded afterward. `torch._scaled_grouped_
 this box is SM100 (`torch.cuda.get_device_capability() == (10, 0)`), so the real op runs here.
 
 The token/weight quant casts (pad + blocked-scale swizzle) live in `api.py`
-(`quantize_to_mxfp8_grouped` / `quantize_to_mxfp8_batched`) over `moe_utils`; only the M-dim unpad of
-the finished output stays here, as it's a GEMM-output step, not a cast. The plain-PyTorch emulated
+(`quantize_to_mxfp8_grouped` / `quantize_to_mxfp8` with a 3D per-expert input) over `moe_utils`; only
+the M-dim unpad of the finished output stays here, as it's a GEMM-output step, not a cast. The plain-PyTorch emulated
 (dequantize-and-matmul) companion path lives in `moe_emulated.py`.
 """
 
@@ -30,7 +30,7 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from experiments.mxfp8_api.api import (  # noqa: E402
     QuantOrientation,
-    quantize_to_mxfp8_batched,
+    quantize_to_mxfp8,
     quantize_to_mxfp8_grouped,
 )
 from quant_cast_bench.quant_cast_gold.recipes import _compute_error  # noqa: E402
@@ -40,8 +40,8 @@ from quant_cast_bench.quant_cast_gold.recipes import _compute_error  # noqa: E40
 # Real (non-emulated) path: call the actual SM100 `torch._scaled_grouped_mm`.
 #
 # The token/weight casts (pad + swizzle) live in `api.py` (`quantize_to_mxfp8_grouped` /
-# `quantize_to_mxfp8_batched`) over the `moe_utils` helpers; only the M-dim unpad of the finished
-# output stays here, as it's a GEMM-output step, not a cast.
+# `quantize_to_mxfp8` with a 3D per-expert input) over the `moe_utils` helpers; only the M-dim unpad
+# of the finished output stays here, as it's a GEMM-output step, not a cast.
 # ===========================================================================
 def _unpad_token_groups(
     padded_inputs: torch.Tensor,
@@ -79,7 +79,7 @@ def mxfp8_fwd_real(
     )
     # Weight cast blocked 1x32 along K (the fwd contraction dim): TRANSPOSED gives a (E,N,K) row-major
     # buffer whose transpose (E,K,N) is the column-major mat2 view the real op requires.
-    w_e4m3, w_scale_blocked = quantize_to_mxfp8_batched(
+    w_e4m3, w_scale_blocked = quantize_to_mxfp8(
         weight_t, orientation=QuantOrientation.TRANSPOSED
     )  # (E,N,K)
     out = torch._scaled_grouped_mm(
@@ -120,7 +120,7 @@ def mxfp8_bwd_real(
     # === dgrad: grad_input = grouped_mm(grad_output, weight) ===
     # Weight blocked 1x32 along N (the dgrad contraction dim). weight_t is (E,K,N) with N last, so
     # NATURAL blocks along N directly; the transpose gives the (E,N,K) column-major mat2 view.
-    q_kn, w_scale_blocked = quantize_to_mxfp8_batched(
+    q_kn, w_scale_blocked = quantize_to_mxfp8(
         weight_t, orientation=QuantOrientation.NATURAL
     )  # (E,K,N)
     w_e4m3 = q_kn.transpose(-2, -1)  # (E,N,K) column-major view
