@@ -1309,6 +1309,72 @@ Nvfp4GsSwizzleGold = QuantCastSingleKernelGold(
 
 
 # ---------------------------------------------------------------------------
+# Golden recipe: nvfp4 (swizzled) in BOTH orientations from one read -- the forward activation cast
+# of torchao's RHT-fused nvfp4 training (`triton_rht_quantize_row_col`, stochastic_rounding=False):
+#   * dim-k (rowwise, no RHT): plain nvfp4 of x (M,N), 1x16 blocks along K -- identical to
+#     Nvfp4GsSwizzleGold. Outer scale is a per-tensor global reduction over |x|.
+#   * dim-m (colwise, WITH RHT): apply the 16x16 RHT to x.t() (16-blocks along the original M), then
+#     nvfp4 that (N,M) tensor along its last dim. Outputs in the transposed (N, M//2) frame.
+# There are **two** outer scales (both aux inputs, like Nvfp4GsSwizzleGold's): the dim-k one over |x|,
+# and the dim-m one over |RHT(x.t())| -- a DIFFERENT tensor, so a distinct scalar. Reference only (no
+# kernel). Mirrors torchao test `_rht_quantize_reference` / `_rht_quantize_rowwise_reference`; the two
+# amaxes are the kernel's `row_global_amax` / `col_global_amax` inputs. RHT = diag(sign) @ H (via the
+# HadamardRht helpers below), orthogonal, so correctness inverts the dim-m path with rht.t().
+# ---------------------------------------------------------------------------
+def nvfp4_gs_swizzle_dim_k_dim_m_rht_f(x, outer_scale_k, outer_scale_m, rht, **kwargs):
+    """Tile-invariant `f`: nvfp4-swizzle x both ways in one read. dim-k is plain nvfp4 (no RHT);
+    dim-m applies the RHT to x.t() then nvfp4s along M. Returns (qk (M,N//2), sk swizzled,
+    qm (N,M//2), sm swizzled). `outer_scale_k`/`outer_scale_m` are per-tensor scalars (aux inputs);
+    `rht` is the 16x16 RHT matrix (aux input)."""
+    qk, sk = nvfp4_gs_swizzle_f(x, outer_scale_k)  # dim-k: 1x16 along K, no RHT
+    # dim-m: RHT along the original M (x.t() is (N, M), RHT hits its last dim), then nvfp4 along M.
+    (x_t_rht,) = hadamard_rht_f(x.t().contiguous(), rht)
+    qm, sm = nvfp4_gs_swizzle_f(x_t_rht, outer_scale_m)  # transposed (N, M//2) frame
+    return qk, sk, qm, sm
+
+
+def _nvfp4_gs_swizzle_dim_k_dim_m_rht_correctness(
+    inputs: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    outputs: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+) -> None:
+    """Dequant each orientation and assert SQNR above threshold. The dim-m pair recovers the RHT
+    domain (RHT(x.t())), so invert the RHT (orthogonal -> rht.t()) and transpose back before
+    comparing to x. nvfp4 is 4-bit, so a low (12 dB) floor -- RHT tends to raise the dim-m SQNR."""
+    x, outer_scale_k, outer_scale_m, rht = inputs
+    qk, sk, qm, sm = outputs
+    x_hat_k = nvfp4_gs_swizzle_dq_f(qk, sk, outer_scale_k)  # (M, N) ~ x
+    x_t_rht_hat = nvfp4_gs_swizzle_dq_f(qm, sm, outer_scale_m)  # (N, M) ~ RHT(x.t())
+    N_, M_ = x_t_rht_hat.shape
+    x_hat_m = (x_t_rht_hat.reshape(N_, M_ // 16, 16) @ rht.t().float()).reshape(N_, M_).t()  # ~ x
+    threshold = 12.0
+    sqnr_k = _compute_error(x.float(), x_hat_k.float())
+    sqnr_m = _compute_error(x.float(), x_hat_m.float())
+    assert sqnr_k > threshold, f"nvfp4 dim-k: sqnr={sqnr_k.item():.2f} dB below {threshold} dB"
+    assert sqnr_m > threshold, f"nvfp4 dim-m (RHT): sqnr={sqnr_m.item():.2f} dB below {threshold} dB"
+
+
+def _nvfp4_gs_swizzle_dim_k_dim_m_rht_inputs(M, K):
+    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+    # fixed +/-1 sign vector (deterministic), same as _hadamard_rht_inputs; build the 16x16 RHT matrix.
+    sign = torch.tensor([1, -1] * 8, device=x.device, dtype=x.dtype)
+    rht = hadamard_rht_matrix(sign, x.device, x.dtype)
+    outer_scale_k = nvfp4_gs_scale(x)  # global amax over |x|
+    # dim-m outer scale is over the SAME bf16 RHT output pt_ref_fn re-derives from `rht` (matches
+    # torchao computing col_global_amax on the bf16 _rht_reference), so the two stay consistent.
+    (x_t_rht,) = hadamard_rht_f(x.t().contiguous(), rht)
+    outer_scale_m = x_t_rht.abs().to(torch.float32).amax() / (F8E4M3_MAX * F4_E2M1_MAX)
+    return (x, outer_scale_k, outer_scale_m, rht)
+
+
+Nvfp4GsSwizzle_DimK_DimMRHT_Gold = QuantCastSingleKernelGold(
+    pt_ref_fn=nvfp4_gs_swizzle_dim_k_dim_m_rht_f,
+    correctness_fn=_nvfp4_gs_swizzle_dim_k_dim_m_rht_correctness,
+    example_input_fn=_nvfp4_gs_swizzle_dim_k_dim_m_rht_inputs,
+    perf_description="(1,16) block, fp4 qdata, swizzle; dim-k (no RHT) + dim-m (RHT), two outer scales",
+)
+
+
+# ---------------------------------------------------------------------------
 # Golden recipe: nvfp4 with global scale (two-level), inner scale in PLAIN ROW-MAJOR layout.
 #
 # Identical two-level nvfp4 quantization to nvfp4_gs_swizzle_f, but the per-16-element e4m3 inner
@@ -1785,6 +1851,7 @@ ALL_RECIPES = [
     # 4 bit 1D
     ("nvfp4", Nvfp4GsGold),
     ("nvfp4_swizzle", Nvfp4GsSwizzleGold),
+    ("nvfp4_swizzle_dim_k_dim_m_rht", Nvfp4GsSwizzle_DimK_DimMRHT_Gold),
     ("nvfp4_blocked_outer", Nvfp4BlockedOuterGold),
     # RHT
     ("bf16_rht", HadamardRht),
