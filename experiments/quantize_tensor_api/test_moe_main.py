@@ -1,7 +1,7 @@
 """Correctness tests for the REAL MoE mxfp8 grouped-GEMM casts (forward + backward).
 
 Each test quantizes random bf16 inputs to mxfp8 with the plain-PyTorch reference in
-`experiments/mxfp8_api/moe_main.py` (blocked scales + token-group padding -> the actual
+`experiments/quantize_tensor_api/moe_main.py` (blocked scales + token-group padding -> the actual
 `torch._scaled_grouped_mm`) and compares against the full-precision bf16 formulation of the same GEMM
 via SQNR. The real path needs the SM100-only `torch._scaled_grouped_mm`; these tests are skipped off
 SM100. The plain-PyTorch emulated companion path is tested in `test_moe_emulated.py`.
@@ -14,14 +14,14 @@ import pytest
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-from experiments.mxfp8_api.moe_main import (  # noqa: E402
+from experiments.quantize_tensor_api.moe_main import (  # noqa: E402
     _unpad_token_groups,
     compute_error,
     mxfp8_bwd_real,
     mxfp8_fwd_real,
     mxfp8_grouped_mm_real,
 )
-from experiments.mxfp8_api.moe_utils import _pad_token_groups  # noqa: E402
+from experiments.quantize_tensor_api.moe_utils import _pad_token_groups  # noqa: E402
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 

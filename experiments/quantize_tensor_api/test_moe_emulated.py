@@ -1,7 +1,7 @@
 """Correctness tests for the EMULATED MoE mxfp8 grouped-GEMM casts (forward + backward).
 
 Each test quantizes random bf16 inputs to mxfp8 with the plain-PyTorch emulated reference in
-`experiments/mxfp8_api/moe_emulated.py` (dequantize -> `torch._grouped_mm`) and compares against the
+`experiments/quantize_tensor_api/moe_emulated.py` (dequantize -> `torch._grouped_mm`) and compares against the
 full-precision bf16 formulation of the same GEMM via SQNR. The emulated path needs no SM100 device;
 the real `torch._scaled_grouped_mm` path is covered separately in `test_moe_moe.py`.
 """
@@ -13,7 +13,7 @@ import pytest
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-from experiments.mxfp8_api.moe_emulated import (  # noqa: E402
+from experiments.quantize_tensor_api.moe_emulated import (  # noqa: E402
     compute_error,
     mxfp8_dgrad_emulated,
     mxfp8_fwd_emulated,

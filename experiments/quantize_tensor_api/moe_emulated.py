@@ -22,7 +22,7 @@ import sys
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-from experiments.mxfp8_api.moe_utils import BLOCK_SIZE, quantize_2d_act  # noqa: E402
+from experiments.quantize_tensor_api.moe_utils import BLOCK_SIZE, quantize_2d_act  # noqa: E402
 from quant_cast_bench.quant_cast_gold.recipes import _compute_error, mxfp8_f  # noqa: E402
 
 
