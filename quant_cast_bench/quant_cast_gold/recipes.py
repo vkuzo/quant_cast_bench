@@ -1354,30 +1354,31 @@ Nvfp4GsDimMSwizzleGold = QuantCastSingleKernelGold(
 # Golden recipe: nvfp4 (swizzled) in BOTH orientations from one read, NO RHT -- the no-RHT twin of
 # Nvfp4GsSwizzle_DimK_DimMRHT_Gold, and just Nvfp4GsSwizzleGold + Nvfp4GsDimMSwizzleGold fused into a
 # single dim-km cast. dim-k is plain nvfp4 of x (1x16 blocks along K); dim-m is plain nvfp4 of x.t()
-# (1x16 blocks along the original M), emitted in the transposed (N, M//2) frame. With no RHT,
-# |x.t()| == |x| (abs is transpose-invariant), so a SINGLE per-tensor outer scale serves both
-# orientations (unlike the RHT version, which needs a distinct dim-m scale over |RHT(x.t())|).
-# Reference only (no kernel yet).
+# (1x16 blocks along the original M), emitted in the transposed (N, M//2) frame. Takes a separate
+# per-tensor outer scale per orientation (outer_scale_k, outer_scale_m), matching the RHT version's
+# signature -- it's the caller's job to pass correct scales. With no RHT |x.t()| == |x| (abs is
+# transpose-invariant), so a caller typically passes the same value for both. Reference only (no
+# kernel yet).
 # ---------------------------------------------------------------------------
-def nvfp4_gs_swizzle_dim_km_f(x, outer_scale, **kwargs):
+def nvfp4_gs_swizzle_dim_km_f(x, outer_scale_k, outer_scale_m, **kwargs):
     """Tile-invariant `f`: nvfp4-swizzle x both ways in one read, no RHT. dim-k is plain nvfp4 of x;
     dim-m is plain nvfp4 of x.t(). Returns (qk (M,N//2), sk swizzled, qm (N,M//2), sm swizzled). One
-    per-tensor `outer_scale` scalar (aux input, REPLICATE) -- |x.t()| == |x| serves both."""
-    qk, sk = nvfp4_gs_swizzle_f(x, outer_scale)  # dim-k: 1x16 along K
-    qm, sm = nvfp4_gs_swizzle_f(x.t().contiguous(), outer_scale)  # dim-m: transposed (N, M//2) frame
+    per-tensor outer scale per orientation (`outer_scale_k`, `outer_scale_m`; aux inputs, REPLICATE)."""
+    qk, sk = nvfp4_gs_swizzle_f(x, outer_scale_k)  # dim-k: 1x16 along K
+    qm, sm = nvfp4_gs_swizzle_f(x.t().contiguous(), outer_scale_m)  # dim-m: transposed (N, M//2) frame
     return qk, sk, qm, sm
 
 
 def _nvfp4_gs_swizzle_dim_km_correctness(
-    inputs: Tuple[torch.Tensor, torch.Tensor],
+    inputs: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     outputs: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
 ) -> None:
-    """Dequant each orientation (same single outer scale) and assert SQNR above threshold. The dim-m
+    """Dequant each orientation with its own outer scale and assert SQNR above threshold. The dim-m
     pair recovers x.t(), so transpose it back before comparing to x. nvfp4 is 4-bit, so a 12 dB floor."""
-    x, outer_scale = inputs
+    x, outer_scale_k, outer_scale_m = inputs
     qk, sk, qm, sm = outputs
-    x_hat_k = nvfp4_gs_swizzle_dq_f(qk, sk, outer_scale)  # (M, N) ~ x
-    x_hat_m = nvfp4_gs_swizzle_dq_f(qm, sm, outer_scale).t()  # (N, M) -> (M, N) ~ x
+    x_hat_k = nvfp4_gs_swizzle_dq_f(qk, sk, outer_scale_k)  # (M, N) ~ x
+    x_hat_m = nvfp4_gs_swizzle_dq_f(qm, sm, outer_scale_m).t()  # (N, M) -> (M, N) ~ x
     threshold = 12.0
     sqnr_k = _compute_error(x.float(), x_hat_k.float())
     sqnr_m = _compute_error(x.float(), x_hat_m.float())
@@ -1387,14 +1388,15 @@ def _nvfp4_gs_swizzle_dim_km_correctness(
 
 def _nvfp4_gs_swizzle_dim_km_inputs(M, K):
     x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
-    return (x, nvfp4_gs_scale(x))  # |x.t()| == |x|, so one per-tensor outer scale serves both
+    # no RHT -> |x.t()| == |x|, so both orientations get the same per-tensor outer scale
+    return (x, nvfp4_gs_scale(x), nvfp4_gs_scale(x))
 
 
 Nvfp4GsDimKMSwizzleGold = QuantCastSingleKernelGold(
     pt_ref_fn=nvfp4_gs_swizzle_dim_km_f,
     correctness_fn=_nvfp4_gs_swizzle_dim_km_correctness,
     example_input_fn=_nvfp4_gs_swizzle_dim_km_inputs,
-    perf_description="(1,16) block, fp4 qdata, swizzle; dim-k + dim-m (no RHT), one outer scale",
+    perf_description="(1,16) block, fp4 qdata, swizzle; dim-k + dim-m (no RHT), per-orientation outer scale",
 )
 
 

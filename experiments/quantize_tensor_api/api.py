@@ -276,8 +276,8 @@ def quantize_tensor_bidirectional(
     skip_transposed_qdata: bool = False,
     rounding_mode: RoundingMode = RoundingMode.RTNE,
     random_key: Tensor | None = None,
-    outer_scale: Tensor | None | tuple[Tensor | None, Tensor | None] = None,
-    rht_tensor: Tensor | None | tuple[Tensor | None, Tensor | None] = None,
+    outer_scale: tuple[Tensor | None, Tensor | None] | None = None,
+    rht_tensor: tuple[Tensor | None, Tensor | None] | None = None,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor] | tuple[Tensor, Tensor, Tensor]:
     """Fused dual-orientation cast: quantize `input` to a block-scaled low-precision format in BOTH
     the natural and transposed orientations in one pass. The single-orientation cast is
@@ -300,15 +300,14 @@ def quantize_tensor_bidirectional(
         no-RHT nvfp4 cast are RTNE only.
       random_key: Philox key for stochastic rounding (required when rounding_mode=STOCHASTIC, must
         be None otherwise). Split internally into one substream per orientation.
-      outer_scale: nvfp4 per-tensor outer scale (required for nvfp4; must be None for mxfp8). Without
-        an RHT both orientations share one scale (|input.t()| == |input|), so pass a single scalar.
-        With an RHT the two orientations differ (|input| for dim-k, |RHT(input.t())| for dim-m), so
-        pass a (dim_k, dim_m) tuple.
-      rht_tensor: optional 16x16 Random Hadamard Transform matrix applied to the transposed (dim-m)
-        cast (the wgrad-operand cast of nvfp4 training); dim-k never applies one. None for mxfp8, and
-        None for the plain (no-RHT) nvfp4 dim-km cast. Because the RHT is dim-m (second-operand) only,
-        it must be passed as the (None, rht) tuple form -- a bare rht_tensor=rht (both operands) is
-        rejected.
+      outer_scale: nvfp4 per-tensor outer scale as a (dim_k, dim_m) tuple (required for nvfp4; must
+        be None for mxfp8). Both orientations are always explicit -- there is no single-value form.
+        Without an RHT the two are the same value (|input.t()| == |input|), so pass (os, os). With an
+        RHT they differ (|input| for dim-k, |RHT(input.t())| for dim-m), so pass (dim_k, dim_m).
+      rht_tensor: optional (dim_k, dim_m) tuple carrying a 16x16 Random Hadamard Transform matrix
+        applied to the transposed (dim-m) cast (the wgrad-operand cast of nvfp4 training); dim-k never
+        applies one. None for mxfp8 and for the plain (no-RHT) nvfp4 dim-km cast. Because the RHT is
+        dim-m (second-operand) only, pass it as (None, rht) -- rht in the dim-k slot is rejected.
 
     Returns:
         4 tensors (qk, sk, qm, sm) normally -- natural (dim-K) pair then transposed (dim-M) pair
@@ -321,15 +320,19 @@ def quantize_tensor_bidirectional(
         assert random_key is not None, "rounding_mode=STOCHASTIC requires a random_key"
     else:
         assert random_key is None, "random_key is only used with rounding_mode=STOCHASTIC"
-    # outer_scale / rht_tensor take either one value (applied to BOTH orientations) or a
-    # (dim_k, dim_m) tuple to set the natural (dim-k) and transposed (dim-m) casts independently.
-    # Normalize to the (dim_k, dim_m) tuple form.
-    outer_scale_k, outer_scale_m = (
-        outer_scale if isinstance(outer_scale, tuple) else (outer_scale, outer_scale)
+    # outer_scale / rht_tensor are per-orientation: a (dim_k, dim_m) tuple sets the natural (dim-k)
+    # and transposed (dim-m) casts independently (or None for neither). Both directions are always
+    # explicit -- there is no single-value form that applies to both.
+    assert outer_scale is None or isinstance(outer_scale, tuple), (
+        "outer_scale must be a (dim_k, dim_m) tuple (or None); pass both orientations explicitly, "
+        "e.g. outer_scale=(os, os) when they share a value"
     )
-    rht_tensor_k, rht_tensor_m = (
-        rht_tensor if isinstance(rht_tensor, tuple) else (rht_tensor, rht_tensor)
+    assert rht_tensor is None or isinstance(rht_tensor, tuple), (
+        "rht_tensor must be a (dim_k, dim_m) tuple (or None); pass both orientations explicitly, "
+        "e.g. rht_tensor=(None, rht)"
     )
+    outer_scale_k, outer_scale_m = outer_scale if outer_scale is not None else (None, None)
+    rht_tensor_k, rht_tensor_m = rht_tensor if rht_tensor is not None else (None, None)
 
     if qdata_dtype == torch.float4_e2m1fn_x2:
         # Fused bidirectional nvfp4 cast: dim-k is plain nvfp4 over |input|; dim-m nvfp4s input.t()
@@ -348,18 +351,18 @@ def quantize_tensor_bidirectional(
             )
         if rht_tensor_k is None and rht_tensor_m is None:
             # No RHT (Nvfp4GsDimKMSwizzleGold's nvfp4_gs_swizzle_dim_km_f): both orientations are
-            # plain nvfp4, and with no RHT |input.t()| == |input|, so ONE outer scale serves both.
-            # Pass it as a single scalar (outer_scale=os); a (dim_k, dim_m) tuple is meaningless here.
-            assert outer_scale is not None and not isinstance(outer_scale, tuple), (
-                "no-RHT nvfp4 quantize_tensor_bidirectional uses one outer scale for both "
-                "orientations (|input.t()| == |input|); pass a single outer_scale scalar, not a tuple"
+            # plain nvfp4, each with its own per-tensor outer scale. With no RHT |input.t()| ==
+            # |input|, so callers typically pass the same value for both (outer_scale=(os, os)).
+            assert outer_scale_k is not None and outer_scale_m is not None, (
+                "no-RHT nvfp4 quantize_tensor_bidirectional requires an outer_scale per orientation "
+                "(a (dim_k, dim_m) tuple)"
             )
             # SR only exists for the RHT (grad_output) cast of nvfp4 training; the plain no-RHT
             # dim-km cast (activation/weight) is RTNE.
             assert rounding_mode == RoundingMode.RTNE, (
                 "stochastic rounding is only supported by the RHT nvfp4 cast (rht_tensor=(None, rht))"
             )
-            return nvfp4_gs_swizzle_dim_km_f(input, outer_scale)
+            return nvfp4_gs_swizzle_dim_km_f(input, outer_scale_k, outer_scale_m)
         # WITH RHT (Nvfp4GsSwizzle_DimK_DimMRHT_Gold's nvfp4_gs_swizzle_dim_k_dim_m_rht_f): dim-m
         # applies the RHT to input.t() before quantizing (the wgrad-operand cast of nvfp4 training).
         # The two orientations now need DIFFERENT outer scales (|input| vs |RHT(input.t())|), so pass

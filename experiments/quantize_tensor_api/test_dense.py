@@ -597,15 +597,15 @@ class _Nvfp4LinearBiDirection(torch.autograd.Function):
         w_gs = nvfp4_gs_scale(weight)  # |W| == |W.T|, so one outer scale serves both
         # Both weight casts in one read via the fused no-RHT quantize_tensor_bidirectional (nvfp4,
         # E4M3_NVFP4, 1x16 blocks, swizzled scale): dim-k (NATURAL) feeds fwd; dim-m (TRANSPOSED, ==
-        # nvfp4 of weight.t()) is the dgrad col operand. No RHT, so one outer scale (w_gs) serves both
-        # (|W| == |W.T|). Maps to Nvfp4GsDimKMSwizzleGold's gold reference.
+        # nvfp4 of weight.t()) is the dgrad col operand. No RHT, so the same outer scale (w_gs) serves
+        # both (|W| == |W.T|) -- passed per-orientation as (w_gs, w_gs). Maps to Nvfp4GsDimKMSwizzleGold.
         w_q_k, ws_k, w_q_n, w_s_n = quantize_tensor_bidirectional(
             weight,
             qdata_dtype=torch.float4_e2m1fn_x2,
             inner_scale_calc=InnerScaleCalc.E4M3_NVFP4,
             scaling_type=ScalingType.BlockWise1x16,
             swizzle_type=SwizzleType.SWIZZLE_32_4_4,
-            outer_scale=w_gs,
+            outer_scale=(w_gs, w_gs),
         )
         # fwd: (M,K) @ (K,N) -> (M,N). Each operand's scale is [1x16 block-wise e4m3 (the 4D swizzle
         # grid nvfp4_gs_swizzle_f emits, flattened as torchao does), tensor-wise fp32 outer scalar].
