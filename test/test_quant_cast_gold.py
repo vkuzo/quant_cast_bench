@@ -93,10 +93,11 @@ class _Nvfp4Linear(torch.autograd.Function):
     See the module comment above for the per-GEMM cast/orientation/RHT breakdown."""
 
     @staticmethod
-    def forward(ctx, input, weight, rht):
+    def forward(ctx, input, weight, rht, key):
         # input: x, shape [M, K]
         # weight: w, shape [N, K]
         # grad_output: go, shape [M, K]
+        # key: caller-supplied prng key (prng.key(seed)); threaded to backward for the SR casts.
 
         # Activation: row cast (no RHT) feeds fwd; col cast (RHT on input.T) is saved for wgrad.
         x_gs_k = nvfp4_gs_scale(input)  # outer scale over |input|
@@ -117,22 +118,24 @@ class _Nvfp4Linear(torch.autograd.Function):
             swizzle_b=[F.SwizzleType.SWIZZLE_32_4_4, F.SwizzleType.NO_SWIZZLE],
             output_dtype=torch.bfloat16,
         )
-        ctx.save_for_backward(x_rht_q_m, x_rht_s_m, x_rht_g_s_m, w_q_n, w_s_n, w_gs, rht)
+        ctx.save_for_backward(x_rht_q_m, x_rht_s_m, x_rht_g_s_m, w_q_n, w_s_n, w_gs, rht, key)
         return out
 
     @staticmethod
     def backward(ctx, grad_output):
-        x_rht_q_m, x_rht_s_m, x_rht_g_s_m, w_q_n, w_s_n, w_gs, rht = ctx.saved_tensors
+        x_rht_q_m, x_rht_s_m, x_rht_g_s_m, w_q_n, w_s_n, w_gs, rht, key = ctx.saved_tensors
         grad_output = grad_output.contiguous()
         # grad_output: row cast (no RHT) feeds dgrad; col cast (RHT on dy.T) feeds wgrad. Both use
         # STOCHASTIC ROUNDING -- torchao applies SR to exactly these two grad_output casts (the
         # activation and weight casts stay RTN), because an unbiased grad cast is what keeps the
-        # gradient estimator unbiased in expectation over training steps. Two independent Philox keys
-        # (one per direction) give the two casts uncorrelated dither.
+        # gradient estimator unbiased in expectation over training steps. prng.split derives two
+        # independent substreams (one per direction) from the caller's key, giving the two casts
+        # uncorrelated dither. The caller controls reproducibility (and, if wanted, per-step freshness)
+        # by choosing what key it passes to forward -- e.g. prng.fold_in(base_key, step); this Function
+        # just splits whatever it is handed.
         go_gs_k = nvfp4_gs_scale(grad_output)  # over |grad_output|
         go_rht_g_s_m = _rht_outer_scale(grad_output, rht)  # over |RHT(grad_output.T)|
-        key_k = prng.key(0, device=grad_output.device)
-        key_m = prng.key(1, device=grad_output.device)
+        key_k, key_m = prng.split(key, 2)
         go_sr_q_k, gos_k, go_sr_q_m, go_s_m = nvfp4_gs_swizzle_dim_k_dim_m_rht_sr_f(
             grad_output, go_gs_k, go_rht_g_s_m, rht, key_k, key_m
         )
@@ -156,7 +159,7 @@ class _Nvfp4Linear(torch.autograd.Function):
             swizzle_b=[F.SwizzleType.SWIZZLE_32_4_4, F.SwizzleType.NO_SWIZZLE],
             output_dtype=torch.bfloat16,
         )
-        return grad_input, grad_weight, None
+        return grad_input, grad_weight, None, None  # extra None: rht, key
 
 
 @requires_sm100
@@ -170,6 +173,7 @@ def test_nvfp4_linear_fwd_bwd_sqnr():
     grad_out = torch.randn(M, N, dtype=torch.bfloat16, device="cuda")  # fixed upstream grad
     sign = torch.tensor([1, -1] * 8, device=x.device, dtype=x.dtype)  # fixed RHT sign vector
     rht = hadamard_rht_matrix(sign, x.device, x.dtype)
+    key = prng.key(0, device=x.device)  # caller-supplied SR key; backward splits it into two streams
 
     # bf16 reference: out = x @ w.T, then backward with the same upstream grad.
     xr = x.clone().requires_grad_(True)
@@ -179,10 +183,10 @@ def test_nvfp4_linear_fwd_bwd_sqnr():
     # nvfp4 path through the reference autograd Function.
     xq = x.clone().requires_grad_(True)
     wq = w.clone().requires_grad_(True)
-    _Nvfp4Linear.apply(xq, wq, rht).backward(grad_out)
+    _Nvfp4Linear.apply(xq, wq, rht, key).backward(grad_out)
 
     out_ref = xr @ wr.t()
-    out_q = _Nvfp4Linear.apply(x, w, rht)
+    out_q = _Nvfp4Linear.apply(x, w, rht, key)
     sqnr_out = _compute_error(out_ref.float(), out_q.float())
     sqnr_gx = _compute_error(xr.grad.float(), xq.grad.float())
     sqnr_gw = _compute_error(wr.grad.float(), wq.grad.float())
