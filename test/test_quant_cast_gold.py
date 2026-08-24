@@ -94,48 +94,52 @@ class _Nvfp4Linear(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, input, weight, rht):
+        # input: x, shape [M, K]
+        # weight: w, shape [N, K]
+        # grad_output: go, shape [M, K]
+
         # Activation: row cast (no RHT) feeds fwd; col cast (RHT on input.T) is saved for wgrad.
         x_gs_k = nvfp4_gs_scale(input)  # outer scale over |input|
-        x_gs_m = _rht_outer_scale(input, rht)  # outer scale over |RHT(input.T)|
-        qk_x, sk_x, qm_x, sm_x = nvfp4_gs_swizzle_dim_k_dim_m_rht_f(input, x_gs_k, x_gs_m, rht)
+        x_rht_g_s_m = _rht_outer_scale(input, rht)  # outer scale over |RHT(input.T)|
+        x_q_k, xs_k, x_rht_q_m, x_rht_s_m = nvfp4_gs_swizzle_dim_k_dim_m_rht_f(input, x_gs_k, x_rht_g_s_m, rht)
         # Weight: row cast (blk K) feeds fwd; transposed row cast (blk N) is the dgrad col operand.
         w_gs = nvfp4_gs_scale(weight)  # |W| == |W.T|, so one outer scale serves both
-        qw_row, sw_row = nvfp4_gs_swizzle_f(weight, w_gs)
-        qwt, swt = nvfp4_gs_swizzle_f(weight.t().contiguous(), w_gs)
+        w_q_k, ws_k = nvfp4_gs_swizzle_f(weight, w_gs)
+        w_q_n, w_s_n = nvfp4_gs_swizzle_f(weight.t().contiguous(), w_gs)
         # fwd: (M,K) @ (K,N) -> (M,N). Each operand's scale is [1x16 block-wise e4m3 (the 4D swizzle
         # grid nvfp4_gs_swizzle_f emits, flattened as torchao does), tensor-wise fp32 outer scalar].
         out = F.scaled_mm(
-            qk_x, qw_row.t(),
-            scale_a=[sk_x.flatten(), x_gs_k], scale_b=[sw_row.flatten(), w_gs],
+            x_q_k, w_q_k.t(),
+            scale_a=[xs_k.flatten(), x_gs_k], scale_b=[ws_k.flatten(), w_gs],
             scale_recipe_a=[F.ScalingType.BlockWise1x16, F.ScalingType.TensorWise],
             scale_recipe_b=[F.ScalingType.BlockWise1x16, F.ScalingType.TensorWise],
             swizzle_a=[F.SwizzleType.SWIZZLE_32_4_4, F.SwizzleType.NO_SWIZZLE],
             swizzle_b=[F.SwizzleType.SWIZZLE_32_4_4, F.SwizzleType.NO_SWIZZLE],
             output_dtype=torch.bfloat16,
         )
-        ctx.save_for_backward(qm_x, sm_x, x_gs_m, qwt, swt, w_gs, rht)
+        ctx.save_for_backward(x_rht_q_m, x_rht_s_m, x_rht_g_s_m, w_q_n, w_s_n, w_gs, rht)
         return out
 
     @staticmethod
     def backward(ctx, grad_output):
-        qm_x, sm_x, x_gs_m, qwt, swt, w_gs, rht = ctx.saved_tensors
+        x_rht_q_m, x_rht_s_m, x_rht_g_s_m, w_q_n, w_s_n, w_gs, rht = ctx.saved_tensors
         grad_output = grad_output.contiguous()
         # grad_output: row cast (no RHT) feeds dgrad; col cast (RHT on dy.T) feeds wgrad. Both use
         # STOCHASTIC ROUNDING -- torchao applies SR to exactly these two grad_output casts (the
         # activation and weight casts stay RTN), because an unbiased grad cast is what keeps the
         # gradient estimator unbiased in expectation over training steps. Two independent Philox keys
         # (one per direction) give the two casts uncorrelated dither.
-        dy_gs_k = nvfp4_gs_scale(grad_output)  # over |grad_output|
-        dy_gs_m = _rht_outer_scale(grad_output, rht)  # over |RHT(grad_output.T)|
+        go_gs_k = nvfp4_gs_scale(grad_output)  # over |grad_output|
+        go_rht_g_s_m = _rht_outer_scale(grad_output, rht)  # over |RHT(grad_output.T)|
         key_k = prng.key(0, device=grad_output.device)
         key_m = prng.key(1, device=grad_output.device)
-        qk_dy, sk_dy, qm_dy, sm_dy = nvfp4_gs_swizzle_dim_k_dim_m_rht_sr_f(
-            grad_output, dy_gs_k, dy_gs_m, rht, key_k, key_m
+        go_sr_q_k, gos_k, go_sr_q_m, go_s_m = nvfp4_gs_swizzle_dim_k_dim_m_rht_sr_f(
+            grad_output, go_gs_k, go_rht_g_s_m, rht, key_k, key_m
         )
         # dgrad: dy (M,N) @ W (N,K) -> grad_input (M,K).
         grad_input = F.scaled_mm(
-            qk_dy, qwt.t(),
-            scale_a=[sk_dy.flatten(), dy_gs_k], scale_b=[swt.flatten(), w_gs],
+            go_sr_q_k, w_q_n.t(),
+            scale_a=[gos_k.flatten(), go_gs_k], scale_b=[w_s_n.flatten(), w_gs],
             scale_recipe_a=[F.ScalingType.BlockWise1x16, F.ScalingType.TensorWise],
             scale_recipe_b=[F.ScalingType.BlockWise1x16, F.ScalingType.TensorWise],
             swizzle_a=[F.SwizzleType.SWIZZLE_32_4_4, F.SwizzleType.NO_SWIZZLE],
@@ -144,8 +148,8 @@ class _Nvfp4Linear(torch.autograd.Function):
         )
         # wgrad: RHT(dy.T) (N,M) @ RHT(input.T).T (M,K) -> grad_weight (N,K); the two RHTs cancel.
         grad_weight = F.scaled_mm(
-            qm_dy, qm_x.t(),
-            scale_a=[sm_dy.flatten(), dy_gs_m], scale_b=[sm_x.flatten(), x_gs_m],
+            go_sr_q_m, x_rht_q_m.t(),
+            scale_a=[go_s_m.flatten(), go_rht_g_s_m], scale_b=[x_rht_s_m.flatten(), x_rht_g_s_m],
             scale_recipe_a=[F.ScalingType.BlockWise1x16, F.ScalingType.TensorWise],
             scale_recipe_b=[F.ScalingType.BlockWise1x16, F.ScalingType.TensorWise],
             swizzle_a=[F.SwizzleType.SWIZZLE_32_4_4, F.SwizzleType.NO_SWIZZLE],
@@ -160,7 +164,7 @@ def test_nvfp4_linear_fwd_bwd_sqnr():
     # Full fwd+bwd of a linear in nvfp4 (gold casts + real scaled_mm) vs a plain bf16 torch.mm
     # reference, comparing output + both gradients by SQNR. M,K,N all %128 (nvfp4 scaled_mm needs it).
     torch.manual_seed(0)
-    M = K = N = 512
+    M, K, N = 256, 512, 1024
     x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
     w = torch.randn(N, K, dtype=torch.bfloat16, device="cuda")
     grad_out = torch.randn(M, N, dtype=torch.bfloat16, device="cuda")  # fixed upstream grad
