@@ -423,7 +423,6 @@ def _rht_outer_scale(x, rht):
     return x_rht.abs().to(torch.float32).amax() / (F8E4M3_MAX * F4_E2M1_MAX)
 
 
-# A future PR will add a bidirectional-cast version alongside this single-direction one.
 class _Nvfp4LinearSingleDirection(torch.autograd.Function):
     """Reference nvfp4 linear composed from the gold casts + torch.nn.functional.scaled_mm. RTN on
     the activation/weight casts, stochastic rounding on the two grad_output casts (as torchao does).
@@ -565,8 +564,119 @@ class _Nvfp4LinearSingleDirection(torch.autograd.Function):
         return grad_input, grad_weight, None, None  # extra None: rht, key
 
 
+class _Nvfp4LinearBiDirection(torch.autograd.Function):
+    """Reference nvfp4 linear composed from the gold casts + torch.nn.functional.scaled_mm. RTN on
+    the activation/weight casts, stochastic rounding on the two grad_output casts (as torchao does).
+    See the module comment above for the per-GEMM cast/orientation/RHT breakdown."""
+
+    @staticmethod
+    def forward(ctx, input, weight, rht, key):
+        # input: x, shape [M, K]
+        # weight: w, shape [N, K]
+        # grad_output: go, shape [M, K]
+        # key: caller-supplied prng key (prng.key(seed)); threaded to backward for the SR casts.
+
+        # Activation: row cast (no RHT) feeds fwd; col cast (RHT on input.T) is saved for wgrad.
+        x_gs_k = nvfp4_gs_scale(input)  # outer scale over |input|
+        x_rht_g_s_m = _rht_outer_scale(input, rht)  # outer scale over |RHT(input.T)|
+        # Activation cast through the fused dual-orientation quantize_tensor_bidirectional API. dim-k
+        # is plain nvfp4 (no RHT, NATURAL) over |input|; dim-m applies the RHT to input.t() then
+        # nvfp4s along M, scaled by |RHT(input.t())|. The two orientations use different outer scales
+        # (passed as the (dim_k, dim_m) tuple); the RHT is dim-m (second-operand) only, so it goes in
+        # as the (None, rht) tuple.
+        x_q_k, xs_k, x_rht_q_m, x_rht_s_m = quantize_tensor_bidirectional(
+            input,
+            qdata_dtype=torch.float4_e2m1fn_x2,
+            inner_scale_calc=InnerScaleCalc.E4M3_NVFP4,
+            scaling_type=ScalingType.BlockWise1x16,
+            swizzle_type=SwizzleType.SWIZZLE_32_4_4,
+            outer_scale=(x_gs_k, x_rht_g_s_m),
+            rht_tensor=(None, rht),
+        )
+        # Weight: row cast (blk K) feeds fwd; transposed row cast (blk N) is the dgrad col operand.
+        w_gs = nvfp4_gs_scale(weight)  # |W| == |W.T|, so one outer scale serves both
+        # Both weight casts in one read via the fused no-RHT quantize_tensor_bidirectional (nvfp4,
+        # E4M3_NVFP4, 1x16 blocks, swizzled scale): dim-k (NATURAL) feeds fwd; dim-m (TRANSPOSED, ==
+        # nvfp4 of weight.t()) is the dgrad col operand. No RHT, so one outer scale (w_gs) serves both
+        # (|W| == |W.T|). Maps to Nvfp4GsDimKMSwizzleGold's gold reference.
+        w_q_k, ws_k, w_q_n, w_s_n = quantize_tensor_bidirectional(
+            weight,
+            qdata_dtype=torch.float4_e2m1fn_x2,
+            inner_scale_calc=InnerScaleCalc.E4M3_NVFP4,
+            scaling_type=ScalingType.BlockWise1x16,
+            swizzle_type=SwizzleType.SWIZZLE_32_4_4,
+            outer_scale=w_gs,
+        )
+        # fwd: (M,K) @ (K,N) -> (M,N). Each operand's scale is [1x16 block-wise e4m3 (the 4D swizzle
+        # grid nvfp4_gs_swizzle_f emits, flattened as torchao does), tensor-wise fp32 outer scalar].
+        out = F.scaled_mm(
+            x_q_k, w_q_k.t(),
+            scale_a=[xs_k.flatten(), x_gs_k], scale_b=[ws_k.flatten(), w_gs],
+            scale_recipe_a=[F.ScalingType.BlockWise1x16, F.ScalingType.TensorWise],
+            scale_recipe_b=[F.ScalingType.BlockWise1x16, F.ScalingType.TensorWise],
+            swizzle_a=[F.SwizzleType.SWIZZLE_32_4_4, F.SwizzleType.NO_SWIZZLE],
+            swizzle_b=[F.SwizzleType.SWIZZLE_32_4_4, F.SwizzleType.NO_SWIZZLE],
+            output_dtype=torch.bfloat16,
+        )
+        ctx.save_for_backward(x_rht_q_m, x_rht_s_m, x_rht_g_s_m, w_q_n, w_s_n, w_gs, rht, key)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x_rht_q_m, x_rht_s_m, x_rht_g_s_m, w_q_n, w_s_n, w_gs, rht, key = ctx.saved_tensors
+        grad_output = grad_output.contiguous()
+        # grad_output: row cast (no RHT) feeds dgrad; col cast (RHT on dy.T) feeds wgrad. Both use
+        # STOCHASTIC ROUNDING -- torchao applies SR to exactly these two grad_output casts (the
+        # activation and weight casts stay RTN), because an unbiased grad cast is what keeps the
+        # gradient estimator unbiased in expectation over training steps. prng.split derives two
+        # independent substreams (one per direction) from the caller's key, giving the two casts
+        # uncorrelated dither. The caller controls reproducibility (and, if wanted, per-step freshness)
+        # by choosing what key it passes to forward -- e.g. prng.fold_in(base_key, step); this Function
+        # just splits whatever it is handed.
+        go_gs_k = nvfp4_gs_scale(grad_output)  # over |grad_output|
+        go_rht_g_s_m = _rht_outer_scale(grad_output, rht)  # over |RHT(grad_output.T)|
+        # Both grad_output casts in one fused bidirectional SR cast (nvfp4_gs_swizzle_dim_k_dim_m_rht_sr_f):
+        # dim-k is plain SR nvfp4 (no RHT) over |grad_output|; dim-m applies the RHT to grad_output.t()
+        # then SR-nvfp4s along M, scaled by |RHT(dy.t())|. Per-orientation outer_scale=(dim_k, dim_m);
+        # the RHT is dim-m (second-operand) only, so rht_tensor=(None, rht). We hand it the single key --
+        # the API splits it into one Philox substream per orientation (== prng.split(key, 2) here).
+        go_sr_q_k, gos_k, go_sr_q_m, go_s_m = quantize_tensor_bidirectional(
+            grad_output,
+            qdata_dtype=torch.float4_e2m1fn_x2,
+            inner_scale_calc=InnerScaleCalc.E4M3_NVFP4,
+            scaling_type=ScalingType.BlockWise1x16,
+            swizzle_type=SwizzleType.SWIZZLE_32_4_4,
+            outer_scale=(go_gs_k, go_rht_g_s_m),
+            rht_tensor=(None, rht),
+            rounding_mode=RoundingMode.STOCHASTIC,
+            random_key=key,
+        )
+        # dgrad: dy (M,N) @ W (N,K) -> grad_input (M,K).
+        grad_input = F.scaled_mm(
+            go_sr_q_k, w_q_n.t(),
+            scale_a=[gos_k.flatten(), go_gs_k], scale_b=[w_s_n.flatten(), w_gs],
+            scale_recipe_a=[F.ScalingType.BlockWise1x16, F.ScalingType.TensorWise],
+            scale_recipe_b=[F.ScalingType.BlockWise1x16, F.ScalingType.TensorWise],
+            swizzle_a=[F.SwizzleType.SWIZZLE_32_4_4, F.SwizzleType.NO_SWIZZLE],
+            swizzle_b=[F.SwizzleType.SWIZZLE_32_4_4, F.SwizzleType.NO_SWIZZLE],
+            output_dtype=torch.bfloat16,
+        )
+        # wgrad: RHT(dy.T) (N,M) @ RHT(input.T).T (M,K) -> grad_weight (N,K); the two RHTs cancel.
+        grad_weight = F.scaled_mm(
+            go_sr_q_m, x_rht_q_m.t(),
+            scale_a=[go_s_m.flatten(), go_rht_g_s_m], scale_b=[x_rht_s_m.flatten(), x_rht_g_s_m],
+            scale_recipe_a=[F.ScalingType.BlockWise1x16, F.ScalingType.TensorWise],
+            scale_recipe_b=[F.ScalingType.BlockWise1x16, F.ScalingType.TensorWise],
+            swizzle_a=[F.SwizzleType.SWIZZLE_32_4_4, F.SwizzleType.NO_SWIZZLE],
+            swizzle_b=[F.SwizzleType.SWIZZLE_32_4_4, F.SwizzleType.NO_SWIZZLE],
+            output_dtype=torch.bfloat16,
+        )
+        return grad_input, grad_weight, None, None  # extra None: rht, key
+
+
 @requires_sm100
-def test_nvfp4_linear_fwd_bwd_sqnr():
+@pytest.mark.parametrize("linear_fn", [_Nvfp4LinearSingleDirection, _Nvfp4LinearBiDirection])
+def test_nvfp4_linear_fwd_bwd_sqnr(linear_fn):
     # Full fwd+bwd of a linear in nvfp4 (gold casts + real scaled_mm) vs a plain bf16 torch.mm
     # reference, comparing output + both gradients by SQNR. M,K,N all %128 (nvfp4 scaled_mm needs it).
     torch.manual_seed(0)
@@ -586,7 +696,7 @@ def test_nvfp4_linear_fwd_bwd_sqnr():
     # nvfp4 path through the reference autograd Function.
     xq = x.clone().requires_grad_(True)
     wq = w.clone().requires_grad_(True)
-    _Nvfp4LinearSingleDirection.apply(xq, wq, rht, key).backward(grad_out)
+    linear_fn.apply(xq, wq, rht, key).backward(grad_out)
 
     out_ref = xr @ wr.t()
     out_q = _Nvfp4LinearSingleDirection.apply(x, w, rht, key)
