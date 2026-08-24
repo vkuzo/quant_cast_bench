@@ -18,8 +18,12 @@ import os
 import sys
 from pathlib import Path
 
-import torch
-import torch.func._random as prng
+import matplotlib
+
+matplotlib.use("Agg")  # headless; render straight to a PNG
+import matplotlib.pyplot as plt  # noqa: E402
+import torch  # noqa: E402
+import torch.func._random as prng  # noqa: E402
 
 # Put the repo root on sys.path so `experiments.*` resolves when run as a script (mirrors api.py).
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -177,21 +181,48 @@ def collect_rows() -> list[tuple[str, ...]]:
     return sorted(rows)  # lexicographic order -> byte-stable output
 
 
-def render_table(rows: list[tuple[str, ...]]) -> str:
-    header = "| " + " | ".join(COLUMNS) + " |"
-    sep = "|" + "|".join(["---"] * len(COLUMNS)) + "|"
-    body = "\n".join("| " + " | ".join(row) + " |" for row in rows)
-    return "\n".join([header, sep, body])
+def render_chart(rows: list[tuple[str, ...]]) -> Path:
+    """Render the probed rows as a monochrome matplotlib table image with vertical column headers
+    and a small font, and return the PNG path (next to this file / the README)."""
+    ncols, nrows = len(COLUMNS), len(rows)
+    fig, ax = plt.subplots(figsize=(ncols * 1.0, nrows * 0.3 + 2.0))
+    ax.axis("off")
+
+    tbl = ax.table(
+        cellText=[list(r) for r in rows],
+        colLabels=COLUMNS,
+        cellLoc="left",
+        loc="center",
+    )
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(6)
+    tbl.auto_set_column_width(range(ncols))
+
+    # Rotate the header row (keyed (0, col)) 90 degrees and give it room to fit the upright labels.
+    for col in range(ncols):
+        cell = tbl[0, col]
+        cell.set_height(cell.get_height() * 4)
+        text = cell.get_text()
+        text.set_rotation(90)
+        text.set_verticalalignment("bottom")
+        text.set_horizontalalignment("center")
+
+    png_path = Path(__file__).with_name("support_matrix.png")
+    # dpi + tight bbox for a crisp crop; drop the version-stamped metadata so re-renders are stable.
+    fig.savefig(png_path, dpi=200, bbox_inches="tight", metadata={"Software": None})
+    plt.close(fig)
+    return png_path
 
 
 def main() -> None:
     rows = collect_rows()
+    png_path = render_chart(rows)
     readme = Path(__file__).with_name("README.md")
     text = readme.read_text()
     start, end = text.index(BEGIN), text.index(END) + len(END)
-    block = f"{BEGIN}\n\n{render_table(rows)}\n\n{END}"
+    block = f"{BEGIN}\n\n![quantize_tensor support matrix]({png_path.name})\n\n{END}"
     readme.write_text(text[:start] + block + text[end:])
-    print(f"wrote {len(rows)} supported combinations to {readme.name}")
+    print(f"wrote {len(rows)} supported combinations to {png_path.name} + {readme.name}")
 
 
 if __name__ == "__main__":
