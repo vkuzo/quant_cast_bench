@@ -48,28 +48,29 @@ def quantize_tensor(
 Returns `(qdata, scale)`. For the fused both-orientation cast use `quantize_tensor_bidirectional`;
 for MoE (`offs`-grouped) casts use `quantize_tensor_grouped` / `quantize_tensor_grouped_bidirectional`.
 
-## 2. Formats
+## 2. High level support status
 
-**Supported today**
-
-- **mxfp8** — `float8_e4m3fn` qdata + `e8m0` (power-of-two) inner scale, `1x32` or `32x32` blocks. No
-  outer scale.
-- **nvfp4** — `float4_e2m1fn_x2` qdata (two e2m1 codes per byte) + `e4m3` `1x16` inner scale computed
-  relative to a per-tensor fp32 **outer** scale (two-level scaling). Per-tensor (incl. RHT and
-  stochastic-rounding variants) and per-token `(M, 1)`.
-- **mxfp4** — `float4_e2m1fn_x2` qdata + `e8m0` `1x32` inner scale (single-level). NATURAL only.
-
-**Could be supported** (hooks that exist in the enums / ecosystem but are not wired — dispatch
-raises `ValueError`):
-
-- fp8 `RowWise` / `TensorWise` scaling.
-- fp8 `BlockWise1x128` / `BlockWise128x128` (DeepSeek-style blockwise).
-- mxfp4 in TRANSPOSED / swizzled / grouped forms.
-- nvfp4 with parametric (non-16×16) RHT sizes — see the `rht_tensor` TODO at
-  [`api.py:99-102`](api.py).
-
-These `ScalingType` values (`RowWise`, `TensorWise`, `BlockWise1x128`, `BlockWise128x128`) are
-already defined in the enum, but no dispatch branch consumes them yet.
+* By format
+  * 🟢 already supported: mxfp8, nvfp4, mxfp4 (limited)
+  * 🟡 could be supported: mxfp6, deepseek fp8
+  * out of scope: affine quantization (has zero point)
+* By scaling type
+  * 🟢 already supported: 1x32, 1x16, 32x32, per-tensor or per-token outer scale
+  * 🟡 could be supported: 16x16, any type of outer scale that can broadcast to inner data
+* By scaling calculation
+  * 🟢 already supported: e8m0_rceil (for mx formats), nvfp4 (for nvfp4)
+  * 🟡 could be supported: any scaling calculation that is worth supporting (handled by enum value)
+* By e2e training recipe
+  * linear mxfp8 e2e fwd + bwd: 🟢 frontend works (TODO confirm), 🟡 needs kernels
+  * grouped_mm mxfp8 e2e fwd + bwd: 🟡 could be supported
+  * linear nvfp4 e2e fwd + bwd with NVIDIA's recipe: 🟢 frontend works, 🟡 needs kernels
+  * grouped_mm nvf4p e2e fwd + bwd with NVIDIA's recipe: 🟡 could be supported
+  * grouped_mm Cursor's mixed precision mxfp8+nvfp4 (https://cursor.com/resources/Composer2.pdf, Figure 10) - 🟡 could be supported
+  * 4over6: 🟡 could be supported (via additional scaling algorithm enum)
+* By cross-cutting feature
+  * stochastic rounding: 🟡 supported for some recipes but far from polished, needs final frontend design
+  * RHT: 🟡 16x16 supported for nvfp4 dense recipes, needs to extend to grouped and needs final frontend design
+  * outer scaling: 🟡 handwavily should work, but needs final design for semantics of broadcasting
 
 ## 3. Support matrix
 
