@@ -1,16 +1,18 @@
-"""Generate the `quantize_tensor` support matrix in README.md by PROBING the real API.
+"""Generate the `quantize_tensor*` support matrices in README.md by PROBING the real API.
 
 This does NOT hardcode the supported rows -- it inspects the actual dispatch in `api.py` by running
-every argument combination through `quantize_tensor` on real CUDA tensors and keeping the ones the
-frontend accepts (i.e. that don't raise). For each accepted combination it also records the function
-the call dispatched to (kernel = a `quant_cast_triton` recipe, reference = a `quant_cast_gold` one),
-captured by wrapping those recipe callables in the `api` module namespace.
+every argument combination through each of the four entry points (`quantize_tensor`,
+`quantize_tensor_bidirectional`, `quantize_tensor_grouped`,
+`quantize_tensor_grouped_bidirectional`) on real CUDA tensors and keeping the ones the frontend
+accepts (i.e. that don't raise). For each accepted combination it also records the function the call
+dispatched to (kernel = a `quant_cast_triton` recipe, reference = a `quant_cast_gold` one), captured
+by wrapping those recipe callables in the `api` and `moe_utils` module namespaces.
 
     python experiments/quantize_tensor_api/gen_support_matrix.py
 
-Requires a CUDA device. It rewrites the region between the BEGIN/END GENERATED markers in README.md
-in place. Rows are emitted in deterministic lexicographic order, so the output is byte-stable
-(rerunning without an `api.py` dispatch change is a no-op).
+Requires a CUDA device. It rewrites the region between each BEGIN/END GENERATED marker pair in
+README.md in place. Rows are emitted in deterministic lexicographic order, so the output is
+byte-stable (rerunning without an `api.py` dispatch change is a no-op).
 """
 
 import itertools
@@ -23,7 +25,7 @@ import torch.func._random as prng
 
 # Put the repo root on sys.path so `experiments.*` resolves when run as a script (mirrors api.py).
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-from experiments.quantize_tensor_api import api  # noqa: E402
+from experiments.quantize_tensor_api import api, moe_utils  # noqa: E402
 from experiments.quantize_tensor_api.api import (
     InnerScaleCalc,
     QuantOrientation,
@@ -31,6 +33,9 @@ from experiments.quantize_tensor_api.api import (
     ScalingType,
     SwizzleType,
     quantize_tensor,
+    quantize_tensor_bidirectional,
+    quantize_tensor_grouped,
+    quantize_tensor_grouped_bidirectional,
 )
 from quant_cast_bench.quant_cast_gold.recipes import (
     hadamard_rht_matrix,
@@ -38,21 +43,51 @@ from quant_cast_bench.quant_cast_gold.recipes import (
     nvfp4_gs_scale,
 )
 
+# --- per-entry-point column layouts (status is always second-to-last, dispatch last) --------------
 COLUMNS = [
-    "format",
-    "scaling_type",
-    "orientation",
-    "swizzle_type",
-    "rounding_mode",
-    "outer_scale",
-    "rht_tensor",
-    "input",
-    "status",
-    "dispatches to",
+    "format", "scl_tp", "orient", "swizzle_type", "rnd_md", "out_scl", "rht", "input",
+    "status", "dispatches to",
+]
+COLUMNS_BI = [
+    "format", "scl_tp", "swizzle_type", "skip_tr", "rnd_md", "input", "status", "dispatches to",
+]
+COLUMNS_GROUPED = [
+    "format", "scl_tp", "orient", "swizzle_type", "rnd_md", "status", "dispatches to",
+]
+COLUMNS_GROUPED_BI = [
+    "format", "scl_tp", "swizzle_type", "skip_tr", "rnd_md", "status", "dispatches to",
 ]
 
-BEGIN = "<!-- BEGIN GENERATED: support-matrix (python gen_support_matrix.py) -->"
-END = "<!-- END GENERATED: support-matrix -->"
+# Abbreviations applied to keep the tables dense; rendered as a legend under the first table.
+HEADER_ABBR = {
+    "scl_tp": "scaling_type",
+    "orient": "orientation",
+    "rnd_md": "rounding_mode",
+    "out_scl": "outer_scale",
+    "rht": "rht_tensor",
+    "skip_tr": "skip_transposed_qdata",
+}
+VALUE_ABBR = {
+    "1x16": "BlockWise1x16",
+    "1x32": "BlockWise1x32",
+    "32x32": "BlockWise32x32",
+    "NT": "NATURAL",
+    "TR": "TRANSPOSED",
+    "NONE": "NO_SWIZZLE",
+    "32_4_4": "SWIZZLE_32_4_4",
+    "RS": "STOCHASTIC",
+}
+
+STATUS_EMOJI = {"kernel": "🟢", "reference": "🟡"}
+
+
+def _begin(tag: str) -> str:
+    return f"<!-- BEGIN GENERATED: {tag} (python gen_support_matrix.py) -->"
+
+
+def _end(tag: str) -> str:
+    return f"<!-- END GENERATED: {tag} -->"
+
 
 # --- per-axis value grids (the argument cross-product we probe) -----------------------------------
 QDATA = [torch.float8_e4m3fn, torch.float4_e2m1fn_x2]
@@ -60,21 +95,27 @@ INNER = [InnerScaleCalc.E8M0_RCEIL, InnerScaleCalc.E4M3_NVFP4]
 SCALING = [ScalingType.BlockWise1x16, ScalingType.BlockWise1x32, ScalingType.BlockWise32x32]
 ORIENT = [QuantOrientation.NATURAL, QuantOrientation.TRANSPOSED]
 SWIZZLE = [SwizzleType.NO_SWIZZLE, SwizzleType.SWIZZLE_32_4_4]
+SKIP = [False, True]
 ROUNDING = [RoundingMode.RTNE, RoundingMode.STOCHASTIC]
 OUTER = ["none", "scalar", "per_token"]  # None / per-tensor scalar / per-token (M, 1)
+OUTER_BI = ["none", "pair"]  # None / (dim_k, dim_m) tuple of per-tensor scalars
 RHT = ["none", "rht"]  # None / 16x16 Hadamard
+RHT_BI = ["none", "dim_m"]  # None / (None, rht) -- RHT applies to the dim-m operand only
 INPUT_DIM = ["2d", "3d"]
 
 # --- how each axis value renders in the table -----------------------------------------------------
 SCALING_R = {ScalingType.BlockWise1x16: "1x16", ScalingType.BlockWise1x32: "1x32", ScalingType.BlockWise32x32: "32x32"}
-SWIZZLE_R = {SwizzleType.NO_SWIZZLE: "NO_SWIZZLE", SwizzleType.SWIZZLE_32_4_4: "32_4_4"}
+ORIENT_R = {QuantOrientation.NATURAL: "NT", QuantOrientation.TRANSPOSED: "TR"}
+SWIZZLE_R = {SwizzleType.NO_SWIZZLE: "NONE", SwizzleType.SWIZZLE_32_4_4: "32_4_4"}
+SKIP_R = {False: "no", True: "yes"}
+ROUNDING_R = {RoundingMode.RTNE: "RTNE", RoundingMode.STOCHASTIC: "RS"}
 OUTER_R = {"none": "None", "scalar": "scalar", "per_token": "`(M,1)`"}
 RHT_R = {"none": "None", "rht": "16×16"}
 INPUT_R = {"2d": "2D", "3d": "3D `(E,N,K)`"}
 
 
 def _format_label(qdata_dtype, inner_scale_calc, outer_variant, rht_variant):
-    """Derive the human format name from the arguments of an ACCEPTED combination."""
+    """Derive the human format name from the arguments of an ACCEPTED `quantize_tensor` combination."""
     if qdata_dtype == torch.float4_e2m1fn_x2:
         if inner_scale_calc == InnerScaleCalc.E8M0_RCEIL:
             return "mxfp4"
@@ -90,27 +131,46 @@ _last = {}  # set by the dispatch probes below to the recipe the last call route
 
 
 def _install_dispatch_probes():
-    """Wrap every recipe callable imported into `api` so a call records (name, status) in `_last`.
+    """Wrap every recipe callable imported into `api` / `moe_utils` so a call records (name, status)
+    in `_last`.
 
     This is how the "dispatches to" / "status" columns are derived from the actual code path rather
-    than hardcoded: whichever recipe `quantize_tensor` calls sets `_last` before returning.
+    than hardcoded: whichever recipe the entry point calls first sets `_last` before returning. Both
+    module namespaces are patched because the grouped entry points reach `mxfp8_f` through
+    `moe_utils.quantize_2d_act`, which holds its own binding to it.
+
+    We record the FIRST recipe entered, not the last: the quantizer runs before any scale-blocking
+    helper (`_to_blocked_*`, which is itself a gold recipe), so first-wins pins "dispatches to" to the
+    quantizer rather than the post-quantize swizzle.
     """
-    for name, obj in list(vars(api).items()):
-        mod = getattr(obj, "__module__", "") or ""
-        is_kernel = "quant_cast_triton" in mod
-        is_ref = "quant_cast_gold" in mod
-        if not (callable(obj) and (is_kernel or is_ref)):
-            continue
-        status = "kernel" if is_kernel else "reference"
+    for module in (api, moe_utils):
+        for name, obj in list(vars(module).items()):
+            mod = getattr(obj, "__module__", "") or ""
+            is_kernel = "quant_cast_triton" in mod
+            is_ref = "quant_cast_gold" in mod
+            if not (callable(obj) and (is_kernel or is_ref)):
+                continue
+            status = "kernel" if is_kernel else "reference"
 
-        def make(orig, nm, st):
-            def wrapper(*args, **kwargs):
-                _last["name"], _last["status"] = nm, st
-                return orig(*args, **kwargs)
+            def make(orig, nm, st):
+                def wrapper(*args, **kwargs):
+                    if "name" not in _last:  # first recipe entered wins (the quantizer)
+                        _last["name"], _last["status"] = nm, st
+                    return orig(*args, **kwargs)
 
-            return wrapper
+                return wrapper
 
-        setattr(api, name, make(obj, name, status))
+            setattr(module, name, make(obj, name, status))
+
+
+def _probe(thunk):
+    """Run one probe call; return (status, dispatch) if the API accepted it, else None."""
+    _last.clear()
+    try:
+        thunk()
+    except Exception:
+        return None  # frontend (or a downstream guard) rejected this combination -> unsupported
+    return _last["status"], f"`{_last['name']}`"
 
 
 def _build_inputs():
@@ -137,61 +197,164 @@ def _build_inputs():
     return inputs, outer, rht, key
 
 
-def collect_rows() -> list[tuple[str, ...]]:
-    assert torch.cuda.is_available(), "gen_support_matrix probes the real API on CUDA; no device found"
-    _install_dispatch_probes()
-    inputs, outer, rht, key = _build_inputs()
+def _build_grouped_inputs():
+    """A 2D grouped `(total_M, C)` input plus block-aligned `offs` (two 128-row token groups)."""
+    dev = "cuda"
+    gx = torch.randn(256, 512, dtype=torch.bfloat16, device=dev)
+    offs = torch.tensor([128, 256], dtype=torch.int32, device=dev)
+    return gx, offs
 
+
+def collect_quantize_tensor() -> list[tuple[str, ...]]:
+    inputs, outer, rht, key = _build_inputs()
     rows = set()
     for qd, isc, st, orient, sw, rm, osv, rhv, dim in itertools.product(
         QDATA, INNER, SCALING, ORIENT, SWIZZLE, ROUNDING, OUTER, RHT, INPUT_DIM
     ):
-        _last.clear()
-        try:
-            quantize_tensor(
-                inputs[dim],
-                qdata_dtype=qd,
-                inner_scale_calc=isc,
-                scaling_type=st,
-                orientation=orient,
-                swizzle_type=sw,
-                rounding_mode=rm,
-                random_key=key if rm == RoundingMode.STOCHASTIC else None,
-                outer_scale=outer[(osv, dim)],
-                rht_tensor=rht[(rhv, dim)],
-            )
-        except Exception:
-            continue  # frontend (or a downstream guard) rejected this combination -> unsupported
+        res = _probe(lambda: quantize_tensor(
+            inputs[dim],
+            qdata_dtype=qd,
+            inner_scale_calc=isc,
+            scaling_type=st,
+            orientation=orient,
+            swizzle_type=sw,
+            rounding_mode=rm,
+            random_key=key if rm == RoundingMode.STOCHASTIC else None,
+            outer_scale=outer[(osv, dim)],
+            rht_tensor=rht[(rhv, dim)],
+        ))
+        if res is None:
+            continue
         rows.add((
             _format_label(qd, isc, osv, rhv),
-            SCALING_R[st],
-            orient.name,
-            SWIZZLE_R[sw],
-            rm.name,
-            OUTER_R[osv],
-            RHT_R[rhv],
-            INPUT_R[dim],
-            _last["status"],
-            f"`{_last['name']}`",
+            SCALING_R[st], ORIENT_R[orient], SWIZZLE_R[sw], ROUNDING_R[rm],
+            OUTER_R[osv], RHT_R[rhv], INPUT_R[dim], *res,
         ))
     return sorted(rows)  # lexicographic order -> byte-stable output
 
 
-def render_table(rows: list[tuple[str, ...]]) -> str:
-    header = "| " + " | ".join(COLUMNS) + " |"
-    sep = "|" + "|".join(["---"] * len(COLUMNS)) + "|"
-    body = "\n".join("| " + " | ".join(row) + " |" for row in rows)
-    return "\n".join([header, sep, body])
+def collect_bidirectional() -> list[tuple[str, ...]]:
+    inputs, outer, rht, key = _build_inputs()
+    # outer_scale / rht_tensor are per-orientation (dim_k, dim_m) tuples here. Without an RHT both
+    # orientations share the scalar (|input.t()| == |input|); the RHT applies to dim-m only.
+    outer_bi = {("none", d): None for d in inputs} | {
+        ("pair", d): (outer[("scalar", d)], outer[("scalar", d)]) for d in inputs
+    }
+    rht_bi = {("none", d): None for d in inputs} | {("dim_m", d): (None, rht[("rht", d)]) for d in inputs}
+    rows = set()
+    for qd, isc, st, sw, skip, rm, osv, rhv, dim in itertools.product(
+        QDATA, INNER, SCALING, SWIZZLE, SKIP, ROUNDING, OUTER_BI, RHT_BI, INPUT_DIM
+    ):
+        res = _probe(lambda: quantize_tensor_bidirectional(
+            inputs[dim],
+            qdata_dtype=qd,
+            inner_scale_calc=isc,
+            scaling_type=st,
+            swizzle_type=sw,
+            skip_transposed_qdata=skip,
+            rounding_mode=rm,
+            random_key=key if rm == RoundingMode.STOCHASTIC else None,
+            outer_scale=outer_bi[(osv, dim)],
+            rht_tensor=rht_bi[(rhv, dim)],
+        ))
+        if res is None:
+            continue
+        fmt = "mxfp8" if qd == torch.float8_e4m3fn else (
+            "nvfp4 (per-tensor, RHT)" if rhv == "dim_m" else "nvfp4 (per-tensor)"
+        )
+        rows.add((fmt, SCALING_R[st], SWIZZLE_R[sw], SKIP_R[skip], ROUNDING_R[rm], INPUT_R[dim], *res))
+    return sorted(rows)
+
+
+def collect_grouped() -> list[tuple[str, ...]]:
+    _, outer, rht, key = _build_inputs()  # reuse the 2D-shaped scalar/per-token/RHT aux tensors
+    gx, offs = _build_grouped_inputs()
+    rows = set()
+    for qd, isc, st, orient, sw, rm, osv, rhv in itertools.product(
+        QDATA, INNER, SCALING, ORIENT, SWIZZLE, ROUNDING, OUTER, RHT
+    ):
+        res = _probe(lambda: quantize_tensor_grouped(
+            gx, offs,
+            qdata_dtype=qd,
+            inner_scale_calc=isc,
+            scaling_type=st,
+            orientation=orient,
+            swizzle_type=sw,
+            rounding_mode=rm,
+            random_key=key if rm == RoundingMode.STOCHASTIC else None,
+            outer_scale=outer[(osv, "2d")],
+            rht_tensor=rht[(rhv, "2d")],
+        ))
+        if res is None:
+            continue
+        # grouped is mxfp8-only (fp4 qdata is rejected), so the format is always mxfp8.
+        rows.add(("mxfp8", SCALING_R[st], ORIENT_R[orient], SWIZZLE_R[sw], ROUNDING_R[rm], *res))
+    return sorted(rows)
+
+
+def collect_grouped_bidirectional() -> list[tuple[str, ...]]:
+    _, outer, rht, key = _build_inputs()
+    gx, offs = _build_grouped_inputs()
+    rows = set()
+    for qd, isc, st, sw, skip, rm, osv, rhv in itertools.product(
+        QDATA, INNER, SCALING, SWIZZLE, SKIP, ROUNDING, OUTER, RHT
+    ):
+        res = _probe(lambda: quantize_tensor_grouped_bidirectional(
+            gx, offs,
+            qdata_dtype=qd,
+            inner_scale_calc=isc,
+            scaling_type=st,
+            swizzle_type=sw,
+            skip_transposed_qdata=skip,
+            rounding_mode=rm,
+            random_key=key if rm == RoundingMode.STOCHASTIC else None,
+            outer_scale=outer[(osv, "2d")],
+            rht_tensor=rht[(rhv, "2d")],
+        ))
+        if res is None:
+            continue
+        rows.add(("mxfp8", SCALING_R[st], SWIZZLE_R[sw], SKIP_R[skip], ROUNDING_R[rm], *res))
+    return sorted(rows)
+
+
+def render_table(columns: list[str], rows: list[tuple[str, ...]], with_legend: bool) -> str:
+    status_idx = len(columns) - 2  # status is always the second-to-last column
+    header = "| " + " | ".join(columns) + " |"
+    sep = "|" + "|".join(["---"] * len(columns)) + "|"
+    body = "\n".join(
+        "| " + " | ".join(f"{STATUS_EMOJI[c]} {c}" if i == status_idx else c for i, c in enumerate(row)) + " |"
+        for row in rows
+    )
+    parts = [header, sep, body]
+    if with_legend:
+        hdr_legend = ", ".join(f"`{abbr}` = `{full}`" for abbr, full in HEADER_ABBR.items())
+        val_legend = ", ".join(f"`{abbr}` = `{full}`" for abbr, full in VALUE_ABBR.items())
+        parts += ["", f"**Header abbreviations:** {hdr_legend}.", "", f"**Value abbreviations:** {val_legend}."]
+    return "\n".join(parts)
 
 
 def main() -> None:
-    rows = collect_rows()
+    assert torch.cuda.is_available(), "gen_support_matrix probes the real API on CUDA; no device found"
+    _install_dispatch_probes()
+    sections = [
+        # (marker tag, columns, collector, emit the abbreviation legend under this table)
+        ("support-matrix", COLUMNS, collect_quantize_tensor, True),
+        ("support-matrix-bidirectional", COLUMNS_BI, collect_bidirectional, False),
+        ("support-matrix-grouped", COLUMNS_GROUPED, collect_grouped, False),
+        ("support-matrix-grouped-bidirectional", COLUMNS_GROUPED_BI, collect_grouped_bidirectional, False),
+    ]
     readme = Path(__file__).with_name("README.md")
     text = readme.read_text()
-    start, end = text.index(BEGIN), text.index(END) + len(END)
-    block = f"{BEGIN}\n\n{render_table(rows)}\n\n{END}"
-    readme.write_text(text[:start] + block + text[end:])
-    print(f"wrote {len(rows)} supported combinations to {readme.name}")
+    total = 0
+    for tag, columns, collect, with_legend in sections:
+        rows = collect()
+        total += len(rows)
+        begin, end = _begin(tag), _end(tag)
+        start, stop = text.index(begin), text.index(end) + len(end)
+        block = f"{begin}\n\n{render_table(columns, rows, with_legend)}\n\n{end}"
+        text = text[:start] + block + text[stop:]
+    readme.write_text(text)
+    print(f"wrote {total} supported combinations across {len(sections)} entry points to {readme.name}")
 
 
 if __name__ == "__main__":
