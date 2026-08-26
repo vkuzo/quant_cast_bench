@@ -723,6 +723,16 @@ _E4M3_EPS = torch.finfo(torch.float8_e4m3fn).tiny
 _NVFP4_CVT_ASM = "{ .reg .b8 t; cvt.rn.satfinite.e2m1x2.f32 t, $1, $2; cvt.u16.u8 $0, t; }"
 
 
+def _div_rn(a, b):
+    """IEEE round-to-nearest fp32 division (div.rn.f32). Helion's `/` lowers to the approximate
+    div.full.f32 (~1 ULP off), which flips fp8/fp4 RNE ties vs the correctly-rounded PyTorch gold, so
+    tensor-by-tensor divides that must stay bit-exact use this. (A tensor-by-PYTHON-scalar divide like
+    `/ 6.0` is already a reciprocal-multiply in BOTH Helion and torch, so leave those as plain `/`.)"""
+    return hl.inline_asm_elementwise(
+        "div.rn.f32 $0, $1, $2;", "=r,r,r", [a, b], dtype=torch.float32, is_pure=True, pack=1,
+    )
+
+
 @helion.kernel(
     # note: setting autotune_effort to full crashes with
     # https://gist.github.com/vkuzo/6f8a4beaebef60aa4e6e7059efbcfad8
@@ -747,10 +757,14 @@ def _nvfp4_gs_kernel(
         amax = torch.amax(torch.amax(torch.abs(x_blk), dim=3), dim=2)  # (bm, bc) over the 16
         # inner e4m3 block scale relative to the outer scale; round-trip through e4m3 BEFORE using it
         # in the reciprocal (the gold does too -- the rounding is load-bearing for bit-exactness).
+        # `/ _F4_E2M1_MAX` (scalar) is a reciprocal-multiply in both Helion and torch, but every other
+        # divide here (`/ outer`, `1/outer`, `/ inner`) is a tensor/tensor divide that Helion lowers to
+        # the approximate div.full.f32 -- force div.rn so the fp8/fp4 RNE ties match the gold.
         inner_e4m3 = torch.clamp(
-            (amax / _F4_E2M1_MAX) / outer, _E4M3_EPS, _F8E4M3_MAX
+            _div_rn(amax / _F4_E2M1_MAX, outer), _E4M3_EPS, _F8E4M3_MAX
         ).to(torch.float8_e4m3fn)
-        recip = (1.0 / outer) / inner_e4m3.to(torch.float32)  # (bm, bc)
+        ones = hl.full([tile_m, tile_c], 1.0)
+        recip = _div_rn(_div_rn(ones, outer), inner_e4m3.to(torch.float32))  # (bm, bc)
         data_scaled = torch.clamp(
             x_blk * recip[:, :, None, None], -_F4_E2M1_MAX, _F4_E2M1_MAX
         )  # (bm, bc, 8, 2)
@@ -834,10 +848,14 @@ def _nvfp4_gs_swizzle_kernel(
         amax = torch.amax(torch.amax(torch.abs(x_blk), dim=6), dim=5)  # [RB,a,b,CB,c] over the 16
         # inner e4m3 block scale relative to the outer scale; round-trip through e4m3 BEFORE using it
         # in the reciprocal (matches the gold / the non-swizzle kernel -- load-bearing for bit-exact).
+        # `/ outer`, `1/outer` and the `/ inner` reciprocal are tensor/tensor divides that Helion lowers
+        # to the approximate div.full.f32 -- force div.rn so the fp8/fp4 RNE ties match the gold
+        # (`/ _F4_E2M1_MAX` is a scalar reciprocal-multiply in both Helion and torch, so keep it plain).
         inner_e4m3 = torch.clamp(
-            (amax / _F4_E2M1_MAX) / outer, _E4M3_EPS, _F8E4M3_MAX
+            _div_rn(amax / _F4_E2M1_MAX, outer), _E4M3_EPS, _F8E4M3_MAX
         ).to(torch.float8_e4m3fn)
-        recip = (1.0 / outer) / inner_e4m3.to(torch.float32)  # [RB,a,b,CB,c]
+        ones = hl.full([tile_rb, 4, 32, tile_cb, 4], 1.0)
+        recip = _div_rn(_div_rn(ones, outer), inner_e4m3.to(torch.float32))  # [RB,a,b,CB,c]
         data_scaled = torch.clamp(
             x_blk * recip[:, :, :, :, :, None, None], -_F4_E2M1_MAX, _F4_E2M1_MAX
         )  # [RB,a,b,CB,c,j,k]

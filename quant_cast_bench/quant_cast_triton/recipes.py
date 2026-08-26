@@ -1587,9 +1587,16 @@ def _nvfp4_blocked_outer_kernel(
     mb = offs_m // 128
     nb = pid_g // 8
     outer = tl.load(outer_ptr + mb * NB + nb, mask=m_mask)  # (BM,)
-    inner_val = tl.minimum(tl.maximum((amax / 6.0) / outer, 0.015625), 448.0)
+    # Match the gold's fp32 ops bit-for-bit so e4m3/fp4 RNE ties resolve identically (the default
+    # Triton `/` lowers to the approximate div.full.f32, ~1 ULP off, which flips ties). Two subtleties:
+    #  * `/ 6.0` in the gold is a tensor-by-PYTHON-SCALAR divide, which torch lowers to a
+    #    reciprocal-MULTIPLY (`* (1/6)`), so mirror it with a multiply -- a true div here (div.rn) is
+    #    1 ULP off from torch and double-rounds the next divide the other way.
+    #  * `/ outer` and the reciprocal divides are tensor-by-tensor in the gold (correctly-rounded
+    #    div.rn), so use tl.div_rn.
+    inner_val = tl.minimum(tl.maximum(tl.div_rn(amax * (1.0 / 6.0), outer), 0.015625), 448.0)
     inner_e4 = inner_val.to(tl.float8e4nv)
-    recip = (1.0 / outer) / inner_e4.to(tl.float32)  # (BM,)
+    recip = tl.div_rn(tl.div_rn(1.0, outer), inner_e4.to(tl.float32))  # (BM,)
     data = tl.minimum(tl.maximum(x * recip[:, None], -6.0), 6.0)
     code = _f32_to_f4_code_tl(data)
     lo, hi = tl.split(tl.reshape(code, (BM, 8, 2)))

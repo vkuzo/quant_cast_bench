@@ -15,12 +15,12 @@ def _as_bytes_or_fp32(t):
     return t.to(torch.float32)
 
 
-def qdata_equal(a, b):
+def qdata_and_scale_equal(a, b):
     """Bit-exact, dtype-aware equality for a quantized qdata/scale tensor pair."""
     return torch.equal(_as_bytes_or_fp32(a), _as_bytes_or_fp32(b))
 
 
 def mismatch_fraction(a, b):
-    """Fraction of elements that differ under the same dtype-aware comparison as ``qdata_equal``."""
+    """Fraction of elements that differ under the same dtype-aware comparison as ``qdata_and_scale_equal``."""
     av, bv = _as_bytes_or_fp32(a), _as_bytes_or_fp32(b)
     return (av != bv).float().mean().item()

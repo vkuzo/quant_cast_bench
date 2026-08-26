@@ -1,5 +1,6 @@
 """Correctness tests for the CuTeDSL quant-cast recipes: each `cute_fn` must reproduce its gold
-`pt_ref_fn`'s outputs. Mirrors quant_cast_triton/test.py (same comparison + tolerance fallback).
+`pt_ref_fn`'s outputs. Mirrors test_quant_cast_triton.py: every recipe's outputs must be a valid
+quantization (gold correctness_fn), and every non-SR recipe must match the gold bit-for-bit.
 """
 
 import importlib.metadata
@@ -10,7 +11,7 @@ import pytest
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from qdata_utils import mismatch_fraction, qdata_equal
+from qdata_utils import mismatch_fraction, qdata_and_scale_equal
 
 # The CuTeDSL kernels import `_maybe_recast_from_f4_f6` (the fp4/fp6 register-packing helper) from
 # cutlass.cute.testing. That is the nvidia-cutlass-dsl >= 4.5.2 name -- older releases spelled it
@@ -41,8 +42,6 @@ pytestmark = pytest.mark.skipif(
     ),
 )
 
-_MAX_MISMATCH_FRAC = 0.01
-
 # Recipes whose CuTeDSL kernels emit the Blackwell-only fp4 E2M1 cvt (`cvt.e2m1x2.f32`); ptxas
 # rejects it below sm_100, so gate them to cuda capability 10.0.
 _REQUIRES_SM100 = frozenset({
@@ -53,8 +52,8 @@ _REQUIRES_SM100 = frozenset({
 
 @pytest.mark.parametrize("name, recipe", ALL_RECIPES, ids=[n for n, _ in ALL_RECIPES])
 def test_cute_matches_reference(name, recipe):
-    # the CuTeDSL kernel should reproduce the gold reference bit-for-bit; where the hardware cvt
-    # rounding legitimately differs (fp4/e8m0 ties), accept a valid quantization with tiny divergence.
+    # the CuTeDSL kernel should reproduce the gold reference bit-for-bit (identical fp32 math + RNE
+    # cast). example_input_fn builds the full positional inputs (x, *aux).
     if name in _REQUIRES_SM100 and torch.cuda.get_device_capability() != (10, 0):
         pytest.skip(f"{name} emits Blackwell-only PTX; requires cuda capability 10.0")
     torch.manual_seed(0)
@@ -75,28 +74,22 @@ def test_cute_matches_reference(name, recipe):
             f"{name} output {i}: shape/dtype mismatch ({t.shape}/{t.dtype} vs {r.shape}/{r.dtype})"
         )
 
-    if all(qdata_equal(t, r) for t, r in zip(cute_outs, ref_outs)):
-        return  # exact match
-
-    # Legitimate CuTeDSL-vs-PyTorch hardware-rounding differences: fp8/fp4 cast RNE ties, and f32
-    # scales computed with the GPU's *approximate* division (~1 ULP). Accept iff the cute output is
-    # still a valid quantization AND every output is close: narrow types (fp8/fp4/e8m0) must match
-    # bit-for-bit on all but <1% of bytes; float (fp32 scale) outputs must be allclose to ~1 ULP.
+    # Every recipe's outputs must be a valid quantization (the gold correctness_fn).
     recipe.correctness_fn(inputs, cute_outs)
+
+    # Stochastic rounding (the *_sr recipes) is the one case that can't bit-match: the cute kernel
+    # draws its dither from a hand-written in-kernel Philox keyed on the global flat index, not the
+    # reference's torch RNG, so only the SR *property* (unbiased, lands on the two bracketing bf16 grid
+    # points) is well-defined -- correctness_fn above checks that, and we stop (~2p(1-p) of elements
+    # differ between any two independent draws, so a per-element bound is meaningless here).
     if "_sr" in name:
-        # stochastic rounding: the cute kernel draws its dither from a hand-written in-kernel Philox
-        # keyed on the global flat index, which cannot bit-match the reference's torch Philox -- only
-        # the SR property (checked above via the gold correctness_fn) is well-defined, so a per-element
-        # bound is meaningless (like triton).
         return
+
+    # Every other recipe must reproduce the gold bit-for-bit: identical fp32 math + RNE cast (the
+    # kernels mirror torch's per-op rounding, incl. reciprocal-multiply vs div.rn, so even the fp8/fp4
+    # RNE ties resolve the same way). Any divergence is a real bug, not tolerable RNE noise.
     for i, (t, r) in enumerate(zip(cute_outs, ref_outs)):
-        if t.dtype in (torch.float4_e2m1fn_x2, torch.float8_e8m0fnu, torch.float8_e4m3fn):
-            frac = mismatch_fraction(t, r)
-            assert frac < _MAX_MISMATCH_FRAC, (
-                f"{name} output {i}: {frac:.3%} of narrow-type elements differ -- likely a real bug"
-            )
-        else:
-            assert torch.allclose(t.float(), r.float(), rtol=2e-6, atol=1e-20), (
-                f"{name} output {i}: float output not within ~1 ULP of reference (max rel "
-                f"{((t.float() - r.float()).abs() / r.float().abs().clamp(min=1e-30)).max().item():.2e})"
-            )
+        assert qdata_and_scale_equal(t, r), (
+            f"{name} output {i}: {mismatch_fraction(t, r):.3%} of elements differ from the gold "
+            f"reference -- expected bit-for-bit equality"
+        )

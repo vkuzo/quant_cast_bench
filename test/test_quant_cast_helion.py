@@ -10,7 +10,7 @@ import pytest
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from qdata_utils import mismatch_fraction, qdata_equal
+from qdata_utils import mismatch_fraction, qdata_and_scale_equal
 
 # Helion is an optional dependency; skip the whole module cleanly if it (or the recipes that
 # import it) can't be imported, rather than erroring at collection.
@@ -25,10 +25,6 @@ pytestmark = pytest.mark.skipif(
     reason="requires CUDA and the helion package",
 )
 
-
-# fraction of the RNE-tie divergence between Helion's and PyTorch's fp8/fp4 casts we tolerate
-# before treating it as a real bug (see the fallback in the test below).
-_MAX_MISMATCH_FRAC = 0.01
 
 # Recipes whose Helion kernels emit the Blackwell-only fp4 E2M1 cvt (`cvt.e2m1x2.f32`); ptxas
 # rejects it below sm_100, so gate them to cuda capability 10.0. (The mxfp8 dim_m Helion kernel
@@ -62,19 +58,22 @@ def test_helion_matches_reference(name, recipe):
             f"{name} output {i}: shape/dtype mismatch ({t.shape}/{t.dtype} vs {r.shape}/{r.dtype})"
         )
 
-    if all(qdata_equal(t, r) for t, r in zip(hel_outs, ref_outs)):
-        return  # exact match to the reference (the common case)
-
-    # Some outputs differ. The legitimate source here is Helion-vs-PyTorch RNE tie-breaking in the
-    # fp8/fp4 cast (the pre-cast fp32 math is identical to the reference). Accept iff the Helion
-    # outputs are still a valid quantization (gold correctness_fn) AND the byte-level divergence is
-    # tiny (guards against real bugs).
+    # Every recipe's outputs must be a valid quantization (the gold correctness_fn).
     recipe.correctness_fn(inputs, hel_outs)
+
+    # Stochastic rounding (the *_sr recipes) is the one case that can't bit-match: the Helion kernel
+    # draws from its own counter-based Philox, not the reference's torch RNG, so only the SR *property*
+    # (unbiased, lands on the two bracketing grid points) is well-defined -- correctness_fn above checks
+    # that, and we stop (~2p(1-p) of elements differ between any two independent draws, so a per-element
+    # bound is meaningless here).
     if "_sr" in name:
         return
+
+    # Every other recipe must reproduce the gold bit-for-bit: identical fp32 math + RNE cast (the
+    # kernels mirror torch's per-op rounding, incl. reciprocal-multiply vs div.rn, so even the fp8/fp4
+    # RNE ties resolve the same way). Any divergence is a real bug, not tolerable RNE noise.
     for i, (t, r) in enumerate(zip(hel_outs, ref_outs)):
-        frac = mismatch_fraction(t, r)
-        assert frac < _MAX_MISMATCH_FRAC, (
-            f"{name} output {i}: {frac:.3%} of elements differ from reference -- too many for "
-            f"RNE ties, likely a real bug"
+        assert qdata_and_scale_equal(t, r), (
+            f"{name} output {i}: {mismatch_fraction(t, r):.3%} of elements differ from the gold "
+            f"reference -- expected bit-for-bit equality"
         )
