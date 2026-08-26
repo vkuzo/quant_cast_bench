@@ -6,8 +6,7 @@ import torch
 import torch.func._random as prng
 import torch.nn.functional as F
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from api import (  # noqa: E402
+from quant_cast_bench.quantize_tensor_api.api import (
     InnerScaleCalc,
     RoundingMode,
     ScalingType,
@@ -18,7 +17,7 @@ from api import (  # noqa: E402
     quantize_tensor_grouped_dual,
 )
 
-from quant_cast_bench.quant_cast_gold.recipes import (  # noqa: E402
+from quant_cast_bench.quant_cast_gold.recipes import (
     F4_E2M1_MAX,
     F8E4M3_MAX,
     _compute_error,

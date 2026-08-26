@@ -23,13 +23,9 @@ they're GEMM-shape steps that must agree across the co-operands of each GEMM, no
 plain-PyTorch emulated (dequantize-and-matmul) companion path lives in `moe_emulated.py`.
 """
 
-import os
-import sys
-
 import torch
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-from experiments.quantize_tensor_api.api import (  # noqa: E402
+from quant_cast_bench.quantize_tensor_api.api import (
     InnerScaleCalc,
     ScalingType,
     SwizzleType,
@@ -37,8 +33,8 @@ from experiments.quantize_tensor_api.api import (  # noqa: E402
     quantize_tensor_grouped,
     quantize_tensor_grouped_dual,
 )
-from experiments.quantize_tensor_api.moe_utils import _pad_token_groups  # noqa: E402
-from quant_cast_bench.quant_cast_gold.recipes import _compute_error  # noqa: E402
+from quant_cast_bench.quantize_tensor_api.moe_utils import _pad_token_groups
+from quant_cast_bench.quant_cast_gold.recipes import _compute_error
 
 
 # ===========================================================================

@@ -8,7 +8,7 @@ accepts (i.e. that don't raise). For each accepted combination it also records t
 dispatched to (kernel = a `quant_cast_triton` recipe, reference = a `quant_cast_gold` one), captured
 by wrapping those recipe callables in the `api` and `moe_utils` module namespaces.
 
-    python experiments/quantize_tensor_api/gen_support_matrix.py
+    python quant_cast_bench/quantize_tensor_api/gen_support_matrix.py
 
 Requires a CUDA device. It rewrites the region between each BEGIN/END GENERATED marker pair in
 README.md in place. Rows are emitted in deterministic lexicographic order, so the output is
@@ -16,17 +16,13 @@ byte-stable (rerunning without an `api.py` dispatch change is a no-op).
 """
 
 import itertools
-import os
-import sys
 from pathlib import Path
 
 import torch
 import torch.func._random as prng
 
-# Put the repo root on sys.path so `experiments.*` resolves when run as a script (mirrors api.py).
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-from experiments.quantize_tensor_api import api, moe_utils  # noqa: E402
-from experiments.quantize_tensor_api.api import (
+from quant_cast_bench.quantize_tensor_api import api, moe_utils
+from quant_cast_bench.quantize_tensor_api.api import (
     InnerScaleCalc,
     RoundingMode,
     ScalingType,

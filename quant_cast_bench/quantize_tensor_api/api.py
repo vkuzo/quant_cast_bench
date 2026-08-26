@@ -1,5 +1,3 @@
-import os
-import sys
 from enum import IntEnum, StrEnum
 
 import torch
@@ -7,18 +5,14 @@ import torch.func._random as prng
 from torch import Tensor
 from torch.nn.functional import SwizzleType  # core enum: NO_SWIZZLE=0, SWIZZLE_32_4_4=1
 
-# The editable install only exposes `quant_cast_bench`, not the `experiments` tree, so put the repo
-# root on sys.path to make the sibling `experiments.quantize_tensor_api.moe_utils` import resolve regardless of
-# how this module is reached (as a package, as a bare `api`, or under pytest).
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-from experiments.quantize_tensor_api.moe_utils import (  # noqa: E402
+from quant_cast_bench.quantize_tensor_api.moe_utils import (
     BLOCK_SIZE,
     _to_blocked_2d_k_groups,
     _to_blocked_2d_m_groups,
     _to_blocked_per_group_3d,
     quantize_2d_act,
 )
-from quant_cast_bench.quant_cast_gold.recipes import (  # noqa: E402
+from quant_cast_bench.quant_cast_gold.recipes import (
     mxfp4_f,
     mxfp8_f,
     nvfp4_gs_f,
@@ -30,7 +24,7 @@ from quant_cast_bench.quant_cast_gold.recipes import (  # noqa: E402
     nvfp4_gs_swizzle_dim_m_rht_sr_f,
     nvfp4_gs_swizzle_sr_f,
 )
-from quant_cast_bench.quant_cast_triton.recipes import (  # noqa: E402
+from quant_cast_bench.quant_cast_triton.recipes import (
     mxfp8_32x32_qdata_dim_k_scale_dim_km_swizzle_triton,
     mxfp8_32x32_triton,
     mxfp8_dim_km_swizzle_triton,

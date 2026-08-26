@@ -16,14 +16,10 @@ The three MoE training grouped GEMMs, with expert groups selected along the toke
 where `weight_t = weight.transpose(-2, -1)` (`weight` is the natural `(E, N, K)` expert stack).
 """
 
-import os
-import sys
-
 import torch
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-from experiments.quantize_tensor_api.moe_utils import BLOCK_SIZE, quantize_2d_act  # noqa: E402
-from quant_cast_bench.quant_cast_gold.recipes import _compute_error, mxfp8_f  # noqa: E402
+from quant_cast_bench.quantize_tensor_api.moe_utils import BLOCK_SIZE, quantize_2d_act
+from quant_cast_bench.quant_cast_gold.recipes import _compute_error, mxfp8_f
 
 
 def quantize_3d_weight(mat2: torch.Tensor):
