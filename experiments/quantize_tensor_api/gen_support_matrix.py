@@ -45,7 +45,7 @@ from quant_cast_bench.quant_cast_gold.recipes import (
 
 # --- per-entry-point column layouts (status is always second-to-last, dispatch last) --------------
 COLUMNS = [
-    "format", "scl_tp", "orient", "swizzle_type", "rnd_md", "out_scl", "rht", "input",
+    "format", "scl_tp", "orient", "swizzle_type", "rnd_md", "rht", "input",
     "status", "dispatches to",
 ]
 COLUMNS_BI = [
@@ -63,7 +63,6 @@ HEADER_ABBR = {
     "scl_tp": "scaling_type",
     "orient": "orientation",
     "rnd_md": "rounding_mode",
-    "out_scl": "outer_scale",
     "rht": "rht_tensor",
     "skip_tr": "skip_transposed_qdata",
 }
@@ -71,6 +70,8 @@ VALUE_ABBR = {
     "1x16": "BlockWise1x16",
     "1x32": "BlockWise1x32",
     "32x32": "BlockWise32x32",
+    "TW": "TensorWise",
+    "RW": "RowWise",
     "NT": "NATURAL",
     "TR": "TRANSPOSED",
     "NONE": "NO_SWIZZLE",
@@ -109,7 +110,6 @@ ORIENT_R = {QuantOrientation.NATURAL: "NT", QuantOrientation.TRANSPOSED: "TR"}
 SWIZZLE_R = {SwizzleType.NO_SWIZZLE: "NONE", SwizzleType.SWIZZLE_32_4_4: "32_4_4"}
 SKIP_R = {False: "no", True: "yes"}
 ROUNDING_R = {RoundingMode.RTNE: "RTNE", RoundingMode.STOCHASTIC: "RS"}
-OUTER_R = {"none": "None", "scalar": "scalar", "per_token": "`(M,1)`"}
 RHT_R = {"none": "None", "rht": "16×16"}
 INPUT_R = {"2d": "2D", "3d": "3D `(E,N,K)`"}
 
@@ -211,11 +211,14 @@ def collect_quantize_tensor() -> list[tuple[str, ...]]:
     for qd, isc, st, orient, sw, rm, osv, rhv, dim in itertools.product(
         QDATA, INNER, SCALING, ORIENT, SWIZZLE, ROUNDING, OUTER, RHT, INPUT_DIM
     ):
+        # The outer scaling LEVEL is named explicitly now: bare (single-level) / [inner, TensorWise]
+        # (per-tensor) / [inner, RowWise] (per-token), keyed off the OUTER axis 1:1 with outer_scale.
+        st_arg = st if osv == "none" else [st, ScalingType.TensorWise if osv == "scalar" else ScalingType.RowWise]
         res = _probe(lambda: quantize_tensor(
             inputs[dim],
             qdata_dtype=qd,
             inner_scale_calc=isc,
-            scaling_type=st,
+            scaling_type=st_arg,
             orientation=orient,
             swizzle_type=sw,
             rounding_mode=rm,
@@ -225,10 +228,11 @@ def collect_quantize_tensor() -> list[tuple[str, ...]]:
         ))
         if res is None:
             continue
+        scl_tp = SCALING_R[st] if osv == "none" else f"{SCALING_R[st]}+{'TW' if osv == 'scalar' else 'RW'}"
         rows.add((
             _format_label(qd, isc, osv, rhv),
-            SCALING_R[st], ORIENT_R[orient], SWIZZLE_R[sw], ROUNDING_R[rm],
-            OUTER_R[osv], RHT_R[rhv], INPUT_R[dim], *res,
+            scl_tp, ORIENT_R[orient], SWIZZLE_R[sw], ROUNDING_R[rm],
+            RHT_R[rhv], INPUT_R[dim], *res,
         ))
     return sorted(rows)  # lexicographic order -> byte-stable output
 
@@ -245,11 +249,13 @@ def collect_bidirectional() -> list[tuple[str, ...]]:
     for qd, isc, st, sw, skip, rm, osv, rhv, dim in itertools.product(
         QDATA, INNER, SCALING, SWIZZLE, SKIP, ROUNDING, OUTER_BI, RHT_BI, INPUT_DIM
     ):
+        # bidirectional nvfp4 is per-tensor only; name the outer level TensorWise when outer_scale is set.
+        st_arg = st if osv == "none" else [st, ScalingType.TensorWise]
         res = _probe(lambda: quantize_tensor_bidirectional(
             inputs[dim],
             qdata_dtype=qd,
             inner_scale_calc=isc,
-            scaling_type=st,
+            scaling_type=st_arg,
             swizzle_type=sw,
             skip_transposed_qdata=skip,
             rounding_mode=rm,
@@ -262,7 +268,8 @@ def collect_bidirectional() -> list[tuple[str, ...]]:
         fmt = "mxfp8" if qd == torch.float8_e4m3fn else (
             "nvfp4 (per-tensor, RHT)" if rhv == "dim_m" else "nvfp4 (per-tensor)"
         )
-        rows.add((fmt, SCALING_R[st], SWIZZLE_R[sw], SKIP_R[skip], ROUNDING_R[rm], INPUT_R[dim], *res))
+        scl_tp = SCALING_R[st] if osv == "none" else f"{SCALING_R[st]}+TW"
+        rows.add((fmt, scl_tp, SWIZZLE_R[sw], SKIP_R[skip], ROUNDING_R[rm], INPUT_R[dim], *res))
     return sorted(rows)
 
 

@@ -96,26 +96,26 @@ map (all `nvfp4` variants share the same pair):
 
 <!-- BEGIN GENERATED: support-matrix (python gen_support_matrix.py) -->
 
-| format | scl_tp | orient | swizzle_type | rnd_md | out_scl | rht | input | status | dispatches to |
-|---|---|---|---|---|---|---|---|---|---|
-| mxfp4 | 1x32 | NT | NONE | RTNE | None | None | 2D | 🟡 reference | `mxfp4_f` |
-| mxfp8 | 1x32 | NT | 32_4_4 | RTNE | None | None | 2D | 🟢 kernel | `mxfp8_swizzle_triton` |
-| mxfp8 | 1x32 | NT | 32_4_4 | RTNE | None | None | 3D `(E,N,K)` | 🟡 reference | `mxfp8_f` |
-| mxfp8 | 1x32 | NT | NONE | RTNE | None | None | 2D | 🟢 kernel | `mxfp8_triton` |
-| mxfp8 | 1x32 | TR | 32_4_4 | RTNE | None | None | 2D | 🟢 kernel | `mxfp8_dim_m_swizzle_triton` |
-| mxfp8 | 1x32 | TR | 32_4_4 | RTNE | None | None | 3D `(E,N,K)` | 🟡 reference | `mxfp8_f` |
-| mxfp8 | 1x32 | TR | NONE | RTNE | None | None | 2D | 🟢 kernel | `mxfp8_dim_m_triton` |
-| mxfp8 | 32x32 | NT | NONE | RTNE | None | None | 2D | 🟢 kernel | `mxfp8_32x32_triton` |
-| nvfp4 (per-tensor) | 1x16 | NT | 32_4_4 | RS | scalar | None | 2D | 🟡 reference | `nvfp4_gs_swizzle_sr_f` |
-| nvfp4 (per-tensor) | 1x16 | NT | 32_4_4 | RTNE | scalar | None | 2D | 🟢 kernel | `nvfp4_swizzle_triton` |
-| nvfp4 (per-tensor) | 1x16 | TR | 32_4_4 | RTNE | scalar | None | 2D | 🟡 reference | `nvfp4_gs_swizzle_dim_m_f` |
-| nvfp4 (per-tensor, RHT) | 1x16 | TR | 32_4_4 | RS | scalar | 16×16 | 2D | 🟡 reference | `nvfp4_gs_swizzle_dim_m_rht_sr_f` |
-| nvfp4 (per-tensor, RHT) | 1x16 | TR | 32_4_4 | RTNE | scalar | 16×16 | 2D | 🟡 reference | `nvfp4_gs_swizzle_dim_m_rht_f` |
-| nvfp4 (per-token) | 1x16 | NT | NONE | RTNE | `(M,1)` | None | 2D | 🟡 reference | `nvfp4_gs_f` |
+| format | scl_tp | orient | swizzle_type | rnd_md | rht | input | status | dispatches to |
+|---|---|---|---|---|---|---|---|---|
+| mxfp4 | 1x32 | NT | NONE | RTNE | None | 2D | 🟡 reference | `mxfp4_f` |
+| mxfp8 | 1x32 | NT | 32_4_4 | RTNE | None | 2D | 🟢 kernel | `mxfp8_swizzle_triton` |
+| mxfp8 | 1x32 | NT | 32_4_4 | RTNE | None | 3D `(E,N,K)` | 🟡 reference | `mxfp8_f` |
+| mxfp8 | 1x32 | NT | NONE | RTNE | None | 2D | 🟢 kernel | `mxfp8_triton` |
+| mxfp8 | 1x32 | TR | 32_4_4 | RTNE | None | 2D | 🟢 kernel | `mxfp8_dim_m_swizzle_triton` |
+| mxfp8 | 1x32 | TR | 32_4_4 | RTNE | None | 3D `(E,N,K)` | 🟡 reference | `mxfp8_f` |
+| mxfp8 | 1x32 | TR | NONE | RTNE | None | 2D | 🟢 kernel | `mxfp8_dim_m_triton` |
+| mxfp8 | 32x32 | NT | NONE | RTNE | None | 2D | 🟢 kernel | `mxfp8_32x32_triton` |
+| nvfp4 (per-tensor) | 1x16+TW | NT | 32_4_4 | RS | None | 2D | 🟡 reference | `nvfp4_gs_swizzle_sr_f` |
+| nvfp4 (per-tensor) | 1x16+TW | NT | 32_4_4 | RTNE | None | 2D | 🟢 kernel | `nvfp4_swizzle_triton` |
+| nvfp4 (per-tensor) | 1x16+TW | TR | 32_4_4 | RTNE | None | 2D | 🟡 reference | `nvfp4_gs_swizzle_dim_m_f` |
+| nvfp4 (per-tensor, RHT) | 1x16+TW | TR | 32_4_4 | RS | 16×16 | 2D | 🟡 reference | `nvfp4_gs_swizzle_dim_m_rht_sr_f` |
+| nvfp4 (per-tensor, RHT) | 1x16+TW | TR | 32_4_4 | RTNE | 16×16 | 2D | 🟡 reference | `nvfp4_gs_swizzle_dim_m_rht_f` |
+| nvfp4 (per-token) | 1x16+RW | NT | NONE | RTNE | None | 2D | 🟡 reference | `nvfp4_gs_f` |
 
-**Header abbreviations:** `scl_tp` = `scaling_type`, `orient` = `orientation`, `rnd_md` = `rounding_mode`, `out_scl` = `outer_scale`, `rht` = `rht_tensor`, `skip_tr` = `skip_transposed_qdata`.
+**Header abbreviations:** `scl_tp` = `scaling_type`, `orient` = `orientation`, `rnd_md` = `rounding_mode`, `rht` = `rht_tensor`, `skip_tr` = `skip_transposed_qdata`.
 
-**Value abbreviations:** `1x16` = `BlockWise1x16`, `1x32` = `BlockWise1x32`, `32x32` = `BlockWise32x32`, `NT` = `NATURAL`, `TR` = `TRANSPOSED`, `NONE` = `NO_SWIZZLE`, `32_4_4` = `SWIZZLE_32_4_4`, `RS` = `STOCHASTIC`.
+**Value abbreviations:** `1x16` = `BlockWise1x16`, `1x32` = `BlockWise1x32`, `32x32` = `BlockWise32x32`, `TW` = `TensorWise`, `RW` = `RowWise`, `NT` = `NATURAL`, `TR` = `TRANSPOSED`, `NONE` = `NO_SWIZZLE`, `32_4_4` = `SWIZZLE_32_4_4`, `RS` = `STOCHASTIC`.
 
 <!-- END GENERATED: support-matrix -->
 
@@ -133,9 +133,9 @@ but both scales). Abbreviations as in the `quantize_tensor` legend above.
 | mxfp8 | 1x32 | 32_4_4 | no | RTNE | 3D `(E,N,K)` | 🟡 reference | `mxfp8_f` |
 | mxfp8 | 1x32 | NONE | no | RTNE | 2D | 🟢 kernel | `mxfp8_dim_km_triton` |
 | mxfp8 | 32x32 | 32_4_4 | yes | RTNE | 2D | 🟢 kernel | `mxfp8_32x32_qdata_dim_k_scale_dim_km_swizzle_triton` |
-| nvfp4 (per-tensor) | 1x16 | 32_4_4 | no | RTNE | 2D | 🟡 reference | `nvfp4_gs_swizzle_dim_km_f` |
-| nvfp4 (per-tensor, RHT) | 1x16 | 32_4_4 | no | RS | 2D | 🟡 reference | `nvfp4_gs_swizzle_dim_k_dim_m_rht_sr_f` |
-| nvfp4 (per-tensor, RHT) | 1x16 | 32_4_4 | no | RTNE | 2D | 🟡 reference | `nvfp4_gs_swizzle_dim_k_dim_m_rht_f` |
+| nvfp4 (per-tensor) | 1x16+TW | 32_4_4 | no | RTNE | 2D | 🟡 reference | `nvfp4_gs_swizzle_dim_km_f` |
+| nvfp4 (per-tensor, RHT) | 1x16+TW | 32_4_4 | no | RS | 2D | 🟡 reference | `nvfp4_gs_swizzle_dim_k_dim_m_rht_sr_f` |
+| nvfp4 (per-tensor, RHT) | 1x16+TW | 32_4_4 | no | RTNE | 2D | 🟡 reference | `nvfp4_gs_swizzle_dim_k_dim_m_rht_f` |
 
 <!-- END GENERATED: support-matrix-bidirectional -->
 
