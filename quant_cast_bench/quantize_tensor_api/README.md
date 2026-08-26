@@ -99,15 +99,15 @@ map (all `nvfp4` variants share the same pair):
 | format | scl_tp | orient | swizzle_type | rnd_md | rht | input | status | dispatches to |
 |---|---|---|---|---|---|---|---|---|
 | mxfp4 | 1x32 | NT | NONE | RTNE | None | 2D | 🟡 reference | `mxfp4_f` |
-| mxfp8 | 1x32 | NT | 32_4_4 | RTNE | None | 2D | 🟢 kernel | `mxfp8_swizzle_triton` |
+| mxfp8 | 1x32 | NT | 32_4_4 | RTNE | None | 2D | 🟢 kernel | `mxfp8_triton` |
 | mxfp8 | 1x32 | NT | 32_4_4 | RTNE | None | 3D `(E,N,K)` | 🟡 reference | `mxfp8_f` |
 | mxfp8 | 1x32 | NT | NONE | RTNE | None | 2D | 🟢 kernel | `mxfp8_triton` |
-| mxfp8 | 1x32 | TR | 32_4_4 | RTNE | None | 2D | 🟢 kernel | `mxfp8_dim_m_swizzle_triton` |
+| mxfp8 | 1x32 | TR | 32_4_4 | RTNE | None | 2D | 🟢 kernel | `mxfp8_dim_m_triton` |
 | mxfp8 | 1x32 | TR | 32_4_4 | RTNE | None | 3D `(E,N,K)` | 🟡 reference | `mxfp8_f` |
 | mxfp8 | 1x32 | TR | NONE | RTNE | None | 2D | 🟢 kernel | `mxfp8_dim_m_triton` |
 | mxfp8 | 32x32 | NT | NONE | RTNE | None | 2D | 🟢 kernel | `mxfp8_32x32_triton` |
 | nvfp4 (per-tensor) | 1x16+TW | NT | 32_4_4 | RS | None | 2D | 🟡 reference | `nvfp4_gs_swizzle_sr_f` |
-| nvfp4 (per-tensor) | 1x16+TW | NT | 32_4_4 | RTNE | None | 2D | 🟢 kernel | `nvfp4_swizzle_triton` |
+| nvfp4 (per-tensor) | 1x16+TW | NT | 32_4_4 | RTNE | None | 2D | 🟢 kernel | `nvfp4_triton` |
 | nvfp4 (per-tensor) | 1x16+TW | TR | 32_4_4 | RTNE | None | 2D | 🟡 reference | `nvfp4_gs_swizzle_dim_m_f` |
 | nvfp4 (per-tensor, RHT) | 1x16+TW | TR | 32_4_4 | RS | 16×16 | 2D | 🟡 reference | `nvfp4_gs_swizzle_dim_m_rht_sr_f` |
 | nvfp4 (per-tensor, RHT) | 1x16+TW | TR | 32_4_4 | RTNE | 16×16 | 2D | 🟡 reference | `nvfp4_gs_swizzle_dim_m_rht_f` |
@@ -129,7 +129,7 @@ but both scales). Abbreviations as in the `quantize_tensor` legend above.
 
 | format | scl_tp | swizzle_type | skip_tr | rnd_md | input | status | dispatches to |
 |---|---|---|---|---|---|---|---|
-| mxfp8 | 1x32 | 32_4_4 | no | RTNE | 2D | 🟢 kernel | `mxfp8_dim_km_swizzle_triton` |
+| mxfp8 | 1x32 | 32_4_4 | no | RTNE | 2D | 🟢 kernel | `mxfp8_dim_km_triton` |
 | mxfp8 | 1x32 | 32_4_4 | no | RTNE | 3D `(E,N,K)` | 🟡 reference | `mxfp8_f` |
 | mxfp8 | 1x32 | NONE | no | RTNE | 2D | 🟢 kernel | `mxfp8_dim_km_triton` |
 | mxfp8 | 32x32 | 32_4_4 | yes | RTNE | 2D | 🟢 kernel | `mxfp8_32x32_qdata_dim_k_scale_dim_km_swizzle_triton` |
