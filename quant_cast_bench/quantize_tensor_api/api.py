@@ -27,13 +27,10 @@ from quant_cast_bench.quant_cast_gold.recipes import (
 from quant_cast_bench.quant_cast_triton.recipes import (
     mxfp8_32x32_qdata_dim_k_scale_dim_km_swizzle_triton,
     mxfp8_32x32_triton,
-    mxfp8_dim_km_swizzle_triton,
     mxfp8_dim_km_triton,
-    mxfp8_dim_m_swizzle_triton,
     mxfp8_dim_m_triton,
-    mxfp8_swizzle_triton,
     mxfp8_triton,
-    nvfp4_swizzle_triton,
+    nvfp4_triton,
 )
 
 
@@ -204,7 +201,7 @@ def quantize_tensor(
                         # SR nvfp4 (Nvfp4GsSRSwizzleGold's nvfp4_gs_swizzle_sr_f): gold reference, no
                         # Triton kernel; random_key is its Philox key.
                         return nvfp4_gs_swizzle_sr_f(x, outer_scale, random_key)
-                    return nvfp4_swizzle_triton(x, outer_scale)
+                    return nvfp4_triton(x, outer_scale, swizzle=True)
                 raise ValueError(
                     f"unsupported (scaling_type, swizzle_type)=({scaling_type!r}, {swizzle_type!r}) for "
                     "dim-k per-tensor nvfp4 (float4_e2m1fn_x2); supported: (BlockWise1x16, SWIZZLE_32_4_4)"
@@ -264,14 +261,14 @@ def quantize_tensor(
     if input.is_contiguous():
         if spec == (ScalingType.BlockWise1x32, SwizzleType.NO_SWIZZLE):
             assert input.shape[1] % 32 == 0, f"last dim must be a multiple of 32, got {input.shape[1]}"
-            return mxfp8_triton(input)
+            return mxfp8_triton(input, swizzle=False)
         if spec == (ScalingType.BlockWise1x32, SwizzleType.SWIZZLE_32_4_4):
             assert input.shape[1] % 32 == 0, f"last dim must be a multiple of 32, got {input.shape[1]}"
-            return mxfp8_swizzle_triton(input)
+            return mxfp8_triton(input, swizzle=True)
         if spec == (ScalingType.BlockWise32x32, SwizzleType.NO_SWIZZLE):
             assert input.shape[0] % 32 == 0, f"first dim must be a multiple of 32, got {input.shape[0]}"
             assert input.shape[1] % 32 == 0, f"last dim must be a multiple of 32, got {input.shape[1]}"
-            return mxfp8_32x32_triton(input)
+            return mxfp8_32x32_triton(input, swizzle=False)
         raise ValueError(
             f"unsupported (scaling_type, swizzle_type)={spec!r} for the dim-k (contiguous input) "
             "mxfp8 cast; supported: (BlockWise1x32, NO_SWIZZLE|SWIZZLE_32_4_4), "
@@ -284,9 +281,9 @@ def quantize_tensor(
         "input must be contiguous (dim-k), or a transpose of a contiguous tensor (dim-m)"
     )
     if spec == (ScalingType.BlockWise1x32, SwizzleType.NO_SWIZZLE):
-        return mxfp8_dim_m_triton(x)
+        return mxfp8_dim_m_triton(x, swizzle=False)
     if spec == (ScalingType.BlockWise1x32, SwizzleType.SWIZZLE_32_4_4):
-        return mxfp8_dim_m_swizzle_triton(x)
+        return mxfp8_dim_m_triton(x, swizzle=True)
     raise ValueError(
         f"unsupported (scaling_type, swizzle_type)={spec!r} for the dim-m (transposed input) mxfp8 "
         "cast; supported: (BlockWise1x32, NO_SWIZZLE|SWIZZLE_32_4_4)"
@@ -480,9 +477,9 @@ def quantize_tensor_dual(
             "supported: (BlockWise32x32, SWIZZLE_32_4_4)"
         )
     if spec == (ScalingType.BlockWise1x32, SwizzleType.NO_SWIZZLE):
-        return mxfp8_dim_km_triton(input)
+        return mxfp8_dim_km_triton(input, swizzle=False)
     if spec == (ScalingType.BlockWise1x32, SwizzleType.SWIZZLE_32_4_4):
-        return mxfp8_dim_km_swizzle_triton(input)
+        return mxfp8_dim_km_triton(input, swizzle=True)
     raise ValueError(
         f"unsupported (scaling_type, swizzle_type)={spec!r}; supported: "
         "(BlockWise1x32, NO_SWIZZLE|SWIZZLE_32_4_4), "
