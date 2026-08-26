@@ -315,9 +315,9 @@ def _deepseek_1x128_opt_kernel(gX: cute.Tensor, gY: cute.Tensor, sflat: cute.Ten
     local = cutlass.max(v, -v).reduce(cute.ReductionOp.MAX, cutlass.Float32(0.0), 0)
     amax = cutlass.max(cute.arch.warp_reduction_max(local, threads_in_group=_DS_GROUP),
                        cutlass.Float32(1e-12))
-    scale = amax / 448.0
-    frgY = cute.make_rmem_tensor(cute.get(tv_layout, mode=[1]), gY.element_type)
-    frgY.store((v * (1.0 / scale)).to(gY.element_type))
+    scale = amax * (1.0 / 448.0)  # reciprocal-mul: matches the gold's `amax / 448.0` (torch lowers
+    frgY = cute.make_rmem_tensor(cute.get(tv_layout, mode=[1]), gY.element_type)  # a tensor/py-scalar
+    frgY.store((v * (1.0 / scale)).to(gY.element_type))  # divide to `amax * (1/448)`, not div.approx)
     cute.copy(st_atom, frgY, thrY)
     # group leader writes the fp32 scale for its 1x128 block at (row, col-block)
     if tidx % _DS_GROUP == 0:
@@ -436,8 +436,8 @@ def _deepseek_dim_m_kernel(atom_in: cute.CopyAtom, ten_in: cute.Tensor, atom_out
                 v = frgIn.load()
                 amax = cutlass.max(amax, cute.where(v < 0, -v, v).reduce(
                     cute.ReductionOp.MAX, cutlass.Float32(0.0), 0))
-            scale = cutlass.max(amax, cutlass.Float32(1e-12)) / 448.0
-            inv = 1.0 / scale                                 # reciprocal-mul, not per-element divs
+            scale = cutlass.max(amax, cutlass.Float32(1e-12)) * (1.0 / 448.0)  # recip-mul: gold's
+            inv = 1.0 / scale                        # `/ 448.0` (tensor/py-scalar) lowers to *(1/448)
             # pass 2: re-read (cheap smem), quantize each chunk (vectorized f32->fp8), transpose in
             # the register->smem write (contiguous run into sOUT).
             for c in cutlass.range_constexpr(_DSM_CHUNKS):
@@ -590,7 +590,7 @@ def _deepseek_dim_km_kernel(atom_in: cute.CopyAtom, ten_in: cute.Tensor,
                 v = frg.load()
                 amax_m = cutlass.max(amax_m, cute.where(v < 0, -v, v).reduce(
                     cute.ReductionOp.MAX, cutlass.Float32(0.0), 0))
-            scale_m = cutlass.max(amax_m, cutlass.Float32(1e-12)) / 448.0
+            scale_m = cutlass.max(amax_m, cutlass.Float32(1e-12)) * (1.0 / 448.0)  # recip-mul (gold)
             inv_m = 1.0 / scale_m
             for c in cutlass.range_constexpr(_DKKM_CHUNKS):     # re-read + quantize + transpose write
                 frg = cute.make_rmem_tensor(cute.make_layout(32), cutlass.Float32)
@@ -615,7 +615,7 @@ def _deepseek_dim_km_kernel(atom_in: cute.CopyAtom, ten_in: cute.Tensor,
                 v = frg.load()
                 amax_k = cutlass.max(amax_k, cute.where(v < 0, -v, v).reduce(
                     cute.ReductionOp.MAX, cutlass.Float32(0.0), 0))
-            scale_k = cutlass.max(amax_k, cutlass.Float32(1e-12)) / 448.0
+            scale_k = cutlass.max(amax_k, cutlass.Float32(1e-12)) * (1.0 / 448.0)  # recip-mul (gold)
             inv_k = 1.0 / scale_k
             base = (m0 + row) * N + (n0 + c0)
             for c in cutlass.range_constexpr(_DKKM_CHUNKS):     # re-read + quantize + direct gmem store
@@ -1685,7 +1685,7 @@ def _deepseek_128x128_kernel(atom_in: cute.CopyAtom, ten_in: cute.Tensor, atom_o
     bmax = red[0]
     for w in cutlass.range_constexpr(1, _D128_WARPS):
         bmax = cutlass.max(bmax, red[w])
-    scale = cutlass.max(bmax, cutlass.Float32(1e-12)) / 448.0
+    scale = cutlass.max(bmax, cutlass.Float32(1e-12)) * (1.0 / 448.0)  # recip-mul (gold's `/ 448.0`)
     inv = 1.0 / scale                                         # reciprocal-mul, not per-element divs
     if tidx == 0:
         scales[bidx * ncb + bidy] = scale.to(scales.element_type)
@@ -1803,8 +1803,8 @@ def _rowwise_opt_kernel(gX: cute.Tensor, gY: cute.Tensor, sflat: cute.Tensor, tv
         for w in cutlass.range_constexpr(1, warps):
             bmax = cutlass.max(bmax, red[w])
         amax = cutlass.max(bmax, cutlass.Float32(1e-12))
-    scale = amax / 448.0
-    inv = 1.0 / scale                                        # reciprocal-mul, not per-element divs
+    scale = amax * (1.0 / 448.0)                            # recip-mul: gold's `amax / 448.0` (tensor
+    inv = 1.0 / scale                            # by py-scalar) lowers to *(1/448), not div.approx
     # pass 2: re-read each block (warm in L2), quantize (vectorized f32->fp8), store.
     for j in cutlass.range_constexpr(nbpr):
         thrX = cute.composition(gX[(None, bidx * nbpr + j)], tv_layout)[(tidx, None)]
@@ -1983,7 +1983,7 @@ def _colwise_quant_kernel(atom_in: cute.CopyAtom, ten_in: cute.Tensor, atom_out:
         col = tidx + it * _CWQ_THREADS
         if col < _CWQ_TN:
             amax = cutlass.max(mA[n0 + col], cutlass.Float32(1e-12))
-            scale = amax / 448.0
+            scale = amax * (1.0 / 448.0)                    # recip-mul (gold's `amax / 448.0`)
             inv = 1.0 / scale                                # reciprocal-mul, not TM divs
             frgIn = cute.make_rmem_tensor(cute.make_layout(_CWQ_TM), cutlass.Float32)
             for r in cutlass.range_constexpr(_CWQ_TM):
@@ -2055,7 +2055,10 @@ _NVFP4_EPS = 0.015625  # torch.finfo(float8_e4m3fn).tiny (E4M3_EPS)
 def _nvfp4_block(v, data_val_layout, outer):
     amax = cutlass.max(v, -v).reduce(cute.ReductionOp.MAX, cutlass.Float32(0.0), 0)
     inner_val = cutlass.min(
-        cutlass.max((amax / 6.0) / outer, cutlass.Float32(_NVFP4_EPS)), cutlass.Float32(448.0)
+        # `amax / 6` is a tensor/py-scalar divide in the gold -> reciprocal-mul; `/ outer` is a
+        # tensor/tensor divide (div.rn, which cute's `/` already is). Mirror both so the e4m3/fp4
+        # RNE ties resolve identically to the gold.
+        cutlass.max((amax * (1.0 / 6.0)) / outer, cutlass.Float32(_NVFP4_EPS)), cutlass.Float32(448.0)
     )
     frgI = cute.make_rmem_tensor(cute.make_layout(4), cutlass.Float32)
     frgI[0], frgI[1], frgI[2], frgI[3] = inner_val, inner_val, inner_val, inner_val
@@ -2166,14 +2169,16 @@ def _cvt_e4m3_byte_to_f32(byte, *, loc=None, ip=None):
 
 
 @cute.jit
-def _nvfp4_scale_e4m3(amax, inv_outer):
+def _nvfp4_scale_e4m3(amax, outer, inv_outer):
     """NVFP4 two-level inner scale via hardware cvts: returns (e4m3 scale byte, fp32 data recip).
-    Matches nvfp4_gs_swizzle_f: local = clamp((amax/6)/outer, eps, 448) -> e4m3;
+    Matches nvfp4_gs_swizzle_f bit-for-bit: local = clamp((amax/6)/outer, eps, 448) -> e4m3;
     recip = (1/outer) / dequant(e4m3) (what each element is multiplied by before the fp4 cast).
-    Takes the hoisted inv_outer = 1/outer so the per-block `/outer` is a multiply (nvfp4 is a
-    coarse 4-bit / SQNR-graded cast, so the reassociated rounding is well within tolerance)."""
+    `amax / 6` is a tensor/py-scalar divide in the gold -> reciprocal-mul; the inner `/ outer` and the
+    recip's `/ dequant` are tensor/tensor divides (div.rn, which cute's `/` already is). inv_outer is
+    the hoisted `1.0 / outer` (loop-invariant, div.rn) and equals the gold's `1.0 / outer_scale`, so
+    the recip's leading `1/outer` stays a single hoisted reciprocal."""
     local = cutlass.min(
-        cutlass.max((amax / 6.0) * inv_outer, cutlass.Float32(_NVFP4_EPS)), cutlass.Float32(448.0)
+        cutlass.max((amax * (1.0 / 6.0)) / outer, cutlass.Float32(_NVFP4_EPS)), cutlass.Float32(448.0)
     )
     e4m3_byte = _cvt_rn_satfinite_e4m3x2_f32(local, local)
     recip = inv_outer / _cvt_e4m3_byte_to_f32(e4m3_byte)
@@ -2247,7 +2252,7 @@ def _nvfp4_swizzle_kernel(gX: cute.Tensor, gQ: cute.Tensor, sflat: cute.Tensor, 
                                   num_bits_per_copy=_NVSWZ_ST_BITS)
     frgO = cute.make_rmem_tensor(cute.make_layout(1), mOuter.element_type)
     cute.copy(cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), mOuter.element_type), mOuter, frgO)
-    inv_outer = 1.0 / frgO[0]                    # loop-invariant; per-block `/outer` becomes a mul
+    inv_outer = 1.0 / frgO[0]                    # loop-invariant hoisted 1/outer for the recip
     blk_layout = cute.make_layout(16)
     ld_layout = cute.make_layout(_NVSWZ_LDWIDTH)
     GPR = N // 32                                # 32-elem groups per row (constexpr)
@@ -2290,7 +2295,7 @@ def _nvfp4_swizzle_kernel(gX: cute.Tensor, gQ: cute.Tensor, sflat: cute.Tensor, 
                         v = blk.load()
                         amax = cutlass.max(v, -v).reduce(
                             cute.ReductionOp.MAX, cutlass.Float32(0.0), 0)
-                        e4m3_byte, recip = _nvfp4_scale_e4m3(amax, inv_outer)
+                        e4m3_byte, recip = _nvfp4_scale_e4m3(amax, frgO[0], inv_outer)
                         # pack 16 scaled values -> 8 bytes = two uint32 (even col -> low nibble, odd
                         # -> high, matching gold _f32_to_packed_fp4); 8 values/call amortizes ALU.
                         for c in cutlass.range_constexpr(2):

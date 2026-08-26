@@ -1038,14 +1038,17 @@ def _to_blocked_4d(scale):
 
 
 def _from_blocked_4d(blocked, rows, cols):
-    """Inverse of `_to_blocked_4d` for the exact case rows % 128 == 0, cols % 4 == 0.
+    """Inverse of `_to_blocked_4d`: reconstruct the row-major `(rows, cols)` block-scale from the
+    4D block grid `(n_row_blocks, n_col_blocks, 32, 16)`.
 
-    `blocked` is the 4D block grid `(n_row_blocks, n_col_blocks, 32, 16)`.
+    Handles the padded case (rows % 128 != 0 or cols % 4 != 0): the forward swizzle zero-pads up to
+    whole 128x4 atoms, so the grid carries `ceil_div` block counts -- undo the permute on the PADDED
+    (n_row_blocks*128, n_col_blocks*4) shape, then slice back to `(rows, cols)`.
     """
-    nrb, ncb = rows // 128, cols // 4
+    nrb, ncb = (rows + 127) // 128, (cols + 3) // 4
     x = blocked.reshape(nrb, ncb, 32, 4, 4).transpose(-3, -2)
     x = x.reshape(nrb, ncb, 128, 4).permute(0, 2, 1, 3)
-    return x.reshape(rows, cols)
+    return x.reshape(nrb * 128, ncb * 4)[:rows, :cols]
 
 
 def mxfp8_swizzle_f(x, **kwargs):
