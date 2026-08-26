@@ -571,7 +571,7 @@ class _Nvfp4LinearSingleDirection(torch.autograd.Function):
             scaling_type=[ScalingType.BlockWise1x16, ScalingType.TensorWise],
                 swizzle_type=SwizzleType.SWIZZLE_32_4_4,
             outer_scale=go_gs_k,
-            rounding_mode=RoundingMode.STOCHASTIC,
+            qdata_rounding_mode=RoundingMode.STOCHASTIC,
             random_key=key_k,
         )
         go_sr_q_m, go_s_m = quantize_tensor(
@@ -582,7 +582,7 @@ class _Nvfp4LinearSingleDirection(torch.autograd.Function):
             swizzle_type=SwizzleType.SWIZZLE_32_4_4,
             outer_scale=go_rht_g_s_m,
             rht_tensor=rht,
-            rounding_mode=RoundingMode.STOCHASTIC,
+            qdata_rounding_mode=RoundingMode.STOCHASTIC,
             random_key=key_m,
         )
         # dgrad: dy (M,N) @ W (N,K) -> grad_input (M,K).
@@ -692,7 +692,7 @@ class _Nvfp4LinearBiDirection(torch.autograd.Function):
             swizzle_type=SwizzleType.SWIZZLE_32_4_4,
             outer_scale=(go_gs_k, go_rht_g_s_m),
             rht_tensor=(None, rht),
-            rounding_mode=RoundingMode.STOCHASTIC,
+            qdata_rounding_mode=RoundingMode.STOCHASTIC,
             random_key=key,
         )
         # dgrad: dy (M,N) @ W (N,K) -> grad_input (M,K).

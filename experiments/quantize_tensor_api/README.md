@@ -113,7 +113,7 @@ map (all `nvfp4` variants share the same pair):
 | nvfp4 (per-tensor, RHT) | 1x16+TW | TR | 32_4_4 | RTNE | 16×16 | 2D | 🟡 reference | `nvfp4_gs_swizzle_dim_m_rht_f` |
 | nvfp4 (per-token) | 1x16+RW | NT | NONE | RTNE | None | 2D | 🟡 reference | `nvfp4_gs_f` |
 
-**Header abbreviations:** `scl_tp` = `scaling_type`, `orient` = `orientation`, `rnd_md` = `rounding_mode`, `rht` = `rht_tensor`, `skip_tr` = `skip_transposed_qdata`.
+**Header abbreviations:** `scl_tp` = `scaling_type`, `orient` = `orientation`, `rnd_md` = `qdata_rounding_mode`, `rht` = `rht_tensor`, `skip_tr` = `skip_transposed_qdata`.
 
 **Value abbreviations:** `1x16` = `BlockWise1x16`, `1x32` = `BlockWise1x32`, `32x32` = `BlockWise32x32`, `TW` = `TensorWise`, `RW` = `RowWise`, `NT` = `NATURAL`, `TR` = `TRANSPOSED`, `NONE` = `NO_SWIZZLE`, `32_4_4` = `SWIZZLE_32_4_4`, `RS` = `STOCHASTIC`.
 
