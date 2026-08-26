@@ -28,7 +28,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 from experiments.quantize_tensor_api import api, moe_utils  # noqa: E402
 from experiments.quantize_tensor_api.api import (
     InnerScaleCalc,
-    QuantOrientation,
     RoundingMode,
     ScalingType,
     SwizzleType,
@@ -94,7 +93,7 @@ def _end(tag: str) -> str:
 QDATA = [torch.float8_e4m3fn, torch.float4_e2m1fn_x2]
 INNER = [InnerScaleCalc.E8M0_RCEIL, InnerScaleCalc.E4M3_NVFP4]
 SCALING = [ScalingType.BlockWise1x16, ScalingType.BlockWise1x32, ScalingType.BlockWise32x32]
-ORIENT = [QuantOrientation.NATURAL, QuantOrientation.TRANSPOSED]
+ORIENT = ["dim_k", "dim_m"]  # dim_k = contiguous input; dim_m = a transposed view of it
 SWIZZLE = [SwizzleType.NO_SWIZZLE, SwizzleType.SWIZZLE_32_4_4]
 SKIP = [False, True]
 ROUNDING = [RoundingMode.RTNE, RoundingMode.STOCHASTIC]
@@ -106,7 +105,7 @@ INPUT_DIM = ["2d", "3d"]
 
 # --- how each axis value renders in the table -----------------------------------------------------
 SCALING_R = {ScalingType.BlockWise1x16: "1x16", ScalingType.BlockWise1x32: "1x32", ScalingType.BlockWise32x32: "32x32"}
-ORIENT_R = {QuantOrientation.NATURAL: "NT", QuantOrientation.TRANSPOSED: "TR"}
+ORIENT_R = {"dim_k": "NT", "dim_m": "TR"}
 SWIZZLE_R = {SwizzleType.NO_SWIZZLE: "NONE", SwizzleType.SWIZZLE_32_4_4: "32_4_4"}
 SKIP_R = {False: "no", True: "yes"}
 ROUNDING_R = {RoundingMode.RTNE: "RTNE", RoundingMode.STOCHASTIC: "RS"}
@@ -214,12 +213,13 @@ def collect_quantize_tensor() -> list[tuple[str, ...]]:
         # The outer scaling LEVEL is named explicitly now: bare (single-level) / [inner, TensorWise]
         # (per-tensor) / [inner, RowWise] (per-token), keyed off the OUTER axis 1:1 with outer_scale.
         st_arg = st if osv == "none" else [st, ScalingType.TensorWise if osv == "scalar" else ScalingType.RowWise]
+        # dim-m is requested by passing a transposed view of the contiguous input (no orientation arg).
+        probe_in = inputs[dim] if orient == "dim_k" else inputs[dim].transpose(-2, -1)
         res = _probe(lambda: quantize_tensor(
-            inputs[dim],
+            probe_in,
             qdata_dtype=qd,
             inner_scale_calc=isc,
             scaling_type=st_arg,
-            orientation=orient,
             swizzle_type=sw,
             rounding_mode=rm,
             random_key=key if rm == RoundingMode.STOCHASTIC else None,
@@ -280,12 +280,12 @@ def collect_grouped() -> list[tuple[str, ...]]:
     for qd, isc, st, orient, sw, rm, osv, rhv in itertools.product(
         QDATA, INNER, SCALING, ORIENT, SWIZZLE, ROUNDING, OUTER, RHT
     ):
+        probe_in = gx if orient == "dim_k" else gx.transpose(-2, -1)
         res = _probe(lambda: quantize_tensor_grouped(
-            gx, offs,
+            probe_in, offs,
             qdata_dtype=qd,
             inner_scale_calc=isc,
             scaling_type=st,
-            orientation=orient,
             swizzle_type=sw,
             rounding_mode=rm,
             random_key=key if rm == RoundingMode.STOCHASTIC else None,

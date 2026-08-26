@@ -9,7 +9,6 @@ import torch.nn.functional as F
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from api import (  # noqa: E402
     InnerScaleCalc,
-    QuantOrientation,
     RoundingMode,
     ScalingType,
     SwizzleType,
@@ -62,7 +61,6 @@ def test_rowwise_matches_gold_bitwise(M, N, dtype):
         qdata_dtype=torch.float8_e4m3fn,
         inner_scale_calc=InnerScaleCalc.E8M0_RCEIL,
         scaling_type=ScalingType.BlockWise1x32,
-        orientation=QuantOrientation.NATURAL,
         swizzle_type=SwizzleType.NO_SWIZZLE,
     )
     q_ref, s_ref = mxfp8_f(x)
@@ -88,7 +86,6 @@ def test_mxfp4_matches_gold_bitwise(M, N, dtype):
         qdata_dtype=torch.float4_e2m1fn_x2,
         inner_scale_calc=InnerScaleCalc.E8M0_RCEIL,
         scaling_type=ScalingType.BlockWise1x32,
-        orientation=QuantOrientation.NATURAL,
         swizzle_type=SwizzleType.NO_SWIZZLE,
     )
     q_ref, s_ref = mxfp4_f(x)
@@ -105,11 +102,10 @@ def test_mxfp4_matches_gold_bitwise(M, N, dtype):
 def test_colwise_matches_gold_bitwise(M, N, dtype):
     x = torch.randn(M, N, dtype=dtype, device="cuda")
     q, s = quantize_tensor(
-        x,
+        x.t(),  # dim-m: pass a transposed view; the API un-transposes and uses the dim-m kernel
         qdata_dtype=torch.float8_e4m3fn,
         inner_scale_calc=InnerScaleCalc.E8M0_RCEIL,
         scaling_type=ScalingType.BlockWise1x32,
-        orientation=QuantOrientation.TRANSPOSED,
         swizzle_type=SwizzleType.NO_SWIZZLE,
     )
     q_ref, s_ref = mxfp8_dim_m_f(x)
@@ -154,7 +150,6 @@ def test_32x32_matches_gold_bitwise(M, N, dtype):
         qdata_dtype=torch.float8_e4m3fn,
         inner_scale_calc=InnerScaleCalc.E8M0_RCEIL,
         scaling_type=ScalingType.BlockWise32x32,
-        orientation=QuantOrientation.NATURAL,
         swizzle_type=SwizzleType.NO_SWIZZLE,
     )
     q_ref, s_ref = mxfp8_32x32_f(x)
@@ -175,7 +170,6 @@ def test_rowwise_swizzle_matches_gold_bitwise(M, N, dtype):
         qdata_dtype=torch.float8_e4m3fn,
         inner_scale_calc=InnerScaleCalc.E8M0_RCEIL,
         scaling_type=ScalingType.BlockWise1x32,
-        orientation=QuantOrientation.NATURAL,
         swizzle_type=SwizzleType.SWIZZLE_32_4_4,
     )
     q_ref, s_ref = mxfp8_swizzle_f(x)
@@ -192,11 +186,10 @@ def test_rowwise_swizzle_matches_gold_bitwise(M, N, dtype):
 def test_colwise_swizzle_matches_gold_bitwise(M, N, dtype):
     x = torch.randn(M, N, dtype=dtype, device="cuda")
     q, s = quantize_tensor(
-        x,
+        x.t(),  # dim-m: pass a transposed view; the API un-transposes and uses the dim-m kernel
         qdata_dtype=torch.float8_e4m3fn,
         inner_scale_calc=InnerScaleCalc.E8M0_RCEIL,
         scaling_type=ScalingType.BlockWise1x32,
-        orientation=QuantOrientation.TRANSPOSED,
         swizzle_type=SwizzleType.SWIZZLE_32_4_4,
     )
     q_ref, s_ref = mxfp8_dim_m_swizzle_f(x)
@@ -268,7 +261,6 @@ def test_nvfp4_matches_gold(M, N, dtype):
         qdata_dtype=torch.float4_e2m1fn_x2,
         inner_scale_calc=InnerScaleCalc.E4M3_NVFP4,
         scaling_type=[ScalingType.BlockWise1x16, ScalingType.TensorWise],
-        orientation=QuantOrientation.NATURAL,
         swizzle_type=SwizzleType.SWIZZLE_32_4_4,
         outer_scale=outer_scale,
     )
@@ -302,7 +294,6 @@ def test_nvfp4_per_token_matches_gold_bitwise(M, N, dtype):
         qdata_dtype=torch.float4_e2m1fn_x2,
         inner_scale_calc=InnerScaleCalc.E4M3_NVFP4,
         scaling_type=[ScalingType.BlockWise1x16, ScalingType.RowWise],
-        orientation=QuantOrientation.NATURAL,
         swizzle_type=SwizzleType.NO_SWIZZLE,
         outer_scale=outer_scale,
     )
@@ -330,11 +321,10 @@ def test_nvfp4_dim_m_rht_matches_gold_bitwise(M, N, dtype):
     (x_t_rht,) = hadamard_rht_f(x.t().contiguous(), rht)
     outer_scale = x_t_rht.abs().to(torch.float32).amax() / (F8E4M3_MAX * F4_E2M1_MAX)
     q, s = quantize_tensor(
-        x,
+        x.t(),  # dim-m: pass a transposed view; the API un-transposes and uses the dim-m kernel
         qdata_dtype=torch.float4_e2m1fn_x2,
         inner_scale_calc=InnerScaleCalc.E4M3_NVFP4,
         scaling_type=[ScalingType.BlockWise1x16, ScalingType.TensorWise],
-        orientation=QuantOrientation.TRANSPOSED,
         swizzle_type=SwizzleType.SWIZZLE_32_4_4,
         outer_scale=outer_scale,
         rht_tensor=rht,
@@ -350,13 +340,12 @@ def test_nvfp4_dim_m_rht_matches_gold_bitwise(M, N, dtype):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
 def test_unsupported_combo_raises():
     x = torch.randn(256, 512, device="cuda")
-    with pytest.raises(ValueError):  # 32x32 only has a NATURAL kernel, not TRANSPOSED
+    with pytest.raises(ValueError):  # 32x32 only has a dim-k kernel, not a dim-m (transposed) one
         quantize_tensor(
-            x,
+            x.t(),  # dim-m: transposed view -> routes to the (absent) dim-m 32x32 kernel
             qdata_dtype=torch.float8_e4m3fn,
             inner_scale_calc=InnerScaleCalc.E8M0_RCEIL,
             scaling_type=ScalingType.BlockWise32x32,
-            orientation=QuantOrientation.TRANSPOSED,
         )
     with pytest.raises(ValueError):  # 32x32 bidirectional (full both) is expressible but unwired
         quantize_tensor_bidirectional(
@@ -372,24 +361,21 @@ def test_unsupported_combo_raises():
             qdata_dtype=torch.float8_e4m3fn,
             inner_scale_calc=InnerScaleCalc.E8M0_RCEIL,
             scaling_type=ScalingType.BlockWise1x128,
-            orientation=QuantOrientation.NATURAL,
-        )
+            )
     with pytest.raises(ValueError):  # RowWise granularity is unwired
         quantize_tensor(
             x,
             qdata_dtype=torch.float8_e4m3fn,
             inner_scale_calc=InnerScaleCalc.E8M0_RCEIL,
             scaling_type=ScalingType.RowWise,
-            orientation=QuantOrientation.NATURAL,
-        )
+            )
     with pytest.raises(ValueError):  # 32x32 has no swizzle kernel
         quantize_tensor(
             x,
             qdata_dtype=torch.float8_e4m3fn,
             inner_scale_calc=InnerScaleCalc.E8M0_RCEIL,
             scaling_type=ScalingType.BlockWise32x32,
-            orientation=QuantOrientation.NATURAL,
-            swizzle_type=SwizzleType.SWIZZLE_32_4_4,
+                swizzle_type=SwizzleType.SWIZZLE_32_4_4,
         )
     with pytest.raises(ValueError):  # skip_transposed_qdata is 32x32-only, not 1x32
         quantize_tensor_bidirectional(
@@ -425,8 +411,8 @@ def test_grouped_return_arity():
         swizzle_type=SwizzleType.SWIZZLE_32_4_4,
     )
     # single-orientation grouped cast always returns (qdata, blocked_scale).
-    assert len(quantize_tensor_grouped(x, offs, orientation=QuantOrientation.NATURAL, **mxfp8_kwargs)) == 2
-    assert len(quantize_tensor_grouped(x, offs, orientation=QuantOrientation.TRANSPOSED, **mxfp8_kwargs)) == 2
+    assert len(quantize_tensor_grouped(x, offs, **mxfp8_kwargs)) == 2  # dim-k (contiguous)
+    assert len(quantize_tensor_grouped(x.t(), offs, **mxfp8_kwargs)) == 2  # dim-m (transposed view)
     # bidirectional returns both pairs: (q_nat, sb_nat, q_t, sb_t).
     assert len(quantize_tensor_grouped_bidirectional(x, offs, **mxfp8_kwargs)) == 4
 
@@ -504,23 +490,21 @@ class _Nvfp4LinearSingleDirection(torch.autograd.Function):
         x_rht_g_s_m = _rht_outer_scale(input, rht)  # outer scale over |RHT(input.T)|
         # Activation casts through the quantize_tensor API (splitting the fused
         # nvfp4_gs_swizzle_dim_k_dim_m_rht_f into its two orientations). dim-k is plain nvfp4 (no RHT,
-        # NATURAL) over |input|; dim-m applies the RHT to input.t() then nvfp4s along M (TRANSPOSED +
-        # rht_tensor), scaled by |RHT(input.t())|.
+        # contiguous input) over |input|; dim-m applies the RHT to input.t() then nvfp4s along M
+        # (selected by passing the transposed view + rht_tensor), scaled by |RHT(input.t())|.
         x_q_k, xs_k = quantize_tensor(
             input,
             qdata_dtype=torch.float4_e2m1fn_x2,
             inner_scale_calc=InnerScaleCalc.E4M3_NVFP4,
             scaling_type=[ScalingType.BlockWise1x16, ScalingType.TensorWise],
-            orientation=QuantOrientation.NATURAL,
-            swizzle_type=SwizzleType.SWIZZLE_32_4_4,
+                swizzle_type=SwizzleType.SWIZZLE_32_4_4,
             outer_scale=x_gs_k,
         )
         x_rht_q_m, x_rht_s_m = quantize_tensor(
-            input,
+            input.t(),  # dim-m: transposed view selects the dim-m cast
             qdata_dtype=torch.float4_e2m1fn_x2,
             inner_scale_calc=InnerScaleCalc.E4M3_NVFP4,
             scaling_type=[ScalingType.BlockWise1x16, ScalingType.TensorWise],
-            orientation=QuantOrientation.TRANSPOSED,
             swizzle_type=SwizzleType.SWIZZLE_32_4_4,
             outer_scale=x_rht_g_s_m,
             rht_tensor=rht,
@@ -529,23 +513,21 @@ class _Nvfp4LinearSingleDirection(torch.autograd.Function):
         w_gs = nvfp4_gs_scale(weight)  # |W| == |W.T|, so one outer scale serves both
         # Weight casts through the quantize_tensor API (same nvfp4 config as test_nvfp4_matches_gold:
         # E4M3_NVFP4 two-level, 1x16 blocks, swizzled scale, per-tensor outer scale). The col operand
-        # is the API cast of weight.t() (NATURAL orientation, mirroring the gold's _weight_quantize_2d
-        # transpose) rather than a TRANSPOSED-orientation call, so both go through the validated path.
+        # is the API cast of weight.t() (dim-m, selected by the transposed view, mirroring the gold's
+        # _weight_quantize_2d transpose).
         w_q_k, ws_k = quantize_tensor(
             weight,
             qdata_dtype=torch.float4_e2m1fn_x2,
             inner_scale_calc=InnerScaleCalc.E4M3_NVFP4,
             scaling_type=[ScalingType.BlockWise1x16, ScalingType.TensorWise],
-            orientation=QuantOrientation.NATURAL,
-            swizzle_type=SwizzleType.SWIZZLE_32_4_4,
+                swizzle_type=SwizzleType.SWIZZLE_32_4_4,
             outer_scale=w_gs,
         )
         w_q_n, w_s_n = quantize_tensor(
-            weight,
+            weight.t(),  # dim-m: transposed view selects the dim-m cast
             qdata_dtype=torch.float4_e2m1fn_x2,
             inner_scale_calc=InnerScaleCalc.E4M3_NVFP4,
             scaling_type=[ScalingType.BlockWise1x16, ScalingType.TensorWise],
-            orientation=QuantOrientation.TRANSPOSED,
             swizzle_type=SwizzleType.SWIZZLE_32_4_4,
             outer_scale=w_gs,
         )
@@ -580,25 +562,23 @@ class _Nvfp4LinearSingleDirection(torch.autograd.Function):
         key_k, key_m = prng.split(key, 2)
         # grad_output casts through the quantize_tensor API with STOCHASTIC rounding (splitting the
         # fused nvfp4_gs_swizzle_dim_k_dim_m_rht_sr_f into its two orientations, one Philox key each).
-        # dim-k is plain SR nvfp4 (no RHT, NATURAL) over |grad_output|; dim-m applies the RHT to
-        # grad_output.t() then SR-nvfp4s along M (TRANSPOSED + rht_tensor), scaled by |RHT(dy.t())|.
+        # dim-k is plain SR nvfp4 (no RHT, contiguous input) over |grad_output|; dim-m applies the RHT
+        # to grad_output.t() then SR-nvfp4s along M (transposed view + rht_tensor), scaled by |RHT(dy.t())|.
         go_sr_q_k, gos_k = quantize_tensor(
             grad_output,
             qdata_dtype=torch.float4_e2m1fn_x2,
             inner_scale_calc=InnerScaleCalc.E4M3_NVFP4,
             scaling_type=[ScalingType.BlockWise1x16, ScalingType.TensorWise],
-            orientation=QuantOrientation.NATURAL,
-            swizzle_type=SwizzleType.SWIZZLE_32_4_4,
+                swizzle_type=SwizzleType.SWIZZLE_32_4_4,
             outer_scale=go_gs_k,
             rounding_mode=RoundingMode.STOCHASTIC,
             random_key=key_k,
         )
         go_sr_q_m, go_s_m = quantize_tensor(
-            grad_output,
+            grad_output.t(),  # dim-m: transposed view selects the dim-m cast
             qdata_dtype=torch.float4_e2m1fn_x2,
             inner_scale_calc=InnerScaleCalc.E4M3_NVFP4,
             scaling_type=[ScalingType.BlockWise1x16, ScalingType.TensorWise],
-            orientation=QuantOrientation.TRANSPOSED,
             swizzle_type=SwizzleType.SWIZZLE_32_4_4,
             outer_scale=go_rht_g_s_m,
             rht_tensor=rht,

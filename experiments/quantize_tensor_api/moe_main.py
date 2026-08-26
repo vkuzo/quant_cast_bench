@@ -31,7 +31,6 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from experiments.quantize_tensor_api.api import (  # noqa: E402
     InnerScaleCalc,
-    QuantOrientation,
     ScalingType,
     SwizzleType,
     quantize_tensor,
@@ -87,17 +86,16 @@ def mxfp8_fwd_real(
         qdata_dtype=torch.float8_e4m3fn,
         inner_scale_calc=InnerScaleCalc.E8M0_RCEIL,
         scaling_type=ScalingType.BlockWise1x32,
-        orientation=QuantOrientation.NATURAL,
         swizzle_type=SwizzleType.SWIZZLE_32_4_4,
     )
-    # Weight cast blocked 1x32 along K (the fwd contraction dim): TRANSPOSED gives a (E,N,K) row-major
-    # buffer whose transpose (E,K,N) is the column-major mat2 view the real op requires.
+    # Weight cast blocked 1x32 along K (the fwd contraction dim): passing the transposed view selects
+    # the dim-m cast, giving a (E,N,K) row-major buffer whose transpose (E,K,N) is the column-major
+    # mat2 view the real op requires.
     w_e4m3, w_scale_blocked = quantize_tensor(
-        weight_t,
+        weight_t.transpose(-2, -1),
         qdata_dtype=torch.float8_e4m3fn,
         inner_scale_calc=InnerScaleCalc.E8M0_RCEIL,
         scaling_type=ScalingType.BlockWise1x32,
-        orientation=QuantOrientation.TRANSPOSED,
         swizzle_type=SwizzleType.SWIZZLE_32_4_4,
     )  # (E,N,K)
     return torch._scaled_grouped_mm(
@@ -151,7 +149,6 @@ def mxfp8_bwd_real(
         qdata_dtype=torch.float8_e4m3fn,
         inner_scale_calc=InnerScaleCalc.E8M0_RCEIL,
         scaling_type=ScalingType.BlockWise1x32,
-        orientation=QuantOrientation.NATURAL,
         swizzle_type=SwizzleType.SWIZZLE_32_4_4,
     )  # (E,K,N)
     w_e4m3 = q_kn.transpose(-2, -1)  # (E,N,K) column-major view
@@ -164,11 +161,10 @@ def mxfp8_bwd_real(
     # (K-groups scale layout). M being contracted, the result needs no unpadding. `padded_input_act`
     # is the fwd activation already padded to `padded_offs`, reused here instead of re-padding.
     ia_t_fp8, ia_t_scale_blocked = quantize_tensor_grouped(
-        padded_input_act, padded_offs,
+        padded_input_act.t(), padded_offs,
         qdata_dtype=torch.float8_e4m3fn,
         inner_scale_calc=InnerScaleCalc.E8M0_RCEIL,
         scaling_type=ScalingType.BlockWise1x32,
-        orientation=QuantOrientation.TRANSPOSED,
         swizzle_type=SwizzleType.SWIZZLE_32_4_4,
     )
     grad_weight = torch._scaled_grouped_mm(
