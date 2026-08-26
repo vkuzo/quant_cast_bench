@@ -13,9 +13,9 @@ from api import (  # noqa: E402
     ScalingType,
     SwizzleType,
     quantize_tensor,
-    quantize_tensor_bidirectional,
+    quantize_tensor_dual,
     quantize_tensor_grouped,
-    quantize_tensor_grouped_bidirectional,
+    quantize_tensor_grouped_dual,
 )
 
 from quant_cast_bench.quant_cast_gold.recipes import (  # noqa: E402
@@ -121,7 +121,7 @@ def test_colwise_matches_gold_bitwise(M, N, dtype):
 @pytest.mark.parametrize("M,N", SHAPES_128)
 def test_both_matches_gold_bitwise(M, N, dtype):
     x = torch.randn(M, N, dtype=dtype, device="cuda")
-    qk, sk, qm, sm = quantize_tensor_bidirectional(
+    qk, sk, qm, sm = quantize_tensor_dual(
         x,
         qdata_dtype=torch.float8_e4m3fn,
         inner_scale_calc=InnerScaleCalc.RCEIL_E8M0,
@@ -205,7 +205,7 @@ def test_colwise_swizzle_matches_gold_bitwise(M, N, dtype):
 @pytest.mark.parametrize("M,N", SHAPES_128)
 def test_both_swizzle_matches_gold_bitwise(M, N, dtype):
     x = torch.randn(M, N, dtype=dtype, device="cuda")
-    qk, sk, qm, sm = quantize_tensor_bidirectional(
+    qk, sk, qm, sm = quantize_tensor_dual(
         x,
         qdata_dtype=torch.float8_e4m3fn,
         inner_scale_calc=InnerScaleCalc.RCEIL_E8M0,
@@ -228,7 +228,7 @@ def test_both_swizzle_matches_gold_bitwise(M, N, dtype):
 @pytest.mark.parametrize("M,N", SHAPES)  # every SHAPES entry is a multiple of 32 in both dims
 def test_32x32_both_scales_natural_qdata_matches_gold_bitwise(M, N, dtype):
     x = torch.randn(M, N, dtype=dtype, device="cuda")
-    qk, sk, sm = quantize_tensor_bidirectional(
+    qk, sk, sm = quantize_tensor_dual(
         x,
         qdata_dtype=torch.float8_e4m3fn,
         inner_scale_calc=InnerScaleCalc.RCEIL_E8M0,
@@ -347,8 +347,8 @@ def test_unsupported_combo_raises():
             inner_scale_calc=InnerScaleCalc.RCEIL_E8M0,
             scaling_type=ScalingType.BlockWise32x32,
         )
-    with pytest.raises(ValueError):  # 32x32 bidirectional (full both) is expressible but unwired
-        quantize_tensor_bidirectional(
+    with pytest.raises(ValueError):  # 32x32 dual (full both) is expressible but unwired
+        quantize_tensor_dual(
             x,
             qdata_dtype=torch.float8_e4m3fn,
             inner_scale_calc=InnerScaleCalc.RCEIL_E8M0,
@@ -378,7 +378,7 @@ def test_unsupported_combo_raises():
                 swizzle_type=SwizzleType.SWIZZLE_32_4_4,
         )
     with pytest.raises(ValueError):  # skip_transposed_qdata is 32x32-only, not 1x32
-        quantize_tensor_bidirectional(
+        quantize_tensor_dual(
             x,
             qdata_dtype=torch.float8_e4m3fn,
             inner_scale_calc=InnerScaleCalc.RCEIL_E8M0,
@@ -387,7 +387,7 @@ def test_unsupported_combo_raises():
             skip_transposed_qdata=True,
         )
     with pytest.raises(ValueError):  # skip_transposed_qdata needs the swizzled layout
-        quantize_tensor_bidirectional(
+        quantize_tensor_dual(
             x,
             qdata_dtype=torch.float8_e4m3fn,
             inner_scale_calc=InnerScaleCalc.RCEIL_E8M0,
@@ -413,17 +413,17 @@ def test_grouped_return_arity():
     # single-orientation grouped cast always returns (qdata, blocked_scale).
     assert len(quantize_tensor_grouped(x, offs, **mxfp8_kwargs)) == 2  # dim-k (contiguous)
     assert len(quantize_tensor_grouped(x.t(), offs, **mxfp8_kwargs)) == 2  # dim-m (transposed view)
-    # bidirectional returns both pairs: (q_nat, sb_nat, q_t, sb_t).
-    assert len(quantize_tensor_grouped_bidirectional(x, offs, **mxfp8_kwargs)) == 4
+    # dual returns both pairs: (q_nat, sb_nat, q_t, sb_t).
+    assert len(quantize_tensor_grouped_dual(x, offs, **mxfp8_kwargs)) == 4
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
-def test_grouped_bidirectional_skip_transposed_qdata_raises():
+def test_grouped_dual_skip_transposed_qdata_raises():
     # No 32x32 grouped kernel exists, so skip_transposed_qdata is unsupported on the grouped path.
     x = torch.randn(64, 64, device="cuda")
     offs = torch.tensor([32, 64], dtype=torch.int32, device="cuda")
     with pytest.raises(NotImplementedError):
-        quantize_tensor_grouped_bidirectional(
+        quantize_tensor_grouped_dual(
             x, offs,
             qdata_dtype=torch.float8_e4m3fn,
             inner_scale_calc=InnerScaleCalc.RCEIL_E8M0,
@@ -623,12 +623,12 @@ class _Nvfp4LinearBiDirection(torch.autograd.Function):
         # Activation: row cast (no RHT) feeds fwd; col cast (RHT on input.T) is saved for wgrad.
         x_gs_k = nvfp4_gs_scale(input)  # outer scale over |input|
         x_rht_g_s_m = _rht_outer_scale(input, rht)  # outer scale over |RHT(input.T)|
-        # Activation cast through the fused dual-orientation quantize_tensor_bidirectional API. dim-k
+        # Activation cast through the fused dual-orientation quantize_tensor_dual API. dim-k
         # is plain nvfp4 (no RHT, NATURAL) over |input|; dim-m applies the RHT to input.t() then
         # nvfp4s along M, scaled by |RHT(input.t())|. The two orientations use different outer scales
         # (passed as the (dim_k, dim_m) tuple); the RHT is dim-m (second-operand) only, so it goes in
         # as the (None, rht) tuple.
-        x_q_k, xs_k, x_rht_q_m, x_rht_s_m = quantize_tensor_bidirectional(
+        x_q_k, xs_k, x_rht_q_m, x_rht_s_m = quantize_tensor_dual(
             input,
             qdata_dtype=torch.float4_e2m1fn_x2,
             inner_scale_calc=InnerScaleCalc.NVFP4_E4M3,
@@ -639,11 +639,11 @@ class _Nvfp4LinearBiDirection(torch.autograd.Function):
         )
         # Weight: row cast (blk K) feeds fwd; transposed row cast (blk N) is the dgrad col operand.
         w_gs = nvfp4_gs_scale(weight)  # |W| == |W.T|, so one outer scale serves both
-        # Both weight casts in one read via the fused no-RHT quantize_tensor_bidirectional (nvfp4,
+        # Both weight casts in one read via the fused no-RHT quantize_tensor_dual (nvfp4,
         # NVFP4_E4M3, 1x16 blocks, swizzled scale): dim-k (NATURAL) feeds fwd; dim-m (TRANSPOSED, ==
         # nvfp4 of weight.t()) is the dgrad col operand. No RHT, so the same outer scale (w_gs) serves
         # both (|W| == |W.T|) -- passed per-orientation as (w_gs, w_gs). Maps to Nvfp4GsDimKMSwizzleGold.
-        w_q_k, ws_k, w_q_n, w_s_n = quantize_tensor_bidirectional(
+        w_q_k, ws_k, w_q_n, w_s_n = quantize_tensor_dual(
             weight,
             qdata_dtype=torch.float4_e2m1fn_x2,
             inner_scale_calc=InnerScaleCalc.NVFP4_E4M3,
@@ -679,12 +679,12 @@ class _Nvfp4LinearBiDirection(torch.autograd.Function):
         # just splits whatever it is handed.
         go_gs_k = nvfp4_gs_scale(grad_output)  # over |grad_output|
         go_rht_g_s_m = _rht_outer_scale(grad_output, rht)  # over |RHT(grad_output.T)|
-        # Both grad_output casts in one fused bidirectional SR cast (nvfp4_gs_swizzle_dim_k_dim_m_rht_sr_f):
+        # Both grad_output casts in one fused dual SR cast (nvfp4_gs_swizzle_dim_k_dim_m_rht_sr_f):
         # dim-k is plain SR nvfp4 (no RHT) over |grad_output|; dim-m applies the RHT to grad_output.t()
         # then SR-nvfp4s along M, scaled by |RHT(dy.t())|. Per-orientation outer_scale=(dim_k, dim_m);
         # the RHT is dim-m (second-operand) only, so rht_tensor=(None, rht). We hand it the single key --
         # the API splits it into one Philox substream per orientation (== prng.split(key, 2) here).
-        go_sr_q_k, gos_k, go_sr_q_m, go_s_m = quantize_tensor_bidirectional(
+        go_sr_q_k, gos_k, go_sr_q_m, go_s_m = quantize_tensor_dual(
             grad_output,
             qdata_dtype=torch.float4_e2m1fn_x2,
             inner_scale_calc=InnerScaleCalc.NVFP4_E4M3,

@@ -8,9 +8,9 @@ Four entry points:
 | entry point | orientation(s) | shape | typical use |
 |---|---|---|---|
 | `quantize_tensor` | one (NATURAL **or** TRANSPOSED) | 2D `(M,K)` or 3D `(E,N,K)` | dense inference or training |
-| `quantize_tensor_bidirectional` | both, one read | 2D `(M,K)` | training |
+| `quantize_tensor_dual` | both, one read | 2D `(M,K)` | training |
 | `quantize_tensor_grouped` | one | 2D `(total_M, C)` + `offs` | MoE inference or training |
-| `quantize_tensor_grouped_bidirectional` | both, one read | 2D + `offs` | MoE training |
+| `quantize_tensor_grouped_dual` | both, one read | 2D + `offs` | MoE training |
 
 The rest of this doc focuses on the **dense unidirectional** entry point, `quantize_tensor`.
 
@@ -45,8 +45,8 @@ def quantize_tensor(
 | `outer_scale` | precomputed fp32 outer scale, required for nvfp4 (must be `None` otherwise). A per-tensor scalar → per-tensor nvfp4 (swizzled kernel); an `(M, 1)` scale → per-token nvfp4 (gold reference). |
 | `rht_tensor` | optional 16×16 Random Hadamard Transform. Only the per-tensor dim-m (TRANSPOSED) swizzled nvfp4 cast uses it (applies RHT to `input.t()` — the wgrad-operand cast of nvfp4 training). |
 
-Returns `(qdata, scale)`. For the fused both-orientation cast use `quantize_tensor_bidirectional`;
-for MoE (`offs`-grouped) casts use `quantize_tensor_grouped` / `quantize_tensor_grouped_bidirectional`.
+Returns `(qdata, scale)`. For the fused both-orientation cast use `quantize_tensor_dual`;
+for MoE (`offs`-grouped) casts use `quantize_tensor_grouped` / `quantize_tensor_grouped_dual`.
 
 ## 2. High level support status
 
@@ -119,13 +119,13 @@ map (all `nvfp4` variants share the same pair):
 
 <!-- END GENERATED: support-matrix -->
 
-### `quantize_tensor_bidirectional`
+### `quantize_tensor_dual`
 
 Fused dual-orientation cast (natural dim-K **and** transposed dim-M in one read). No `orientation`
 argument (both are always emitted); `skip_tr` = `skip_transposed_qdata` (emit only the natural qdata
 but both scales). Abbreviations as in the `quantize_tensor` legend above.
 
-<!-- BEGIN GENERATED: support-matrix-bidirectional (python gen_support_matrix.py) -->
+<!-- BEGIN GENERATED: support-matrix-dual (python gen_support_matrix.py) -->
 
 | format | scl_tp | swizzle_type | skip_tr | rnd_md | input | status | dispatches to |
 |---|---|---|---|---|---|---|---|
@@ -137,7 +137,7 @@ but both scales). Abbreviations as in the `quantize_tensor` legend above.
 | nvfp4 (per-tensor, RHT) | 1x16+TW | 32_4_4 | no | RS | 2D | 🟡 reference | `nvfp4_gs_swizzle_dim_k_dim_m_rht_sr_f` |
 | nvfp4 (per-tensor, RHT) | 1x16+TW | 32_4_4 | no | RTNE | 2D | 🟡 reference | `nvfp4_gs_swizzle_dim_k_dim_m_rht_f` |
 
-<!-- END GENERATED: support-matrix-bidirectional -->
+<!-- END GENERATED: support-matrix-dual -->
 
 ### `quantize_tensor_grouped`
 
@@ -153,16 +153,16 @@ swizzled independently. Abbreviations as in the `quantize_tensor` legend above.
 
 <!-- END GENERATED: support-matrix-grouped -->
 
-### `quantize_tensor_grouped_bidirectional`
+### `quantize_tensor_grouped_dual`
 
 Fused dual-orientation grouped (`offs`) cast on a 2D `(total_M, C)` input; emits the natural (dim-K)
 pair then the transposed (dim-M) pair. Abbreviations as in the `quantize_tensor` legend above.
 
-<!-- BEGIN GENERATED: support-matrix-grouped-bidirectional (python gen_support_matrix.py) -->
+<!-- BEGIN GENERATED: support-matrix-grouped-dual (python gen_support_matrix.py) -->
 
 | format | scl_tp | swizzle_type | skip_tr | rnd_md | status | dispatches to |
 |---|---|---|---|---|---|---|
 | mxfp8 | 1x32 | 32_4_4 | no | RTNE | 🟡 reference | `mxfp8_f` |
 
-<!-- END GENERATED: support-matrix-grouped-bidirectional -->
+<!-- END GENERATED: support-matrix-grouped-dual -->
 

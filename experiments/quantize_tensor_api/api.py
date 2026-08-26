@@ -90,7 +90,7 @@ def quantize_tensor(
     + one `inner_scale_calc` scale per block.
 
     For the fused dual-orientation cast (both the natural and transposed pairs in one pass), use
-    `quantize_tensor_bidirectional`.
+    `quantize_tensor_dual`.
 
     Args:
       input: 2D input tensor (bf16 or fp32) of shape (M, K), or 3D of shape (E, M, K).
@@ -282,7 +282,7 @@ def quantize_tensor(
             f"unsupported (scaling_type, swizzle_type)={spec!r} for the dim-k (contiguous input) "
             "mxfp8 cast; supported: (BlockWise1x32, NO_SWIZZLE|SWIZZLE_32_4_4), "
             "(BlockWise32x32, NO_SWIZZLE); for the fused dual-orientation cast use "
-            "quantize_tensor_bidirectional"
+            "quantize_tensor_dual"
         )
 
     x = input.transpose(-2, -1)  # un-transpose -> the original contiguous (M, K)
@@ -299,7 +299,7 @@ def quantize_tensor(
     )
 
 
-def quantize_tensor_bidirectional(
+def quantize_tensor_dual(
     input: Tensor,
     *,
     qdata_dtype: torch.dtype,
@@ -378,7 +378,7 @@ def quantize_tensor_bidirectional(
     rht_tensor_k, rht_tensor_m = rht_tensor if rht_tensor is not None else (None, None)
 
     if qdata_dtype == torch.float4_e2m1fn_x2:
-        # Fused bidirectional nvfp4 cast: dim-k is plain nvfp4 over |input|; dim-m nvfp4s input.t()
+        # Fused dual nvfp4 cast: dim-k is plain nvfp4 over |input|; dim-m nvfp4s input.t()
         # along the original M. No Triton kernel yet, so both map to gold references.
         assert input.dim() == 2, "fp4 quantization is only supported for 2D input"
         assert input.is_contiguous(), "input must be contiguous"
@@ -393,7 +393,7 @@ def quantize_tensor_bidirectional(
             f"nvfp4 inner scaling_type must be BlockWise1x16, got {inner_scaling_type!r}"
         )
         assert outer_scaling_type == ScalingType.TensorWise, (
-            "bidirectional nvfp4 is per-tensor (TensorWise) only"
+            "dual nvfp4 is per-tensor (TensorWise) only"
         )
         spec = (inner_scaling_type, swizzle_type)
         if spec != (ScalingType.BlockWise1x16, SwizzleType.SWIZZLE_32_4_4):
@@ -406,7 +406,7 @@ def quantize_tensor_bidirectional(
             # plain nvfp4, each with its own per-tensor outer scale. With no RHT |input.t()| ==
             # |input|, so callers typically pass the same value for both (outer_scale=(os, os)).
             assert outer_scale_k is not None and outer_scale_m is not None, (
-                "no-RHT nvfp4 quantize_tensor_bidirectional requires an outer_scale per orientation "
+                "no-RHT nvfp4 quantize_tensor_dual requires an outer_scale per orientation "
                 "(a (dim_k, dim_m) tuple)"
             )
             # SR only exists for the RHT (grad_output) cast of nvfp4 training; the plain no-RHT
@@ -422,11 +422,11 @@ def quantize_tensor_bidirectional(
         # the (None, rht) tuple form -- a bare rht_tensor=rht (which would apply to both operands) is
         # rejected.
         assert rht_tensor_k is None and rht_tensor_m is not None, (
-            "nvfp4 quantize_tensor_bidirectional applies the RHT to the dim-m (second) operand only; "
+            "nvfp4 quantize_tensor_dual applies the RHT to the dim-m (second) operand only; "
             "pass rht_tensor=(None, rht), not a bare rht_tensor=rht"
         )
         assert outer_scale_k is not None and outer_scale_m is not None, (
-            "RHT nvfp4 quantize_tensor_bidirectional requires an outer_scale per orientation "
+            "RHT nvfp4 quantize_tensor_dual requires an outer_scale per orientation "
             "(a (dim_k, dim_m) tuple)"
         )
         if qdata_rounding_mode == RoundingMode.STOCHASTIC:
@@ -465,7 +465,7 @@ def quantize_tensor_bidirectional(
         if (inner_scaling_type, swizzle_type) != (ScalingType.BlockWise1x32, SwizzleType.SWIZZLE_32_4_4):
             raise ValueError(
                 f"unsupported (scaling_type, swizzle_type)=({scaling_type!r}, {swizzle_type!r}); "
-                "quantize_tensor_bidirectional with 3D (E, N, K) input supports only "
+                "quantize_tensor_dual with 3D (E, N, K) input supports only "
                 "(BlockWise1x32, SWIZZLE_32_4_4)"
             )
         q_nat, s_nat = mxfp8_f(input.contiguous())  # (E,N,K), 1x32 along K
@@ -510,7 +510,7 @@ def quantize_tensor_grouped(
     rht_tensor: Tensor | None = None,
 ) -> tuple[Tensor, Tensor]:
     """Single-orientation grouped cast to a block-scaled low-precision format. For the fused
-    dual-orientation cast use `quantize_tensor_grouped_bidirectional`.
+    dual-orientation cast use `quantize_tensor_grouped_dual`.
 
     The scaling axis follows the dims of the passed tensor: a contiguous `(M, C)` input casts 1x32
     along the last dim (dim-k); passing a transposed view (`input.t()`) selects the dim-m cast (1x32
@@ -564,7 +564,7 @@ def quantize_tensor_grouped(
     return q, sb
 
 
-def quantize_tensor_grouped_bidirectional(
+def quantize_tensor_grouped_dual(
     input: Tensor,  # (total_M, C)
     offs: Tensor,
     *,
@@ -609,13 +609,13 @@ def quantize_tensor_grouped_bidirectional(
         rht_tensor if isinstance(rht_tensor, tuple) else (rht_tensor, rht_tensor)
     )
     assert outer_scale_k is None and outer_scale_m is None, (
-        "outer_scale is not supported by quantize_tensor_grouped_bidirectional yet"
+        "outer_scale is not supported by quantize_tensor_grouped_dual yet"
     )
     assert rht_tensor_k is None and rht_tensor_m is None, (
-        "rht_tensor is not supported by quantize_tensor_grouped_bidirectional yet"
+        "rht_tensor is not supported by quantize_tensor_grouped_dual yet"
     )
     assert not isinstance(scaling_type, list), (
-        "quantize_tensor_grouped_bidirectional is single-level (mxfp8); pass a bare ScalingType"
+        "quantize_tensor_grouped_dual is single-level (mxfp8); pass a bare ScalingType"
     )
     inner_scaling_type = scaling_type
     if qdata_rounding_mode == RoundingMode.STOCHASTIC:
@@ -625,12 +625,12 @@ def quantize_tensor_grouped_bidirectional(
     if skip_transposed_qdata:
         # No 32x32 grouped kernel exists (the natural-qdata/both-scales path is dense-only).
         raise NotImplementedError(
-            "skip_transposed_qdata is not supported by quantize_tensor_grouped_bidirectional"
+            "skip_transposed_qdata is not supported by quantize_tensor_grouped_dual"
         )
     if (inner_scaling_type, swizzle_type) != (ScalingType.BlockWise1x32, SwizzleType.SWIZZLE_32_4_4):
         raise ValueError(
             f"unsupported (scaling_type, swizzle_type)=({scaling_type!r}, {swizzle_type!r}); "
-            "quantize_tensor_grouped_bidirectional supports only (BlockWise1x32, SWIZZLE_32_4_4)"
+            "quantize_tensor_grouped_dual supports only (BlockWise1x32, SWIZZLE_32_4_4)"
         )
 
     x = input.contiguous()

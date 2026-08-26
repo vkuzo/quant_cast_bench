@@ -35,7 +35,7 @@ from experiments.quantize_tensor_api.api import (  # noqa: E402
     SwizzleType,
     quantize_tensor,
     quantize_tensor_grouped,
-    quantize_tensor_grouped_bidirectional,
+    quantize_tensor_grouped_dual,
 )
 from experiments.quantize_tensor_api.moe_utils import _pad_token_groups  # noqa: E402
 from quant_cast_bench.quant_cast_gold.recipes import _compute_error  # noqa: E402
@@ -132,7 +132,7 @@ def mxfp8_bwd_real(
     # M-groups scale), transposed-orientation feeds wgrad (1x32 along M, K-groups scale). This single
     # call is exactly the fused both-orientation cast a kernel would collapse. ---
     go_fp8, go_scale_blocked, go_t_fp8, go_t_scale_blocked = (
-        quantize_tensor_grouped_bidirectional(
+        quantize_tensor_grouped_dual(
             padded_grad_output, padded_offs,
             qdata_dtype=torch.float8_e4m3fn,
             inner_scale_calc=InnerScaleCalc.RCEIL_E8M0,

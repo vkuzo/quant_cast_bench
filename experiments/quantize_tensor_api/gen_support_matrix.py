@@ -2,8 +2,8 @@
 
 This does NOT hardcode the supported rows -- it inspects the actual dispatch in `api.py` by running
 every argument combination through each of the four entry points (`quantize_tensor`,
-`quantize_tensor_bidirectional`, `quantize_tensor_grouped`,
-`quantize_tensor_grouped_bidirectional`) on real CUDA tensors and keeping the ones the frontend
+`quantize_tensor_dual`, `quantize_tensor_grouped`,
+`quantize_tensor_grouped_dual`) on real CUDA tensors and keeping the ones the frontend
 accepts (i.e. that don't raise). For each accepted combination it also records the function the call
 dispatched to (kernel = a `quant_cast_triton` recipe, reference = a `quant_cast_gold` one), captured
 by wrapping those recipe callables in the `api` and `moe_utils` module namespaces.
@@ -32,9 +32,9 @@ from experiments.quantize_tensor_api.api import (
     ScalingType,
     SwizzleType,
     quantize_tensor,
-    quantize_tensor_bidirectional,
+    quantize_tensor_dual,
     quantize_tensor_grouped,
-    quantize_tensor_grouped_bidirectional,
+    quantize_tensor_grouped_dual,
 )
 from quant_cast_bench.quant_cast_gold.recipes import (
     hadamard_rht_matrix,
@@ -237,7 +237,7 @@ def collect_quantize_tensor() -> list[tuple[str, ...]]:
     return sorted(rows)  # lexicographic order -> byte-stable output
 
 
-def collect_bidirectional() -> list[tuple[str, ...]]:
+def collect_dual() -> list[tuple[str, ...]]:
     inputs, outer, rht, key = _build_inputs()
     # outer_scale / rht_tensor are per-orientation (dim_k, dim_m) tuples here. Without an RHT both
     # orientations share the scalar (|input.t()| == |input|); the RHT applies to dim-m only.
@@ -249,9 +249,9 @@ def collect_bidirectional() -> list[tuple[str, ...]]:
     for qd, isc, st, sw, skip, rm, osv, rhv, dim in itertools.product(
         QDATA, INNER, SCALING, SWIZZLE, SKIP, ROUNDING, OUTER_BI, RHT_BI, INPUT_DIM
     ):
-        # bidirectional nvfp4 is per-tensor only; name the outer level TensorWise when outer_scale is set.
+        # dual nvfp4 is per-tensor only; name the outer level TensorWise when outer_scale is set.
         st_arg = st if osv == "none" else [st, ScalingType.TensorWise]
-        res = _probe(lambda: quantize_tensor_bidirectional(
+        res = _probe(lambda: quantize_tensor_dual(
             inputs[dim],
             qdata_dtype=qd,
             inner_scale_calc=isc,
@@ -299,14 +299,14 @@ def collect_grouped() -> list[tuple[str, ...]]:
     return sorted(rows)
 
 
-def collect_grouped_bidirectional() -> list[tuple[str, ...]]:
+def collect_grouped_dual() -> list[tuple[str, ...]]:
     _, outer, rht, key = _build_inputs()
     gx, offs = _build_grouped_inputs()
     rows = set()
     for qd, isc, st, sw, skip, rm, osv, rhv in itertools.product(
         QDATA, INNER, SCALING, SWIZZLE, SKIP, ROUNDING, OUTER, RHT
     ):
-        res = _probe(lambda: quantize_tensor_grouped_bidirectional(
+        res = _probe(lambda: quantize_tensor_grouped_dual(
             gx, offs,
             qdata_dtype=qd,
             inner_scale_calc=isc,
@@ -346,9 +346,9 @@ def main() -> None:
     sections = [
         # (marker tag, columns, collector, emit the abbreviation legend under this table)
         ("support-matrix", COLUMNS, collect_quantize_tensor, True),
-        ("support-matrix-bidirectional", COLUMNS_BI, collect_bidirectional, False),
+        ("support-matrix-dual", COLUMNS_BI, collect_dual, False),
         ("support-matrix-grouped", COLUMNS_GROUPED, collect_grouped, False),
-        ("support-matrix-grouped-bidirectional", COLUMNS_GROUPED_BI, collect_grouped_bidirectional, False),
+        ("support-matrix-grouped-dual", COLUMNS_GROUPED_BI, collect_grouped_dual, False),
     ]
     readme = Path(__file__).with_name("README.md")
     text = readme.read_text()
