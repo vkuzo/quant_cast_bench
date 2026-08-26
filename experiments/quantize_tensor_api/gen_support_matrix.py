@@ -91,7 +91,7 @@ def _end(tag: str) -> str:
 
 # --- per-axis value grids (the argument cross-product we probe) -----------------------------------
 QDATA = [torch.float8_e4m3fn, torch.float4_e2m1fn_x2]
-INNER = [InnerScaleCalc.E8M0_RCEIL, InnerScaleCalc.E4M3_NVFP4]
+INNER = [InnerScaleCalc.RCEIL_E8M0, InnerScaleCalc.NVFP4_E4M3]
 SCALING = [ScalingType.BlockWise1x16, ScalingType.BlockWise1x32, ScalingType.BlockWise32x32]
 ORIENT = ["dim_k", "dim_m"]  # dim_k = contiguous input; dim_m = a transposed view of it
 SWIZZLE = [SwizzleType.NO_SWIZZLE, SwizzleType.SWIZZLE_32_4_4]
@@ -116,7 +116,7 @@ INPUT_R = {"2d": "2D", "3d": "3D `(E,N,K)`"}
 def _format_label(qdata_dtype, inner_scale_calc, outer_variant, rht_variant):
     """Derive the human format name from the arguments of an ACCEPTED `quantize_tensor` combination."""
     if qdata_dtype == torch.float4_e2m1fn_x2:
-        if inner_scale_calc == InnerScaleCalc.E8M0_RCEIL:
+        if inner_scale_calc == InnerScaleCalc.RCEIL_E8M0:
             return "mxfp4"
         if outer_variant == "per_token":
             return "nvfp4 (per-token)"

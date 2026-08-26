@@ -67,12 +67,13 @@ class RoundingMode(StrEnum):
 class InnerScaleCalc(StrEnum):
     # The per-block ("inner") scale strategy: fixes BOTH the scale dtype and the amax->scale
     # computation.
-    #   E8M0_RCEIL -- float8_e8m0fnu (power-of-two) scale via reciprocal-multiply with RCEIL
+    #   RCEIL_E8M0 -- float8_e8m0fnu (power-of-two) scale via reciprocal-multiply with RCEIL
     #     rounding (mxfp8; no outer scale).
-    #   E4M3_NVFP4 -- float8_e4m3fn inner scale computed relative to a per-tensor fp32 OUTER scale
+    #   NVFP4_E4M3 -- float8_e4m3fn inner scale computed relative to a per-tensor fp32 OUTER scale
     #     (nvfp4 two-level scaling); requires the caller to pass the precomputed `outer_scale`.
-    E8M0_RCEIL = "e8m0_rceil"
-    E4M3_NVFP4 = "e4m3_nvfp4"
+    # TODO(claude): rename RCEIL_E8M0 TO RCEIL_E8M0, and NVFP4_E4M3 TO NVFP4_E4M3. do the values too
+    RCEIL_E8M0 = "rceil_e8m0"
+    NVFP4_E4M3 = "nvfp4_e4m3"
 
 
 def quantize_tensor(
@@ -101,7 +102,7 @@ def quantize_tensor(
       qdata_dtype: qdata element format -- torch.float8_e4m3fn (mxfp8) or torch.float4_e2m1fn_x2
         (nvfp4, 2D only).
       inner_scale_calc: per-block scale strategy -- fixes the scale dtype and the amax->scale
-        computation. InnerScaleCalc.E8M0_RCEIL (mxfp8) or InnerScaleCalc.E4M3_NVFP4 (nvfp4).
+        computation. InnerScaleCalc.RCEIL_E8M0 (mxfp8) or InnerScaleCalc.NVFP4_E4M3 (nvfp4).
       scaling_type: single-level formats pass a bare ScalingType -- BlockWise1x32 / BlockWise32x32
         (mxfp8, mxfp4). Two-level nvfp4 passes [inner, outer]: [BlockWise1x16, TensorWise] for
         per-tensor, [BlockWise1x16, RowWise] for per-token. The outer level names the outer_scale
@@ -161,10 +162,10 @@ def quantize_tensor(
                 "input must be contiguous (dim-k), or a transpose of a contiguous tensor (dim-m)"
             )
             is_dim_m = True
-        if inner_scale_calc == InnerScaleCalc.E8M0_RCEIL:
+        if inner_scale_calc == InnerScaleCalc.RCEIL_E8M0:
             assert not is_dim_m, "mxfp4 supports only the dim-k (contiguous input) cast"
-            assert outer_scaling_type is None, "mxfp4 (E8M0_RCEIL) is single-level; pass a bare ScalingType"
-            assert outer_scale is None, "mxfp4 (E8M0_RCEIL) is single-level; outer_scale must be None"
+            assert outer_scaling_type is None, "mxfp4 (RCEIL_E8M0) is single-level; pass a bare ScalingType"
+            assert outer_scale is None, "mxfp4 (RCEIL_E8M0) is single-level; outer_scale must be None"
             assert rht_tensor is None, "rht_tensor is only supported by the dim-m nvfp4 cast"
             assert rounding_mode == RoundingMode.RTNE, "stochastic rounding is not supported for mxfp4"
             if (inner_scaling_type, swizzle_type) == (ScalingType.BlockWise1x32, SwizzleType.NO_SWIZZLE):
@@ -172,11 +173,11 @@ def quantize_tensor(
                 return mxfp4_f(x)
             raise ValueError(
                 f"unsupported (scaling_type, swizzle_type)=({scaling_type!r}, {swizzle_type!r}) for "
-                "mxfp4 (float4_e2m1fn_x2, E8M0_RCEIL); supported: (BlockWise1x32, NO_SWIZZLE)"
+                "mxfp4 (float4_e2m1fn_x2, RCEIL_E8M0); supported: (BlockWise1x32, NO_SWIZZLE)"
             )
-        assert inner_scale_calc == InnerScaleCalc.E4M3_NVFP4, (
-            f"float4_e2m1fn_x2 qdata requires inner_scale_calc=E4M3_NVFP4 (nvfp4) or "
-            f"E8M0_RCEIL (mxfp4), got {inner_scale_calc!r}"
+        assert inner_scale_calc == InnerScaleCalc.NVFP4_E4M3, (
+            f"float4_e2m1fn_x2 qdata requires inner_scale_calc=NVFP4_E4M3 (nvfp4) or "
+            f"RCEIL_E8M0 (mxfp4), got {inner_scale_calc!r}"
         )
         assert outer_scale is not None, "nvfp4 quantization requires a precomputed outer_scale"
         assert outer_scaling_type is not None, (
@@ -202,7 +203,7 @@ def quantize_tensor(
                 return nvfp4_gs_f(x, outer_scale)
             raise ValueError(
                 f"unsupported (scaling_type, swizzle_type)=({scaling_type!r}, {swizzle_type!r}) for "
-                "per-token nvfp4 (float4_e2m1fn_x2, E4M3_NVFP4, RowWise outer); supported: "
+                "per-token nvfp4 (float4_e2m1fn_x2, NVFP4_E4M3, RowWise outer); supported: "
                 "(BlockWise1x16, NO_SWIZZLE)"
             )
         if outer_scaling_type == ScalingType.TensorWise:
@@ -246,8 +247,8 @@ def quantize_tensor(
     assert qdata_dtype == torch.float8_e4m3fn, (
         f"only float8_e4m3fn or float4_e2m1fn_x2 qdata supported, got {qdata_dtype}"
     )
-    assert inner_scale_calc == InnerScaleCalc.E8M0_RCEIL, (
-        f"only InnerScaleCalc.E8M0_RCEIL supported for float8_e4m3fn, got {inner_scale_calc!r}"
+    assert inner_scale_calc == InnerScaleCalc.RCEIL_E8M0, (
+        f"only InnerScaleCalc.RCEIL_E8M0 supported for float8_e4m3fn, got {inner_scale_calc!r}"
     )
     assert outer_scaling_type is None, "mxfp8 is single-level; pass a bare ScalingType"
     assert outer_scale is None, "outer_scale is only used by nvfp4 (float4_e2m1fn_x2) quantization"
@@ -326,7 +327,7 @@ def quantize_tensor_bidirectional(
       qdata_dtype: qdata element format -- torch.float8_e4m3fn (mxfp8) or torch.float4_e2m1fn_x2
         (nvfp4).
       inner_scale_calc: per-block scale strategy -- fixes the scale dtype and the amax->scale
-        computation. InnerScaleCalc.E8M0_RCEIL (mxfp8) or InnerScaleCalc.E4M3_NVFP4 (nvfp4).
+        computation. InnerScaleCalc.RCEIL_E8M0 (mxfp8) or InnerScaleCalc.NVFP4_E4M3 (nvfp4).
       scaling_type: single-level formats pass a bare ScalingType -- BlockWise1x32 / BlockWise32x32
         (mxfp8). nvfp4 (per-tensor only here) passes [BlockWise1x16, TensorWise].
       swizzle_type: NO_SWIZZLE or SWIZZLE_32_4_4. Note that for 3d inputs, swizzle is per-expert.
@@ -386,8 +387,8 @@ def quantize_tensor_bidirectional(
         # along the original M. No Triton kernel yet, so both map to gold references.
         assert input.dim() == 2, "fp4 quantization is only supported for 2D input"
         assert input.is_contiguous(), "input must be contiguous"
-        assert inner_scale_calc == InnerScaleCalc.E4M3_NVFP4, (
-            f"float4_e2m1fn_x2 qdata requires inner_scale_calc=E4M3_NVFP4 (nvfp4), got {inner_scale_calc!r}"
+        assert inner_scale_calc == InnerScaleCalc.NVFP4_E4M3, (
+            f"float4_e2m1fn_x2 qdata requires inner_scale_calc=NVFP4_E4M3 (nvfp4), got {inner_scale_calc!r}"
         )
         assert not skip_transposed_qdata, "skip_transposed_qdata is not supported for nvfp4"
         assert outer_scaling_type is not None, (
@@ -403,7 +404,7 @@ def quantize_tensor_bidirectional(
         if spec != (ScalingType.BlockWise1x16, SwizzleType.SWIZZLE_32_4_4):
             raise ValueError(
                 f"unsupported (scaling_type, swizzle_type)={spec!r} for nvfp4 "
-                "(float4_e2m1fn_x2, E4M3_NVFP4); supported: (BlockWise1x16, SWIZZLE_32_4_4)"
+                "(float4_e2m1fn_x2, NVFP4_E4M3); supported: (BlockWise1x16, SWIZZLE_32_4_4)"
             )
         if rht_tensor_k is None and rht_tensor_m is None:
             # No RHT (Nvfp4GsDimKMSwizzleGold's nvfp4_gs_swizzle_dim_km_f): both orientations are
@@ -448,8 +449,8 @@ def quantize_tensor_bidirectional(
     assert qdata_dtype == torch.float8_e4m3fn, (
         f"only float8_e4m3fn or float4_e2m1fn_x2 qdata supported, got {qdata_dtype}"
     )
-    assert inner_scale_calc == InnerScaleCalc.E8M0_RCEIL, (
-        f"only InnerScaleCalc.E8M0_RCEIL supported for float8_e4m3fn, got {inner_scale_calc!r}"
+    assert inner_scale_calc == InnerScaleCalc.RCEIL_E8M0, (
+        f"only InnerScaleCalc.RCEIL_E8M0 supported for float8_e4m3fn, got {inner_scale_calc!r}"
     )
     assert outer_scaling_type is None, "mxfp8 is single-level; pass a bare ScalingType"
     assert outer_scale_k is None and outer_scale_m is None, (
@@ -529,14 +530,14 @@ def quantize_tensor_grouped(
     Args:
       qdata_dtype: qdata element format (only torch.float8_e4m3fn today).
       inner_scale_calc: per-block scale strategy -- fixes the scale dtype and the amax->scale
-        computation (only InnerScaleCalc.E8M0_RCEIL today).
+        computation (only InnerScaleCalc.RCEIL_E8M0 today).
 
     Token groups must already be block-aligned (each group's row count a multiple of 32); the caller
     is responsible for any token-group padding (see `_pad_token_groups`).
     """
     assert qdata_dtype == torch.float8_e4m3fn, f"only float8_e4m3fn qdata supported, got {qdata_dtype}"
-    assert inner_scale_calc == InnerScaleCalc.E8M0_RCEIL, (
-        f"only InnerScaleCalc.E8M0_RCEIL supported, got {inner_scale_calc!r}"
+    assert inner_scale_calc == InnerScaleCalc.RCEIL_E8M0, (
+        f"only InnerScaleCalc.RCEIL_E8M0 supported, got {inner_scale_calc!r}"
     )
     assert outer_scale is None, "outer_scale is not supported by quantize_tensor_grouped yet"
     assert rht_tensor is None, "rht_tensor is not supported by quantize_tensor_grouped yet"
@@ -589,7 +590,7 @@ def quantize_tensor_grouped_bidirectional(
     `quantize_tensor_grouped`.
 
     `qdata_dtype` (only torch.float8_e4m3fn today) and `inner_scale_calc` (only
-    InnerScaleCalc.E8M0_RCEIL today) select the format, as in `quantize_tensor`.
+    InnerScaleCalc.RCEIL_E8M0 today) select the format, as in `quantize_tensor`.
 
     Token groups must already be block-aligned (see `quantize_tensor_grouped`); the caller owns any
     token-group padding. Returns the natural (dim-K) pair then the transposed (dim-M) pair
@@ -600,8 +601,8 @@ def quantize_tensor_grouped_bidirectional(
     neither is wired to a kernel yet.
     """
     assert qdata_dtype == torch.float8_e4m3fn, f"only float8_e4m3fn qdata supported, got {qdata_dtype}"
-    assert inner_scale_calc == InnerScaleCalc.E8M0_RCEIL, (
-        f"only InnerScaleCalc.E8M0_RCEIL supported, got {inner_scale_calc!r}"
+    assert inner_scale_calc == InnerScaleCalc.RCEIL_E8M0, (
+        f"only InnerScaleCalc.RCEIL_E8M0 supported, got {inner_scale_calc!r}"
     )
     # outer_scale / rht_tensor take either one value (applied to BOTH orientations) or a
     # (dim_k, dim_m) tuple to set the natural (dim-k) and transposed (dim-m) casts independently.

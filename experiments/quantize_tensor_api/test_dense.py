@@ -59,7 +59,7 @@ def test_rowwise_matches_gold_bitwise(M, N, dtype):
     q, s = quantize_tensor(
         x,
         qdata_dtype=torch.float8_e4m3fn,
-        inner_scale_calc=InnerScaleCalc.E8M0_RCEIL,
+        inner_scale_calc=InnerScaleCalc.RCEIL_E8M0,
         scaling_type=ScalingType.BlockWise1x32,
         swizzle_type=SwizzleType.NO_SWIZZLE,
     )
@@ -78,13 +78,13 @@ def test_rowwise_matches_gold_bitwise(M, N, dtype):
 @pytest.mark.parametrize("M,N", SHAPES)
 def test_mxfp4_matches_gold_bitwise(M, N, dtype):
     x = torch.randn(M, N, dtype=dtype, device="cuda")
-    # mxfp4: fp4 (e2m1) qdata + e8m0 rceil 1x32 block scale (E8M0_RCEIL tells it apart from nvfp4,
+    # mxfp4: fp4 (e2m1) qdata + e8m0 rceil 1x32 block scale (RCEIL_E8M0 tells it apart from nvfp4,
     # which shares the float4_e2m1fn_x2 qdata dtype). No Triton kernel yet, so the API dispatches to
     # the gold reference -> byte-identical by construction; the test pins the wiring/shape/dtype.
     q, s = quantize_tensor(
         x,
         qdata_dtype=torch.float4_e2m1fn_x2,
-        inner_scale_calc=InnerScaleCalc.E8M0_RCEIL,
+        inner_scale_calc=InnerScaleCalc.RCEIL_E8M0,
         scaling_type=ScalingType.BlockWise1x32,
         swizzle_type=SwizzleType.NO_SWIZZLE,
     )
@@ -104,7 +104,7 @@ def test_colwise_matches_gold_bitwise(M, N, dtype):
     q, s = quantize_tensor(
         x.t(),  # dim-m: pass a transposed view; the API un-transposes and uses the dim-m kernel
         qdata_dtype=torch.float8_e4m3fn,
-        inner_scale_calc=InnerScaleCalc.E8M0_RCEIL,
+        inner_scale_calc=InnerScaleCalc.RCEIL_E8M0,
         scaling_type=ScalingType.BlockWise1x32,
         swizzle_type=SwizzleType.NO_SWIZZLE,
     )
@@ -124,7 +124,7 @@ def test_both_matches_gold_bitwise(M, N, dtype):
     qk, sk, qm, sm = quantize_tensor_bidirectional(
         x,
         qdata_dtype=torch.float8_e4m3fn,
-        inner_scale_calc=InnerScaleCalc.E8M0_RCEIL,
+        inner_scale_calc=InnerScaleCalc.RCEIL_E8M0,
         scaling_type=ScalingType.BlockWise1x32,
         swizzle_type=SwizzleType.NO_SWIZZLE,
     )
@@ -148,7 +148,7 @@ def test_32x32_matches_gold_bitwise(M, N, dtype):
     q, s = quantize_tensor(
         x,
         qdata_dtype=torch.float8_e4m3fn,
-        inner_scale_calc=InnerScaleCalc.E8M0_RCEIL,
+        inner_scale_calc=InnerScaleCalc.RCEIL_E8M0,
         scaling_type=ScalingType.BlockWise32x32,
         swizzle_type=SwizzleType.NO_SWIZZLE,
     )
@@ -168,7 +168,7 @@ def test_rowwise_swizzle_matches_gold_bitwise(M, N, dtype):
     q, s = quantize_tensor(
         x,
         qdata_dtype=torch.float8_e4m3fn,
-        inner_scale_calc=InnerScaleCalc.E8M0_RCEIL,
+        inner_scale_calc=InnerScaleCalc.RCEIL_E8M0,
         scaling_type=ScalingType.BlockWise1x32,
         swizzle_type=SwizzleType.SWIZZLE_32_4_4,
     )
@@ -188,7 +188,7 @@ def test_colwise_swizzle_matches_gold_bitwise(M, N, dtype):
     q, s = quantize_tensor(
         x.t(),  # dim-m: pass a transposed view; the API un-transposes and uses the dim-m kernel
         qdata_dtype=torch.float8_e4m3fn,
-        inner_scale_calc=InnerScaleCalc.E8M0_RCEIL,
+        inner_scale_calc=InnerScaleCalc.RCEIL_E8M0,
         scaling_type=ScalingType.BlockWise1x32,
         swizzle_type=SwizzleType.SWIZZLE_32_4_4,
     )
@@ -208,7 +208,7 @@ def test_both_swizzle_matches_gold_bitwise(M, N, dtype):
     qk, sk, qm, sm = quantize_tensor_bidirectional(
         x,
         qdata_dtype=torch.float8_e4m3fn,
-        inner_scale_calc=InnerScaleCalc.E8M0_RCEIL,
+        inner_scale_calc=InnerScaleCalc.RCEIL_E8M0,
         scaling_type=ScalingType.BlockWise1x32,
         swizzle_type=SwizzleType.SWIZZLE_32_4_4,
     )
@@ -231,7 +231,7 @@ def test_32x32_both_scales_natural_qdata_matches_gold_bitwise(M, N, dtype):
     qk, sk, sm = quantize_tensor_bidirectional(
         x,
         qdata_dtype=torch.float8_e4m3fn,
-        inner_scale_calc=InnerScaleCalc.E8M0_RCEIL,
+        inner_scale_calc=InnerScaleCalc.RCEIL_E8M0,
         scaling_type=ScalingType.BlockWise32x32,
         swizzle_type=SwizzleType.SWIZZLE_32_4_4,
         skip_transposed_qdata=True,
@@ -259,7 +259,7 @@ def test_nvfp4_matches_gold(M, N, dtype):
     q, s = quantize_tensor(
         x,
         qdata_dtype=torch.float4_e2m1fn_x2,
-        inner_scale_calc=InnerScaleCalc.E4M3_NVFP4,
+        inner_scale_calc=InnerScaleCalc.NVFP4_E4M3,
         scaling_type=[ScalingType.BlockWise1x16, ScalingType.TensorWise],
         swizzle_type=SwizzleType.SWIZZLE_32_4_4,
         outer_scale=outer_scale,
@@ -292,7 +292,7 @@ def test_nvfp4_per_token_matches_gold_bitwise(M, N, dtype):
     q, s = quantize_tensor(
         x,
         qdata_dtype=torch.float4_e2m1fn_x2,
-        inner_scale_calc=InnerScaleCalc.E4M3_NVFP4,
+        inner_scale_calc=InnerScaleCalc.NVFP4_E4M3,
         scaling_type=[ScalingType.BlockWise1x16, ScalingType.RowWise],
         swizzle_type=SwizzleType.NO_SWIZZLE,
         outer_scale=outer_scale,
@@ -323,7 +323,7 @@ def test_nvfp4_dim_m_rht_matches_gold_bitwise(M, N, dtype):
     q, s = quantize_tensor(
         x.t(),  # dim-m: pass a transposed view; the API un-transposes and uses the dim-m kernel
         qdata_dtype=torch.float4_e2m1fn_x2,
-        inner_scale_calc=InnerScaleCalc.E4M3_NVFP4,
+        inner_scale_calc=InnerScaleCalc.NVFP4_E4M3,
         scaling_type=[ScalingType.BlockWise1x16, ScalingType.TensorWise],
         swizzle_type=SwizzleType.SWIZZLE_32_4_4,
         outer_scale=outer_scale,
@@ -344,14 +344,14 @@ def test_unsupported_combo_raises():
         quantize_tensor(
             x.t(),  # dim-m: transposed view -> routes to the (absent) dim-m 32x32 kernel
             qdata_dtype=torch.float8_e4m3fn,
-            inner_scale_calc=InnerScaleCalc.E8M0_RCEIL,
+            inner_scale_calc=InnerScaleCalc.RCEIL_E8M0,
             scaling_type=ScalingType.BlockWise32x32,
         )
     with pytest.raises(ValueError):  # 32x32 bidirectional (full both) is expressible but unwired
         quantize_tensor_bidirectional(
             x,
             qdata_dtype=torch.float8_e4m3fn,
-            inner_scale_calc=InnerScaleCalc.E8M0_RCEIL,
+            inner_scale_calc=InnerScaleCalc.RCEIL_E8M0,
             scaling_type=ScalingType.BlockWise32x32,
             swizzle_type=SwizzleType.SWIZZLE_32_4_4,
         )
@@ -359,21 +359,21 @@ def test_unsupported_combo_raises():
         quantize_tensor(
             x,
             qdata_dtype=torch.float8_e4m3fn,
-            inner_scale_calc=InnerScaleCalc.E8M0_RCEIL,
+            inner_scale_calc=InnerScaleCalc.RCEIL_E8M0,
             scaling_type=ScalingType.BlockWise1x128,
             )
     with pytest.raises(ValueError):  # RowWise granularity is unwired
         quantize_tensor(
             x,
             qdata_dtype=torch.float8_e4m3fn,
-            inner_scale_calc=InnerScaleCalc.E8M0_RCEIL,
+            inner_scale_calc=InnerScaleCalc.RCEIL_E8M0,
             scaling_type=ScalingType.RowWise,
             )
     with pytest.raises(ValueError):  # 32x32 has no swizzle kernel
         quantize_tensor(
             x,
             qdata_dtype=torch.float8_e4m3fn,
-            inner_scale_calc=InnerScaleCalc.E8M0_RCEIL,
+            inner_scale_calc=InnerScaleCalc.RCEIL_E8M0,
             scaling_type=ScalingType.BlockWise32x32,
                 swizzle_type=SwizzleType.SWIZZLE_32_4_4,
         )
@@ -381,7 +381,7 @@ def test_unsupported_combo_raises():
         quantize_tensor_bidirectional(
             x,
             qdata_dtype=torch.float8_e4m3fn,
-            inner_scale_calc=InnerScaleCalc.E8M0_RCEIL,
+            inner_scale_calc=InnerScaleCalc.RCEIL_E8M0,
             scaling_type=ScalingType.BlockWise1x32,
             swizzle_type=SwizzleType.SWIZZLE_32_4_4,
             skip_transposed_qdata=True,
@@ -390,7 +390,7 @@ def test_unsupported_combo_raises():
         quantize_tensor_bidirectional(
             x,
             qdata_dtype=torch.float8_e4m3fn,
-            inner_scale_calc=InnerScaleCalc.E8M0_RCEIL,
+            inner_scale_calc=InnerScaleCalc.RCEIL_E8M0,
             scaling_type=ScalingType.BlockWise32x32,
             swizzle_type=SwizzleType.NO_SWIZZLE,
             skip_transposed_qdata=True,
@@ -406,7 +406,7 @@ def test_grouped_return_arity():
 
     mxfp8_kwargs = dict(
         qdata_dtype=torch.float8_e4m3fn,
-        inner_scale_calc=InnerScaleCalc.E8M0_RCEIL,
+        inner_scale_calc=InnerScaleCalc.RCEIL_E8M0,
         scaling_type=ScalingType.BlockWise1x32,
         swizzle_type=SwizzleType.SWIZZLE_32_4_4,
     )
@@ -426,7 +426,7 @@ def test_grouped_bidirectional_skip_transposed_qdata_raises():
         quantize_tensor_grouped_bidirectional(
             x, offs,
             qdata_dtype=torch.float8_e4m3fn,
-            inner_scale_calc=InnerScaleCalc.E8M0_RCEIL,
+            inner_scale_calc=InnerScaleCalc.RCEIL_E8M0,
             scaling_type=ScalingType.BlockWise1x32,
             swizzle_type=SwizzleType.SWIZZLE_32_4_4,
             skip_transposed_qdata=True,
@@ -495,7 +495,7 @@ class _Nvfp4LinearSingleDirection(torch.autograd.Function):
         x_q_k, xs_k = quantize_tensor(
             input,
             qdata_dtype=torch.float4_e2m1fn_x2,
-            inner_scale_calc=InnerScaleCalc.E4M3_NVFP4,
+            inner_scale_calc=InnerScaleCalc.NVFP4_E4M3,
             scaling_type=[ScalingType.BlockWise1x16, ScalingType.TensorWise],
                 swizzle_type=SwizzleType.SWIZZLE_32_4_4,
             outer_scale=x_gs_k,
@@ -503,7 +503,7 @@ class _Nvfp4LinearSingleDirection(torch.autograd.Function):
         x_rht_q_m, x_rht_s_m = quantize_tensor(
             input.t(),  # dim-m: transposed view selects the dim-m cast
             qdata_dtype=torch.float4_e2m1fn_x2,
-            inner_scale_calc=InnerScaleCalc.E4M3_NVFP4,
+            inner_scale_calc=InnerScaleCalc.NVFP4_E4M3,
             scaling_type=[ScalingType.BlockWise1x16, ScalingType.TensorWise],
             swizzle_type=SwizzleType.SWIZZLE_32_4_4,
             outer_scale=x_rht_g_s_m,
@@ -512,13 +512,13 @@ class _Nvfp4LinearSingleDirection(torch.autograd.Function):
         # Weight: row cast (blk K) feeds fwd; transposed row cast (blk N) is the dgrad col operand.
         w_gs = nvfp4_gs_scale(weight)  # |W| == |W.T|, so one outer scale serves both
         # Weight casts through the quantize_tensor API (same nvfp4 config as test_nvfp4_matches_gold:
-        # E4M3_NVFP4 two-level, 1x16 blocks, swizzled scale, per-tensor outer scale). The col operand
+        # NVFP4_E4M3 two-level, 1x16 blocks, swizzled scale, per-tensor outer scale). The col operand
         # is the API cast of weight.t() (dim-m, selected by the transposed view, mirroring the gold's
         # _weight_quantize_2d transpose).
         w_q_k, ws_k = quantize_tensor(
             weight,
             qdata_dtype=torch.float4_e2m1fn_x2,
-            inner_scale_calc=InnerScaleCalc.E4M3_NVFP4,
+            inner_scale_calc=InnerScaleCalc.NVFP4_E4M3,
             scaling_type=[ScalingType.BlockWise1x16, ScalingType.TensorWise],
                 swizzle_type=SwizzleType.SWIZZLE_32_4_4,
             outer_scale=w_gs,
@@ -526,7 +526,7 @@ class _Nvfp4LinearSingleDirection(torch.autograd.Function):
         w_q_n, w_s_n = quantize_tensor(
             weight.t(),  # dim-m: transposed view selects the dim-m cast
             qdata_dtype=torch.float4_e2m1fn_x2,
-            inner_scale_calc=InnerScaleCalc.E4M3_NVFP4,
+            inner_scale_calc=InnerScaleCalc.NVFP4_E4M3,
             scaling_type=[ScalingType.BlockWise1x16, ScalingType.TensorWise],
             swizzle_type=SwizzleType.SWIZZLE_32_4_4,
             outer_scale=w_gs,
@@ -567,7 +567,7 @@ class _Nvfp4LinearSingleDirection(torch.autograd.Function):
         go_sr_q_k, gos_k = quantize_tensor(
             grad_output,
             qdata_dtype=torch.float4_e2m1fn_x2,
-            inner_scale_calc=InnerScaleCalc.E4M3_NVFP4,
+            inner_scale_calc=InnerScaleCalc.NVFP4_E4M3,
             scaling_type=[ScalingType.BlockWise1x16, ScalingType.TensorWise],
                 swizzle_type=SwizzleType.SWIZZLE_32_4_4,
             outer_scale=go_gs_k,
@@ -577,7 +577,7 @@ class _Nvfp4LinearSingleDirection(torch.autograd.Function):
         go_sr_q_m, go_s_m = quantize_tensor(
             grad_output.t(),  # dim-m: transposed view selects the dim-m cast
             qdata_dtype=torch.float4_e2m1fn_x2,
-            inner_scale_calc=InnerScaleCalc.E4M3_NVFP4,
+            inner_scale_calc=InnerScaleCalc.NVFP4_E4M3,
             scaling_type=[ScalingType.BlockWise1x16, ScalingType.TensorWise],
             swizzle_type=SwizzleType.SWIZZLE_32_4_4,
             outer_scale=go_rht_g_s_m,
@@ -631,7 +631,7 @@ class _Nvfp4LinearBiDirection(torch.autograd.Function):
         x_q_k, xs_k, x_rht_q_m, x_rht_s_m = quantize_tensor_bidirectional(
             input,
             qdata_dtype=torch.float4_e2m1fn_x2,
-            inner_scale_calc=InnerScaleCalc.E4M3_NVFP4,
+            inner_scale_calc=InnerScaleCalc.NVFP4_E4M3,
             scaling_type=[ScalingType.BlockWise1x16, ScalingType.TensorWise],
             swizzle_type=SwizzleType.SWIZZLE_32_4_4,
             outer_scale=(x_gs_k, x_rht_g_s_m),
@@ -640,13 +640,13 @@ class _Nvfp4LinearBiDirection(torch.autograd.Function):
         # Weight: row cast (blk K) feeds fwd; transposed row cast (blk N) is the dgrad col operand.
         w_gs = nvfp4_gs_scale(weight)  # |W| == |W.T|, so one outer scale serves both
         # Both weight casts in one read via the fused no-RHT quantize_tensor_bidirectional (nvfp4,
-        # E4M3_NVFP4, 1x16 blocks, swizzled scale): dim-k (NATURAL) feeds fwd; dim-m (TRANSPOSED, ==
+        # NVFP4_E4M3, 1x16 blocks, swizzled scale): dim-k (NATURAL) feeds fwd; dim-m (TRANSPOSED, ==
         # nvfp4 of weight.t()) is the dgrad col operand. No RHT, so the same outer scale (w_gs) serves
         # both (|W| == |W.T|) -- passed per-orientation as (w_gs, w_gs). Maps to Nvfp4GsDimKMSwizzleGold.
         w_q_k, ws_k, w_q_n, w_s_n = quantize_tensor_bidirectional(
             weight,
             qdata_dtype=torch.float4_e2m1fn_x2,
-            inner_scale_calc=InnerScaleCalc.E4M3_NVFP4,
+            inner_scale_calc=InnerScaleCalc.NVFP4_E4M3,
             scaling_type=[ScalingType.BlockWise1x16, ScalingType.TensorWise],
             swizzle_type=SwizzleType.SWIZZLE_32_4_4,
             outer_scale=(w_gs, w_gs),
@@ -687,7 +687,7 @@ class _Nvfp4LinearBiDirection(torch.autograd.Function):
         go_sr_q_k, gos_k, go_sr_q_m, go_s_m = quantize_tensor_bidirectional(
             grad_output,
             qdata_dtype=torch.float4_e2m1fn_x2,
-            inner_scale_calc=InnerScaleCalc.E4M3_NVFP4,
+            inner_scale_calc=InnerScaleCalc.NVFP4_E4M3,
             scaling_type=[ScalingType.BlockWise1x16, ScalingType.TensorWise],
             swizzle_type=SwizzleType.SWIZZLE_32_4_4,
             outer_scale=(go_gs_k, go_rht_g_s_m),

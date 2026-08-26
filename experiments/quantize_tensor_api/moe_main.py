@@ -84,7 +84,7 @@ def mxfp8_fwd_real(
     act_fp8, act_scale_blocked = quantize_tensor_grouped(
         padded_act, padded_offs,
         qdata_dtype=torch.float8_e4m3fn,
-        inner_scale_calc=InnerScaleCalc.E8M0_RCEIL,
+        inner_scale_calc=InnerScaleCalc.RCEIL_E8M0,
         scaling_type=ScalingType.BlockWise1x32,
         swizzle_type=SwizzleType.SWIZZLE_32_4_4,
     )
@@ -94,7 +94,7 @@ def mxfp8_fwd_real(
     w_e4m3, w_scale_blocked = quantize_tensor(
         weight_t.transpose(-2, -1),
         qdata_dtype=torch.float8_e4m3fn,
-        inner_scale_calc=InnerScaleCalc.E8M0_RCEIL,
+        inner_scale_calc=InnerScaleCalc.RCEIL_E8M0,
         scaling_type=ScalingType.BlockWise1x32,
         swizzle_type=SwizzleType.SWIZZLE_32_4_4,
     )  # (E,N,K)
@@ -135,7 +135,7 @@ def mxfp8_bwd_real(
         quantize_tensor_grouped_bidirectional(
             padded_grad_output, padded_offs,
             qdata_dtype=torch.float8_e4m3fn,
-            inner_scale_calc=InnerScaleCalc.E8M0_RCEIL,
+            inner_scale_calc=InnerScaleCalc.RCEIL_E8M0,
             scaling_type=ScalingType.BlockWise1x32,
             swizzle_type=SwizzleType.SWIZZLE_32_4_4,
         )
@@ -147,7 +147,7 @@ def mxfp8_bwd_real(
     q_kn, w_scale_blocked = quantize_tensor(
         weight_t,
         qdata_dtype=torch.float8_e4m3fn,
-        inner_scale_calc=InnerScaleCalc.E8M0_RCEIL,
+        inner_scale_calc=InnerScaleCalc.RCEIL_E8M0,
         scaling_type=ScalingType.BlockWise1x32,
         swizzle_type=SwizzleType.SWIZZLE_32_4_4,
     )  # (E,K,N)
@@ -163,7 +163,7 @@ def mxfp8_bwd_real(
     ia_t_fp8, ia_t_scale_blocked = quantize_tensor_grouped(
         padded_input_act.t(), padded_offs,
         qdata_dtype=torch.float8_e4m3fn,
-        inner_scale_calc=InnerScaleCalc.E8M0_RCEIL,
+        inner_scale_calc=InnerScaleCalc.RCEIL_E8M0,
         scaling_type=ScalingType.BlockWise1x32,
         swizzle_type=SwizzleType.SWIZZLE_32_4_4,
     )
