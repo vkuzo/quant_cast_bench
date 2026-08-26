@@ -30,7 +30,10 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from experiments.quantize_tensor_api.api import (  # noqa: E402
+    InnerScaleCalc,
     QuantOrientation,
+    ScalingType,
+    SwizzleType,
     quantize_tensor,
     quantize_tensor_grouped,
     quantize_tensor_grouped_bidirectional,
@@ -80,12 +83,22 @@ def mxfp8_fwd_real(
     function operates purely in padded space."""
     # Activation: block 1x32 along K (the contraction dim) -> M-groups blocked scale.
     act_fp8, act_scale_blocked = quantize_tensor_grouped(
-        padded_act, padded_offs, orientation=QuantOrientation.NATURAL
+        padded_act, padded_offs,
+        qdata_dtype=torch.float8_e4m3fn,
+        inner_scale_calc=InnerScaleCalc.E8M0_RCEIL,
+        scaling_type=ScalingType.BlockWise1x32,
+        orientation=QuantOrientation.NATURAL,
+        swizzle_type=SwizzleType.SWIZZLE_32_4_4,
     )
     # Weight cast blocked 1x32 along K (the fwd contraction dim): TRANSPOSED gives a (E,N,K) row-major
     # buffer whose transpose (E,K,N) is the column-major mat2 view the real op requires.
     w_e4m3, w_scale_blocked = quantize_tensor(
-        weight_t, orientation=QuantOrientation.TRANSPOSED
+        weight_t,
+        qdata_dtype=torch.float8_e4m3fn,
+        inner_scale_calc=InnerScaleCalc.E8M0_RCEIL,
+        scaling_type=ScalingType.BlockWise1x32,
+        orientation=QuantOrientation.TRANSPOSED,
+        swizzle_type=SwizzleType.SWIZZLE_32_4_4,
     )  # (E,N,K)
     return torch._scaled_grouped_mm(
         act_fp8, w_e4m3.transpose(-2, -1), act_scale_blocked, w_scale_blocked,
@@ -121,14 +134,25 @@ def mxfp8_bwd_real(
     # M-groups scale), transposed-orientation feeds wgrad (1x32 along M, K-groups scale). This single
     # call is exactly the fused both-orientation cast a kernel would collapse. ---
     go_fp8, go_scale_blocked, go_t_fp8, go_t_scale_blocked = (
-        quantize_tensor_grouped_bidirectional(padded_grad_output, padded_offs)
+        quantize_tensor_grouped_bidirectional(
+            padded_grad_output, padded_offs,
+            qdata_dtype=torch.float8_e4m3fn,
+            inner_scale_calc=InnerScaleCalc.E8M0_RCEIL,
+            scaling_type=ScalingType.BlockWise1x32,
+            swizzle_type=SwizzleType.SWIZZLE_32_4_4,
+        )
     )
 
     # === dgrad: grad_input = grouped_mm(grad_output, weight) ===
     # Weight blocked 1x32 along N (the dgrad contraction dim). weight_t is (E,K,N) with N last, so
     # NATURAL blocks along N directly; the transpose gives the (E,N,K) column-major mat2 view.
     q_kn, w_scale_blocked = quantize_tensor(
-        weight_t, orientation=QuantOrientation.NATURAL
+        weight_t,
+        qdata_dtype=torch.float8_e4m3fn,
+        inner_scale_calc=InnerScaleCalc.E8M0_RCEIL,
+        scaling_type=ScalingType.BlockWise1x32,
+        orientation=QuantOrientation.NATURAL,
+        swizzle_type=SwizzleType.SWIZZLE_32_4_4,
     )  # (E,K,N)
     w_e4m3 = q_kn.transpose(-2, -1)  # (E,N,K) column-major view
     grad_input = torch._scaled_grouped_mm(
@@ -140,7 +164,12 @@ def mxfp8_bwd_real(
     # (K-groups scale layout). M being contracted, the result needs no unpadding. `padded_input_act`
     # is the fwd activation already padded to `padded_offs`, reused here instead of re-padding.
     ia_t_fp8, ia_t_scale_blocked = quantize_tensor_grouped(
-        padded_input_act, padded_offs, orientation=QuantOrientation.TRANSPOSED
+        padded_input_act, padded_offs,
+        qdata_dtype=torch.float8_e4m3fn,
+        inner_scale_calc=InnerScaleCalc.E8M0_RCEIL,
+        scaling_type=ScalingType.BlockWise1x32,
+        orientation=QuantOrientation.TRANSPOSED,
+        swizzle_type=SwizzleType.SWIZZLE_32_4_4,
     )
     grad_weight = torch._scaled_grouped_mm(
         go_t_fp8,

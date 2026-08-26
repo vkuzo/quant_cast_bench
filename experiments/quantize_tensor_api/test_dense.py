@@ -57,7 +57,14 @@ SHAPES_128 = [(256, 512)]
 @pytest.mark.parametrize("M,N", SHAPES)
 def test_rowwise_matches_gold_bitwise(M, N, dtype):
     x = torch.randn(M, N, dtype=dtype, device="cuda")
-    q, s = quantize_tensor(x, swizzle_type=SwizzleType.NO_SWIZZLE)  # BlockWise1x32, NATURAL
+    q, s = quantize_tensor(
+        x,
+        qdata_dtype=torch.float8_e4m3fn,
+        inner_scale_calc=InnerScaleCalc.E8M0_RCEIL,
+        scaling_type=ScalingType.BlockWise1x32,
+        orientation=QuantOrientation.NATURAL,
+        swizzle_type=SwizzleType.NO_SWIZZLE,
+    )
     q_ref, s_ref = mxfp8_f(x)
     # both paths pick the e8m0 scale by floor(log2(amax)) and divide, so the API (Triton) output is
     # byte-identical to the eager golden reference -- exact, not merely within tolerance.
@@ -99,6 +106,8 @@ def test_colwise_matches_gold_bitwise(M, N, dtype):
     x = torch.randn(M, N, dtype=dtype, device="cuda")
     q, s = quantize_tensor(
         x,
+        qdata_dtype=torch.float8_e4m3fn,
+        inner_scale_calc=InnerScaleCalc.E8M0_RCEIL,
         scaling_type=ScalingType.BlockWise1x32,
         orientation=QuantOrientation.TRANSPOSED,
         swizzle_type=SwizzleType.NO_SWIZZLE,
@@ -118,6 +127,8 @@ def test_both_matches_gold_bitwise(M, N, dtype):
     x = torch.randn(M, N, dtype=dtype, device="cuda")
     qk, sk, qm, sm = quantize_tensor_bidirectional(
         x,
+        qdata_dtype=torch.float8_e4m3fn,
+        inner_scale_calc=InnerScaleCalc.E8M0_RCEIL,
         scaling_type=ScalingType.BlockWise1x32,
         swizzle_type=SwizzleType.NO_SWIZZLE,
     )
@@ -140,6 +151,8 @@ def test_32x32_matches_gold_bitwise(M, N, dtype):
     x = torch.randn(M, N, dtype=dtype, device="cuda")
     q, s = quantize_tensor(
         x,
+        qdata_dtype=torch.float8_e4m3fn,
+        inner_scale_calc=InnerScaleCalc.E8M0_RCEIL,
         scaling_type=ScalingType.BlockWise32x32,
         orientation=QuantOrientation.NATURAL,
         swizzle_type=SwizzleType.NO_SWIZZLE,
@@ -159,6 +172,8 @@ def test_rowwise_swizzle_matches_gold_bitwise(M, N, dtype):
     x = torch.randn(M, N, dtype=dtype, device="cuda")
     q, s = quantize_tensor(
         x,
+        qdata_dtype=torch.float8_e4m3fn,
+        inner_scale_calc=InnerScaleCalc.E8M0_RCEIL,
         scaling_type=ScalingType.BlockWise1x32,
         orientation=QuantOrientation.NATURAL,
         swizzle_type=SwizzleType.SWIZZLE_32_4_4,
@@ -178,6 +193,8 @@ def test_colwise_swizzle_matches_gold_bitwise(M, N, dtype):
     x = torch.randn(M, N, dtype=dtype, device="cuda")
     q, s = quantize_tensor(
         x,
+        qdata_dtype=torch.float8_e4m3fn,
+        inner_scale_calc=InnerScaleCalc.E8M0_RCEIL,
         scaling_type=ScalingType.BlockWise1x32,
         orientation=QuantOrientation.TRANSPOSED,
         swizzle_type=SwizzleType.SWIZZLE_32_4_4,
@@ -197,6 +214,8 @@ def test_both_swizzle_matches_gold_bitwise(M, N, dtype):
     x = torch.randn(M, N, dtype=dtype, device="cuda")
     qk, sk, qm, sm = quantize_tensor_bidirectional(
         x,
+        qdata_dtype=torch.float8_e4m3fn,
+        inner_scale_calc=InnerScaleCalc.E8M0_RCEIL,
         scaling_type=ScalingType.BlockWise1x32,
         swizzle_type=SwizzleType.SWIZZLE_32_4_4,
     )
@@ -218,6 +237,8 @@ def test_32x32_both_scales_natural_qdata_matches_gold_bitwise(M, N, dtype):
     x = torch.randn(M, N, dtype=dtype, device="cuda")
     qk, sk, sm = quantize_tensor_bidirectional(
         x,
+        qdata_dtype=torch.float8_e4m3fn,
+        inner_scale_calc=InnerScaleCalc.E8M0_RCEIL,
         scaling_type=ScalingType.BlockWise32x32,
         swizzle_type=SwizzleType.SWIZZLE_32_4_4,
         skip_transposed_qdata=True,
@@ -330,16 +351,42 @@ def test_nvfp4_dim_m_rht_matches_gold_bitwise(M, N, dtype):
 def test_unsupported_combo_raises():
     x = torch.randn(256, 512, device="cuda")
     with pytest.raises(ValueError):  # 32x32 only has a NATURAL kernel, not TRANSPOSED
-        quantize_tensor(x, scaling_type=ScalingType.BlockWise32x32, orientation=QuantOrientation.TRANSPOSED)
+        quantize_tensor(
+            x,
+            qdata_dtype=torch.float8_e4m3fn,
+            inner_scale_calc=InnerScaleCalc.E8M0_RCEIL,
+            scaling_type=ScalingType.BlockWise32x32,
+            orientation=QuantOrientation.TRANSPOSED,
+        )
     with pytest.raises(ValueError):  # 32x32 bidirectional (full both) is expressible but unwired
-        quantize_tensor_bidirectional(x, scaling_type=ScalingType.BlockWise32x32)
+        quantize_tensor_bidirectional(
+            x,
+            qdata_dtype=torch.float8_e4m3fn,
+            inner_scale_calc=InnerScaleCalc.E8M0_RCEIL,
+            scaling_type=ScalingType.BlockWise32x32,
+            swizzle_type=SwizzleType.SWIZZLE_32_4_4,
+        )
     with pytest.raises(ValueError):  # a core ScalingType we don't have a kernel for
-        quantize_tensor(x, scaling_type=ScalingType.BlockWise1x128, orientation=QuantOrientation.NATURAL)
+        quantize_tensor(
+            x,
+            qdata_dtype=torch.float8_e4m3fn,
+            inner_scale_calc=InnerScaleCalc.E8M0_RCEIL,
+            scaling_type=ScalingType.BlockWise1x128,
+            orientation=QuantOrientation.NATURAL,
+        )
     with pytest.raises(ValueError):  # RowWise granularity is unwired
-        quantize_tensor(x, scaling_type=ScalingType.RowWise, orientation=QuantOrientation.NATURAL)
+        quantize_tensor(
+            x,
+            qdata_dtype=torch.float8_e4m3fn,
+            inner_scale_calc=InnerScaleCalc.E8M0_RCEIL,
+            scaling_type=ScalingType.RowWise,
+            orientation=QuantOrientation.NATURAL,
+        )
     with pytest.raises(ValueError):  # 32x32 has no swizzle kernel
         quantize_tensor(
             x,
+            qdata_dtype=torch.float8_e4m3fn,
+            inner_scale_calc=InnerScaleCalc.E8M0_RCEIL,
             scaling_type=ScalingType.BlockWise32x32,
             orientation=QuantOrientation.NATURAL,
             swizzle_type=SwizzleType.SWIZZLE_32_4_4,
@@ -347,6 +394,8 @@ def test_unsupported_combo_raises():
     with pytest.raises(ValueError):  # skip_transposed_qdata is 32x32-only, not 1x32
         quantize_tensor_bidirectional(
             x,
+            qdata_dtype=torch.float8_e4m3fn,
+            inner_scale_calc=InnerScaleCalc.E8M0_RCEIL,
             scaling_type=ScalingType.BlockWise1x32,
             swizzle_type=SwizzleType.SWIZZLE_32_4_4,
             skip_transposed_qdata=True,
@@ -354,6 +403,8 @@ def test_unsupported_combo_raises():
     with pytest.raises(ValueError):  # skip_transposed_qdata needs the swizzled layout
         quantize_tensor_bidirectional(
             x,
+            qdata_dtype=torch.float8_e4m3fn,
+            inner_scale_calc=InnerScaleCalc.E8M0_RCEIL,
             scaling_type=ScalingType.BlockWise32x32,
             swizzle_type=SwizzleType.NO_SWIZZLE,
             skip_transposed_qdata=True,
@@ -367,11 +418,17 @@ def test_grouped_return_arity():
     x = torch.randn(64, 128, dtype=torch.bfloat16, device="cuda")
     offs = torch.tensor([32, 64], dtype=torch.int32, device="cuda")
 
+    mxfp8_kwargs = dict(
+        qdata_dtype=torch.float8_e4m3fn,
+        inner_scale_calc=InnerScaleCalc.E8M0_RCEIL,
+        scaling_type=ScalingType.BlockWise1x32,
+        swizzle_type=SwizzleType.SWIZZLE_32_4_4,
+    )
     # single-orientation grouped cast always returns (qdata, blocked_scale).
-    assert len(quantize_tensor_grouped(x, offs, orientation=QuantOrientation.NATURAL)) == 2
-    assert len(quantize_tensor_grouped(x, offs, orientation=QuantOrientation.TRANSPOSED)) == 2
+    assert len(quantize_tensor_grouped(x, offs, orientation=QuantOrientation.NATURAL, **mxfp8_kwargs)) == 2
+    assert len(quantize_tensor_grouped(x, offs, orientation=QuantOrientation.TRANSPOSED, **mxfp8_kwargs)) == 2
     # bidirectional returns both pairs: (q_nat, sb_nat, q_t, sb_t).
-    assert len(quantize_tensor_grouped_bidirectional(x, offs)) == 4
+    assert len(quantize_tensor_grouped_bidirectional(x, offs, **mxfp8_kwargs)) == 4
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
@@ -380,7 +437,14 @@ def test_grouped_bidirectional_skip_transposed_qdata_raises():
     x = torch.randn(64, 64, device="cuda")
     offs = torch.tensor([32, 64], dtype=torch.int32, device="cuda")
     with pytest.raises(NotImplementedError):
-        quantize_tensor_grouped_bidirectional(x, offs, skip_transposed_qdata=True)
+        quantize_tensor_grouped_bidirectional(
+            x, offs,
+            qdata_dtype=torch.float8_e4m3fn,
+            inner_scale_calc=InnerScaleCalc.E8M0_RCEIL,
+            scaling_type=ScalingType.BlockWise1x32,
+            swizzle_type=SwizzleType.SWIZZLE_32_4_4,
+            skip_transposed_qdata=True,
+        )
 
 # ===========================================================================
 # End-to-end nvfp4 linear (fwd + bwd) built ONLY from the gold casts + the real
