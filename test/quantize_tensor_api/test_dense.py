@@ -472,6 +472,133 @@ def _rht_outer_scale(x, rht):
     return x_rht.abs().to(torch.float32).amax() / (F8E4M3_MAX * F4_E2M1_MAX)
 
 
+class _MXFP8LinearSingleDirection(torch.autograd.Function):
+    """Reference mxfp8 linear composed from the quantize_tensor API casts + torch.nn.functional.scaled_mm.
+    The mxfp8 sibling of _Nvfp4LinearSingleDirection: same per-GEMM operand orientations, but a much
+    simpler cast -- mxfp8 is single-level (one 1x32 block-wise e8m0 scale per operand, no per-tensor
+    outer scale), has no RHT, and has no stochastic rounding (the mxfp8 casts are RTNE-only), so every
+    cast is a plain swizzled fp8 1x32 quantize_tensor call and no key/rht is threaded through.
+
+    Linear: out = input @ weight.T, input (M,K), weight (N,K), out (M,N). Three GEMMs:
+      fwd   out         = input @ W.T : input row (blk K) x weight row (blk K)
+      dgrad grad_input  = dy @ W      : dy row (blk N)    x W col=W.T (blk N)
+      wgrad grad_weight = dy.T @ input: dy col=dy.T (blk M) x input col=input.T (blk M)
+    Each operand's scaled_mm scale is a single 1x32 block-wise e8m0 scale in the 4D swizzle grid the
+    mxfp8 swizzle cast emits, flattened as torchao's mxfp8 mm does.
+
+    "SingleDirection": each orientation is a separate quantize_tensor call (one dim-k, one dim-m per
+    operand). The fused-dual sibling is _MXFP8LinearBiDirection."""
+
+    _mxfp8_kwargs = dict(
+        qdata_dtype=torch.float8_e4m3fn,
+        inner_scale_calc=InnerScaleCalc.RCEIL_E8M0,
+        scaling_type=ScalingType.BlockWise1x32,
+        swizzle_type=SwizzleType.SWIZZLE_32_4_4,
+    )
+
+    @staticmethod
+    def forward(ctx, input, weight):
+        # input: x, shape [M, K]; weight: w, shape [N, K].
+        # Activation: row cast (dim-k) feeds fwd; col cast (dim-m, == mxfp8 of input.T) is saved for wgrad.
+        x_q_k, xs_k = quantize_tensor(input, **_MXFP8LinearSingleDirection._mxfp8_kwargs)
+        x_q_m, xs_m = quantize_tensor(input.t(), **_MXFP8LinearSingleDirection._mxfp8_kwargs)  # dim-m: transposed view
+        # Weight: row cast (blk K) feeds fwd; transposed row cast (dim-m, blk N) is the dgrad col operand.
+        w_q_k, ws_k = quantize_tensor(weight, **_MXFP8LinearSingleDirection._mxfp8_kwargs)
+        w_q_n, ws_n = quantize_tensor(weight.t(), **_MXFP8LinearSingleDirection._mxfp8_kwargs)  # dim-m: transposed view
+        # fwd: (M,K) @ (K,N) -> (M,N). Each operand carries a single swizzled 1x32 e8m0 block scale.
+        out = F.scaled_mm(
+            x_q_k, w_q_k.t(),
+            scale_a=xs_k.flatten(), scale_b=ws_k.flatten(),
+            scale_recipe_a=F.ScalingType.BlockWise1x32, scale_recipe_b=F.ScalingType.BlockWise1x32,
+            swizzle_a=F.SwizzleType.SWIZZLE_32_4_4, swizzle_b=F.SwizzleType.SWIZZLE_32_4_4,
+            output_dtype=torch.bfloat16,
+        )
+        ctx.save_for_backward(x_q_m, xs_m, w_q_n, ws_n)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x_q_m, xs_m, w_q_n, ws_n = ctx.saved_tensors
+        grad_output = grad_output.contiguous()
+        # grad_output: row cast (dim-k) feeds dgrad; col cast (dim-m, == mxfp8 of dy.T) feeds wgrad.
+        # No stochastic rounding -- mxfp8 casts are RTNE-only.
+        go_q_k, gos_k = quantize_tensor(grad_output, **_MXFP8LinearSingleDirection._mxfp8_kwargs)
+        go_q_m, gos_m = quantize_tensor(grad_output.t(), **_MXFP8LinearSingleDirection._mxfp8_kwargs)  # dim-m
+        # dgrad: dy (M,N) @ W (N,K) -> grad_input (M,K).
+        grad_input = F.scaled_mm(
+            go_q_k, w_q_n.t(),
+            scale_a=gos_k.flatten(), scale_b=ws_n.flatten(),
+            scale_recipe_a=F.ScalingType.BlockWise1x32, scale_recipe_b=F.ScalingType.BlockWise1x32,
+            swizzle_a=F.SwizzleType.SWIZZLE_32_4_4, swizzle_b=F.SwizzleType.SWIZZLE_32_4_4,
+            output_dtype=torch.bfloat16,
+        )
+        # wgrad: dy.T (N,M) @ input (M,K) -> grad_weight (N,K).
+        grad_weight = F.scaled_mm(
+            go_q_m, x_q_m.t(),
+            scale_a=gos_m.flatten(), scale_b=xs_m.flatten(),
+            scale_recipe_a=F.ScalingType.BlockWise1x32, scale_recipe_b=F.ScalingType.BlockWise1x32,
+            swizzle_a=F.SwizzleType.SWIZZLE_32_4_4, swizzle_b=F.SwizzleType.SWIZZLE_32_4_4,
+            output_dtype=torch.bfloat16,
+        )
+        return grad_input, grad_weight
+
+
+class _MXFP8LinearBiDirection(torch.autograd.Function):
+    """Fused-dual mxfp8 linear, the sibling of _MXFP8LinearSingleDirection. Identical numerics and
+    scaled_mm GEMMs; the only difference is that each tensor's dim-k and dim-m casts are produced in
+    one pass by quantize_tensor_dual (as _Nvfp4LinearBiDirection does), instead of two separate
+    quantize_tensor calls. mxfp8 is single-level (no outer scale), no RHT, no SR."""
+
+    _mxfp8_kwargs = dict(
+        qdata_dtype=torch.float8_e4m3fn,
+        inner_scale_calc=InnerScaleCalc.RCEIL_E8M0,
+        scaling_type=ScalingType.BlockWise1x32,
+        swizzle_type=SwizzleType.SWIZZLE_32_4_4,
+    )
+
+    @staticmethod
+    def forward(ctx, input, weight):
+        # input: x, shape [M, K]; weight: w, shape [N, K]. One fused dual cast per operand yields both
+        # the dim-k (NATURAL, row) and dim-m (TRANSPOSED, col) pairs. dim-k feeds fwd; dim-m is saved.
+        x_q_k, xs_k, x_q_m, xs_m = quantize_tensor_dual(input, **_MXFP8LinearBiDirection._mxfp8_kwargs)
+        w_q_k, ws_k, w_q_n, ws_n = quantize_tensor_dual(weight, **_MXFP8LinearBiDirection._mxfp8_kwargs)
+        # fwd: (M,K) @ (K,N) -> (M,N). Each operand carries a single swizzled 1x32 e8m0 block scale.
+        out = F.scaled_mm(
+            x_q_k, w_q_k.t(),
+            scale_a=xs_k.flatten(), scale_b=ws_k.flatten(),
+            scale_recipe_a=F.ScalingType.BlockWise1x32, scale_recipe_b=F.ScalingType.BlockWise1x32,
+            swizzle_a=F.SwizzleType.SWIZZLE_32_4_4, swizzle_b=F.SwizzleType.SWIZZLE_32_4_4,
+            output_dtype=torch.bfloat16,
+        )
+        ctx.save_for_backward(x_q_m, xs_m, w_q_n, ws_n)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x_q_m, xs_m, w_q_n, ws_n = ctx.saved_tensors
+        grad_output = grad_output.contiguous()
+        # grad_output: both orientations in one fused dual cast. dim-k (row) feeds dgrad; dim-m (col)
+        # feeds wgrad. No stochastic rounding -- mxfp8 casts are RTNE-only.
+        go_q_k, gos_k, go_q_m, gos_m = quantize_tensor_dual(grad_output, **_MXFP8LinearBiDirection._mxfp8_kwargs)
+        # dgrad: dy (M,N) @ W (N,K) -> grad_input (M,K).
+        grad_input = F.scaled_mm(
+            go_q_k, w_q_n.t(),
+            scale_a=gos_k.flatten(), scale_b=ws_n.flatten(),
+            scale_recipe_a=F.ScalingType.BlockWise1x32, scale_recipe_b=F.ScalingType.BlockWise1x32,
+            swizzle_a=F.SwizzleType.SWIZZLE_32_4_4, swizzle_b=F.SwizzleType.SWIZZLE_32_4_4,
+            output_dtype=torch.bfloat16,
+        )
+        # wgrad: dy.T (N,M) @ input (M,K) -> grad_weight (N,K).
+        grad_weight = F.scaled_mm(
+            go_q_m, x_q_m.t(),
+            scale_a=gos_m.flatten(), scale_b=xs_m.flatten(),
+            scale_recipe_a=F.ScalingType.BlockWise1x32, scale_recipe_b=F.ScalingType.BlockWise1x32,
+            swizzle_a=F.SwizzleType.SWIZZLE_32_4_4, swizzle_b=F.SwizzleType.SWIZZLE_32_4_4,
+            output_dtype=torch.bfloat16,
+        )
+        return grad_input, grad_weight
+
+
 class _Nvfp4LinearSingleDirection(torch.autograd.Function):
     """Reference nvfp4 linear composed from the gold casts + torch.nn.functional.scaled_mm. RTN on
     the activation/weight casts, stochastic rounding on the two grad_output casts (as torchao does).
@@ -776,6 +903,44 @@ def test_nvfp4_linear_fwd_bwd_sqnr(linear_fn):
     sqnr_gx_vs_gold = _compute_error(xg.grad.float(), xq.grad.float())
     assert sqnr_out_vs_gold > 30.0, f"output vs gold sqnr={sqnr_out_vs_gold.item():.2f} dB below 30 dB"
     assert sqnr_gx_vs_gold > 30.0, f"grad_input vs gold sqnr={sqnr_gx_vs_gold.item():.2f} dB below 30 dB"
+
+
+@requires_sm100
+@pytest.mark.parametrize("linear_fn", [_MXFP8LinearSingleDirection, _MXFP8LinearBiDirection])
+def test_mxfp8_linear_fwd_bwd_sqnr(linear_fn):
+    # Full fwd+bwd of a linear in mxfp8 (quantize_tensor API casts + real scaled_mm) vs a plain bf16
+    # torch.mm reference, comparing output + both gradients by SQNR. The mxfp8 sibling of
+    # test_nvfp4_linear_fwd_bwd_sqnr, minus the two-level scale / RHT / SR machinery. Parametrized over
+    # the single- (two quantize_tensor calls per operand) and dual- (one quantize_tensor_dual call)
+    # orientation Functions, which are numerically identical. M,K,N all %128.
+    torch.manual_seed(0)
+    M, K, N = 256, 512, 1024
+    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+    w = torch.randn(N, K, dtype=torch.bfloat16, device="cuda")
+    grad_out = torch.randn(M, N, dtype=torch.bfloat16, device="cuda")  # fixed upstream grad
+
+    # bf16 reference: out = x @ w.T, then backward with the same upstream grad.
+    xr = x.clone().requires_grad_(True)
+    wr = w.clone().requires_grad_(True)
+    (xr @ wr.t()).backward(grad_out)
+
+    # mxfp8 path through the reference autograd Function.
+    xq = x.clone().requires_grad_(True)
+    wq = w.clone().requires_grad_(True)
+    linear_fn.apply(xq, wq).backward(grad_out)
+
+    out_ref = xr @ wr.t()
+    out_q = linear_fn.apply(x, w)
+    sqnr_out = _compute_error(out_ref.float(), out_q.float())
+    sqnr_gx = _compute_error(xr.grad.float(), xq.grad.float())
+    sqnr_gw = _compute_error(wr.grad.float(), wq.grad.float())
+
+    # mxfp8 is 8-bit (e4m3) with per-1x32-block e8m0 scales and every GEMM operand quantized. All three
+    # tensors (RTNE casts, no SR) sit ~28 dB here; floor at 24 dB for a comfortable margin. mxfp8 is far
+    # more accurate than the 4-bit nvfp4 path above (~17 dB fwd), so the bars are correspondingly higher.
+    assert sqnr_out > 24.0, f"output sqnr={sqnr_out.item():.2f} dB below 24 dB"
+    assert sqnr_gx > 24.0, f"grad_input sqnr={sqnr_gx.item():.2f} dB below 24 dB"
+    assert sqnr_gw > 24.0, f"grad_weight sqnr={sqnr_gw.item():.2f} dB below 24 dB"
 
 
 if __name__ == "__main__":
