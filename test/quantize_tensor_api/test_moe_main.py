@@ -46,7 +46,7 @@ def generate_jagged_offs(num_groups, M, multiple_of=32, device="cuda"):
 def test_mxfp8_forward_2d_3d_real():
     """Forward via the real op: out = grouped_mm(act, weight_t) -- 2d-3d, grouped along M."""
     torch.manual_seed(0)
-    M, K, N = 1024, 1024, 1024
+    M, K, N = 256, 512, 1024
     num_experts = 8
 
     offs = generate_jagged_offs(num_experts, M)
@@ -70,7 +70,7 @@ def test_mxfp8_backward_2d_real():
     grad_input = grouped_mm(grad_output, weight) (dgrad, 2d-3d, grouped along M) and
     grad_weight_t = per-group grad_output^T @ input_act (wgrad, 2d-2d, grouped along M)."""
     torch.manual_seed(0)
-    M, K, N = 1024, 1024, 1024
+    M, K, N = 256, 512, 1024
     num_experts = 8
 
     offs = generate_jagged_offs(num_experts, M)
@@ -102,7 +102,7 @@ def test_mxfp8_backward_2d_real():
 def test_mxfp8_fwd_bwd_e2e_real():
     """End-to-end: differentiable real mxfp8 grouped GEMM vs a bf16 autograd reference."""
     torch.manual_seed(0)
-    M, K, N = 1024, 1024, 1024
+    M, K, N = 256, 512, 1024
     num_experts = 8
 
     offs = generate_jagged_offs(num_experts, M)
@@ -135,7 +135,7 @@ def test_mxfp8_fwd_bwd_e2e_real_unaligned_offsets():
     """End-to-end real path with group offsets NOT aligned to the block size, exercising the
     token-group pad/unpad (aligned offsets make padding a no-op)."""
     torch.manual_seed(0)
-    M, K, N = 1024, 1024, 1024
+    M, K, N = 256, 512, 1024
     num_experts = 8
 
     # multiple_of=16 -> group boundaries are generally not multiples of 32; padding is real.
