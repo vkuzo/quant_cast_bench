@@ -61,7 +61,7 @@ for MoE (`offs`-grouped) casts use `quantize_tensor_grouped` / `quantize_tensor_
   * 🟢 already supported: e8m0_rceil (for mx formats), nvfp4 (for nvfp4)
   * 🟡 could be supported: any scaling calculation that is worth supporting (handled by enum value)
 * By e2e training recipe
-  * linear mxfp8 e2e fwd + bwd: 🟢 frontend works (TODO confirm), 🟡 needs kernels
+  * linear mxfp8 e2e fwd + bwd: 🟢 frontend works (TODO confirm), 🟡 triton kernels (not SOL)
   * grouped_mm mxfp8 e2e fwd + bwd: 🟡 could be supported
   * linear nvfp4 e2e fwd + bwd with NVIDIA's recipe: 🟢 frontend works, 🟡 needs kernels
   * grouped_mm nvf4p e2e fwd + bwd with NVIDIA's recipe: 🟡 could be supported
@@ -70,7 +70,7 @@ for MoE (`offs`-grouped) casts use `quantize_tensor_grouped` / `quantize_tensor_
 * By cross-cutting feature
   * stochastic rounding: 🟡 supported for some recipes but far from polished, needs final frontend design
   * RHT: 🟡 16x16 supported for nvfp4 dense recipes, needs to extend to grouped and needs final frontend design
-  * outer scaling: 🟡 handwavily should work, but needs final design for semantics of broadcasting
+  * outer scaling: 🟡 supported, very light testing
 
 ## 3. Support matrix
 
