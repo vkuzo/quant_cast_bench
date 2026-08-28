@@ -1520,9 +1520,8 @@ Nvfp4GsSwizzle_DimK_DimMRHT_Gold = QuantCastSingleKernelGold(
 # (Rounding.STOCHASTIC's `_reference_impl`, NOT the NVIDIA cvt.rs hardware intrinsics): add a uniform
 # dither into the fp32 mantissa bits the target format discards, then truncate. fp4 (e2m1) keeps one
 # mantissa bit, so it drops 23 - 1 = 22 bits (vs that reference's 16 for bf16 / 20 for e4m3). The
-# reference draws its dither from `prng.bits`; this torch build has no `prng.bits`, so we draw an
-# equivalent uniform 22-bit dither from `prng.uniform` -- exactly as the repo's other SR golds do
-# (sr_bf16_f). SR is unbiased (E[SR(v)] = v), so the round-trip SQNR stays above the same 12 dB floor
+# dither is the low 22 bits of a raw `prng.bits` draw -- exactly as the reference does, and matching
+# the repo's other SR golds (sr_bf16_f). SR is unbiased (E[SR(v)] = v), so the round-trip SQNR stays above the same 12 dB floor
 # as the RNE gold; the point of SR here is an unbiased grad cast, which the RNE gold cannot give.
 # ---------------------------------------------------------------------------
 def _f32_to_packed_fp4_sr(data_scaled, key):
@@ -1530,13 +1529,13 @@ def _f32_to_packed_fp4_sr(data_scaled, key):
     `_f32_to_packed_fp4`) with STOCHASTIC rounding to the fp4 grid instead of RNE. Adds a uniform
     22-bit dither into the discarded fp32 mantissa field, then truncates (the software-SR trick from
     stochastic_rounding_api's STOCHASTIC `_reference_impl`, drop = 23 - 1 fp4 mantissa bit = 22). The
-    dither comes from `prng.uniform(key, ...)` (this build lacks `prng.bits`; same substitution as
-    sr_bf16_f). After the add-and-truncate the value already sits on the fp4 normal grid, so the
+    dither is the low 22 bits of a raw `prng.bits(key, ...)` draw (same as sr_bf16_f). After the
+    add-and-truncate the value already sits on the fp4 normal grid, so the
     f32_to_f4_unpacked RNE below is a no-op for normals (subnormals, |scaled| < 1, double-round -- the
     same approximation the e4m3 SR reference tolerates)."""
     drop = 22  # 23 fp32 mantissa bits - 1 fp4 (e2m1) mantissa bit
-    u = prng.uniform(key, tuple(data_scaled.shape))
-    rand = (u * (1 << drop)).to(torch.int32)  # uniform int in [0, 2**22)
+    bits = prng.bits(key, tuple(data_scaled.shape))  # full 32-bit uniform draw per element
+    rand = bits & ((1 << drop) - 1)  # keep only the low `drop` bits -> uniform int in [0, 2**22)
     xi = (data_scaled.contiguous().view(torch.int32) + rand) & -(1 << drop)
     x_sr = xi.view(torch.float32)
     return pack_uint4(f32_to_f4_unpacked(x_sr))
@@ -2060,9 +2059,9 @@ def sr_bf16_f(x, key, **kwargs):
     as the counterexample. Returns `(out,)`.
     """
     assert x.dtype == torch.float32, f"SR bf16 expects fp32 input, got {x.dtype}"
-    # uniform [0, 1) per element from the Philox key, scaled to a uniform 16-bit dither.
-    u = prng.uniform(key, tuple(x.shape))
-    rand16 = (u * (1 << 16)).to(torch.int32)  # uniform int in [0, 2**16)
+    # uniform 16-bit dither per element: the low 16 bits of a raw prng.bits draw off the Philox key.
+    bits = prng.bits(key, tuple(x.shape))  # full 32-bit uniform draw per element
+    rand16 = bits & ((1 << 16) - 1)  # keep only the low 16 bits -> uniform int in [0, 2**16)
     return (_sr_bf16_dither(x, rand16),)
 
 
@@ -2124,8 +2123,8 @@ def sr_bf16_global_f(x, key, **kwargs):
     # stays traceable / survives the FakeTensor shape-probe).
     seed = key[0:1].to(torch.int64).expand(gidx.numel())
     keys = torch.stack([seed, gidx], dim=-1).to(torch.uint64)
-    u = prng.uniform(keys, (gidx.numel(),)).reshape(M, N)
-    rand16 = (u * (1 << 16)).to(torch.int32)
+    bits = prng.bits(keys, (gidx.numel(),))  # full 32-bit uniform draw per element
+    rand16 = (bits & ((1 << 16) - 1)).reshape(M, N)  # keep only the low 16 bits -> uniform int in [0, 2**16)
     return (_sr_bf16_dither(x, rand16),)
 
 
