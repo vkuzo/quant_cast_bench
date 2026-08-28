@@ -26,7 +26,7 @@ from quant_cast_bench.quant_cast_gold.recipes import (
     HadamardRht,
     Mxfp832x32DimKMSwizzleGold,
     Mxfp832x32DimMSwizzleGold,
-    Mxfp832x32Gold,
+    Mxfp832x32ExpandGold,
     Mxfp832x32QdataDimKScaleDimKMSwizzleGold,
     Mxfp832x32SwizzleGold,
     Mxfp8DimKmGold,
@@ -650,12 +650,12 @@ MXFP8_SWIZZLE = QuantCastTritonRecipe.from_gold(
 
 
 # ---------------------------------------------------------------------------
-# mxfp8 32x32: one e8m0 scale per 32x32 block. Mirrors mxfp8_32x32_f / mxfp8_32x32_swizzle_f.
+# mxfp8 32x32: one e8m0 scale per 32x32 block. Mirrors mxfp8_32x32_expand_f / mxfp8_32x32_swizzle_f.
 # Perf: one 32x32 block per program is tiny/low-intensity. Batch CB col-blocks per program
 # (32 rows x CB*32 cols), reshaping to (32, CB, 32) and reducing the row + within-block dims;
 # autotune CB and num_warps.
-# SWIZZLE=False writes the scale as a plain, exactly-sized (M//32, N//32) 2D buffer (one byte per
-# 32-row-block, strides ss*). SWIZZLE=True expands each block scale along its 32 rows -> a (M, N//32)
+# SWIZZLE=False expands each block scale over its 32 rows -> a plain, exactly-sized (M, N//32) 2D
+# buffer (the 1x32 layout a gemm consumes, strides ss*). SWIZZLE=True expands the same way -> a (M, N//32)
 # grid scattered into the NVIDIA-swizzled 4D block grid (nrb, ncb, 32, 16) via _mxfp8_kernel's flat
 # formula; that swizzled buffer is a bijection over the PADDED grid (row in [0, nrb*128), col in
 # [0, ncb*4)), real scale at row<M and col<N//32, the rest padding gold's _to_blocked_4d zero-fills,
@@ -710,11 +710,15 @@ def _mxfp8_32x32_kernel(
                            tl.broadcast_to(biased.to(tl.uint8)[None, :], (32, CB)), 0)
         tl.store(s_ptr + flat, s_bytes, mask=(col < (NCB * 4)))
     else:
-        # plain 2D scale store: one byte per (32-row-block, col). Buffer is exactly (M//32, N//32) ->
-        # skip padded block-cols (>= N//32) and, when RAGGED, padded row-blocks (pid_rb*32 >= M).
-        s_cols = pid_cb * CB + tl.arange(0, CB)
-        tl.store(s_ptr + pid_rb * ssm + s_cols * ssn, biased.to(tl.uint8),
-                 mask=(s_cols < (N // 32)) & (pid_rb * 32 < M) if RAGGED else (s_cols < (N // 32)))
+        # plain 2D scale store, EXPANDED to the 1x32 layout: repeat the single block scale over all 32
+        # rows of the block -> a (M, N//32) grid a gemm consumes directly (no swizzle). Buffer is
+        # exactly (M, N//32) -> skip padded block-cols (>= N//32) and, when RAGGED, padded rows.
+        s_rows = offs_m[:, None]                             # (32, 1)
+        s_cols = (pid_cb * CB + tl.arange(0, CB))[None, :]   # (1, CB)
+        col_ok = s_cols < (N // 32)
+        tl.store(s_ptr + s_rows * ssm + s_cols * ssn,
+                 tl.broadcast_to(biased.to(tl.uint8)[None, :], (32, CB)),
+                 mask=(col_ok & m_mask[:, None]) if RAGGED else col_ok)
 
 
 def mxfp8_32x32_triton(x, swizzle, **kwargs):
@@ -738,7 +742,7 @@ def mxfp8_32x32_triton(x, swizzle, **kwargs):
             SWIZZLE=True, RAGGED=ragged,  # ss* unused on swizzle path
         )
     else:
-        s_u8 = torch.empty(M // 32, N // 32, dtype=torch.uint8, device=x.device)
+        s_u8 = torch.empty(M, N // 32, dtype=torch.uint8, device=x.device)  # expanded (1x32) scale
         _mxfp8_32x32_kernel[grid](
             x, y, s_u8, M, N, x.stride(0), x.stride(1), y.stride(0), y.stride(1),
             s_u8.stride(0), s_u8.stride(1), 0,  # NCB unused when not swizzled
@@ -748,7 +752,7 @@ def mxfp8_32x32_triton(x, swizzle, **kwargs):
 
 
 MXFP8_32X32 = QuantCastTritonRecipe.from_gold(
-    Mxfp832x32Gold, triton_fn=functools.partial(mxfp8_32x32_triton, swizzle=False)
+    Mxfp832x32ExpandGold, triton_fn=functools.partial(mxfp8_32x32_triton, swizzle=False)
 )
 MXFP8_32X32_SWIZZLE = QuantCastTritonRecipe.from_gold(
     Mxfp832x32SwizzleGold, triton_fn=functools.partial(mxfp8_32x32_triton, swizzle=True)

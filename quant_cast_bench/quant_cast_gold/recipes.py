@@ -771,36 +771,24 @@ def mxfp8_32x32_f(x, **kwargs):
     return qdata, scale_e8m0.squeeze(-1)  # scale (M//32, N//32)
 
 
-def mxfp8_32x32_dq_f(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    # inverse: un-block the e8m0 scale over the 32x32 grid (mirrors deepseek_128x128_dq_f).
-    M, N = q.shape
-    n1, n2 = M // 32, N // 32
-    s = _e8m0_to_fp32(scale).reshape(n1, 1, n2, 1)
-    return (q.float().reshape(n1, 32, n2, 32) * s).reshape(M, N)
+def mxfp8_32x32_expand_f(x, **kwargs):
+    # Compute one e8m0 scale per 32x32 square block, then EXPAND it along the rows -> a (M, N//32)
+    # grid. That is the plain (unswizzled) 1x32 scale layout a downstream gemm consumes directly:
+    # all 32 rows of a block share the block's scale, so dequant matches mxfp8's last-dim-32 form.
+    qdata, scale_e8m0 = mxfp8_32x32_f(x)  # (M, N), (M//32, N//32)
+    return qdata, scale_e8m0.repeat_interleave(32, dim=0)  # scale (M, N//32)
 
 
-def _mxfp8_32x32_correctness(
-    inputs: Tuple[torch.Tensor, ...], outputs: Tuple[torch.Tensor, torch.Tensor]
-) -> None:
-    """Assert dequant(outputs) recovers `x` with SQNR above threshold. e8m0 pow2 scale is coarse,
-    so the threshold matches mxfp8's (15 dB), not the fp8 recipes' (20 dB)."""
-    (x,) = inputs
-    qdata, scale = outputs
-    x_hat = mxfp8_32x32_dq_f(qdata, scale)
-    sqnr = _compute_error(x.float(), x_hat.float())
-    threshold = 15.0
-    assert sqnr > threshold, f"mxfp8_32x32: sqnr={sqnr.item():.2f} dB below {threshold} dB"
-
-
-Mxfp832x32Gold = QuantCastSingleKernelGold(
-    pt_ref_fn=mxfp8_32x32_f,
-    correctness_fn=_mxfp8_32x32_correctness,
+Mxfp832x32ExpandGold = QuantCastSingleKernelGold(
+    pt_ref_fn=mxfp8_32x32_expand_f,
+    # the expanded scale is already the plain 1x32 layout, so mxfp8's (M, N//32) dequant applies.
+    correctness_fn=_mxfp8_correctness,
     example_input_fn=lambda M, K: (torch.randn(M, K, dtype=torch.bfloat16, device="cuda"),),
-    perf_description="(32,32) block",
+    perf_description="(32,32) block, expanded to (1,32)",
 )
 
 # ---------------------------------------------------------------------------
-# Golden recipe: mxfp8 with square 32x32 blocks (as Mxfp832x32Gold), but the single e8m0
+# Golden recipe: mxfp8 with square 32x32 blocks (as Mxfp832x32ExpandGold), but the single e8m0
 # scale per 32x32 block is expanded along M -- each block scale repeated over its 32 rows,
 # giving a (M, N//32) grid -- and then swizzled into the NVIDIA 32x4x4 blocked layout via
 # _to_blocked_4d. The expansion makes the 32x32-block scale look like the 1x32-block
@@ -2171,7 +2159,7 @@ ALL_RECIPES = [
     ("mxfp8_dim_km_swizzle", Mxfp8DimKmSwizzleGold),
     ("fp8_deepseek_1x128_dim_km", Deepseek1x128DimKmGold),
     # 8-bit 2D
-    ("mxfp8_32x32", Mxfp832x32Gold),
+    ("mxfp8_32x32", Mxfp832x32ExpandGold),
     ("mxfp8_32x32_swizzle", Mxfp832x32SwizzleGold),
     ("mxfp8_32x32_dim_m_swizzle", Mxfp832x32DimMSwizzleGold),
     ("mxfp8_32x32_dim_km_swizzle", Mxfp832x32DimKMSwizzleGold),

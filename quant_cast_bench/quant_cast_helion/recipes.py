@@ -23,7 +23,7 @@ from quant_cast_bench.quant_cast_gold.recipes import (
     Deepseek128x128Gold,
     Float8TensorwiseGold,
     HadamardRht,
-    Mxfp832x32Gold,
+    Mxfp832x32ExpandGold,
     Mxfp8DimKmGold,
     Mxfp8DimKmSwizzleGold,
     Mxfp8DimMGold,
@@ -334,7 +334,8 @@ MXFP8_DIM_M_SWIZZLE = QuantCastHelionRecipe.from_gold(
 
 # ---------------------------------------------------------------------------
 # mxfp8 32x32: one e8m0 scale per square 32x32 block; qdata keeps the input's (M, N) layout
-# (no transpose), scale is (M//32, N//32). Mirrors mxfp8_32x32_f. Viewing (M, N) as
+# (no transpose), the block scale is EXPANDED over its 32 rows into the plain (M, N//32) 1x32
+# layout a gemm consumes. Mirrors mxfp8_32x32_expand_f. Viewing (M, N) as
 # (M//32, 32, N//32, 32) makes each 32x32 block a (dim1, dim3) pair, so the block amax is a reduce
 # over those two axes and the store lands back in place. autotune_effort="none" -> default config.
 # ---------------------------------------------------------------------------
@@ -352,12 +353,13 @@ MXFP8_DIM_M_SWIZZLE = QuantCastHelionRecipe.from_gold(
 def _mxfp8_32x32_kernel(
     x: torch.Tensor,  # (M, N) bf16 input
     qdata: torch.Tensor,  # (M, N) fp8_e4m3fn, mutated in place
-    scale_u8: torch.Tensor,  # (M // 32, N // 32) uint8 e8m0 bits, mutated in place
+    scale_u8: torch.Tensor,  # (M, N // 32) uint8 e8m0 bits, mutated in place (expanded 1x32 layout)
 ) -> None:
     M, N = x.shape
     rb, cb = M // 32, N // 32  # 32x32 block grid
     xv = x.view(rb, 32, cb, 32)
     qv = qdata.view(rb, 32, cb, 32)
+    sv = scale_u8.view(rb, 32, cb)  # the expanded (M, N//32) scale as (rb, 32-rows-per-block, cb)
     for tile_rb, tile_cb in hl.tile([rb, cb]):
         x_blk = xv[tile_rb, :, tile_cb, :].to(torch.float32)  # (t_rb, 32, t_cb, 32)
         # block amax over both within-block axes (the two 32s): reduce the trailing 32, then the
@@ -367,24 +369,26 @@ def _mxfp8_32x32_kernel(
         rcp = _e8m0_biased_to_reciprocal_fp32(biased)  # (t_rb, t_cb) fp32 reciprocal pow2 factor
         y = (x_blk * rcp[:, None, :, None]).to(torch.float8_e4m3fn)  # (t_rb, 32, t_cb, 32)
         qv[tile_rb, :, tile_cb, :] = y
-        scale_u8[tile_rb, tile_cb] = biased.to(torch.uint8)
+        # EXPAND: repeat the block scale over all 32 rows of the block (the 1x32 layout a gemm reads).
+        sv[tile_rb, :, tile_cb] = biased[:, None, :].to(torch.uint8)
 
 
 def mxfp8_32x32_helion(x, **kwargs):
     """mxfp8 with square 32x32 blocks in Helion: one e8m0 power-of-two scale per 32x32
-    block, quantize to fp8 in the input's (M, N) layout (no transpose). Matches the gold
-    `mxfp8_32x32_f`. `**kwargs` are accepted and ignored."""
+    block, quantize to fp8 in the input's (M, N) layout (no transpose), with the block scale
+    EXPANDED over its 32 rows into the plain (M, N//32) 1x32 layout a gemm consumes. Matches the
+    gold `mxfp8_32x32_expand_f`. `**kwargs` are accepted and ignored."""
     assert x.is_contiguous() and x.dim() == 2
     M, N = x.shape
     assert M % 32 == 0 and N % 32 == 0, f"mxfp8_32x32 requires M,N divisible by 32, got {(M, N)}"
     qdata = torch.empty_like(x, dtype=torch.float8_e4m3fn)
-    scale_u8 = torch.empty((M // 32, N // 32), dtype=torch.uint8, device=x.device)
+    scale_u8 = torch.empty((M, N // 32), dtype=torch.uint8, device=x.device)
     _mxfp8_32x32_kernel(x, qdata, scale_u8)
     return qdata, scale_u8.view(torch.float8_e8m0fnu)
 
 
 MXFP8_32X32 = QuantCastHelionRecipe.from_gold(
-    Mxfp832x32Gold, helion_fn=mxfp8_32x32_helion
+    Mxfp832x32ExpandGold, helion_fn=mxfp8_32x32_helion
 )
 
 

@@ -23,7 +23,7 @@ from quant_cast_bench.quant_cast_gold.recipes import (
     _compute_error,
     hadamard_rht_f,
     hadamard_rht_matrix,
-    mxfp8_32x32_f,
+    mxfp8_32x32_expand_f,
     mxfp8_32x32_qdata_dim_k_scale_dim_km_swizzle_f,
     mxfp8_dim_km_f,
     mxfp8_dim_km_swizzle_f,
@@ -152,12 +152,13 @@ def test_32x32_matches_gold_bitwise(M, N, dtype):
         swizzle_type=SwizzleType.NO_SWIZZLE,
         scaling_type_square_block_and_expand=True,
     )
-    q_ref, s_ref = mxfp8_32x32_f(x)
+    q_ref, s_ref = mxfp8_32x32_expand_f(x)
     assert torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8)), "qdata differs from gold"
     assert torch.equal(s.view(torch.uint8), s_ref.view(torch.uint8)), "scale differs from gold"
     assert q.dtype == torch.float8_e4m3fn
     assert s.dtype == torch.float8_e8m0fnu
-    assert q.shape == (M, N) and s.shape == (M // 32, N // 32)
+    # the 32x32 block scale is expanded along the rows into the plain 1x32 layout a gemm consumes.
+    assert q.shape == (M, N) and s.shape == (M, N // 32)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")

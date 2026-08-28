@@ -20,7 +20,7 @@ from quant_cast_bench.quant_cast_gold.recipes import (
     Deepseek128x128Gold,
     Float8TensorwiseGold,
     HadamardRht,
-    Mxfp832x32Gold,
+    Mxfp832x32ExpandGold,
     Mxfp8DimMGold,
     Mxfp8Gold,
     Mxfp8SwizzleGold,
@@ -147,7 +147,7 @@ MXFP8_DIM_M = RecipeV2.from_gold(
 # mxfp8 with square 32x32 blocks: each block is independent, so a tile just needs whole blocks
 # on both dims (checked on `actual`). No swizzle, no transpose.
 MXFP8_32X32 = RecipeV2.from_gold(
-    Mxfp832x32Gold,
+    Mxfp832x32ExpandGold,
     valid_tile_size_fn=lambda ts, a, p: a[0] % 32 == 0 and a[1] % 32 == 0,
 )
 # reduction (1x32) checked on `actual`; swizzle atom (128x128) checked on `padded` (edge-exempt).

@@ -34,7 +34,7 @@ from quant_cast_bench.quant_cast_gold.recipes import (
     Deepseek128x128Gold,
     Float8TensorwiseGold,
     HadamardRht,
-    Mxfp832x32Gold,
+    Mxfp832x32ExpandGold,
     Mxfp8DimKmGold,
     Mxfp8DimKmSwizzleGold,
     Mxfp8DimMGold,
@@ -1417,10 +1417,11 @@ def _mxfp8_32x32_kernel(atom_in: cute.CopyAtom, ten_in: cute.Tensor, atom_out: c
         local = cute.where(v < 0, -v, v).reduce(cute.ReductionOp.MAX, cutlass.Float32(0.0), 0)
         amax = cute.arch.warp_reduction_max(local)       # across the 32 columns -> whole-block amax
         rcp, biased = _e8m0(amax)                         # rcp = 1/scale (pow2), reciprocal-mul below
-        if lane == 0:
-            gbr = bidx * _M32_BR + br
-            gbc = bidy * _M32_BC + bc
-            scales[gbr * ncb + gbc] = biased.to(scales.element_type)
+        # EXPAND: biased is warp-uniform (warp_reduction_max), so each lane writes the block scale to
+        # its own row -> the plain (M, N//32) 1x32 layout a gemm consumes (32 rows share one scale).
+        gbr = bidx * _M32_BR + br
+        gbc = bidy * _M32_BC + bc
+        scales[(gbr * 32 + lane) * ncb + gbc] = biased.to(scales.element_type)
         frgOut = cute.make_rmem_tensor(cute.make_layout(32), cutlass.Float8E4M3FN)
         frgOut.store((v * rcp).to(cutlass.Float8E4M3FN))  # reciprocal-mul, not 32 per-element divs
         for i in cutlass.range_constexpr(32):
@@ -1453,7 +1454,7 @@ def mxfp8_32x32_cute(x, **kwargs):
         f"mxfp8_32x32 cute kernel needs M%{_M32_TM}==0 and N%{_M32_TN}==0"
     y = torch.empty(M, N, dtype=torch.float8_e4m3fn, device=x.device)
     ncb = N // 32
-    s_u8 = torch.empty(M // 32, ncb, dtype=torch.uint8, device=x.device)
+    s_u8 = torch.empty(M, ncb, dtype=torch.uint8, device=x.device)  # expanded (1x32) scale
     # TMA needs full layout/divisibility marking (leading dim contiguous, 16-elem aligned).
     mX = (from_dlpack(x, assumed_align=16).mark_layout_dynamic(leading_dim=1)
           .mark_compact_shape_dynamic(mode=1, divisibility=16))
@@ -1466,7 +1467,7 @@ def mxfp8_32x32_cute(x, **kwargs):
 
 
 MXFP8_32X32 = QuantCastCuteRecipe.from_gold(
-    Mxfp832x32Gold, cute_fn=mxfp8_32x32_cute
+    Mxfp832x32ExpandGold, cute_fn=mxfp8_32x32_cute
 )
 
 
