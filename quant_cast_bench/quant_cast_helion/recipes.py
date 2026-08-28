@@ -32,7 +32,7 @@ from quant_cast_bench.quant_cast_gold.recipes import (
     Nvfp4GsGold,
     Nvfp4GsSwizzleGold,
     QuantCastSingleKernelGold,
-    SrF32ToBf16,
+    SrF32ToBf16Global,
 )
 
 # fp8_e4m3fn representable max; the deepseek scale is amax / fp8_max (see the gold recipe).
@@ -952,18 +952,20 @@ BF16_RHT = QuantCastHelionRecipe.from_gold(HadamardRht, helion_fn=rht_helion)
 
 
 # ---------------------------------------------------------------------------
-# Stochastic-rounding fp32 -> bf16 (mirrors sr_bf16_f). SR add-then-truncate: dither the 16 mantissa
-# bits fp32->bf16 drops with a uniform 16-bit value, then mask them off. bf16 shares fp32's exponent
-# so there's no rebias/scale/packing -- just the dither. Randomness comes from a counter-based Philox
-# draw, but instead of `hl.rand` we drop into raw Triton via `hl.inline_triton` and call
-# `tl.randint4x` directly -- the same batched primitive the hand-written Triton SR kernel uses (one
-# Philox round yields FOUR int32 draws). The draws don't match the torch reference bit-for-bit --
-# only the SR *property* (unbiased, lands on the two bracketing bf16 grid points) is well-defined, and
-# that's what the test's correctness_fn checks for the *_sr recipes. To consume ALL FOUR draws from
-# the single Philox round, we view the flat input as (n // 4, 4) and dither 4 elements per round: one
-# offset (`hl.tile_index`) per group of 4, the four blocks (a, b, c, d) supplying the four columns'
-# dithers. The columns are filled with a one-hot weighted sum over the size-4 minor axis
-# (`hl.arange(4)`) rather than strided column indexing, which Helion rejects.
+# Tiling-INVARIANT stochastic-rounding fp32 -> bf16 (mirrors sr_bf16_global_f). SR add-then-truncate:
+# dither the 16 mantissa bits fp32->bf16 drops with a uniform 16-bit value, then mask them off. bf16
+# shares fp32's exponent so there's no rebias/scale/packing -- just the dither. Randomness comes from a
+# counter-based Philox draw, but instead of `hl.rand` we drop into raw Triton via `hl.inline_triton`
+# and call `tl.randint4x` directly -- the same batched primitive the hand-written Triton SR kernel uses
+# (one Philox round yields FOUR int32 draws). To consume ALL FOUR draws from the single Philox round,
+# we view the flat input as (n // 4, 4) and dither 4 elements per round: one offset (`hl.tile_index`)
+# per group of 4, the four blocks (a, b, c, d) supplying the four columns' dithers. The columns are
+# filled with a one-hot weighted sum over the size-4 minor axis (`hl.arange(4)`) rather than strided
+# column indexing, which Helion rejects.
+#
+# `hl.tile_index` is the GLOBAL group index (flat index >> 2), independent of the block size, and the
+# four draws feed the group's four elements in straight order with the LOW 16 bits -- exactly the gold
+# `sr_bf16_global_f` scheme (counter = gidx>>2, stream = gidx&3), so this bit-matches the gold.
 # Elementwise + bandwidth-bound (read fp32, write bf16) -> 81.9% peak. inline_triton is a raw-Triton
 # HOP that aborts autotune_effort="full", so the config below (block_sizes=[1024]) was found under
 # autotune_effort="none" and hand-pinned.
@@ -1019,20 +1021,22 @@ def _sr_bf16_kernel(
 
 
 def sr_bf16_helion(x, key, **kwargs):
-    """fp32 -> bf16 stochastic rounding in Helion (mirrors `sr_bf16_f`). `key` is a torch Philox key
-    tensor; its first 32-bit word seeds `hl.rand`. SR is unbiased -- a value between two bf16 grid
-    points rounds up with probability (x-lo)/(hi-lo). Returns a 1-tuple `(out,)`. `**kwargs` accepted
-    and ignored (the kernel owns its tiling)."""
+    """Tiling-invariant fp32 -> bf16 stochastic rounding in Helion (mirrors `sr_bf16_global_f`). `key`
+    is a torch Philox key tensor; its first 32-bit word seeds `tl.randint4x`. SR is unbiased -- a value
+    between two bf16 grid points rounds up with probability (x-lo)/(hi-lo). Returns a 1-tuple `(out,)`.
+    `**kwargs` accepted and ignored (the kernel owns its tiling)."""
     assert x.dtype == torch.float32, f"SR bf16 expects fp32 input, got {x.dtype}"
     assert x.is_contiguous()
     n = x.numel()
-    seed = int(key.reshape(-1)[0].item()) & 0x7FFFFFFF  # first word of the key as a Philox seed
+    seed = int(key.reshape(-1)[0].item())  # first word of the key as a Philox seed (full 32 bits)
     out = torch.empty_like(x, dtype=torch.bfloat16)
     _sr_bf16_kernel(x.view(n), out.view(n), seed)
     return (out,)
 
 
-FP32_TO_BF16_SR = QuantCastHelionRecipe.from_gold(SrF32ToBf16, helion_fn=sr_bf16_helion)
+FP32_TO_BF16_SR_GLOBAL = QuantCastHelionRecipe.from_gold(
+    SrF32ToBf16Global, helion_fn=sr_bf16_helion
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1240,5 +1244,5 @@ ALL_RECIPES = [
     ("nvfp4", NVFP4),
     ("nvfp4_swizzle", NVFP4_SWIZZLE),
     ("bf16_rht", BF16_RHT),
-    ("fp32_to_bf16_sr", FP32_TO_BF16_SR),
+    ("fp32_to_bf16_sr_global_offsets", FP32_TO_BF16_SR_GLOBAL),
 ]

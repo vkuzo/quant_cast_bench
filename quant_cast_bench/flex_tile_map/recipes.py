@@ -31,7 +31,6 @@ from quant_cast_bench.quant_cast_gold.recipes import (
     QuantCastSingleKernelGold,
     RowwiseFp8Gold,
     RowwisePrecalcGold,
-    SrF32ToBf16,
     SrF32ToBf16Global,
 )
 
@@ -204,19 +203,10 @@ HADAMARD_RHT = RecipeV2.from_gold(
     valid_tile_size_fn=lambda ts, a, p: a[1] % 16 == 0,
     aux_kinds=(AuxKind.REPLICATE,),
 )
-# stochastic rounding fp32 -> bf16 (tile-LOCAL, from SrF32ToBf16 gold). The DELIBERATE
-# non-tile-invariant counterexample: the dither is keyed on tile-local element order, so
-# MANUAL_TILE rounds differently from INDUCTOR (test_flex_tile_map_backends_keep_numerics is
-# skipped for it -- see the skip in test.py). Its example_input_fn supplies the fp32 constant
-# input + the REPLICATE PRNG key.
-SR_BF16 = RecipeV2.from_gold(
-    SrF32ToBf16,
-    aux_kinds=(AuxKind.REPLICATE,),
-)
 # tiling-INVARIANT SR (from SrF32ToBf16Global): keys the dither on each element's GLOBAL
-# position, so INDUCTOR == MANUAL_TILE bit-for-bit (unlike SR_BF16). Its backend check is still
-# skipped in the generic suite (kept alongside SR_BF16); the invariance is asserted by
-# test_sr_bf16_global_tiling_invariant.
+# position, so INDUCTOR == MANUAL_TILE bit-for-bit. Its backend check is skipped in the generic
+# suite; the invariance is asserted by test_sr_bf16_global_tiling_invariant. Its example_input_fn
+# supplies the fp32 constant input + the REPLICATE PRNG key.
 SR_BF16_GLOBAL = RecipeV2.from_gold(
     SrF32ToBf16Global,
     aux_kinds=(AuxKind.REPLICATE,),
@@ -242,7 +232,6 @@ RECIPES_V2 = [
     ("nvfp4_blocked_outer", NVFP4_BLOCKED_OUTER),
     ("mxfp8_bias", MXFP8_BIAS),
     ("bf16_rht", HADAMARD_RHT),
-    ("fp32_to_bf16_sr", SR_BF16),
     ("fp32_to_bf16_sr_global_offsets", SR_BF16_GLOBAL),
     ("debug_relu", DEBUG_RELU),
 ]

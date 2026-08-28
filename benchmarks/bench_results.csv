@@ -27,7 +27,6 @@ nvfp4_dim_m_rht_sr_swizzle,compile,1.4366,478.8,5.99
 nvfp4_swizzle_dim_k_dim_m_rht,compile,1.3914,602.9,7.54
 nvfp4_swizzle_dim_k_sr_dim_m_rht_sr,compile,2.2085,379.8,4.75
 bf16_rht,compile,0.4583,2342.9,29.29
-fp32_to_bf16_sr,compile,0.6831,2357.9,29.47
 debug_relu,compile,0.1639,6552.3,81.90
 relu (baseline),triton,0.1773,6057.6,75.72
 fp8_tensorwise_precalc_scale,triton,0.1410,5711.5,71.39
@@ -50,7 +49,6 @@ fp8_colwise,triton,0.2217,3632.2,45.40
 nvfp4,triton,0.1284,5355.6,66.95
 nvfp4_swizzle,triton,0.1375,5004.3,62.55
 bf16_rht,triton,0.1991,5392.2,67.40
-fp32_to_bf16_sr,triton,0.2734,5891.8,73.65
 fp32_to_bf16_sr_global_offsets,triton,0.2565,6280.0,78.50
 relu (baseline),cute,0.1772,6059.2,75.74
 fp8_tensorwise_precalc_scale,cute,0.1169,6887.7,86.10
@@ -68,7 +66,6 @@ fp8_rowwise,cute,0.1263,6375.1,79.69
 fp8_colwise,cute,0.2196,3667.4,45.84
 nvfp4_swizzle,cute,0.1407,4888.7,61.11
 bf16_rht,cute,0.1963,5469.5,68.37
-fp32_to_bf16_sr,cute,0.2372,6790.8,84.88
 fp32_to_bf16_sr_global_offsets,cute,0.2371,6791.8,84.90
 relu (baseline),helion,0.1773,6057.5,75.72
 fp8_tensorwise_precalc_scale,helion,0.1168,6896.8,86.21
@@ -85,7 +82,7 @@ fp8_deepseek_128x128,helion,0.1331,6051.0,75.64
 nvfp4,helion,0.4810,1430.1,17.88
 nvfp4_swizzle,helion,0.3806,1807.2,22.59
 bf16_rht,helion,0.1571,6832.6,85.41
-fp32_to_bf16_sr,helion,0.2429,6631.7,82.90
+fp32_to_bf16_sr_global_offsets,helion,0.2429,6631.7,82.90
 relu (baseline),flex_tile_map_triton,0.1773,6057.6,75.72
 fp8_deepseek_1x128_dim_m,flex_tile_map_triton,0.1461,5568.5,69.61
 mxfp8_dim_m,flex_tile_map_triton,0.1968,4133.6,51.67

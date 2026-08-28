@@ -13,7 +13,7 @@ Two-step workflow:
 The CSV is long/tidy (kernel,mode,gpu_time_ms,gbps,mem_bw_pct); this script pivots it to a scatter
 plot with one marker series per mode (points not connected) -- bandwidth on the x-axis, one kernel
 per row on the y-axis. Kernels benchmarked in only some modes (e.g. the compile-only bf16_rht /
-fp32_to_bf16_sr) simply show fewer points.
+fp32_to_bf16_sr_global_offsets) simply show fewer points.
 """
 
 import csv

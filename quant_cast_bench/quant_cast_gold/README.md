@@ -159,7 +159,6 @@ orientation; `—` means "none / no".
 | `nvfp4_swizzle`                    | x     | (1, 16)         | fp4 | swizzle | —   | — |
 | `nvfp4_blocked_outer`              | x     | (1, 16)         | fp4 | swizzle | —   | — |
 | `bf16_rht`                         | x     | — (16-wide RHT) | —   | RHT     | —   | — |
-| `fp32_to_bf16_sr`                  | x     | — (elementwise) | —   | —       | —   | — |
 | `fp32_to_bf16_sr_global_offsets`   | x     | — (elementwise) | —   | —       | yes | — |
 | `mxfp8_bias`                       | x     | (1, 32)         | —   | —       | —   | — |
 
@@ -171,7 +170,7 @@ Notes:
 * `nvfp4_swizzle` vs `nvfp4_blocked_outer` are identical under these five axes — they differ only in
   the outer-scale source (per-tensor vs 128×128-blocked), which is a scale-scheme detail, not one of
   the five axes.
-* `bf16_rht` (a 16-wide randomized Hadamard transform) and the `fp32_to_bf16_sr*` recipes are the
+* `bf16_rht` (a 16-wide randomized Hadamard transform) and `fp32_to_bf16_sr_global_offsets` are the
   non-block-quant examples; `mxfp8_bias` is a debug recipe.
 
 ## Code structure

@@ -57,7 +57,6 @@ nvfp4_dim_m_rht_sr_swizzle                                                      
 nvfp4_swizzle_dim_k_dim_m_rht                                                   1.3914   602.9        7.5%  (1,16) block, fp4 qdata, swizzle; dim-k (no RHT) + dim-m (RHT), two outer scales
 nvfp4_swizzle_dim_k_sr_dim_m_rht_sr                                             2.2085   379.8        4.7%  (1,16) block, fp4 qdata (stochastic rounding), swizzle; dim-k (no RHT) + dim-m (RHT), two outer scales
 bf16_rht                                                                        0.4583  2342.9       29.3%  elementwise RHT
-fp32_to_bf16_sr                                                                 0.6831  2357.9       29.5%
 fp32_to_bf16_sr_global_offsets                SKIPPED: Unsupported: Observed exception                      elementwise SR with stateless RNG
 debug_relu                                                                      0.1639  6552.3       81.9%  debug: relu, elementwise, no quant
 ```
@@ -90,7 +89,6 @@ fp8_colwise                                          0.2217  3632.2       45.4% 
 nvfp4                                                0.1284  5355.6       66.9%  (1,16) block, fp4 qdata, no swizzle
 nvfp4_swizzle                                        0.1375  5004.3       62.6%  (1,16) block, fp4 qdata, swizzle
 bf16_rht                                             0.1991  5392.2       67.4%  elementwise RHT
-fp32_to_bf16_sr                                      0.2734  5891.8       73.6%
 fp32_to_bf16_sr_global_offsets                       0.2565    6280       78.5%  elementwise SR with stateless RNG
 ```
 
@@ -260,31 +258,21 @@ fp32_to_bf16_sr_global_offsets                       0.2565    6280       78.5% 
   vs the torch reference: bf16×bf16 is exact in fp32, so the tensor-core fp32 accumulation reproduces
   torch's bf16 matmul (the cute test compares bf16 outputs to ~1 ULP, i.e. demands exactness).
 
-* `fp32_to_bf16_sr` (83.5%) — stochastic-rounding fp32→bf16, a pure elementwise streaming cast (read
-  fp32, write bf16), so it takes the same DRAM-speed-of-light recipe as `fp8_tensorwise`: flatten to
-  1-D, 256 threads/CTA, VPT=8 with 128-bit vectorized load/store (8 fp32 = 2×128b in, 8 bf16 = 1×128b
-  out; VPT=4 drops to 70.5% — the 64-bit store loses the vectorization). CuTeDSL exposes no
-  counter-based PRNG intrinsic (unlike Triton's `tl.randint4x`), so the dither comes from a
-  **hand-written Philox-4×32-10** (`_philox_4x32`) — the same generator torch/triton use, built out of
-  the DSL's integer ops (the mulhilo step widens to `Uint64`; verified bit-exact vs the Random123
-  reference). It's keyed like the global SR kernel (counter = flat index // 4, one call dithers 4
-  consecutive elements from its 4 outputs' top 16 bits). The test only checks the SR *property*
-  (unbiased, lands on the two bracketing bf16 grid points — mean error ~1e-5 vs the 1e-3 tolerance),
-  not a bit-match. This is the **fastest SR path** — beats triton (72.3%, `tl.randint4x` in-register)
-  and is ~2.8× compile (29.3%, which wastes a DRAM round-trip materializing the uniforms; see Known
-  issues). The 10-round Philox mix costs ~5 pts vs a cheap MurmurHash3 fmix32 dither (88.0%), which
-  also passes — the extra ALU of a full Philox is the price of matching the standard generator.
-  fp32-in/bf16-out is 6 bytes/element, so the 83.5% isn't directly comparable to the bf16 relu ceiling.
-
-* `fp32_to_bf16_sr_global_offsets` (82.9%) — the tiling-invariant SR counterpart. In the gold/triton
-  pair the two SR recipes differ in RNG keying: the plain one keys the dither on the *tile-local*
-  element order (so tiling changes the rounding — the deliberate counterexample), the global one keys
-  on each element's *global* flat index (tile-invariant). But the CuTeDSL SR kernel is built on
-  `cute.make_identity_tensor` global coordinates, so it **already** keys Philox on the global flat
-  index (counter = flat index // 4, stream = flat index % 4), independent of the tile shape. That is
-  exactly the "global offsets" scheme, so this recipe reuses the same kernel — there is no separate
-  tile-local cute kernel to contrast against, and the ±0.6-pt gap from `fp32_to_bf16_sr` is run-to-run
-  variance on identical code.
+* `fp32_to_bf16_sr_global_offsets` (84.9%) — stochastic-rounding fp32→bf16, a pure elementwise
+  streaming cast (read fp32, write bf16), so it takes the same DRAM-speed-of-light recipe as
+  `fp8_tensorwise`: flatten to 1-D, 256 threads/CTA, VPT=8 with 128-bit vectorized load/store (8 fp32 =
+  2×128b in, 8 bf16 = 1×128b out; VPT=4 drops to 70.5% — the 64-bit store loses the vectorization).
+  CuTeDSL exposes no counter-based PRNG intrinsic (unlike Triton's `tl.randint4x`), so the dither comes
+  from a **hand-written Philox-4×32-10** (`_philox_4x32`) — the same generator torch/triton use, built
+  out of the DSL's integer ops (the mulhilo step widens to `Uint64`; verified bit-exact vs the
+  Random123 reference). Because the kernel is built on `cute.make_identity_tensor` global coordinates it
+  keys Philox on each element's **global flat index** (counter = flat index // 4, stream = flat index %
+  4, straight lane order) and dithers the **low 16 bits** of the mantissa — independent of the tile
+  shape, so it is tiling-invariant and **bit-matches the gold** (and the Triton global kernel), not just
+  the SR *property*. This is the **fastest SR path** — beats triton (78.5%, `tl.randint4x` in-register).
+  The 10-round Philox mix costs ~5 pts vs a cheap MurmurHash3 fmix32 dither (88.0%), which also passes —
+  the extra ALU of a full Philox is the price of matching the standard generator. fp32-in/bf16-out is
+  6 bytes/element, so the 84.9% isn't directly comparable to the bf16 relu ceiling.
 
 ```
 shape: (16384, 16384)  mode: cute
@@ -307,7 +295,6 @@ fp8_rowwise                            0.1263  6375.1       79.7%  (1,-1) block
 fp8_colwise                            0.2196  3667.4       45.8%  (-1,1) block, t-contig
 nvfp4_swizzle                          0.1407  4888.7       61.1%  (1,16) block, fp4 qdata, swizzle
 bf16_rht                               0.1963  5469.5       68.4%  elementwise RHT
-fp32_to_bf16_sr                        0.2372  6790.8       84.9%
 fp32_to_bf16_sr_global_offsets         0.2371  6791.8       84.9%  elementwise SR with stateless RNG
 ```
 
@@ -365,7 +352,7 @@ fp8_deepseek_128x128                 0.1331    6051       75.6%  (128,128) block
 nvfp4                                 0.481  1430.1       17.9%  (1,16) block, fp4 qdata, no swizzle
 nvfp4_swizzle                        0.3806  1807.2       22.6%  (1,16) block, fp4 qdata, swizzle
 bf16_rht                             0.1571  6832.6       85.4%  elementwise RHT
-fp32_to_bf16_sr                      0.2429  6631.7       82.9%
+fp32_to_bf16_sr_global_offsets       0.2429  6631.7       82.9%  elementwise SR with stateless RNG
 ```
 
 * `fp8_tensorwise_precalc_scale` (85.3%, above the relu ceiling), `fp8_deepseek_1x128` (87.3%) and
@@ -460,37 +447,23 @@ fp32_to_bf16_sr                      0.2429  6631.7       82.9%
   too small a block (`block_sizes=[32]`, ~40% peak); a pinned wider block matching the triton kernel's
   `BLOCK_G=512` lifts it to the top of the table (blocks ≥1024 groups overflow tensor memory since the
   matmul lowers to `tl.dot`/tmem).
-* `fp32_to_bf16_sr` (81.9%, above this run's relu ceiling) is the stochastic-rounding fp32→bf16 dither
-  (add a uniform 16-bit value to the mantissa, then truncate). It never materializes a random tensor
-  the way `compile` mode does, and it's bit-unrelated to the torch reference (only the SR *property* —
-  unbiased, lands on the two bracketing bf16 grid points — is checked). The dither is drawn by calling
-  **`tl.randint4x` directly through `hl.inline_triton`** (Helion's raw-Triton HOP) rather than
-  `hl.rand`: `hl.rand` runs a full 10-round Philox per element and throws away 3 of every 4 outputs,
-  which capped this kernel at ~4.3%. Instead the input is viewed as `(n//4, 4)` and one Philox round
-  dithers 4 elements (its four blocks scattered across the size-4 minor axis via a one-hot sum, since
-  Helion rejects strided column indexing). `tl.randint4x` returns `uint32`, so each block is
-  `bitcast` to int32. Because `inline_triton` is a raw-Triton HOP that aborts `autotune_effort="full"`,
-  the config (`block_sizes=[1024]`, `num_warps=8`, `num_stages=7`) was found under
-  `autotune_effort="none"` and hand-pinned. This lands at/above the bespoke triton (73.0%) and cute
-  (84.8%) SR kernels.
+* `fp32_to_bf16_sr_global_offsets` (82.9%, above this run's relu ceiling) is the stochastic-rounding
+  fp32→bf16 dither (add a uniform 16-bit value to the mantissa, then truncate). It never materializes a
+  random tensor the way `compile` mode does. The dither is drawn by calling **`tl.randint4x` directly
+  through `hl.inline_triton`** (Helion's raw-Triton HOP) rather than `hl.rand`: `hl.rand` runs a full
+  10-round Philox per element and throws away 3 of every 4 outputs, which capped this kernel at ~4.3%.
+  Instead the input is viewed as `(n//4, 4)` and one Philox round dithers 4 elements (its four blocks
+  scattered across the size-4 minor axis via a one-hot sum, since Helion rejects strided column
+  indexing). `tl.randint4x` returns `uint32`, so each block is `bitcast` to int32. Because
+  `hl.tile_index` is the global group index (the flat index >> 2), the kernel keys Philox on each
+  element's **global flat index** (straight lane order, low-16-bit dither) exactly like the gold, so it
+  is tiling-invariant and **bit-matches the gold** — the test asserts full equality, not just the SR
+  *property*. Because `inline_triton` is a raw-Triton HOP that aborts `autotune_effort="full"`, the
+  config (`block_sizes=[1024]`, `num_warps=8`, `num_stages=7`) was found under
+  `autotune_effort="none"` and hand-pinned. This lands at/above the bespoke triton (78.5%) and cute
+  (84.9%) SR kernels.
 
 ## Known issues
-
-* `fp32_to_bf16_sr` (compile) reports only ~29.3% peak, but this understates the real bandwidth.
-  The stochastic-rounding uniform is drawn via `torch.func._random.uniform` → `aten._philox_uniform`,
-  which inductor treats as an opaque extern op rather than a fusible in-kernel RNG. So it runs as
-  two DRAM passes: kernel 1 materializes a full-size fp32 random tensor (~1.07 GB write, ~63% of
-  the runtime), kernel 2 reads it back alongside `x` to dither+truncate. Real traffic is ~3.76 GB
-  (write u + read x + read u + write out) ≈ 46% of peak; the benchmark only counts input+output
-  (~1.61 GB), so the wasted RNG round-trip shows up as the low 29.3%. Fix: fuse the Philox RNG into
-  the dither kernel (generate uniforms in-register, never materialize) — as inductor already does
-  for `torch.rand`/dropout — which would cut traffic to ~1.61 GB and approach the relu ceiling
-  (~2–3× speedup). **The hand-written Triton kernel does exactly this and confirms the prediction:
-  `tl.randint4x` generates the Philox uniforms in-register (never materializing `u`), so it moves
-  ~1.61 GB in one pass and hits 72.2% — ~2.5× the compile mode's 29.3% and near the relu ceiling.**
-  The CuTeDSL kernel goes further (83.5%): the same one-pass, in-register dither with 128-bit
-  vectorized fp32-load/bf16-store, using a hand-written Philox-4×32-10 (CuTeDSL has no PRNG intrinsic,
-  so it's built from the DSL's integer ops — bit-exact vs the Random123 reference).
 
 * `bf16_rht` (compile) runs at only ~29% peak, and here the traffic is not wasted (the whole 1.07 GB
   is useful read x + write out) — it's GEMM-kernel inefficiency. The 16×16 RHT `x.reshape(..., 16) @ rht`
@@ -555,17 +528,18 @@ fp32_to_bf16_sr                      0.2429  6631.7       82.9%
   granularity means 4× as many e8m0 scales (M/32 vs M/128) plus the per-scale e8m0 bit-math, and the
   transposed dim-M store remains the binding cost.
 
-* `fp32_to_bf16_sr_global_offsets` (compile) runs at only ~7.0% peak — ~4.2× slower (wall-clock) than
-  `fp32_to_bf16_sr` (29.3%) for identical dithering math. The difference is how the Philox draw is
-  keyed. Both use `torch.func._random.uniform` (experimental stateless Philox → unfused
-  `aten._philox_uniform`, so both share the same materialized-`u` ~46%-real-BW ceiling). The plain
-  variant keys on tile-LOCAL position (one shared key, counter = flat index within the call), which
-  is cheap but changes with tiling. The global variant is tile-INVARIANT: it keys each draw on the
-  element's GLOBAL index, which — because `uniform` only exposes a single scalar starting offset (the
-  `(seed, offset)` key pair, fine for 1D/full-width tiles but not 2D sub-blocks) — forces
-  materializing a per-element `(numel, 2)` uint64 key tensor = **4.29 GB** (16 B/element, 8× the
-  0.54 GB bf16 output), written then read back by a batched Philox. That ~8.5 GB key round-trip
-  roughly triples total traffic (~12.3 GB vs ~3.76 GB), the bulk of the slowdown.
+* `fp32_to_bf16_sr_global_offsets` (compile) runs at only ~7.0% peak, and two separate DRAM
+  round-trips explain it. First, the stochastic-rounding uniform is drawn via
+  `torch.func._random.uniform` (experimental stateless Philox → unfused `aten._philox_uniform`), which
+  inductor treats as an opaque extern op rather than a fusible in-kernel RNG: it materializes a
+  full-size fp32 `u` (~1.07 GB write) then reads it back alongside `x` to dither+truncate — ~3.76 GB
+  real traffic (write u + read x + read u + write out) ≈ 46% of peak, a ceiling any stateless-Philox SR
+  under compile shares. Second, this recipe is tile-INVARIANT: it keys each draw on the element's
+  GLOBAL index, which — because `uniform` only exposes a single scalar starting offset (the
+  `(seed, offset)` key pair, fine for 1D/full-width tiles but not 2D sub-blocks) — forces materializing
+  a per-element `(numel, 2)` uint64 key tensor = **4.29 GB** (16 B/element, 8× the 0.54 GB bf16 output),
+  written then read back by a batched Philox. That ~8.5 GB key round-trip roughly triples total traffic
+  (~12.3 GB vs ~3.76 GB), the bulk of the slowdown.
 
 ### Fix direction: key by global index without materializing keys
 
@@ -624,9 +598,8 @@ sub-tile), an element's global index is just its flat position `f` in `x` — so
 `counter = f >> 2` (via `tl.randint4x`, so one counter's 4 streams serve 4 consecutive elements),
 computed in-register from `f` alone. This makes the result **invariant to the internal block size**
 (the meaningful sense of "tile-invariant" for a standalone kernel — change `BLOCK` and every element
-still draws the same dither; the tile-*local* `fp32_to_bf16_sr` kernel, keyed on `pid*BLOCK+lane`, is
-not), with zero materialized key/uniform tensors — exactly the fused, never-materialize path the
-compile mode can't generate.
+still draws the same dither), with zero materialized key/uniform tensors — exactly the fused,
+never-materialize path the compile mode can't generate.
 
 The CuTeDSL kernel reaches the same 82.9% as its plain SR sibling because it is *literally the same
 kernel*: the cute SR kernel is built on `cute.make_identity_tensor` global coordinates, so it already

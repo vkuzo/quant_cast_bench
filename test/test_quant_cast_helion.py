@@ -61,12 +61,16 @@ def test_helion_matches_reference(name, recipe):
     # Every recipe's outputs must be a valid quantization (the gold correctness_fn).
     recipe.correctness_fn(inputs, hel_outs)
 
-    # Stochastic rounding (the *_sr recipes) is the one case that can't bit-match: the Helion kernel
-    # draws from its own counter-based Philox, not the reference's torch RNG, so only the SR *property*
-    # (unbiased, lands on the two bracketing grid points) is well-defined -- correctness_fn above checks
-    # that, and we stop (~2p(1-p) of elements differ between any two independent draws, so a per-element
-    # bound is meaningless here).
-    if "_sr" in name:
+    # Stochastic rounding (the *_sr recipes) is generally the one case that can't bit-match: the Helion
+    # kernel draws from its own counter-based Philox, not the reference's torch RNG, so only the SR
+    # *property* (unbiased, lands on the two bracketing grid points) is well-defined -- correctness_fn
+    # above checks that, and we stop (~2p(1-p) of elements differ between any two independent draws, so a
+    # per-element bound is meaningless here).
+    #
+    # The exception is fp32_to_bf16_sr_global_offsets: the Helion kernel's Philox is keyed on the global
+    # flat index (counter = gidx>>2, straight lane order, low-16-bit dither), identical to the gold, so
+    # it IS bit-exact and must fall through to the equality assertion below.
+    if "_sr" in name and name != "fp32_to_bf16_sr_global_offsets":
         return
 
     # Every other recipe must reproduce the gold bit-for-bit: identical fp32 math + RNE cast (the

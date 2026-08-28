@@ -1521,7 +1521,7 @@ Nvfp4GsSwizzle_DimK_DimMRHT_Gold = QuantCastSingleKernelGold(
 # dither into the fp32 mantissa bits the target format discards, then truncate. fp4 (e2m1) keeps one
 # mantissa bit, so it drops 23 - 1 = 22 bits (vs that reference's 16 for bf16 / 20 for e4m3). The
 # dither is the low 22 bits of a raw `prng.bits` draw -- exactly as the reference does, and matching
-# the repo's other SR golds (sr_bf16_f). SR is unbiased (E[SR(v)] = v), so the round-trip SQNR stays above the same 12 dB floor
+# the repo's other SR golds (sr_bf16_global_f). SR is unbiased (E[SR(v)] = v), so the round-trip SQNR stays above the same 12 dB floor
 # as the RNE gold; the point of SR here is an unbiased grad cast, which the RNE gold cannot give.
 # ---------------------------------------------------------------------------
 def _f32_to_packed_fp4_sr(data_scaled, key):
@@ -1529,7 +1529,7 @@ def _f32_to_packed_fp4_sr(data_scaled, key):
     `_f32_to_packed_fp4`) with STOCHASTIC rounding to the fp4 grid instead of RNE. Adds a uniform
     22-bit dither into the discarded fp32 mantissa field, then truncates (the software-SR trick from
     stochastic_rounding_api's STOCHASTIC `_reference_impl`, drop = 23 - 1 fp4 mantissa bit = 22). The
-    dither is the low 22 bits of a raw `prng.bits(key, ...)` draw (same as sr_bf16_f). After the
+    dither is the low 22 bits of a raw `prng.bits(key, ...)` draw (same as sr_bf16_global_f). After the
     add-and-truncate the value already sits on the fp4 normal grid, so the
     f32_to_f4_unpacked RNE below is a no-op for normals (subnormals, |scaled| < 1, double-round -- the
     same approximation the e4m3 SR reference tolerates)."""
@@ -2050,21 +2050,6 @@ def _sr_bf16_dither(x, rand16):
     return xi.view(torch.float32).to(torch.bfloat16)
 
 
-def sr_bf16_f(x, key, **kwargs):
-    """fp32 -> bf16 stochastic rounding, keyed on the TILE-LOCAL element layout.
-
-    `key` is a torch.func._random (stateless counter-based Philox) PRNG key, an explicit input
-    (a REPLICATE aux under flex_tile_map). One uniform is drawn per element in tile-local order,
-    so offsets repeat across tiles and tiling CHANGES the rounding -- NOT tile-invariant, kept
-    as the counterexample. Returns `(out,)`.
-    """
-    assert x.dtype == torch.float32, f"SR bf16 expects fp32 input, got {x.dtype}"
-    # uniform 16-bit dither per element: the low 16 bits of a raw prng.bits draw off the Philox key.
-    bits = prng.bits(key, tuple(x.shape))  # full 32-bit uniform draw per element
-    rand16 = bits & ((1 << 16) - 1)  # keep only the low 16 bits -> uniform int in [0, 2**16)
-    return (_sr_bf16_dither(x, rand16),)
-
-
 def _sr_bf16_unbiased_correctness(
     inputs: Tuple[torch.Tensor, torch.Tensor], outputs: Tuple[torch.Tensor]
 ) -> None:
@@ -2085,23 +2070,15 @@ def _sr_bf16_unbiased_correctness(
 
 def _sr_inputs(M, K):
     # SR asserts fp32 (not bf16) and its correctness_fn checks unbiasedness on a CONSTANT value
-    # strictly between two bf16 grid points (spacing 2**-7 near 1.0). Shared by both SR variants.
+    # strictly between two bf16 grid points (spacing 2**-7 near 1.0).
     x = torch.full((M, K), 1.0 + 0.003, dtype=torch.float32, device="cuda")
     return (x, prng.key(0, device=x.device))
 
 
-SrF32ToBf16 = QuantCastSingleKernelGold(
-    pt_ref_fn=sr_bf16_f,
-    correctness_fn=_sr_bf16_unbiased_correctness,
-    example_input_fn=_sr_inputs,
-    perf_description="",
-)
-
-
 def sr_bf16_global_f(x, key, **kwargs):
     """Tiling-INVARIANT fp32 -> bf16 stochastic rounding: keys the dither on each element's
-    GLOBAL position in the parent tensor, so the draws don't shift with tiling (the tile-invariant
-    counterpart to `sr_bf16_f`, which keys on tile-local order and so is NOT tile-invariant).
+    GLOBAL position in the parent tensor, so the draws don't shift with tiling (keying on
+    tile-local element order instead would make the rounding change with the tiling).
 
     The framework supplies the tile's global origin and row stride via kwargs, read here as
     `global_row`, `global_col`, `num_col`. Each element's global flat index is
@@ -2132,8 +2109,6 @@ def sr_bf16_global_f(x, key, **kwargs):
     return (_sr_bf16_dither(x, rand16),)
 
 
-# same unbiasedness check as SrF32ToBf16 -- the two variants differ only in RNG keying (global
-# position vs tile-local order), not in the SR property each output must satisfy.
 SrF32ToBf16Global = QuantCastSingleKernelGold(
     pt_ref_fn=sr_bf16_global_f,
     correctness_fn=_sr_bf16_unbiased_correctness,
@@ -2188,7 +2163,6 @@ ALL_RECIPES = [
     # RHT
     ("bf16_rht", HadamardRht),
     # stochastic rounding
-    ("fp32_to_bf16_sr", SrF32ToBf16),
     ("fp32_to_bf16_sr_global_offsets", SrF32ToBf16Global),
     # debug (not real recipes)
     ("mxfp8_bias", Mxfp8BiasGold),

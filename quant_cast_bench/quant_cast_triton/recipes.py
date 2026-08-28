@@ -41,7 +41,6 @@ from quant_cast_bench.quant_cast_gold.recipes import (
     QuantCastSingleKernelGold,
     RowwiseFp8Gold,
     RowwisePrecalcGold,
-    SrF32ToBf16,
     SrF32ToBf16Global,
 )
 
@@ -1496,62 +1495,6 @@ NVFP4_BLOCKED_OUTER = QuantCastTritonRecipe.from_gold(
 
 
 # ---------------------------------------------------------------------------
-# Stochastic-rounding fp32 -> bf16 (mirrors sr_bf16_f). SR add-then-truncate: dither the 16
-# mantissa bits fp32->bf16 drops with a uniform 16-bit value, then mask them off. Randomness comes
-# from Triton's own counter-based Philox (`tl.randint4x`), so the draws don't match the reference's
-# torch RNG bit-for-bit -- only the SR *property* (unbiased, lands on the two bracketing bf16 grid
-# points) is well-defined, and that's what the test checks for the *_sr recipes.
-#
-# Philox natively emits 4 int32s per counter, so `randint4x` fills 4*BLOCK contiguous elements from
-# BLOCK counters: element (k*BLOCK + i) in this program's span draws stream r_k at counter i. The
-# counter i = pid*BLOCK + arange(BLOCK) is unique per (program, lane), so every element gets a
-# distinct (counter, stream) pair across the whole grid.
-# ---------------------------------------------------------------------------
-@triton.jit
-def _sr_bf16_kernel(x_ptr, y_ptr, seed_ptr, n_elements, BLOCK: tl.constexpr):
-    seed = tl.load(seed_ptr)  # load the Philox seed on-device (no host sync)
-    pid = tl.program_id(0)
-    counter = pid * BLOCK + tl.arange(0, BLOCK)  # (BLOCK,) unique Philox counter per lane
-    r0, r1, r2, r3 = tl.randint4x(seed, counter)  # 4 independent int32 streams, (BLOCK,) each
-    base = pid * (4 * BLOCK)
-    _sr_bf16_store(x_ptr, y_ptr, base + 0 * BLOCK, r0, n_elements, BLOCK)
-    _sr_bf16_store(x_ptr, y_ptr, base + 1 * BLOCK, r1, n_elements, BLOCK)
-    _sr_bf16_store(x_ptr, y_ptr, base + 2 * BLOCK, r2, n_elements, BLOCK)
-    _sr_bf16_store(x_ptr, y_ptr, base + 3 * BLOCK, r3, n_elements, BLOCK)
-
-
-@triton.jit
-def _sr_bf16_store(x_ptr, y_ptr, offs0, rand, n_elements, BLOCK: tl.constexpr):
-    offs = offs0 + tl.arange(0, BLOCK)
-    mask = offs < n_elements
-    xi = tl.load(x_ptr + offs, mask=mask).to(tl.int32, bitcast=True)
-    rand16 = (rand & 0xFFFF).to(tl.int32)  # uniform 16-bit dither in [0, 2**16); randint4x is uint32
-    xi = (xi + rand16) & -65536  # add dither, then truncate the low 16 mantissa bits (0xFFFF0000)
-    y = xi.to(tl.float32, bitcast=True).to(tl.bfloat16)  # exact: low 16 bits are zero
-    tl.store(y_ptr + offs, y, mask=mask)
-
-
-def sr_bf16_triton(x, key, **kwargs):
-    """Matches sr_bf16_f: fp32 -> bf16 stochastic rounding. `key` is a Philox key tensor; its first
-    32-bit word seeds Triton's `tl.randint4x`, loaded on-device (no host sync). Returns `(out,)`."""
-    assert x.dtype == torch.float32, f"SR bf16 expects fp32 input, got {x.dtype}"
-    assert x.is_contiguous()
-    out = torch.empty_like(x, dtype=torch.bfloat16)
-    n = x.numel()
-    seed = key.reshape(-1)[:1].view(torch.int32)  # first 32 bits of the key, stays on-device
-    BLOCK = 1024
-
-    def grid(meta):
-        return (triton.cdiv(n, 4 * meta["BLOCK"]),)
-
-    _sr_bf16_kernel[grid](x, out, seed, n, BLOCK=BLOCK)
-    return (out,)
-
-
-SR_F32_TO_BF16 = QuantCastTritonRecipe.from_gold(SrF32ToBf16, triton_fn=sr_bf16_triton)
-
-
-# ---------------------------------------------------------------------------
 # 16x16 randomized Hadamard transform (bf16 in, bf16 out, no scale). Mirrors hadamard_rht_f:
 # reshape the last dim into groups of 16 and right-multiply each group by the 16x16 RHT matrix
 # (`out = x.reshape(..., 16) @ rht`). The RHT matrix is an explicit input (built once on the host);
@@ -1593,15 +1536,15 @@ BF16_RHT = QuantCastTritonRecipe.from_gold(HadamardRht, triton_fn=rht_triton)
 
 
 # ---------------------------------------------------------------------------
-# Tiling-INVARIANT stochastic-rounding fp32 -> bf16 (the tile-invariant counterpart of the kernel
-# above, mirroring sr_bf16_global_f). The gold recipe keys the dither on each element's GLOBAL index
-# so the draws don't shift with tiling; under flex_tile_map it's told the tile's origin/stride
-# (global_row/global_col/num_col) to reconstruct that index from a sub-tile. A standalone Triton
-# kernel needs none of that: it receives the whole tensor and owns its own blocking, so an element's
-# global index is just its flat position `f` in `x`. We key Philox on `counter = f >> 2` -- so the
-# result is invariant to the internal block size (change BLOCK and every element still draws the
-# same dither), which is the meaningful sense of "tile-invariant" here. Contrast the tile-LOCAL
-# kernel above, whose counter (`pid*BLOCK + lane`) shifts with the block size.
+# Tiling-INVARIANT stochastic-rounding fp32 -> bf16 (mirroring sr_bf16_global_f). SR add-then-truncate:
+# dither the 16 mantissa bits fp32->bf16 drops with a uniform 16-bit value, then mask them off. The
+# gold recipe keys the dither on each element's GLOBAL index so the draws don't shift with tiling;
+# under flex_tile_map it's told the tile's origin/stride (global_row/global_col/num_col) to reconstruct
+# that index from a sub-tile. A standalone Triton kernel needs none of that: it receives the whole
+# tensor and owns its own blocking, so an element's global index is just its flat position `f` in `x`.
+# We key Philox on `counter = f >> 2` -- so the result is invariant to the internal block size (change
+# BLOCK and every element still draws the same dither), which is the meaningful sense of
+# "tile-invariant" here, and it bit-matches the gold (same single-seed Philox stream).
 #
 # `counter = f >> 2` lets one Philox counter serve 4 consecutive elements via randint4x's 4 streams
 # (Philox runs once per 4 elements). The 4 streams are interleaved back into the contiguous element
@@ -1631,8 +1574,8 @@ def _sr_bf16_global_kernel(x_ptr, y_ptr, seed_ptr, n_elements, BLOCK: tl.constex
 
 
 def sr_bf16_global_triton(x, key, **kwargs):
-    """Tiling-invariant fp32 -> bf16 stochastic rounding (the tile-invariant counterpart of
-    `sr_bf16_triton`). Keys Philox on each element's global flat index, so the output is invariant to
+    """Tiling-invariant fp32 -> bf16 stochastic rounding (mirrors `sr_bf16_global_f`).
+    Keys Philox on each element's global flat index, so the output is invariant to
     the internal block size -- no `global_row`/`global_col`/`num_col` needed (those are flex_tile_map
     artifacts; Triton owns its own tiling). No materialized key/uniform tensors. Returns `(out,)`."""
     assert x.dtype == torch.float32, f"SR bf16 expects fp32 input, got {x.dtype}"
@@ -1693,6 +1636,5 @@ ALL_RECIPES = [
     # RHT
     ("bf16_rht", BF16_RHT),
     # stochastic rounding
-    ("fp32_to_bf16_sr", SR_F32_TO_BF16),
     ("fp32_to_bf16_sr_global_offsets", SR_F32_TO_BF16_GLOBAL),
 ]

@@ -31,7 +31,6 @@ from quant_cast_bench.flex_tile_map.recipes import (
     MXFP8,
     MXFP8_SWIZZLE,
     RECIPES_V2,
-    SR_BF16,
     SR_BF16_GLOBAL,
 )
 from quant_cast_bench.quant_cast_gold.recipes import (
@@ -106,12 +105,10 @@ def test_flex_tile_map_backends_keep_numerics(name, recipe):
     # exactly via qdata_and_scale_equal (packed fp4 and e8m0 scales via their uint8 view; everything else --
     # fp8_e4m3, fp32, 4D swizzle grids -- as a bit-exact fp32 compare).
     #
-    # the SR recipes are skipped here; both keep their INDUCTOR-vs-MANUAL_TILE behavior in
-    # dedicated tests. sr_bf16 is the NON-tile-invariant counterexample (dither keyed on
-    # tile-local order, so MANUAL_TILE != INDUCTOR by design -- test_sr_bf16_tiling_changes_rounding).
+    # the SR recipe is skipped here; it keeps its INDUCTOR-vs-MANUAL_TILE behavior in a dedicated test.
     # sr_bf16_global IS tile-invariant (keyed on global position); that equality is asserted by
-    # test_sr_bf16_global_tiling_invariant, so it's skipped here too rather than duplicated.
-    if name in ("fp32_to_bf16_sr", "fp32_to_bf16_sr_global_offsets"):
+    # test_sr_bf16_global_tiling_invariant, so it's skipped here rather than duplicated.
+    if name == "fp32_to_bf16_sr_global_offsets":
         pytest.skip(f"{name}: INDUCTOR-vs-MANUAL_TILE behavior is covered by a dedicated SR test")
 
     torch.manual_seed(0)
@@ -384,26 +381,9 @@ def test_pad_matches_manual_pad():
     assert torch.equal(scale, scale_ref)
 
 
-def test_sr_bf16_tiling_changes_rounding():
-    # documents the accepted non-invariance: INDUCTOR vs MANUAL_TILE differ bit-for-bit
-    # (tile-local offsets repeat), yet both stay unbiased (mean ~= input).
-    torch.manual_seed(0)
-    inputs = SR_BF16.example_input_fn(512, 512)  # (x, key); x is the fp32 constant
-    x, aux = inputs[0], inputs[1:]
-    v = x.flatten()[0].item()
-
-    kw = dict(aux_inputs=aux, aux_kinds=SR_BF16.aux_kinds)
-    (out_ref,) = flex_tile_map(x, SR_BF16.pt_ref_fn, _backend=FlexTileMapBackend.INDUCTOR, **kw)
-    (out_tile,) = flex_tile_map(x, SR_BF16.pt_ref_fn, _backend=FlexTileMapBackend.MANUAL_TILE, **kw)
-
-    assert not torch.equal(out_ref, out_tile)
-    assert abs(out_ref.float().mean().item() - v) < 2e-3
-    assert abs(out_tile.float().mean().item() - v) < 2e-3
-
-
 def test_sr_bf16_global_tiling_invariant():
     # the tiling-invariant SR: keyed on GLOBAL element position, so INDUCTOR == MANUAL_TILE
-    # bit-for-bit (contrast test_sr_bf16_tiling_changes_rounding, which uses the tile-local key).
+    # bit-for-bit (keying on tile-local order instead would make MANUAL_TILE differ from INDUCTOR).
     torch.manual_seed(0)
     inputs = SR_BF16_GLOBAL.example_input_fn(512, 512)  # (x, key); x is the fp32 constant
     x, aux = inputs[0], inputs[1:]

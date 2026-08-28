@@ -46,7 +46,6 @@ from quant_cast_bench.quant_cast_gold.recipes import (
     QuantCastSingleKernelGold,
     RowwiseFp8Gold,
     RowwisePrecalcGold,
-    SrF32ToBf16,
     SrF32ToBf16Global,
 )
 
@@ -2546,7 +2545,7 @@ BF16_RHT = QuantCastCuteRecipe.from_gold(HadamardRht, cute_fn=rht_cute)
 
 
 # ---------------------------------------------------------------------------
-# Stochastic-rounding fp32 -> bf16 (mirrors sr_bf16_f). SR add-then-truncate: dither the 16 mantissa
+# Stochastic-rounding fp32 -> bf16 (mirrors sr_bf16_global_f). SR add-then-truncate: dither the 16 mantissa
 # bits fp32->bf16 drops with a uniform 16-bit value, then mask them off (& 0xFFFF0000); the low bits
 # are then zero so f32->bf16 is an exact truncation. bf16 shares fp32's 8-bit exponent, so this is
 # the simplest SR target -- no exponent rebias, no packing, no scale.
@@ -2558,8 +2557,7 @@ BF16_RHT = QuantCastCuteRecipe.from_gold(HadamardRht, cute_fn=rht_cute)
 # SR kernel: counter = (flat index // 4), and the four outputs feed the four consecutive elements of
 # that group in straight order (element 4c+lane <- philox(seed, c)[lane]), each dithered by its LOW 16
 # bits. That is bit-identical to the gold `sr_bf16_global_f` (`prng.bits(key, n)[gidx] & 0xFFFF`) and
-# the Triton global kernel, so the `fp32_to_bf16_sr_global_offsets` recipe bit-matches the gold (the
-# TILE-LOCAL `sr_bf16_f` gold does not -- it keys on tile order, so only its SR *property* is checked).
+# the Triton global kernel, so the `fp32_to_bf16_sr_global_offsets` recipe bit-matches the gold.
 # One Philox call per 4 elements amortizes the 10-round mix. E[SR(x)] = x holds (mean error ~1e-5 vs
 # the 1e-3 tolerance on the 512x512 constant-input test).
 #
@@ -2668,9 +2666,13 @@ def _sr_bf16_jit(mX, mY, mSeed):
         grid=[cute.size(gX, mode=[1]), 1, 1], block=[cute.size(tv_layout, mode=[0]), 1, 1])
 
 
-def sr_bf16_cute(x, key, **kwargs):
-    """Matches sr_bf16_f: fp32 -> bf16 stochastic rounding. `key` is a Philox key tensor; its first
-    32-bit word seeds the in-kernel fmix32 dither (loaded on-device, no host sync). Returns `(out,)`."""
+def sr_bf16_global_cute(x, key, **kwargs):
+    """Tiling-invariant fp32 -> bf16 stochastic rounding (mirrors sr_bf16_global_f). The kernel keys
+    Philox on each element's GLOBAL flat index (counter = f>>2, stream = f&3 -- see `p0 = thrC[0][0]`
+    and `ctr = p0//4 + g`), so it's tile-invariant AND bit-matches the gold. `key` is a Philox key
+    tensor; its first 32-bit word seeds the in-kernel dither (loaded on-device, no host sync).
+    `global_row`/`global_col`/`num_col` are flex_tile_map artifacts a standalone kernel that owns its
+    own tiling doesn't need. Returns `(out,)`."""
     assert x.dtype == torch.float32, f"SR bf16 expects fp32 input, got {x.dtype}"
     assert x.is_contiguous() and x.dim() == 2
     assert _SR_VPT % 4 == 0, "SR Philox groups 4 elements per call, so VPT must be a multiple of 4"
@@ -2685,31 +2687,6 @@ def sr_bf16_cute(x, key, **kwargs):
     fn = _compiled(("sr_bf16", M, N), _sr_bf16_jit, mX, mY, mSeed)
     fn(mX, mY, mSeed)
     return (y,)
-
-
-SR_F32_TO_BF16 = QuantCastCuteRecipe.from_gold(SrF32ToBf16, cute_fn=sr_bf16_cute)
-
-
-# ---------------------------------------------------------------------------
-# Tiling-INVARIANT fp32 -> bf16 stochastic rounding (mirrors sr_bf16_global_f). The gold SR pair
-# differs ONLY in RNG keying: sr_bf16_f keys the dither on the TILE-LOCAL element order (so tiling
-# changes the rounding -- the deliberate counterexample), while sr_bf16_global_f keys on each
-# element's GLOBAL flat index (tile-invariant). The Triton pair writes two distinct kernels: its plain
-# kernel keys on `pid*BLOCK + lane` (tile-local) and its global kernel on `f>>2` (global).
-#
-# The CuTeDSL SR kernel above is built on cute.make_identity_tensor global coordinates, so it ALREADY
-# keys Philox on each element's global flat index f (counter = f>>2, stream = f&3 -- see `p0 =
-# thrC[0][0]` and `ctr = p0//4 + g`), independent of _SR_THREADS/_SR_VPT. That is exactly the
-# tile-invariant "global offsets" scheme, so the global recipe reuses the same kernel: there is no
-# separate tile-local cute kernel to contrast against (the plain cute recipe is already global-keyed),
-# and duplicating the code would add nothing. `global_row`/`global_col`/`num_col` are flex_tile_map
-# artifacts a standalone kernel that owns its own tiling doesn't need.
-# ---------------------------------------------------------------------------
-def sr_bf16_global_cute(x, key, **kwargs):
-    """Tiling-invariant fp32 -> bf16 stochastic rounding (mirrors sr_bf16_global_f). The cute SR kernel
-    keys Philox on each element's global flat index (counter = f>>2, stream = f&3), which is already
-    tile-invariant, so this shares `sr_bf16_cute`'s kernel. Returns `(out,)`."""
-    return sr_bf16_cute(x, key, **kwargs)
 
 
 SR_F32_TO_BF16_GLOBAL = QuantCastCuteRecipe.from_gold(
@@ -2746,6 +2723,5 @@ ALL_RECIPES = [
     # RHT
     ("bf16_rht", BF16_RHT),
     # stochastic rounding
-    ("fp32_to_bf16_sr", SR_F32_TO_BF16),
     ("fp32_to_bf16_sr_global_offsets", SR_F32_TO_BF16_GLOBAL),
 ]
