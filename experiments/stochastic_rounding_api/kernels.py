@@ -12,11 +12,13 @@ tiling (block size):
     then uses the Blackwell `cvt.rn.satfinite.e2m1x2.f32` intrinsic (like the repo's `_nvfp4_kernel`),
     so it needs cuda capability (10, 0). Round-to-nearest cvt on the already-SR'd grid points, so the
     stochastic rounding is still fully in software.
-  * `_sr_bf16_hardware_kernel` / `_sr_fp8_hardware_kernel` -- hardware SR via the Blackwell-only PTX
-    intrinsics `cvt.rs.bf16x2.f32` / `cvt.rs.satfinite.e4m3x4.f32`, inlined with
-    `tl.inline_asm_elementwise`. The rounding happens inside the instruction (it adds `rbits` to the
-    truncated mantissa bits and rounds on the carry-out), so it is faster but NOT reproducible from
-    eager PyTorch. Requires cuda capability (10, 0).
+  * `_sr_bf16_hardware_kernel` / `_sr_fp8_hardware_kernel` / `_sr_fp4_hardware_kernel` -- hardware SR
+    via the Blackwell-only PTX intrinsics `cvt.rs.bf16x2.f32` / `cvt.rs.satfinite.e4m3x4.f32` /
+    `cvt.rs.satfinite.e2m1x4.f32`, inlined with `tl.inline_asm_elementwise`. The rounding happens
+    inside the instruction (it adds `rbits` to the truncated mantissa bits and rounds on the
+    carry-out), so it is faster but NOT reproducible from eager PyTorch. Requires cuda capability
+    (10, 0). (The eager reference in api.py still bit-matches them via the reverse-engineered
+    random-bit layout in experiments/nvidia_rs_bit_probe.)
 
 All take the Philox `seed` as an on-device int32 tensor (no host sync); `api.py` resolves a
 key down to that seed. Randomness is `tl.randint4x`, which returns four independent uint32
@@ -278,3 +280,60 @@ def sr_fp8_hardware_triton(x, seed, block=1024):
     grid = (triton.cdiv(n, block),)  # block = input elements per program
     _sr_fp8_hardware_kernel[grid](x, out_i32, seed, num_groups, BLOCK=block)
     return out_i32.view(torch.float8_e4m3fn).reshape(x.shape)
+
+
+# --- hardware SR for float4_e2m1fn_x2: copy of nvidia_rs_demo/api.py `_rs_quad16_kernel` for e2m1 -
+# The `cvt.rs.satfinite.e2m1x4.f32` intrinsic converts 4 f32 lanes -> one b16 (four packed e2m1
+# nibbles), consuming one 32-bit `rbits` word. Unlike the fp8 x4 form the packed result is only 16
+# bits wide, so the output register is `.b16` (constraint `=h`, int16 out). The rounding happens
+# inside the instruction (add the lane's random slice to the discarded mantissa, round on carry-out),
+# and the fp4 grid saturates at +-6 (`.satfinite`). Blackwell-only. The stored two bytes per group
+# hold the 4 nibbles in element order [base+0, base+1, base+2, base+3] -> two codes per byte, even
+# element in the low nibble (matches gold `pack_uint4`).
+@triton.jit
+def _sr_fp4_hardware_kernel(x_ptr, y_ptr, seed_ptr, num_groups, BLOCK: tl.constexpr):
+    # BLOCK = input f32 elements per program. Each group is 4 elements needing one 32-bit rbits
+    # word, and randint4x yields 4 words per counter, so this program needs:
+    #     groups   = BLOCK // 4
+    #     counters = groups // 4 = BLOCK // 16  (one randint4x call each, all 4 words used)
+    seed = tl.load(seed_ptr)  # Philox seed, on-device (no host sync)
+    pid = tl.program_id(0)
+    ctr = pid * (BLOCK // 16) + tl.arange(0, BLOCK // 16)  # unique Philox counters for this program
+    r0, r1, r2, r3 = tl.randint4x(seed, ctr)               # 4 words per counter, (BLOCK//16,) each
+    # interleave lays the words down so 4 consecutive groups take one counter's 4 words: no word is
+    # recomputed and none discarded. Element f -> group f>>2 -> counter f>>4 (independent of BLOCK).
+    rbits = tl.interleave(tl.interleave(r0, r1), tl.interleave(r2, r3))  # (BLOCK//4,) one word/group
+    g = pid * (BLOCK // 4) + tl.arange(0, BLOCK // 4)       # group index (each group = 4 elements)
+    mask = g < num_groups
+    base = g * 4
+    # e2m1x4 packs {$1,$2,$3,$4} with $1 in the HIGH nibble, so a little-endian view of the b16 output
+    # is [$4,$3,$2,$1]. Load the 4 lanes reversed so the stored quad comes out in element order
+    # [base+0, base+1, base+2, base+3] (byte 0 = elements base+0/base+1, byte 1 = base+2/base+3).
+    a = tl.load(x_ptr + base + 3, mask=mask)
+    b = tl.load(x_ptr + base + 2, mask=mask)
+    c = tl.load(x_ptr + base + 1, mask=mask)
+    d = tl.load(x_ptr + base + 0, mask=mask)
+    q = tl.inline_asm_elementwise(
+        asm="cvt.rs.satfinite.e2m1x4.f32 $0, {$1, $2, $3, $4}, $5;",
+        constraints="=h,f,f,f,f,r", args=[a, b, c, d, rbits],
+        dtype=tl.int16, is_pure=True, pack=1,
+    )
+    tl.store(y_ptr + g, q, mask=mask)
+
+
+def sr_fp4_hardware_triton(x, seed, block=1024):
+    """Tiling-invariant hardware fp32 -> float4_e2m1fn_x2 (packed nvfp4) stochastic rounding via
+    `cvt.rs.satfinite.e2m1x4.f32`. Blackwell-only (the caller must gate on cuda capability). `seed`
+    is an on-device int32 tensor. Output is packed two codes per byte (last dim halves; it must be
+    even)."""
+    assert x.dtype == torch.float32 and x.is_contiguous()
+    n = x.numel()
+    assert n % 4 == 0, "e2m1x4 needs an element count divisible by 4"
+    assert x.shape[-1] % 2 == 0, "fp4 packs 2 codes per byte; the last dim must be even"
+    shape = x.shape
+    x = x.reshape(-1)
+    num_groups = n // 4
+    out_i16 = torch.empty(num_groups, dtype=torch.int16, device=x.device)  # 2 bytes = 4 nibbles/group
+    grid = (triton.cdiv(n, block),)  # block = input elements per program
+    _sr_fp4_hardware_kernel[grid](x, out_i16, seed, num_groups, BLOCK=block)
+    return out_i16.view(torch.uint8).view(torch.float4_e2m1fn_x2).reshape(*shape[:-1], shape[-1] // 2)

@@ -6,6 +6,7 @@ import torch.func._random as prng
 from kernels import (
     sr_bf16_hardware_triton,
     sr_bf16_software_triton,
+    sr_fp4_hardware_triton,
     sr_fp4_software_triton,
     sr_fp8_hardware_triton,
     sr_fp8_software_triton,
@@ -21,6 +22,59 @@ class Rounding(StrEnum):
     STOCHASTIC_NVIDIA_SM100 = "stochastic-nvidia-sm100"
 
 
+def _rs_satfinite_x4_round(flat, R, *, maxval, mbits, exp_bias):
+    """Shared eager model of the `.rs` carry-round used by both satfinite x4 cvt intrinsics
+    (`cvt.rs.satfinite.e4m3x4.f32` for fp8_e4m3, `cvt.rs.satfinite.e2m1x4.f32` for fp4 e2m1). Given
+    the fp32 tensor `flat` and its per-element 16-bit random slice `R` (already laid out by the
+    caller from the shared 32-bit Philox word), returns the stochastically-rounded value ON THE fp32
+    GRID of the target format -- the caller does the final dtype encode (fp8 casts, fp4 packs e2m1).
+
+    The formats differ only in three e-format constants, so the whole numeric core is parametrized:
+      * maxval    -- satfinite saturation magnitude (fp8: 448, fp4: 6).
+      * mbits     -- kept mantissa bits -> normals discard drop = 23 - mbits fp32 mantissa bits
+                     (fp8: 3 -> 20, fp4: 1 -> 22).
+      * exp_bias  -- format exponent bias -> min normal unbiased exponent E_min = 1 - exp_bias
+                     (fp8: 7 -> -6, fp4: 1 -> 0) and subnormal ulp = 2^(E_min - mbits)
+                     (fp8: 2^-9, fp4: 2^-1).
+
+    The .rs rule is add-dither-then-truncate with a carry-out round-up, but with a discarded-field
+    width D chosen so truncation lands exactly on the target grid: normals discard `drop` bits, and
+    each binade below E_min needs one more -> D(E) = drop + max(0, E_min - E). R aligns to the TOP of
+    the D-bit field (<< D-16), so round-up is the carry out of bit D. This is exact while D <= 23
+    (|x| >= subnormal_ulp). The bottom bin |x| < subnormal_ulp rounds between 0 and subnormal_ulp,
+    which is not a mantissa truncation (0 needs a zero exponent), so it's a direct frac compare.
+    Out-of-range magnitudes saturate to +-maxval (satfinite)."""
+    e_min = 1 - exp_bias
+    drop = 23 - mbits
+    sub_ulp = 2.0 ** (e_min - mbits)
+
+    # the intrinsic is satfinite, so we clamp to the max representable magnitude first
+    flat_c = flat.clamp(-maxval, maxval)
+
+    # fp32 exponent of |x|: decides whether the value is normal or subnormal in the target encoding
+    E = ((flat_c.abs().view(torch.int32).to(torch.int64) >> 23) & 0xFF) - 127
+
+    # exponent-dependent drop width freezes the truncation grid at the subnormal ulp for the
+    # subnormal binades (spacing = 2^(E-23+D)); cap to a valid shift/mask width (D>23 only for the
+    # bottom bin, which is overridden below)
+    D = drop + (e_min - E).clamp(min=0)
+    Dc = D.clamp(max=23)
+
+    # add-dither-truncate in int64 (avoids overflow in the negative mask arithmetic and the shifts)
+    xbits = flat_c.view(torch.int32).to(torch.int64)
+    xi = (xbits + (R.to(torch.int64) << (Dc - 16))) & -(torch.ones_like(Dc) << Dc)
+    out = xi.to(torch.int32).view(torch.float32)  # on the target grid for |x| >= subnormal_ulp
+
+    # bottom bin |x| < subnormal_ulp: neighbors are 0 and subnormal_ulp, frac = |x| / subnormal_ulp;
+    # round away from zero on frac + R/2^16 >= 1
+    ax = flat.abs().double()
+    promote = ax / sub_ulp + R / (1 << 16) >= 1.0
+    bottom = torch.sign(flat).double() * torch.where(
+        promote, torch.full_like(ax, sub_ulp), torch.zeros_like(ax)
+    )
+    return torch.where(ax < sub_ulp, bottom.to(torch.float32), out)
+
+
 def to(
     x: torch.Tensor, 
     dtype: torch.dtype, 
@@ -33,9 +87,10 @@ def to(
 
     As this is a POC, input must be fp32 and output is bfloat16, float8_e4m3fn, or
     float4_e2m1fn_x2 (packed nvfp4, two e2m1 codes per byte -- the last dim halves, and it must be
-    even). fp4 is STOCHASTIC-only (there is no `.to()` fp4 cast for RTNE and no cvt.rs fp4 intrinsic),
-    and its software-SR kernel packs with the Blackwell cvt.rn.satfinite.e2m1x2.f32, so it needs
-    cuda capability (10, 0) -- unlike the portable bf16/fp8 software-SR kernels.
+    even). fp4 is stochastic-only (there is no `.to()` fp4 cast for RTNE), and both fp4 SR paths use a
+    Blackwell e2m1 cvt intrinsic (software SR packs with cvt.rn.satfinite.e2m1x2.f32, hardware SR
+    rounds with cvt.rs.satfinite.e2m1x4.f32), so fp4 needs cuda capability (10, 0) -- unlike the
+    portable bf16/fp8 software-SR kernels.
 
     Examples::
 
@@ -45,6 +100,7 @@ def to(
         to(x, torch.float4_e2m1fn_x2, rounding=Rounding.STOCHASTIC, key=k)          # software SR, fp4
         to(x, torch.bfloat16, rounding=Rounding.STOCHASTIC_NVIDIA_SM100, key=k)     # hardware SR
         to(x, torch.float8_e4m3fn, rounding=Rounding.STOCHASTIC_NVIDIA_SM100, key=k) # hardware SR, fp8
+        to(x, torch.float4_e2m1fn_x2, rounding=Rounding.STOCHASTIC_NVIDIA_SM100, key=k) # hardware SR, fp4
 
     Rounding modes:
       * RTNE -- round-to-nearest-even
@@ -52,8 +108,9 @@ def to(
                     requires a torch build with torch.func._random.bits. Backed by
                     a triton kernel.
       * STOCHASTIC_NVIDIA_SM100  -- stochastic rounding in hardware via the
-                    NVIDIA Blackwell PTX intrinsics `cvt.rs.bf16x2.f32` (bf16) and
-                    `cvt.rs.satfinite.e4m3x4.f32` (fp8). Backed by a triton kernel.
+                    NVIDIA Blackwell PTX intrinsics `cvt.rs.bf16x2.f32` (bf16),
+                    `cvt.rs.satfinite.e4m3x4.f32` (fp8) and `cvt.rs.satfinite.e2m1x4.f32`
+                    (fp4). Backed by a triton kernel.
 
     Randomness source (required for the two stochastic modes):
       * key= -- a `torch.func._random` Philox key tensor.
@@ -65,10 +122,12 @@ def to(
         f"only bfloat16 / float8_e4m3fn / float4_e2m1fn_x2 output supported for now, got {dtype}"
     )
     # float4_e2m1fn_x2 (packed nvfp4) is stochastic-only: there is no direct `.to()` fp4 cast for RTNE
-    # and no cvt.rs fp4 intrinsic for the hardware path -- only the software SR kernel supports it.
-    if dtype == torch.float4_e2m1fn_x2 and rounding != Rounding.STOCHASTIC:
+    # (both SR modes encode e2m1 explicitly instead). Software SR packs with cvt.rn.satfinite.e2m1x2.f32
+    # and hardware SR rounds with cvt.rs.satfinite.e2m1x4.f32 -- both need cuda capability (10, 0).
+    if dtype == torch.float4_e2m1fn_x2 and rounding == Rounding.RTNE:
         raise NotImplementedError(
-            f"float4_e2m1fn_x2 output only supports rounding='{Rounding.STOCHASTIC}', not '{rounding}'"
+            f"float4_e2m1fn_x2 output has no RTNE cast; use rounding='{Rounding.STOCHASTIC}' or "
+            f"'{Rounding.STOCHASTIC_NVIDIA_SM100}'"
         )
 
     if rounding == Rounding.RTNE:
@@ -128,24 +187,30 @@ def to(
         if _reference_impl:
             # Bit-exact eager model of the cvt.rs.* intrinsic (matches the hardware kernel). Each
             # kernel feeds one 32-bit Philox word W per group (2 elements for cvt.rs.bf16x2.f32, 4 for
-            # cvt.rs.satfinite.e4m3x4.f32) and the intrinsic hands each element a 16-bit slice of W,
-            # reverse-engineered in experiments/nvidia_rs_bit_probe:
+            # the x4 forms cvt.rs.satfinite.e4m3x4.f32 / .e2m1x4.f32) and the intrinsic hands each
+            # element a 16-bit slice of W, reverse-engineered in experiments/nvidia_rs_bit_probe:
             #   bf16x2:  element base+0 <- W[0:15]            element base+1 <- W[16:31]
             #   e4m3x4:  element base+0 <- W[0:15]            element base+2 <- W[16:31]
             #            element base+1 <- reverse(W[0:15])   element base+3 <- reverse(W[16:31])
-            # (bf16 reads its two halves in natural weight order; fp8 packs 4 elements into the same
-            # word by reusing each half twice, once bit-reversed.) Both dtypes then use the SAME .rs
-            # carry rule -- add the 16-bit dither R to the discarded mantissa field, round up on the
-            # carry-out -- but with a discarded-field width D that lands truncation exactly on the
-            # target grid: bf16 has a fixed D=16 (a plain add-and-truncate), while fp8 varies D per
-            # element so it stays grid-correct for subnormals too (see the fp8 block). Both
+            #   e2m1x4:  same two-lanes-share-a-slice pattern, but the slices are byte-interleaved
+            #            instead of contiguous 16-bit halves (fp4's probe finding). With bytes
+            #            b0=W[0:7], b1=W[8:15], b2=W[16:23], b3=W[24:31] and rev() a per-byte
+            #            bit-reverse, the four elements read:
+            #              base+0 <- (b2<<8)|b0            base+2 <- (b3<<8)|b1
+            #              base+1 <- (rev b0<<8)|rev b2    base+3 <- (rev b1<<8)|rev b3
+            # (bf16 reads its two halves in natural weight order; the x4 forms pack 4 elements into the
+            # same word by reusing each slice twice, once bit-reversed.) All dtypes then use the SAME
+            # .rs carry rule -- add the 16-bit dither R to the discarded mantissa field, round up on
+            # the carry-out -- but with a discarded-field width D that lands truncation exactly on the
+            # target grid: bf16 has a fixed D=16 (a plain add-and-truncate), while fp8/fp4 vary D per
+            # element so they stay grid-correct for subnormals too (see the fp8/fp4 blocks). All
             # kernels lay the 4 words of Philox counter c across groups
             # 4c,4c+2,4c+1,4c+3 (perm [0,2,1,3] within each block of 4 groups, from their shared
             # interleave(interleave(r0,r1),interleave(r2,r3))), so we index the words the same way.
 
             # get the correct number of 32-bit words of randomness
             flat = x.contiguous().reshape(-1)
-            per_group = 2 if dtype == torch.bfloat16 else 4
+            per_group = 2 if dtype == torch.bfloat16 else 4  # fp8/fp4 x4 both group 4 elements
             assert flat.numel() % per_group == 0, f"{dtype} SR needs numel divisible by {per_group}"
             groups = flat.numel() // per_group
             n_words = ((groups + 3) // 4) * 4  # round up to a whole Philox counter (4 words each)
@@ -158,13 +223,25 @@ def to(
 
             # reverse engineer the NVIDIA implementation of mapping the 32 bits 
             # of randomness to the inputs of `cvt.rs.bf16x2.f32` and `cvt.rs.satfinite.e4m3x4.f32`
-            low, high = W & 0xFFFF, (W >> 16) & 0xFFFF
-            if dtype == torch.bfloat16:
-                R = torch.stack([low, high], dim=1).reshape(-1).double()  # per element, natural order
+            if dtype == torch.float4_e2m1fn_x2:
+                # fp4 slices are byte-interleaved (see the layout comment). Split W into bytes, and
+                # reverse the bits of a byte for the two lanes that read a slice bit-reversed.
+                b0, b1 = W & 0xFF, (W >> 8) & 0xFF
+                b2, b3 = (W >> 16) & 0xFF, (W >> 24) & 0xFF
+                rev = lambda bb: sum(((bb >> i) & 1) << (7 - i) for i in range(8))  # per-byte reverse
+                r_e0 = (b2 << 8) | b0                    # element base+0: bytes 2&0, natural
+                r_e1 = (rev(b0) << 8) | rev(b2)          # element base+1: bytes 0&2, bit-reversed
+                r_e2 = (b3 << 8) | b1                    # element base+2: bytes 3&1, natural
+                r_e3 = (rev(b1) << 8) | rev(b3)          # element base+3: bytes 1&3, bit-reversed
+                R = torch.stack([r_e0, r_e1, r_e2, r_e3], dim=1).reshape(-1).double()
             else:
-                low_rev = sum(((low >> i) & 1) << (15 - i) for i in range(16))    # bit-reverse low 16
-                high_rev = sum(((high >> i) & 1) << (15 - i) for i in range(16))  # bit-reverse high 16
-                R = torch.stack([low, low_rev, high, high_rev], dim=1).reshape(-1).double()
+                low, high = W & 0xFFFF, (W >> 16) & 0xFFFF
+                if dtype == torch.bfloat16:
+                    R = torch.stack([low, high], dim=1).reshape(-1).double()  # per element, natural
+                else:
+                    low_rev = sum(((low >> i) & 1) << (15 - i) for i in range(16))    # reverse low 16
+                    high_rev = sum(((high >> i) & 1) << (15 - i) for i in range(16))  # reverse high 16
+                    R = torch.stack([low, low_rev, high, high_rev], dim=1).reshape(-1).double()
 
             # rounding logic that consumes the per-element 16-bit random slice R
             if dtype == torch.bfloat16:
@@ -176,52 +253,23 @@ def to(
                 xi = (flat.view(torch.int32) + R.to(torch.int32)) & -(1 << 16)
                 return xi.view(torch.float32).to(torch.bfloat16).reshape(x.shape)
 
-            else:
-                assert dtype == torch.float8_e4m3fn
-
-                # fp8_e4m3: same add-dither-truncate carry rule as bf16, but a FIXED 20-bit drop is wrong
-                # for subnormals (it truncates onto a too-fine grid, then the cast double-rounds). Make the
-                # drop width exponent-dependent so truncation lands exactly on the true fp8 grid: normals
-                # discard D=20 fp32 mantissa bits, and each binade below the min normal exponent
-                # (E_min=-6) needs one more -> D(E) = 20 + max(0, E_min - E). R aligns to the TOP of the
-                # D-bit field (<< D-16), so round-up is the carry out of bit D. This is exact for
-                # |x| >= 2^-9 (E >= -9 -> D <= 23). The bottom bin |x| < 2^-9 rounds between 0 and 2^-9,
-                # which is not a mantissa truncation (0 needs a zero exponent), so it's a direct frac
-                # compare masked in below. Out-of-range magnitudes saturate to +-448 (satfinite).
-
-                # the intrinsic is satfinite, so we clamp to min/max repr value
-                flat_c = flat.clamp(-448.0, 448.0)
-
-                # get the unbiased fp32 exponent, E decides whether the value will
-                # be normal or subnormal in the float8_e4m3fn encoding
-                E = ((flat_c.abs().view(torch.int32).to(torch.int64) >> 23) & 0xFF) - 127  # fp32 exp of |x|
-
-                # exponent-dependent drop width: incrementing D one bit per binade below E_min
-                # freezes the truncation grid at the fixed 2^-9 subnormal ulp (spacing = 2^(E-23+D)),
-                # which is what makes the dither work correctly for subnormals
-                D = 20 + (-6 - E).clamp(min=0)          # per-element discarded-bit width
-
-                # cap to a valid shift/mask width; D>23 only for |x|<2^-9, which is overridden below
-                Dc = D.clamp(max=23)
-
-                # add-dither-truncate, use int64 to prevent overflow in the negative mask
-                # arithmetic and the shifts
-                xbits = flat_c.view(torch.int32).to(torch.int64)
-                xi = (xbits + (R.to(torch.int64) << (Dc - 16))) & -(torch.ones_like(Dc) << Dc)
-                out = xi.to(torch.int32).view(torch.float32)  # sits exactly on the fp8 grid for |x| >= 2^-9
-
-                # special case numbers next to the zero bin
-                # bottom bin |x| < 2^-9: neighbors are 0 and 2^-9, frac = |x| / 2^-9; round away from zero
-                ax = flat.abs().double()
-                promote = ax * (1 << 9) + R / (1 << 16) >= 1.0  # frac + R/2^16 >= 1
-                bottom = torch.sign(flat).double() * torch.where(promote, torch.full_like(ax, 2.0**-9), torch.zeros_like(ax))
-
-                # combine the truncation path (`out`, |x| >= 2^-9) and the bottom-bin path
-                # (`bottom`, |x| < 2^-9) with a mask
-                out = torch.where(ax < 2.0**-9, bottom.to(torch.float32), out)
-
-                # last round to target dtype, and we're done!
+            elif dtype == torch.float8_e4m3fn:
+                # fp8_e4m3: mantissa=3, exp bias 7 (E_min=-6), saturates at +-448. The exponent-
+                # dependent .rs carry round is the shared model in _rs_satfinite_x4_round; the final
+                # `.to(fp8)` cast is exact on the returned grid points (|x| >= 2^-9 already has <=3
+                # mantissa bits; the bottom bin returns 0 or 2^-9 exactly).
+                out = _rs_satfinite_x4_round(flat, R, maxval=448.0, mbits=3, exp_bias=7)
                 return out.to(dtype).reshape(x.shape)
+
+            else:
+                assert dtype == torch.float4_e2m1fn_x2
+                # fp4 e2m1: mantissa=1, exp bias 1 (E_min=0), saturates at +-6 -- same shared carry
+                # round as fp8, just those three format constants. fp4 has no `.to()` cast, so RNE-encode
+                # the on-grid result to e2m1 codes and pack two per byte (the RNE is a no-op on grid
+                # points), bit-matching the software reference / gold f32_to_f4_unpacked.
+                out = _rs_satfinite_x4_round(flat, R, maxval=6.0, mbits=1, exp_bias=1)
+                packed = pack_uint4(f32_to_f4_unpacked(out)).view(torch.float4_e2m1fn_x2)
+                return packed.reshape(*x.shape[:-1], x.shape[-1] // 2)
         else:
             cap = torch.cuda.get_device_capability() if torch.cuda.is_available() else None
             if cap != (10, 0):
@@ -233,6 +281,8 @@ def to(
             seed = key.reshape(-1)[:1].view(torch.int32)  # on-device int32 seed for the kernel, no sync
             if dtype == torch.bfloat16:
                 return sr_bf16_hardware_triton(x, seed)  # cvt.rs.bf16x2.f32
+            elif dtype == torch.float4_e2m1fn_x2:
+                return sr_fp4_hardware_triton(x, seed)  # cvt.rs.satfinite.e2m1x4.f32
             return sr_fp8_hardware_triton(x, seed)  # cvt.rs.satfinite.e4m3x4.f32
 
     raise ValueError(f"unknown rounding {rounding!r}; expected one of {[r.value for r in Rounding]}")

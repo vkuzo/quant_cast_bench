@@ -7,10 +7,10 @@ Checks, per mode:
                          property), tile-invariant across block sizes, deterministic given a key, and
                          bit-identical to the eager reference (both read the same raw Philox words via
                          prng.bits).
-  * stochastic-nvidia-sm100 -- (Blackwell only, both output dtypes) unbiased/two-neighbor +
+  * stochastic-nvidia-sm100 -- (Blackwell only, all three output dtypes) unbiased/two-neighbor +
                          deterministic. The eager reference is bit-identical to the cvt.rs.bf16x2.f32 /
-                         cvt.rs.satfinite.e4m3x4.f32 kernels (reverse-engineered bit layout). On
-                         non-Blackwell the API raises.
+                         cvt.rs.satfinite.e4m3x4.f32 / cvt.rs.satfinite.e2m1x4.f32 kernels
+                         (reverse-engineered bit layout). On non-Blackwell the API raises.
 
 Run under pytest (`pytest test.py -q`) or directly (`python test.py`).
 """
@@ -136,9 +136,13 @@ def test_stochastic_matches_reference_bitwise(dtype):
     _check_sr(out, x, dtype)  # and is still valid unbiased SR
 
 
-# --- hardware stochastic-nvidia-sm100 (both output dtypes: bf16 via bf16x2, fp8 via e4m3x4) -----
+# --- hardware stochastic-nvidia-sm100 (bf16 via bf16x2, fp8 via e4m3x4, fp4 via e2m1x4) ---------
+# All three are Blackwell-only (the cvt.rs intrinsic), so the whole group is gated on sm100.
+_HW_DTYPES = [torch.bfloat16, torch.float8_e4m3fn, torch.float4_e2m1fn_x2]
+
+
 @pytest.mark.skipif(not (torch.cuda.is_available() and torch.cuda.get_device_capability() == (10, 0)), reason="cvt.rs emits Blackwell-only PTX; requires cuda capability (10, 0)")
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("dtype", _HW_DTYPES)
 def test_stochastic_nvidia_sm100_unbiased_and_deterministic(dtype):
     x = _x()
     out = to(x, dtype, rounding="stochastic-nvidia-sm100", key=_key())
@@ -149,35 +153,37 @@ def test_stochastic_nvidia_sm100_unbiased_and_deterministic(dtype):
 
 
 @pytest.mark.skipif(not (torch.cuda.is_available() and torch.cuda.get_device_capability() == (10, 0)), reason="cvt.rs emits Blackwell-only PTX; requires cuda capability (10, 0)")
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("dtype", _HW_DTYPES)
 def test_stochastic_nvidia_sm100_matches_reference_bitwise(dtype):
     x = _x()
     out = to(x, dtype, rounding="stochastic-nvidia-sm100", key=_key())
     ref = to(x, dtype, rounding="stochastic-nvidia-sm100", key=_key(), _reference_impl=True)
-    # the eager reference reproduces the cvt.rs.bf16x2.f32 / cvt.rs.satfinite.e4m3x4.f32 intrinsic from
+    # the eager reference reproduces the cvt.rs.bf16x2.f32 / .e4m3x4.f32 / .e2m1x4.f32 intrinsic from
     # its reverse-engineered random-bit layout, so it is BIT-IDENTICAL to the hardware kernel (normals
     # AND subnormals), not merely statistically equal.
     assert torch.equal(out.view(torch.uint8), ref.view(torch.uint8))
     _check_sr(out, x, dtype)  # and is still valid unbiased SR
 
 
-# distributions that stress the corners `randn` barely reaches: the fp8 subnormal binades
-# (E in {-7,-8,-9}), the bottom bin |x| < 2^-9 (rounds between 0 and 2^-9), and the satfinite
-# clamp (|x| > 448). Each is where the exponent-dependent drop width / bottom-bin / clamp branches
-# of the eager reference must still match the hardware intrinsic bit-for-bit.
+# distributions that stress the corners `randn` barely reaches: the subnormal binades (fp8 E in
+# {-7,-8,-9}; fp4's single subnormal binade [0.5, 1.0)), the bottom bin (fp8 |x| < 2^-9, fp4
+# |x| < 0.5 -- rounds between 0 and the subnormal ulp), and the satfinite clamp (fp8 |x| > 448, fp4
+# |x| > 6). Each is where the exponent-dependent drop width / bottom-bin / clamp branches of the
+# eager reference must still match the hardware intrinsic bit-for-bit, for whichever dtype is active.
 def _stress_dists(seed):
     g = torch.Generator(device="cuda").manual_seed(seed)
     r = lambda: torch.randn(N, generator=g, dtype=torch.float32, device="cuda")
     return {
         "subnormal": r() * 2.0**-8,                 # heavy in the fp8 subnormal range
-        "bottom_bin": r() * 2.0**-10,               # heavy in |x| < 2^-9 (rounds to 0 or 2^-9)
-        "saturating": r() * 300.0,                  # magnitudes past 448 -> satfinite clamp
+        "bottom_bin": r() * 2.0**-10,               # heavy in fp8 |x| < 2^-9 / fp4 |x| < 0.5 bottom bin
+        "fp4_subnormal": r() * 0.7,                 # centered on fp4's [0.5, 1.0) subnormal binade
+        "saturating": r() * 300.0,                  # magnitudes past 448 (fp8) / 6 (fp4) -> satfinite
         "uniform": (torch.rand(N, generator=g, dtype=torch.float32, device="cuda") * 2 - 1) * 500,
     }
 
 
 @pytest.mark.skipif(not (torch.cuda.is_available() and torch.cuda.get_device_capability() == (10, 0)), reason="cvt.rs emits Blackwell-only PTX; requires cuda capability (10, 0)")
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("dtype", _HW_DTYPES)
 @pytest.mark.parametrize("seed", [0, 1, 2, 3])
 def test_stochastic_nvidia_sm100_matches_reference_bitwise_stress(dtype, seed):
     # the plain bitwise test above uses randn, which rarely produces fp8 subnormals / bottom-bin /
@@ -191,7 +197,7 @@ def test_stochastic_nvidia_sm100_matches_reference_bitwise_stress(dtype, seed):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("dtype", _HW_DTYPES)
 def test_stochastic_nvidia_sm100_gated_off_blackwell(dtype):
     if torch.cuda.is_available() and torch.cuda.get_device_capability() == (10, 0):
         return  # this GPU supports cvt.rs; nothing to gate
