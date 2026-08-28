@@ -2551,17 +2551,17 @@ BF16_RHT = QuantCastCuteRecipe.from_gold(HadamardRht, cute_fn=rht_cute)
 # are then zero so f32->bf16 is an exact truncation. bf16 shares fp32's 8-bit exponent, so this is
 # the simplest SR target -- no exponent rebias, no packing, no scale.
 #
-# RNG: the gold reference draws the dither from torch's Philox and the Triton kernel from its own
-# `tl.randint4x`, so neither bit-matches the other -- only the SR *property* is well-defined (unbiased,
-# every output lands on one of the two bracketing bf16 grid points), and that's all the test checks
-# for the `_sr` recipes. CuTeDSL exposes no counter-based PRNG intrinsic (unlike Triton's
-# `tl.randint4x`), so we implement Philox-4x32-10 by hand (`_philox_4x32`) out of the integer ops the
-# DSL does have -- the same generator Triton/PyTorch use. It's a stateless pure function
-# `(counter, key) -> 4 uniform uint32`, so every thread computes its own draws with no shared state.
-# We key it like Triton's global SR kernel: counter = (flat index // 4), and the four outputs feed the
-# four consecutive elements of that group (top 16 bits each = a uniform dither in [0, 2**16)). One
-# Philox call per 4 elements amortizes the 10-round mix. E[SR(x)] = x holds (mean error ~1e-5 vs the
-# 1e-3 tolerance on the 512x512 constant-input test).
+# RNG: CuTeDSL exposes no counter-based PRNG intrinsic (unlike Triton's `tl.randint4x`), so we
+# implement Philox-4x32-10 by hand (`_philox_4x32`) out of the integer ops the DSL does have -- the
+# same generator Triton/PyTorch use. It's a stateless pure function `(counter, key) -> 4 uniform
+# uint32`, so every thread computes its own draws with no shared state. We key it like Triton's global
+# SR kernel: counter = (flat index // 4), and the four outputs feed the four consecutive elements of
+# that group in straight order (element 4c+lane <- philox(seed, c)[lane]), each dithered by its LOW 16
+# bits. That is bit-identical to the gold `sr_bf16_global_f` (`prng.bits(key, n)[gidx] & 0xFFFF`) and
+# the Triton global kernel, so the `fp32_to_bf16_sr_global_offsets` recipe bit-matches the gold (the
+# TILE-LOCAL `sr_bf16_f` gold does not -- it keys on tile order, so only its SR *property* is checked).
+# One Philox call per 4 elements amortizes the 10-round mix. E[SR(x)] = x holds (mean error ~1e-5 vs
+# the 1e-3 tolerance on the 512x512 constant-input test).
 #
 # It's a pure elementwise streaming cast (read fp32, write bf16, no reduction), so it wants the same
 # DRAM-speed-of-light recipe as fp8_tensorwise: FLATTEN to 1-D, each thread owning a CONTIGUOUS run
@@ -2644,11 +2644,14 @@ def _sr_bf16_kernel(gX: cute.Tensor, gY: cute.Tensor, gSeed: cute.Tensor, cX: cu
             ctr = cutlass.Uint32(p0 // 4) + cutlass.Uint32(g)
             r0, r1, r2, r3 = _philox_4x32(ctr, zero, zero, zero, seed, zero)
             b = g * 4
-            # add the top-16-bit dither, then truncate the low 16 mantissa bits (-65536 == 0xFFFF0000).
-            frgXi[b + 0] = (frgXi[b + 0] + cutlass.Int32(r0 >> 16)) & cutlass.Int32(-65536)
-            frgXi[b + 1] = (frgXi[b + 1] + cutlass.Int32(r1 >> 16)) & cutlass.Int32(-65536)
-            frgXi[b + 2] = (frgXi[b + 2] + cutlass.Int32(r2 >> 16)) & cutlass.Int32(-65536)
-            frgXi[b + 3] = (frgXi[b + 3] + cutlass.Int32(r3 >> 16)) & cutlass.Int32(-65536)
+            # add the low-16-bit dither, then truncate the low 16 mantissa bits (-65536 == 0xFFFF0000).
+            # LOW (not top) 16 bits so the dither is bit-identical to the gold/Triton path, which take
+            # `philox_word & 0xFFFF`; element 4c+lane == philox(seed, c)[lane] in straight order below.
+            m16 = cutlass.Uint32(0xFFFF)
+            frgXi[b + 0] = (frgXi[b + 0] + cutlass.Int32(r0 & m16)) & cutlass.Int32(-65536)
+            frgXi[b + 1] = (frgXi[b + 1] + cutlass.Int32(r1 & m16)) & cutlass.Int32(-65536)
+            frgXi[b + 2] = (frgXi[b + 2] + cutlass.Int32(r2 & m16)) & cutlass.Int32(-65536)
+            frgXi[b + 3] = (frgXi[b + 3] + cutlass.Int32(r3 & m16)) & cutlass.Int32(-65536)
         frgY = cute.make_rmem_tensor(cute.get(tv_layout, mode=[1]), gY.element_type)
         frgY.store(frgX.load().to(cutlass.BFloat16))      # exact: low 16 bits are zero
         cute.copy(st_atom, frgY, thrY)

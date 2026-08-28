@@ -2105,25 +2105,29 @@ def sr_bf16_global_f(x, key, **kwargs):
 
     The framework supplies the tile's global origin and row stride via kwargs, read here as
     `global_row`, `global_col`, `num_col`. Each element's global flat index is
-    `(global_row + i) * num_col + (global_col + j)`; we build a per-element Philox key
-    `[seed, global_index]` (vectorized, no host sync) and draw one uniform each. Because the
-    index is global, element (i, j) gets the same draw regardless of which tile it lands in, so
-    INDUCTOR == MANUAL_TILE bit-for-bit. Returns `(out,)`.
+    `(global_row + i) * num_col + (global_col + j)`. We draw from the SINGLE-seed Philox counter
+    stream `prng.bits` exposes (`bits(key, n)[f] == philox(seed, f>>2)[f&3]`) and gather each
+    element's word at its global flat position. Because the position is global, element (i, j) gets
+    the same draw regardless of which tile it lands in, so INDUCTOR == MANUAL_TILE bit-for-bit.
+    Keying by global counter (not by a per-element key) is also what lets the Triton kernel
+    reproduce this bit-for-bit via `tl.randint4x(seed, gidx>>2)[gidx&3]`. Returns `(out,)`.
     """
     assert x.dtype == torch.float32, f"SR bf16 expects fp32 input, got {x.dtype}"
     global_row = kwargs["global_row"]
     global_col = kwargs["global_col"]
     num_col = kwargs["num_col"]
     M, N = x.shape
-    # per-element global flat index (int64 arithmetic; uint64 mul is unsupported on cuda).
+    # per-element global flat index (int64 arithmetic; uint64 mul is unsupported on cuda). This is
+    # the flat position into the Philox counter stream.
     i = (global_row + torch.arange(M, device=x.device)).view(-1, 1)
     j = (global_col + torch.arange(N, device=x.device)).view(1, -1)
     gidx = (i * num_col + j).reshape(-1).to(torch.int64)
-    # per-element Philox key [seed, global_index]; seed = key[0:1] (a slice, not .item(), so this
-    # stays traceable / survives the FakeTensor shape-probe).
-    seed = key[0:1].to(torch.int64).expand(gidx.numel())
-    keys = torch.stack([seed, gidx], dim=-1).to(torch.uint64)
-    bits = prng.bits(keys, (gidx.numel(),))  # full 32-bit uniform draw per element
+    # draw the contiguous single-seed stream up to this tile's highest global index, then gather
+    # each element's word at its global position. bits[f] == philox(seed, f>>2)[f&3], so the gather
+    # picks out exactly what the kernel's tl.randint4x(seed, gidx>>2)[gidx&3] produces. n_flat is a
+    # Python int (origin/stride are eager ints), so this stays traceable / no host sync.
+    n_flat = (global_row + M - 1) * num_col + (global_col + N - 1) + 1
+    bits = prng.bits(key, n_flat, dtype=torch.uint32).view(torch.int32)[gidx]  # full 32-bit words
     rand16 = (bits & ((1 << 16) - 1)).reshape(M, N)  # keep only the low 16 bits -> uniform int in [0, 2**16)
     return (_sr_bf16_dither(x, rand16),)
 

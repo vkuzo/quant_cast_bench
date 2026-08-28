@@ -83,12 +83,17 @@ def test_triton_matches_reference(name, recipe, shape):
     # Every recipe's outputs must be a valid quantization (the gold correctness_fn).
     recipe.correctness_fn(inputs, tri_outs)
 
-    # Stochastic rounding (the *_sr recipes) is the one case that can't bit-match: the Triton kernel
-    # draws from its own counter-based Philox (tl.randint4x), not the reference's torch RNG, so only
-    # the SR *property* (unbiased, lands on the two bracketing bf16 grid points) is well-defined --
-    # correctness_fn above checks that, and we stop (~2p(1-p) of elements differ between any two
-    # independent draws, so a per-element bound is meaningless here).
-    if "_sr" in name:
+    # Stochastic rounding (the *_sr recipes) is generally the one case that can't bit-match: the
+    # Triton kernel draws from its own counter-based Philox (tl.randint4x), not the reference's torch
+    # RNG, so only the SR *property* (unbiased, lands on the two bracketing bf16 grid points) is
+    # well-defined -- correctness_fn above checks that, and we stop (~2p(1-p) of elements differ
+    # between any two independent draws, so a per-element bound is meaningless here).
+    #
+    # The exception is fp32_to_bf16_sr_global_offsets: both its gold and kernel draw from the SAME
+    # single-seed Philox counter stream keyed on the element's GLOBAL flat index (gold gathers
+    # prng.bits(key, n)[gidx]; kernel does tl.randint4x(seed, gidx>>2)[gidx&3]), so it IS bit-exact
+    # and must fall through to the equality assertion below.
+    if "_sr" in name and name != "fp32_to_bf16_sr_global_offsets":
         return
 
     # Every other recipe must reproduce the gold bit-for-bit: identical fp32 math + RNE cast (the
