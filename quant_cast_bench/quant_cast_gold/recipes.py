@@ -1232,7 +1232,10 @@ E4M3_EPS = torch.finfo(torch.float8_e4m3fn).tiny
 # (cf. mxfp8 swizzle).
 # ---------------------------------------------------------------------------
 def nvfp4_gs_scale(x):
-    """Per-tensor fp32 outer scale (global reduction; computed outside flex_tile_map)."""
+    """Per-tensor fp32 outer scale S = amax/(fp8_max*fp4_max) (global reduction; computed outside
+    flex_tile_map). This is the DEQUANT multiplier (x ~= q*inner*S) that F.scaled_mm consumes; the
+    quantize recipes/kernels instead take its reciprocal 1/S (MSLK/torchao `global_scale` convention)
+    and MULTIPLY, so example_input_fns and quantize_tensor pass `nvfp4_gs_scale(x).reciprocal()`."""
     outer_amax = x.abs().to(torch.float32).amax()
     return outer_amax / (F8E4M3_MAX * F4_E2M1_MAX)
 
@@ -1243,13 +1246,13 @@ def nvfp4_gs_swizzle_f(x, outer_scale, **kwargs):
     *lead, last = x.shape
     x_b = x.reshape(*lead, last // 16, 16)
     local_amax = x_b.abs().amax(dim=-1, keepdim=True)
-    # inner e4m3 block scale, relative to the outer scale.
+    # inner e4m3 block scale, relative to the outer scale (outer_scale is 1/S, so multiply).
     inner = torch.clamp(
-        (local_amax.to(torch.float32) / F4_E2M1_MAX) / outer_scale,
+        (local_amax.to(torch.float32) / F4_E2M1_MAX) * outer_scale,
         min=E4M3_EPS, max=F8E4M3_MAX,
     ).to(torch.float8_e4m3fn)
-    # cast: divide by (outer * inner), clamp to fp4 range, pack two per byte.
-    reciprocal = (1.0 / outer_scale) / inner.to(torch.float32)
+    # cast: multiply by (inv_outer / inner), clamp to fp4 range, pack two per byte.
+    reciprocal = outer_scale / inner.to(torch.float32)
     data_scaled = torch.clamp(x_b.to(torch.float32) * reciprocal, -F4_E2M1_MAX, F4_E2M1_MAX)
     qdata_b = _f32_to_packed_fp4(data_scaled).view(torch.float4_e2m1fn_x2)
     qdata = qdata_b.reshape(*lead, last // 2)
@@ -1270,7 +1273,8 @@ def nvfp4_gs_swizzle_dq_f(q: torch.Tensor, inner_swizzled: torch.Tensor, outer_s
     # un-swizzle inner scale (4D block grid) back to (M, cols) e4m3 -> fp32.
     inner = _from_blocked_4d(inner_swizzled, M, cols)
     inner_fp32 = inner.to(torch.float32).reshape(M, cols, 1)
-    return (unpacked.reshape(M, cols, 16) * inner_fp32 * outer_scale).reshape(M, N)
+    # outer_scale is 1/S, so DIVIDE to dequant (x ~= q*inner*S = q*inner/outer_scale).
+    return (unpacked.reshape(M, cols, 16) * inner_fp32 / outer_scale).reshape(M, N)
 
 
 def _nvfp4_gs_swizzle_correctness(
@@ -1288,7 +1292,7 @@ def _nvfp4_gs_swizzle_correctness(
 
 def _nvfp4_gs_swizzle_inputs(M, K):
     x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
-    return (x, nvfp4_gs_scale(x))
+    return (x, nvfp4_gs_scale(x).reciprocal())  # recipes take 1/S (MSLK/torchao global_scale)
 
 
 Nvfp4GsSwizzleGold = QuantCastSingleKernelGold(
@@ -1330,7 +1334,7 @@ def _nvfp4_gs_swizzle_dim_m_correctness(
 
 def _nvfp4_gs_swizzle_dim_m_inputs(M, K):
     x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
-    return (x, nvfp4_gs_scale(x))  # |x.t()| == |x|, so the same per-tensor outer scale serves both
+    return (x, nvfp4_gs_scale(x).reciprocal())  # |x.t()| == |x|; recipes take 1/S, one scale serves both
 
 
 Nvfp4GsDimMSwizzleGold = QuantCastSingleKernelGold(
@@ -1379,8 +1383,8 @@ def _nvfp4_gs_swizzle_dim_km_correctness(
 
 def _nvfp4_gs_swizzle_dim_km_inputs(M, K):
     x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
-    # no RHT -> |x.t()| == |x|, so both orientations get the same per-tensor outer scale
-    return (x, nvfp4_gs_scale(x), nvfp4_gs_scale(x))
+    # no RHT -> |x.t()| == |x|, so both orientations get the same per-tensor outer scale (as 1/S)
+    return (x, nvfp4_gs_scale(x).reciprocal(), nvfp4_gs_scale(x).reciprocal())
 
 
 Nvfp4GsDimKMSwizzleGold = QuantCastSingleKernelGold(
@@ -1433,7 +1437,7 @@ def _nvfp4_gs_swizzle_dim_m_rht_inputs(M, K):
     # outer scale is over the SAME bf16 RHT output pt_ref_fn re-derives from `rht` (col_global_amax).
     (x_t_rht,) = hadamard_rht_f(x.t().contiguous(), rht)
     outer_scale = x_t_rht.abs().to(torch.float32).amax() / (F8E4M3_MAX * F4_E2M1_MAX)
-    return (x, outer_scale, rht)
+    return (x, outer_scale.reciprocal(), rht)  # recipes take 1/S
 
 
 Nvfp4GsSwizzleDimMRHTGold = QuantCastSingleKernelGold(
@@ -1499,7 +1503,7 @@ def _nvfp4_gs_swizzle_dim_k_dim_m_rht_inputs(M, K):
     # torchao computing col_global_amax on the bf16 _rht_reference), so the two stay consistent.
     (x_t_rht,) = hadamard_rht_f(x.t().contiguous(), rht)
     outer_scale_m = x_t_rht.abs().to(torch.float32).amax() / (F8E4M3_MAX * F4_E2M1_MAX)
-    return (x, outer_scale_k, outer_scale_m, rht)
+    return (x, outer_scale_k.reciprocal(), outer_scale_m.reciprocal(), rht)  # recipes take 1/S
 
 
 Nvfp4GsSwizzle_DimK_DimMRHT_Gold = QuantCastSingleKernelGold(
@@ -1550,10 +1554,10 @@ def nvfp4_gs_swizzle_sr_f(x, outer_scale, key, **kwargs):
     local_amax = x_b.abs().amax(dim=-1, keepdim=True)
     # inner e4m3 block scale, relative to the outer scale (identical to the RNE path).
     inner = torch.clamp(
-        (local_amax.to(torch.float32) / F4_E2M1_MAX) / outer_scale,
+        (local_amax.to(torch.float32) / F4_E2M1_MAX) * outer_scale,
         min=E4M3_EPS, max=F8E4M3_MAX,
     ).to(torch.float8_e4m3fn)
-    reciprocal = (1.0 / outer_scale) / inner.to(torch.float32)
+    reciprocal = outer_scale / inner.to(torch.float32)
     data_scaled = torch.clamp(x_b.to(torch.float32) * reciprocal, -F4_E2M1_MAX, F4_E2M1_MAX)
     qdata_b = _f32_to_packed_fp4_sr(data_scaled, key).view(torch.float4_e2m1fn_x2)  # SR, not RNE
     qdata = qdata_b.reshape(*lead, last // 2)
@@ -1578,7 +1582,7 @@ def _nvfp4_gs_swizzle_sr_correctness(
 
 def _nvfp4_gs_swizzle_sr_inputs(M, K):
     x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
-    return (x, nvfp4_gs_scale(x), prng.key(0, device=x.device))  # fixed Philox key -> reproducible SR
+    return (x, nvfp4_gs_scale(x).reciprocal(), prng.key(0, device=x.device))  # 1/S; fixed Philox key -> reproducible SR
 
 
 Nvfp4GsSRSwizzleGold = QuantCastSingleKernelGold(
@@ -1631,7 +1635,7 @@ def _nvfp4_gs_swizzle_dim_k_dim_m_rht_sr_inputs(M, K):
     # independent Philox keys for the two SR casts (dim-k over x, dim-m over RHT(x.t())).
     key_k = prng.key(0, device=x.device)
     key_m = prng.key(1, device=x.device)
-    return (x, outer_scale_k, outer_scale_m, rht, key_k, key_m)
+    return (x, outer_scale_k.reciprocal(), outer_scale_m.reciprocal(), rht, key_k, key_m)  # recipes take 1/S
 
 
 Nvfp4GsSwizzle_DimKSR_DimMRHTSR_Gold = QuantCastSingleKernelGold(
@@ -1685,7 +1689,7 @@ def _nvfp4_gs_swizzle_dim_m_rht_sr_inputs(M, K):
     rht = hadamard_rht_matrix(sign, x.device, x.dtype)
     (x_t_rht,) = hadamard_rht_f(x.t().contiguous(), rht)
     outer_scale = x_t_rht.abs().to(torch.float32).amax() / (F8E4M3_MAX * F4_E2M1_MAX)
-    return (x, outer_scale, rht, prng.key(0, device=x.device))  # fixed Philox key -> reproducible SR
+    return (x, outer_scale.reciprocal(), rht, prng.key(0, device=x.device))  # 1/S; fixed Philox key -> reproducible SR
 
 
 Nvfp4GsDimMRHTSRSwizzleGold = QuantCastSingleKernelGold(
@@ -1717,13 +1721,13 @@ def nvfp4_gs_f(x, outer_scale, **kwargs):
     x_b = x.reshape(*lead, last // 16, 16)
     outer = outer_scale.unsqueeze(-1) if outer_scale.ndim == 2 else outer_scale  # per-token -> block axis
     local_amax = x_b.abs().amax(dim=-1, keepdim=True)
-    # inner e4m3 block scale, relative to the outer scale.
+    # inner e4m3 block scale, relative to the outer scale (outer is 1/S, so multiply).
     inner = torch.clamp(
-        (local_amax.to(torch.float32) / F4_E2M1_MAX) / outer,
+        (local_amax.to(torch.float32) / F4_E2M1_MAX) * outer,
         min=E4M3_EPS, max=F8E4M3_MAX,
     ).to(torch.float8_e4m3fn)
-    # cast: divide by (outer * inner), clamp to fp4 range, pack two per byte.
-    reciprocal = (1.0 / outer) / inner.to(torch.float32)
+    # cast: multiply by (inv_outer / inner), clamp to fp4 range, pack two per byte.
+    reciprocal = outer / inner.to(torch.float32)
     data_scaled = torch.clamp(x_b.to(torch.float32) * reciprocal, -F4_E2M1_MAX, F4_E2M1_MAX)
     qdata_b = _f32_to_packed_fp4(data_scaled).view(torch.float4_e2m1fn_x2)
     qdata = qdata_b.reshape(*lead, last // 2)
@@ -1743,7 +1747,8 @@ def nvfp4_gs_dq_f(q: torch.Tensor, inner_scale: torch.Tensor, outer_scale: torch
     # outer_scale broadcasts against (M, cols, 16): a per-token (M, 1) is unsqueeze(-1)'d to the
     # intra-block axis ((M, 1, 1)); a per-tensor scalar/(1,) already broadcasts. Matches nvfp4_gs_f.
     outer = outer_scale.unsqueeze(-1) if outer_scale.ndim == 2 else outer_scale
-    return (unpacked.reshape(M, cols, 16) * inner_fp32 * outer).reshape(M, N)
+    # outer is 1/S, so DIVIDE to dequant.
+    return (unpacked.reshape(M, cols, 16) * inner_fp32 / outer).reshape(M, N)
 
 
 def _nvfp4_gs_correctness(
@@ -1761,7 +1766,7 @@ def _nvfp4_gs_correctness(
 
 def _nvfp4_gs_inputs(M, K):
     x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
-    return (x, nvfp4_gs_scale(x))
+    return (x, nvfp4_gs_scale(x).reciprocal())  # recipes take 1/S (MSLK/torchao global_scale)
 
 
 Nvfp4GsGold = QuantCastSingleKernelGold(
@@ -1789,7 +1794,7 @@ def nvfp4_gs_per_token_scale(x):
 
 def _nvfp4_gs_per_token_inputs(M, K):
     x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
-    return (x, nvfp4_gs_per_token_scale(x))
+    return (x, nvfp4_gs_per_token_scale(x).reciprocal())  # recipes take 1/S
 
 
 # Reuses nvfp4_gs_f / _nvfp4_gs_correctness (which dequant via nvfp4_gs_dq_f): both broadcast the
@@ -1837,10 +1842,10 @@ def nvfp4_blocked_outer_f(x, outer_blocked, **kwargs):
     outer_b = outer_blocked[:, None, :, None, None]     # (Mb, 1, Nb, 1, 1), broadcasts
     local_amax = x_b.abs().amax(dim=-1, keepdim=True)   # (Mb, rpb, Nb, n16, 1)
     inner = torch.clamp(
-        (local_amax.to(torch.float32) / F4_E2M1_MAX) / outer_b,
+        (local_amax.to(torch.float32) / F4_E2M1_MAX) * outer_b,
         min=E4M3_EPS, max=F8E4M3_MAX,
     ).to(torch.float8_e4m3fn)
-    reciprocal = (1.0 / outer_b) / inner.to(torch.float32)
+    reciprocal = outer_b / inner.to(torch.float32)
     data_scaled = torch.clamp(x_b.to(torch.float32) * reciprocal, -F4_E2M1_MAX, F4_E2M1_MAX)
     qdata = pack_uint4(f32_to_f4_unpacked(data_scaled)).view(torch.float4_e2m1fn_x2).reshape(M, N // 2)
     # inner scale back to (M, N//16) row-major, then swizzle.
@@ -1864,7 +1869,8 @@ def nvfp4_blocked_outer_dq_f(q: torch.Tensor, inner_swizzled: torch.Tensor, oute
     data = unpacked.reshape(Mb, rpb, Nb, n16, 16)
     inner_b = inner.to(torch.float32).reshape(Mb, rpb, Nb, n16, 1)
     outer_b = outer_blocked[:, None, :, None, None]
-    return (data * inner_b * outer_b).reshape(M, N)
+    # outer_b is 1/S, so DIVIDE to dequant.
+    return (data * inner_b / outer_b).reshape(M, N)
 
 
 def _nvfp4_blocked_outer_correctness(
@@ -1882,7 +1888,7 @@ def _nvfp4_blocked_outer_correctness(
 
 def _nvfp4_blocked_outer_inputs(M, K):
     x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
-    return (x, nvfp4_blocked_outer_scale(x))
+    return (x, nvfp4_blocked_outer_scale(x).reciprocal())  # recipes take 1/S
 
 
 Nvfp4BlockedOuterGold = QuantCastSingleKernelGold(

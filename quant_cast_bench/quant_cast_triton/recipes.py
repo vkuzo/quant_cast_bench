@@ -1377,16 +1377,16 @@ def _nvfp4_kernel(x_ptr, outer_ptr, q_ptr, s_ptr, seed_ptr, sxm, sxn, ssm, ssn, 
     x = tl.load(x_ptr + offs_m * sxm + offs_n * sxn).to(tl.float32)  # (128, 64)
     x_blocks = x.reshape(128, 4, 16)
     amax = tl.max(tl.abs(x_blocks), axis=2)  # (128, 4)
-    outer = tl.load(outer_ptr)  # per-tensor scalar
+    outer = tl.load(outer_ptr)  # per-tensor scalar, 1/S (MSLK/torchao global_scale)
     # Match the gold's fp32 ops bit-for-bit so the e4m3 scale (and downstream fp4) RNE ties resolve
-    # identically (same fix as _nvfp4_blocked_outer_kernel). The default Triton `/` lowers to the
-    # approximate div.full.f32 (~1 ULP off), which flips ties -> a wrong e4m3 scale byte shifts every
-    # fp4 code in that block. The gold's `/ 6.0` is a tensor-by-PYTHON-SCALAR divide (torch lowers it
-    # to a reciprocal-MULTIPLY `* (1/6)`), while `/ outer` and the reciprocal divides are
-    # tensor-by-tensor correctly-rounded div.rn -- so mirror each exactly.
-    inner_val = tl.minimum(tl.maximum(tl.div_rn(amax * (1.0 / 6.0), outer), 0.015625), 448.0)
+    # identically. `outer` is 1/S, so the gold MULTIPLIES by it. The gold's `/ 6.0` is a
+    # tensor-by-PYTHON-SCALAR divide (torch lowers it to a reciprocal-MULTIPLY `* (1/6)`); `* outer` is
+    # a correctly-rounded tensor*tensor multiply; and the remaining `outer / inner` is a tensor-by-
+    # tensor correctly-rounded div.rn. The default Triton `/` lowers to the approximate div.full.f32
+    # (~1 ULP off) and would flip ties -> a wrong e4m3 scale byte, so use div.rn for that quotient.
+    inner_val = tl.minimum(tl.maximum(amax * (1.0 / 6.0) * outer, 0.015625), 448.0)
     inner_e4 = inner_val.to(tl.float8e4nv)  # (128, 4)
-    recip = tl.div_rn(tl.div_rn(1.0, outer), inner_e4.to(tl.float32))  # (128, 4)
+    recip = tl.div_rn(outer, inner_e4.to(tl.float32))  # (128, 4)
     x_blocks = x_blocks * recip[:, :, None]  # (128, 4, 16); RNE path lets cvt saturate to +-6
     if SWIZZLE:
         # coherent swizzled scale store: atom (pid_m, pid_n) at flat offset (pid_m*NCB + pid_n)*512.
@@ -1479,17 +1479,17 @@ def _nvfp4_blocked_outer_kernel(
     # outer scale for this group: block (row//128, (g*16)//128) == (row//128, g//8)
     mb = offs_m // 128
     nb = pid_g // 8
-    outer = tl.load(outer_ptr + mb * NB + nb, mask=m_mask)  # (BM,)
-    # Match the gold's fp32 ops bit-for-bit so e4m3/fp4 RNE ties resolve identically (the default
-    # Triton `/` lowers to the approximate div.full.f32, ~1 ULP off, which flips ties). Two subtleties:
+    outer = tl.load(outer_ptr + mb * NB + nb, mask=m_mask)  # (BM,), 1/S per 128x128 block
+    # Match the gold's fp32 ops bit-for-bit so e4m3/fp4 RNE ties resolve identically. `outer` is 1/S,
+    # so the gold MULTIPLIES by it. Two subtleties:
     #  * `/ 6.0` in the gold is a tensor-by-PYTHON-SCALAR divide, which torch lowers to a
-    #    reciprocal-MULTIPLY (`* (1/6)`), so mirror it with a multiply -- a true div here (div.rn) is
-    #    1 ULP off from torch and double-rounds the next divide the other way.
-    #  * `/ outer` and the reciprocal divides are tensor-by-tensor in the gold (correctly-rounded
-    #    div.rn), so use tl.div_rn.
-    inner_val = tl.minimum(tl.maximum(tl.div_rn(amax * (1.0 / 6.0), outer), 0.015625), 448.0)
+    #    reciprocal-MULTIPLY (`* (1/6)`); `* outer` is a correctly-rounded tensor*tensor multiply, so
+    #    mirror both with multiplies.
+    #  * the remaining `outer / inner` is tensor-by-tensor in the gold (correctly-rounded div.rn), so
+    #    use tl.div_rn (the default Triton `/` lowers to the approximate div.full.f32, ~1 ULP off).
+    inner_val = tl.minimum(tl.maximum(amax * (1.0 / 6.0) * outer, 0.015625), 448.0)
     inner_e4 = inner_val.to(tl.float8e4nv)
-    recip = tl.div_rn(tl.div_rn(1.0, outer), inner_e4.to(tl.float32))  # (BM,)
+    recip = tl.div_rn(outer, inner_e4.to(tl.float32))  # (BM,)
     data = tl.minimum(tl.maximum(x * recip[:, None], -6.0), 6.0)
     code = _f32_to_f4_code_tl(data)
     lo, hi = tl.split(tl.reshape(code, (BM, 8, 2)))

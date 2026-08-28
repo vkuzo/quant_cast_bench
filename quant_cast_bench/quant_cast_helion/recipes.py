@@ -745,7 +745,7 @@ def _div_rn(a, b):
 )
 def _nvfp4_gs_kernel(
     x: torch.Tensor,  # (M, N) bf16 input
-    outer_scale: torch.Tensor,  # (1,) f32 per-tensor outer scale (global amax, host-computed)
+    outer_scale: torch.Tensor,  # (1,) f32 per-tensor 1/S (reciprocal global scale, host-computed)
     qdata: torch.Tensor,  # (M, N // 2) uint8, fp4-packed (two e2m1 per byte), mutated in place
     inner_scale: torch.Tensor,  # (M, N // 16) e4m3 inner block scale, mutated in place
 ) -> None:
@@ -761,14 +761,15 @@ def _nvfp4_gs_kernel(
         amax = torch.amax(torch.amax(torch.abs(x_blk), dim=3), dim=2)  # (bm, bc) over the 16
         # inner e4m3 block scale relative to the outer scale; round-trip through e4m3 BEFORE using it
         # in the reciprocal (the gold does too -- the rounding is load-bearing for bit-exactness).
-        # `/ _F4_E2M1_MAX` (scalar) is a reciprocal-multiply in both Helion and torch, but every other
-        # divide here (`/ outer`, `1/outer`, `/ inner`) is a tensor/tensor divide that Helion lowers to
-        # the approximate div.full.f32 -- force div.rn so the fp8/fp4 RNE ties match the gold.
+        # `outer` is 1/S, so MULTIPLY (`* outer`, a correctly-rounded mul like the gold); `/ _F4_E2M1_MAX`
+        # (scalar) is a reciprocal-multiply in both Helion and torch. Only the `outer / inner` reciprocal
+        # is a tensor/tensor divide that Helion lowers to the approximate div.full.f32 -- force div.rn
+        # there so the fp8/fp4 RNE ties match the gold.
         inner_e4m3 = torch.clamp(
-            _div_rn(amax / _F4_E2M1_MAX, outer), _E4M3_EPS, _F8E4M3_MAX
+            (amax / _F4_E2M1_MAX) * outer, _E4M3_EPS, _F8E4M3_MAX
         ).to(torch.float8_e4m3fn)
         ones = hl.full([tile_m, tile_c], 1.0)
-        recip = _div_rn(_div_rn(ones, outer), inner_e4m3.to(torch.float32))  # (bm, bc)
+        recip = _div_rn(ones * outer, inner_e4m3.to(torch.float32))  # (bm, bc); outer is 1/S
         data_scaled = torch.clamp(
             x_blk * recip[:, :, None, None], -_F4_E2M1_MAX, _F4_E2M1_MAX
         )  # (bm, bc, 8, 2)
@@ -837,7 +838,7 @@ NVFP4 = QuantCastHelionRecipe.from_gold(Nvfp4GsGold, helion_fn=nvfp4_gs_helion)
 )
 def _nvfp4_gs_swizzle_kernel(
     x: torch.Tensor,  # (M, N) bf16 input
-    outer_scale: torch.Tensor,  # (1,) f32 per-tensor outer scale (global amax, host-computed)
+    outer_scale: torch.Tensor,  # (1,) f32 per-tensor 1/S (reciprocal global scale, host-computed)
     qdata: torch.Tensor,  # (M, N // 2) uint8, fp4-packed (two e2m1 per byte), mutated in place
     scale5: torch.Tensor,  # (nrb, ncb, 32, 4, 4) e4m3 inner scale, swizzled, pre (4,4)->16
 ) -> None:
@@ -852,14 +853,15 @@ def _nvfp4_gs_swizzle_kernel(
         amax = torch.amax(torch.amax(torch.abs(x_blk), dim=6), dim=5)  # [RB,a,b,CB,c] over the 16
         # inner e4m3 block scale relative to the outer scale; round-trip through e4m3 BEFORE using it
         # in the reciprocal (matches the gold / the non-swizzle kernel -- load-bearing for bit-exact).
-        # `/ outer`, `1/outer` and the `/ inner` reciprocal are tensor/tensor divides that Helion lowers
-        # to the approximate div.full.f32 -- force div.rn so the fp8/fp4 RNE ties match the gold
-        # (`/ _F4_E2M1_MAX` is a scalar reciprocal-multiply in both Helion and torch, so keep it plain).
+        # `outer` is 1/S, so MULTIPLY (`* outer`, a correctly-rounded mul like the gold); only the
+        # `outer / inner` reciprocal is a tensor/tensor divide that Helion lowers to the approximate
+        # div.full.f32 -- force div.rn so the fp8/fp4 RNE ties match the gold (`/ _F4_E2M1_MAX` is a
+        # scalar reciprocal-multiply in both Helion and torch, so keep it plain).
         inner_e4m3 = torch.clamp(
-            _div_rn(amax / _F4_E2M1_MAX, outer), _E4M3_EPS, _F8E4M3_MAX
+            (amax / _F4_E2M1_MAX) * outer, _E4M3_EPS, _F8E4M3_MAX
         ).to(torch.float8_e4m3fn)
         ones = hl.full([tile_rb, 4, 32, tile_cb, 4], 1.0)
-        recip = _div_rn(_div_rn(ones, outer), inner_e4m3.to(torch.float32))  # [RB,a,b,CB,c]
+        recip = _div_rn(ones * outer, inner_e4m3.to(torch.float32))  # [RB,a,b,CB,c]; outer is 1/S
         data_scaled = torch.clamp(
             x_blk * recip[:, :, :, :, :, None, None], -_F4_E2M1_MAX, _F4_E2M1_MAX
         )  # [RB,a,b,CB,c,j,k]

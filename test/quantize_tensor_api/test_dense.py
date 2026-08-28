@@ -266,7 +266,7 @@ def test_nvfp4_matches_gold(M, N, dtype):
         swizzle_type=SwizzleType.SWIZZLE_32_4_4,
         outer_scale=outer_scale,
     )
-    q_ref, s_ref = nvfp4_gs_swizzle_f(x, outer_scale)
+    q_ref, s_ref = nvfp4_gs_swizzle_f(x, outer_scale.reciprocal())  # gold takes 1/S; quantize_tensor took S
     assert q.dtype == torch.float4_e2m1fn_x2
     assert s.dtype == torch.float8_e4m3fn  # nvfp4 inner scale is e4m3 (not e8m0)
     assert q.shape == (M, N // 2)  # two fp4 codes packed per byte
@@ -299,7 +299,7 @@ def test_nvfp4_per_token_matches_gold_bitwise(M, N, dtype):
         swizzle_type=SwizzleType.NO_SWIZZLE,
         outer_scale=outer_scale,
     )
-    q_ref, s_ref = nvfp4_gs_f(x, outer_scale)
+    q_ref, s_ref = nvfp4_gs_f(x, outer_scale.reciprocal())  # gold takes 1/S; quantize_tensor took S
     assert torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8)), "qdata differs from gold"
     assert torch.equal(s.view(torch.uint8), s_ref.view(torch.uint8)), "scale differs from gold"
     assert q.dtype == torch.float4_e2m1fn_x2
@@ -331,7 +331,7 @@ def test_nvfp4_dim_m_rht_matches_gold_bitwise(M, N, dtype):
         outer_scale=outer_scale,
         rht_tensor=rht,
     )
-    q_ref, s_ref = nvfp4_gs_swizzle_dim_m_rht_f(x, outer_scale, rht)
+    q_ref, s_ref = nvfp4_gs_swizzle_dim_m_rht_f(x, outer_scale.reciprocal(), rht)  # gold takes 1/S; quantize_tensor took S
     assert torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8)), "qdata differs from gold"
     assert torch.equal(s.view(torch.uint8), s_ref.view(torch.uint8)), "scale differs from gold"
     assert q.dtype == torch.float4_e2m1fn_x2

@@ -100,13 +100,17 @@ class _Nvfp4Linear(torch.autograd.Function):
         # key: caller-supplied prng key (prng.key(seed)); threaded to backward for the SR casts.
 
         # Activation: row cast (no RHT) feeds fwd; col cast (RHT on input.T) is saved for wgrad.
-        x_gs_k = nvfp4_gs_scale(input)  # outer scale over |input|
-        x_rht_g_s_m = _rht_outer_scale(input, rht)  # outer scale over |RHT(input.T)|
-        x_q_k, xs_k, x_rht_q_m, x_rht_s_m = nvfp4_gs_swizzle_dim_k_dim_m_rht_f(input, x_gs_k, x_rht_g_s_m, rht)
+        # The gold casts take 1/S (recipes' MSLK/torchao global_scale convention) while F.scaled_mm
+        # takes S (the dequant multiplier), so reciprocate at each cast and keep S for the gemm scales.
+        x_gs_k = nvfp4_gs_scale(input)  # outer scale S over |input|
+        x_rht_g_s_m = _rht_outer_scale(input, rht)  # outer scale S over |RHT(input.T)|
+        x_q_k, xs_k, x_rht_q_m, x_rht_s_m = nvfp4_gs_swizzle_dim_k_dim_m_rht_f(
+            input, x_gs_k.reciprocal(), x_rht_g_s_m.reciprocal(), rht
+        )
         # Weight: row cast (blk K) feeds fwd; transposed row cast (blk N) is the dgrad col operand.
         w_gs = nvfp4_gs_scale(weight)  # |W| == |W.T|, so one outer scale serves both
-        w_q_k, ws_k = nvfp4_gs_swizzle_f(weight, w_gs)
-        w_q_n, w_s_n = nvfp4_gs_swizzle_f(weight.t().contiguous(), w_gs)
+        w_q_k, ws_k = nvfp4_gs_swizzle_f(weight, w_gs.reciprocal())
+        w_q_n, w_s_n = nvfp4_gs_swizzle_f(weight.t().contiguous(), w_gs.reciprocal())
         # fwd: (M,K) @ (K,N) -> (M,N). Each operand's scale is [1x16 block-wise e4m3 (the 4D swizzle
         # grid nvfp4_gs_swizzle_f emits, flattened as torchao does), tensor-wise fp32 outer scalar].
         out = F.scaled_mm(
@@ -133,11 +137,12 @@ class _Nvfp4Linear(torch.autograd.Function):
         # uncorrelated dither. The caller controls reproducibility (and, if wanted, per-step freshness)
         # by choosing what key it passes to forward -- e.g. prng.fold_in(base_key, step); this Function
         # just splits whatever it is handed.
-        go_gs_k = nvfp4_gs_scale(grad_output)  # over |grad_output|
-        go_rht_g_s_m = _rht_outer_scale(grad_output, rht)  # over |RHT(grad_output.T)|
+        go_gs_k = nvfp4_gs_scale(grad_output)  # outer scale S over |grad_output|
+        go_rht_g_s_m = _rht_outer_scale(grad_output, rht)  # outer scale S over |RHT(grad_output.T)|
         key_k, key_m = prng.split(key, 2)
+        # gold casts take 1/S, F.scaled_mm below takes S (see forward): reciprocate for the casts only.
         go_sr_q_k, gos_k, go_sr_q_m, go_s_m = nvfp4_gs_swizzle_dim_k_dim_m_rht_sr_f(
-            grad_output, go_gs_k, go_rht_g_s_m, rht, key_k, key_m
+            grad_output, go_gs_k.reciprocal(), go_rht_g_s_m.reciprocal(), rht, key_k, key_m
         )
         # dgrad: dy (M,N) @ W (N,K) -> grad_input (M,K).
         grad_input = F.scaled_mm(

@@ -230,7 +230,9 @@ def test_triton_template_nvfp4_compiled():
     # Outputs: fp4-packed qdata (M, N//2) + e4m3 inner scale (M, N//16), plain row-major (no swizzle).
     torch.manual_seed(0)
     x = torch.randn(256, 256, dtype=torch.bfloat16, device="cuda")
-    outer_scale = nvfp4_gs_scale(x)
+    # nvfp4_gs_scale returns S (the dequant multiplier); the gold cast takes 1/S (recipes'
+    # MSLK/torchao global_scale convention), so reciprocate before feeding it to the recipe.
+    outer_scale = nvfp4_gs_scale(x).reciprocal()
 
     qr, sr = nvfp4_gs_f(x, outer_scale)  # eager reference (whole tensor)
 

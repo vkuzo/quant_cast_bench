@@ -103,10 +103,11 @@ def quantize_tensor(
         and requires random_key; every other path is RTNE-only.
       random_key: SR entropy, a torch.func._random Philox key. Required when (and only when)
         qdata_rounding_mode is STOCHASTIC.
-      outer_scale: precomputed fp32 outer scale, required for nvfp4 (float4_e2m1fn_x2) two-level
-        scaling; must be None otherwise. A per-tensor scalar selects per-tensor nvfp4 (swizzled
-        kernel); a per-token (M, 1) scale selects per-token nvfp4 (mapped to the gold reference,
-        no swizzle).
+      outer_scale: precomputed fp32 outer scale S = amax/(fp8_max*fp4_max) (the dequant multiplier,
+        as F.scaled_mm consumes it), required for nvfp4 (float4_e2m1fn_x2) two-level scaling; must be
+        None otherwise. A per-tensor scalar selects per-tensor nvfp4 (swizzled kernel); a per-token
+        (M, 1) scale selects per-token nvfp4 (mapped to the gold reference, no swizzle). Reciprocated
+        to 1/S internally, since the recipes/kernels consume 1/S (MSLK/torchao global_scale).
       rht_tensor: optional 16x16 Random Hadamard Transform matrix. Only used by the per-tensor
         dim-m swizzled nvfp4 cast (selected by passing a transposed view), where it applies the RHT
         to the un-transposed input before quantizing (the wgrad-operand cast of nvfp4 training); must
@@ -183,6 +184,9 @@ def quantize_tensor(
         assert inner_scaling_type == ScalingType.BlockWise1x16, (
             f"nvfp4 inner scaling_type must be BlockWise1x16, got {inner_scaling_type!r}"
         )
+        # The recipes/kernels consume 1/S (MSLK/torchao global_scale convention); the caller passes S
+        # (the dequant multiplier F.scaled_mm consumes), so reciprocate at this quantize boundary.
+        outer_scale = outer_scale.reciprocal()
         # The outer scaling level names the outer_scale broadcast directly (no shape guessing):
         # RowWise = per-token (one fp32 value per row, (M, 1)), TensorWise = per-tensor (a scalar).
         if outer_scaling_type == ScalingType.RowWise:
@@ -331,10 +335,12 @@ def quantize_tensor_dual(
         no-RHT nvfp4 cast are RTNE only.
       random_key: Philox key for stochastic rounding (required when qdata_rounding_mode=STOCHASTIC, must
         be None otherwise). Split internally into one substream per orientation.
-      outer_scale: nvfp4 per-tensor outer scale as a (dim_k, dim_m) tuple (required for nvfp4; must
-        be None for mxfp8). Both orientations are always explicit -- there is no single-value form.
-        Without an RHT the two are the same value (|input.t()| == |input|), so pass (os, os). With an
-        RHT they differ (|input| for dim-k, |RHT(input.t())| for dim-m), so pass (dim_k, dim_m).
+      outer_scale: nvfp4 per-tensor outer scale S = amax/(fp8_max*fp4_max) (the dequant multiplier,
+        as F.scaled_mm consumes it) as a (dim_k, dim_m) tuple (required for nvfp4; must be None for
+        mxfp8). Reciprocated to 1/S internally (the recipes consume 1/S, MSLK/torchao global_scale).
+        Both orientations are always explicit -- there is no single-value form. Without an RHT the two
+        are the same value (|input.t()| == |input|), so pass (os, os). With an RHT they differ
+        (|input| for dim-k, |RHT(input.t())| for dim-m), so pass (dim_k, dim_m).
       rht_tensor: optional (dim_k, dim_m) tuple carrying a 16x16 Random Hadamard Transform matrix
         applied to the transposed (dim-m) cast (the wgrad-operand cast of nvfp4 training); dim-k never
         applies one. None for mxfp8 and for the plain (no-RHT) nvfp4 dim-km cast. Because the RHT is
@@ -405,6 +411,10 @@ def quantize_tensor_dual(
         assert outer_scaling_type == ScalingType.TensorWise, (
             "dual nvfp4 is per-tensor (TensorWise) only"
         )
+        # The recipes consume 1/S (MSLK/torchao global_scale convention); the caller passes S (the
+        # dequant multiplier F.scaled_mm consumes), so reciprocate at this quantize boundary.
+        outer_scale_k = outer_scale_k.reciprocal() if outer_scale_k is not None else None
+        outer_scale_m = outer_scale_m.reciprocal() if outer_scale_m is not None else None
         spec = (inner_scaling_type, swizzle_type)
         if spec != (ScalingType.BlockWise1x16, SwizzleType.SWIZZLE_32_4_4):
             raise ValueError(

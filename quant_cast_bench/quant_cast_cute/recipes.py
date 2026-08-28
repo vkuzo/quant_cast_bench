@@ -2043,10 +2043,11 @@ FP8_COLWISE = QuantCastCuteRecipe.from_gold(ColwiseFp8Gold, cute_fn=fp8_colwise_
 
 
 # ---------------------------------------------------------------------------
-# nvfp4 shared device helper: given a 1x16 block fragment `v` (f32) and its `outer` scale, compute
-# the inner e4m3 block scale + the packed fp4 qdata (8 bytes). Mirrors nvfp4_gs_swizzle_f's per-block
-# math: inner = clamp((amax/6)/outer, eps, 448)->e4m3; data = v/(outer*inner) -> fp4 (RN, saturating,
-# so the explicit +-6 clamp is redundant). Returns (packed_bytes_ssa, inner_e4_scalar). Scalar->e4m3
+# nvfp4 shared device helper: given a 1x16 block fragment `v` (f32) and its `outer` scale (1/S,
+# MSLK/torchao global_scale), compute the inner e4m3 block scale + the packed fp4 qdata (8 bytes).
+# Mirrors nvfp4_gs_swizzle_f's per-block math: inner = clamp((amax/6)*outer, eps, 448)->e4m3;
+# data = v*(outer/inner) -> fp4 (RN, saturating, so the explicit +-6 clamp is redundant). Returns
+# (packed_bytes_ssa, inner_e4_scalar). Scalar->e4m3
 # and e4m3->f32 both need a >=32-bit-aligned vector, so a 4-lane broadcast fragment is used.
 _NVFP4_EPS = 0.015625  # torch.finfo(float8_e4m3fn).tiny (E4M3_EPS)
 
@@ -2055,10 +2056,10 @@ _NVFP4_EPS = 0.015625  # torch.finfo(float8_e4m3fn).tiny (E4M3_EPS)
 def _nvfp4_block(v, data_val_layout, outer):
     amax = cutlass.max(v, -v).reduce(cute.ReductionOp.MAX, cutlass.Float32(0.0), 0)
     inner_val = cutlass.min(
-        # `amax / 6` is a tensor/py-scalar divide in the gold -> reciprocal-mul; `/ outer` is a
-        # tensor/tensor divide (div.rn, which cute's `/` already is). Mirror both so the e4m3/fp4
+        # `outer` is 1/S, so the gold MULTIPLIES: `amax / 6` is a tensor/py-scalar divide ->
+        # reciprocal-mul, and `* outer` is a correctly-rounded multiply. Mirror both so the e4m3/fp4
         # RNE ties resolve identically to the gold.
-        cutlass.max((amax * (1.0 / 6.0)) / outer, cutlass.Float32(_NVFP4_EPS)), cutlass.Float32(448.0)
+        cutlass.max((amax * (1.0 / 6.0)) * outer, cutlass.Float32(_NVFP4_EPS)), cutlass.Float32(448.0)
     )
     frgI = cute.make_rmem_tensor(cute.make_layout(4), cutlass.Float32)
     frgI[0], frgI[1], frgI[2], frgI[3] = inner_val, inner_val, inner_val, inner_val
@@ -2066,7 +2067,7 @@ def _nvfp4_block(v, data_val_layout, outer):
     frgIe.store(frgI.load().to(cutlass.Float8E4M3FN))  # RN to e4m3 (vector conversion)
     frgIf = cute.make_rmem_tensor(cute.make_layout(4), cutlass.Float32)
     frgIf.store(frgIe.load().to(cutlass.Float32))  # e4m3 -> f32 (vector conversion)
-    recip = (1.0 / outer) / frgIf[0]
+    recip = outer / frgIf[0]
     frgD = cute.make_rmem_tensor(data_val_layout, cutlass.Float32)  # 16 scaled f32 values
     frgD.store(v * recip)
     packed = _maybe_recast_from_f4_f6(frgD.load().to(cutlass.Float4E2M1FN), cutlass.Float4E2M1FN)
@@ -2171,14 +2172,14 @@ def _cvt_e4m3_byte_to_f32(byte, *, loc=None, ip=None):
 @cute.jit
 def _nvfp4_scale_e4m3(amax, outer, inv_outer):
     """NVFP4 two-level inner scale via hardware cvts: returns (e4m3 scale byte, fp32 data recip).
-    Matches nvfp4_gs_swizzle_f bit-for-bit: local = clamp((amax/6)/outer, eps, 448) -> e4m3;
-    recip = (1/outer) / dequant(e4m3) (what each element is multiplied by before the fp4 cast).
-    `amax / 6` is a tensor/py-scalar divide in the gold -> reciprocal-mul; the inner `/ outer` and the
-    recip's `/ dequant` are tensor/tensor divides (div.rn, which cute's `/` already is). inv_outer is
-    the hoisted `1.0 / outer` (loop-invariant, div.rn) and equals the gold's `1.0 / outer_scale`, so
-    the recip's leading `1/outer` stays a single hoisted reciprocal."""
+    Matches nvfp4_gs_swizzle_f bit-for-bit. `outer` and `inv_outer` are both 1/S (MSLK/torchao
+    global_scale), so the gold MULTIPLIES: local = clamp((amax/6)*outer, eps, 448) -> e4m3;
+    recip = inv_outer / dequant(e4m3) (what each element is multiplied by before the fp4 cast).
+    `amax / 6` is a tensor/py-scalar divide in the gold -> reciprocal-mul; `* outer` is a
+    correctly-rounded multiply; the recip's `/ dequant` is a tensor/tensor div.rn (which cute's `/`
+    already is). inv_outer == outer == 1/S is passed in loop-invariant (no in-kernel reciprocal)."""
     local = cutlass.min(
-        cutlass.max((amax * (1.0 / 6.0)) / outer, cutlass.Float32(_NVFP4_EPS)), cutlass.Float32(448.0)
+        cutlass.max((amax * (1.0 / 6.0)) * outer, cutlass.Float32(_NVFP4_EPS)), cutlass.Float32(448.0)
     )
     e4m3_byte = _cvt_rn_satfinite_e4m3x2_f32(local, local)
     recip = inv_outer / _cvt_e4m3_byte_to_f32(e4m3_byte)
@@ -2252,7 +2253,7 @@ def _nvfp4_swizzle_kernel(gX: cute.Tensor, gQ: cute.Tensor, sflat: cute.Tensor, 
                                   num_bits_per_copy=_NVSWZ_ST_BITS)
     frgO = cute.make_rmem_tensor(cute.make_layout(1), mOuter.element_type)
     cute.copy(cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), mOuter.element_type), mOuter, frgO)
-    inv_outer = 1.0 / frgO[0]                    # loop-invariant hoisted 1/outer for the recip
+    inv_outer = frgO[0]                          # frgO[0] is already 1/S -> the recip numerator
     blk_layout = cute.make_layout(16)
     ld_layout = cute.make_layout(_NVSWZ_LDWIDTH)
     GPR = N // 32                                # 32-elem groups per row (constexpr)
