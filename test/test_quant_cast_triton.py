@@ -7,10 +7,11 @@ import sys
 
 import pytest
 import torch
+import torch.func._random as prng
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from qdata_utils import mismatch_fraction, qdata_and_scale_equal
-from quant_cast_bench.quant_cast_triton.recipes import ALL_RECIPES
+from quant_cast_bench.quant_cast_triton.recipes import ALL_RECIPES, SR_F32_TO_BF16_GLOBAL
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="requires CUDA"
@@ -117,3 +118,44 @@ def test_triton_matches_reference(name, recipe, shape):
             f"{name} output {i}: {mismatch_fraction(t, r):.3%} of elements differ from the gold "
             f"reference -- expected bit-for-bit equality"
         )
+
+
+def test_bf16_sr_global_full_key():
+    """The bf16 global-offsets SR kernel must reproduce the gold (`sr_bf16_global_f`) bit-for-bit
+    for ANY Philox key, including an advanced (incremented) one -- SR-specific, so it lives in its
+    own test rather than the parametrized sweep above.
+
+    The gold draws via `prng.bits(key, n)`, which honors the FULL key: `key[0]` is the 64-bit seed
+    and `key[1]` is a base counter offset (in Philox-block units). The kernel currently reads only
+    the low 32 bits of `key[0]` as its seed and starts counters at `f>>2`, ignoring `key[1]`. That
+    matches only because `prng.key(int)` always yields `[small_seed, 0]` (base offset 0, seed
+    < 2**32). `fold_in`/`split` set BOTH words to full 64-bit values, which the kernel drops.
+
+    So the default-key check passes and the incremented-key check (currently) FAILS -- it documents
+    the gap before the kernel is fixed to consume the whole key (seed=key[0] 64-bit, counter=
+    key[1] + f>>2).
+    """
+    recipe = SR_F32_TO_BF16_GLOBAL
+    M, N = 512, 512
+    torch.manual_seed(0)
+    x, key = recipe.example_input_fn(M, N)  # key = prng.key(0) -> [0, 0]
+    tile_kwargs = {"global_row": 0, "global_col": 0, "num_col": N}
+
+    # default key: kernel and gold draw the same single-seed stream -> bit-for-bit equal.
+    (ref0,) = recipe.pt_ref_fn(x, key, **tile_kwargs)
+    (tri0,) = recipe.triton_fn(x, key, **tile_kwargs)
+    assert qdata_and_scale_equal(tri0, ref0), (
+        f"default key: {mismatch_fraction(tri0, ref0):.3%} of elements differ -- expected "
+        f"bit-for-bit equality"
+    )
+
+    # advance the key: fold_in sets both words to full 64-bit values. gold's prng.bits honors them;
+    # the kernel drops key[1] and the high 32 bits of key[0], so the streams diverge.
+    key2 = prng.fold_in(key, 1)
+    assert int(key2[1]) != 0, "expected fold_in to set a nonzero base-offset word (key[1])"
+    (ref1,) = recipe.pt_ref_fn(x, key2, **tile_kwargs)
+    (tri1,) = recipe.triton_fn(x, key2, **tile_kwargs)
+    assert qdata_and_scale_equal(tri1, ref1), (
+        f"incremented key: {mismatch_fraction(tri1, ref1):.3%} of elements differ -- kernel ignores "
+        f"key[1] and the high 32 bits of key[0]; expected bit-for-bit equality"
+    )

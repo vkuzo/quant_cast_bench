@@ -1638,9 +1638,15 @@ BF16_RHT = QuantCastTritonRecipe.from_gold(HadamardRht, triton_fn=rht_triton)
 # ---------------------------------------------------------------------------
 @triton.jit
 def _sr_bf16_global_kernel(x_ptr, y_ptr, seed_ptr, n_elements, BLOCK: tl.constexpr):
-    seed = tl.load(seed_ptr)  # on-device, no host sync
+    # Consume the WHOLE Philox key (the int64 [key[0], key[1]] at seed_ptr): `seed` is the full 64-bit
+    # key[0] (Triton splits it into the two 32-bit Philox key words k0/k1) and `base` is key[1], the
+    # base counter offset (in 4-word Philox blocks) that prng.bits adds to every block index.
+    # tl.randint4x lays a 64-bit offset into the low two counter words (c0,c1), matching torch's
+    # philox4x32-10 counter, so an advanced key (fold_in / split, which set both words to full 64-bit
+    # values) reproduces the gold bit-for-bit.
+    seed, base = tl.split(tl.load(seed_ptr + tl.arange(0, 2)))  # int64 key[0] (seed), key[1] (base)
     pid = tl.program_id(0)
-    grp = pid * BLOCK + tl.arange(0, BLOCK)  # (BLOCK,) group index = global flat index >> 2
+    grp = base + (pid * BLOCK + tl.arange(0, BLOCK)).to(tl.int64)  # (BLOCK,) counter = key[1] + f>>2
     r0, r1, r2, r3 = tl.randint4x(seed, grp)  # 4 streams; the group's 4 elements each take one
     # interleave the 4 streams back to the contiguous 4*BLOCK element span -> coalesced ld/st. Element
     # at flat index f gets counter f>>2 (independent of BLOCK) and stream f&3 -- a pure function of f,
@@ -1666,7 +1672,9 @@ def sr_bf16_global_triton(x, key, **kwargs):
     assert x.is_contiguous()
     out = torch.empty_like(x, dtype=torch.bfloat16)
     n = x.numel()
-    seed = key.reshape(-1)[:1].view(torch.int32)  # first 32 bits of the key, stays on-device
+    # Pass the full Philox key on-device: key[0] is the 64-bit seed, key[1] the base counter offset.
+    # (prng.key(int) yields [seed<2**32, 0]; fold_in/split set both words to full 64-bit values.)
+    seed = key.reshape(-1).view(torch.int64)  # [key[0], key[1]]
     BLOCK = 1024
 
     def grid(meta):
