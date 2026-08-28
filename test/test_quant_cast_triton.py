@@ -24,6 +24,7 @@ _REQUIRES_SM100 = frozenset({
     "nvfp4",
     "nvfp4_swizzle",
     "nvfp4_sr_swizzle",
+    "nvfp4_nvidia_sr_swizzle",  # cvt.rs.satfinite.e2m1x4.f32 is Blackwell-only PTX
     "mxfp8_dim_m",
     "mxfp8_dim_m_swizzle",
 })
@@ -44,11 +45,12 @@ _SHAPES = [(512, 512), (96, 160), (128, 160)]
 _SHAPE_UNSUPPORTED = {
     (96, 160): frozenset({
         "fp8_deepseek_1x128", "fp8_deepseek_1x128_dim_m", "fp8_deepseek_1x128_dim_km",
-        "fp8_deepseek_128x128", "nvfp4", "nvfp4_swizzle", "nvfp4_sr_swizzle", "nvfp4_blocked_outer",
+        "fp8_deepseek_128x128", "nvfp4", "nvfp4_swizzle", "nvfp4_sr_swizzle",
+        "nvfp4_nvidia_sr_swizzle", "nvfp4_blocked_outer",
     }),
     (128, 160): frozenset({
         "fp8_deepseek_1x128", "fp8_deepseek_1x128_dim_km", "fp8_deepseek_128x128",
-        "nvfp4", "nvfp4_swizzle", "nvfp4_sr_swizzle", "nvfp4_blocked_outer",
+        "nvfp4", "nvfp4_swizzle", "nvfp4_sr_swizzle", "nvfp4_nvidia_sr_swizzle", "nvfp4_blocked_outer",
     }),
 }
 
@@ -97,9 +99,14 @@ def test_triton_matches_reference(name, recipe, shape):
     #   * nvfp4_sr_swizzle -- 22-bit dither into the scaled fp32 data, truncate, then the hardware fp4
     #     cvt. Because the truncation lands normals exactly on the e2m1 grid and the scale uses div.rn,
     #     the cvt matches gold's software f32_to_f4_unpacked (incl. the subnormal ties truncation makes).
-    # Both fall through to the equality assertion below. Other _sr recipes (e.g. nvfp4_dim_m_rht_sr_swizzle)
+    #   * nvfp4_nvidia_sr_swizzle -- the Blackwell cvt.rs.satfinite.e2m1x4.f32 intrinsic, fed one Philox
+    #     word per group of 4 elements in the gold's perm order; the gold reproduces the intrinsic's
+    #     exact carry-round + byte-interleaved bit layout, so kernel and gold agree bit-for-bit.
+    # All fall through to the equality assertion below. Other _sr recipes (e.g. nvfp4_dim_m_rht_sr_swizzle)
     # have no Triton kernel yet and are only property-checked, so they still stop here.
-    if "_sr" in name and name not in ("fp32_to_bf16_sr_global_offsets", "nvfp4_sr_swizzle"):
+    if "_sr" in name and name not in (
+        "fp32_to_bf16_sr_global_offsets", "nvfp4_sr_swizzle", "nvfp4_nvidia_sr_swizzle"
+    ):
         return
 
     # Every other recipe must reproduce the gold bit-for-bit: identical fp32 math + RNE cast (the

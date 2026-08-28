@@ -37,6 +37,7 @@ from quant_cast_bench.quant_cast_gold.recipes import (
     Mxfp8SwizzleGold,
     Nvfp4BlockedOuterGold,
     Nvfp4GsGold,
+    Nvfp4GsNVIDIASRSwizzleGold,
     Nvfp4GsSRSwizzleGold,
     Nvfp4GsSwizzleGold,
     QuantCastSingleKernelGold,
@@ -1359,8 +1360,12 @@ def _convert_fp32_to_fp4_packed(x_pairs):
 # Numerics: bit-exact vs the gold reference. The inner e4m3 scale, reciprocal, and data-scaling use
 # div.rn / reciprocal-multiply to mirror torch's per-op rounding exactly (see the note below), and
 # the hardware fp4 cvt then matches gold's software f32_to_f4_unpacked on the resulting values.
-# ENABLE_SR swaps the RNE data for a dithered+truncated value before the same cvt (stochastic
-# rounding), keyed on the gold's Philox stream so it too is bit-exact.
+# ROUNDING selects the fp4 rounding, all keyed on the gold's Philox stream so every mode is bit-exact:
+#   * "rtne"      -- round-to-nearest-even (the plain cvt.rn.satfinite.e2m1x2.f32 pack).
+#   * "sr"        -- software stochastic rounding: dither the 22 dropped mantissa bits + truncate,
+#                    then the same RNE pack (a no-op on the now-on-grid normals).
+#   * "nvidia_sr" -- hardware stochastic rounding via the Blackwell cvt.rs.satfinite.e2m1x4.f32
+#                    intrinsic (one 32-bit Philox word per group of 4 elements).
 # SWIZZLE=False stores the (128, 4) scale tile into its natural row-major (M, N//16) buffer (strides
 # ss*); SWIZZLE=True writes it as a coherent per-atom store into the swizzled 4D grid (nrb, ncb, 32,
 # 16) at flat offset (pid_m*NCB + pid_n)*512. Everything else (quant + fp4 pack + qdata store) is
@@ -1369,7 +1374,7 @@ def _convert_fp32_to_fp4_packed(x_pairs):
 # ---------------------------------------------------------------------------
 @triton.jit
 def _nvfp4_kernel(x_ptr, outer_ptr, q_ptr, s_ptr, seed_ptr, sxm, sxn, ssm, ssn, M, N, NCB,
-                  SWIZZLE: tl.constexpr, ENABLE_SR: tl.constexpr):
+                  SWIZZLE: tl.constexpr, ROUNDING: tl.constexpr):
     pid_n = tl.program_id(0)
     pid_m = tl.program_id(1)
     offs_m = pid_m * 128 + tl.arange(0, 128)[:, None]
@@ -1398,51 +1403,85 @@ def _nvfp4_kernel(x_ptr, outer_ptr, q_ptr, s_ptr, seed_ptr, sxm, sxn, ssm, ssn, 
         # pid_n*4 + [0,4) of the (M, N//16) buffer (no swizzle).
         s_offs_n = pid_n * 4 + tl.arange(0, 4)[None, :]
         tl.store(s_ptr + offs_m * ssm + s_offs_n * ssn, inner_e4)
-    if ENABLE_SR:
-        # Stochastic rounding (mirrors gold `_f32_to_packed_fp4_sr`): clamp to the fp4 range, dither
-        # the 22 mantissa bits fp32->e2m1 drops with a uniform 22-bit value, then truncate them off.
-        # The hardware cvt below then RNE-encodes the result -- a no-op for normals (which now sit
-        # exactly on the e2m1 grid), and identical to gold's software encode on the subnormal ties the
-        # truncation creates (verified bit-exact once the scale uses div.rn above). The gold clamps
-        # BEFORE dithering, so we do too. Bit-matches the gold via the same Philox stream.
-        x_blocks = tl.minimum(tl.maximum(x_blocks, -6.0), 6.0)
+    if ROUNDING == "nvidia_sr":
+        # Hardware SR via the Blackwell `cvt.rs.satfinite.e2m1x4.f32` intrinsic (mirrors gold
+        # `_f32_to_packed_fp4_nvidia_sr`): 4 f32 lanes + one 32-bit random word -> one b16 (4 packed
+        # e2m1 nibbles). The intrinsic does the whole SR round + saturate itself (it slices the word
+        # byte-interleaved across the 4 lanes internally), so we feed the scaled data unclamped.
         seed = tl.load(seed_ptr)  # first 32 bits of the Philox key, on-device
-        # Key the dither on each element's GLOBAL row-major flat index f = offs_m*N + col, matching the
-        # gold's `prng.bits(key, data_scaled.shape)` fill order (data_scaled is a contiguous reshape of
-        # x). N%64==0 so row_base = offs_m*N + pid_n*64 is a multiple of 4, hence f>>2 == (row_base>>2) +
-        # (col>>2) and f&3 == col&3. randint4x on the per-4-element group counter, straight (r0,r1,r2,r3)
-        # lane order (same interleave idiom as _sr_bf16_global_kernel), gives rand[row, 4g+lane] ==
-        # philox(seed, f>>2)[f&3] -- bit-for-bit the gold's per-element draw.
-        grp_counter = ((offs_m * N + pid_n * 64) >> 2) + tl.arange(0, 16)[None, :]  # (128, 16)
-        r0, r1, r2, r3 = tl.randint4x(seed, grp_counter)  # 4 streams, each (128, 16)
-        rand = tl.interleave(tl.interleave(r0, r2), tl.interleave(r1, r3))  # (128, 64) -> (r0,r1,r2,r3)
-        dither = (rand & 0x3FFFFF).to(tl.int32).reshape(128, 4, 16)  # uniform low-22-bit dither
-        xi = (x_blocks.to(tl.int32, bitcast=True) + dither) & -4194304  # add, truncate low 22 bits
-        x_blocks = xi.to(tl.float32, bitcast=True)  # dithered+truncated data for the shared HW pack
-    # hardware fp4 pack (RNE + saturate): (128,4,16) -> (128,32,2) pairs -> (128,32) packed bytes.
-    q = _convert_fp32_to_fp4_packed(x_blocks.reshape(128, 32, 2).split())
+        # One random WORD per group of 4 elements (not per element as the software path). The gold uses
+        # word gf -> philox(seed, gf//4)[perm[gf%4]] with perm=[0,2,1,3]; the hardware interleave
+        # `interleave(interleave(r0,r1),interleave(r2,r3))` lays exactly that perm across each block of
+        # 4 groups. Global group gf = f>>2 for f = offs_m*N + col; N%64==0 => row_base = offs_m*N +
+        # pid_n*64 is a multiple of 16, so gf//4 == (row_base>>4) + (grp>>2) and gf%4 == grp%4 -- i.e.
+        # the 16 row-local groups split cleanly into 4 Philox counters starting at row_base>>4.
+        grp_ctr = ((offs_m * N + pid_n * 64) >> 4) + tl.arange(0, 4)[None, :]  # (128, 4) counters
+        r0, r1, r2, r3 = tl.randint4x(seed, grp_ctr)  # 4 words per counter, each (128, 4)
+        rbits = tl.interleave(tl.interleave(r0, r1), tl.interleave(r2, r3))  # (128, 16) one word/group
+        # Split the 64 cols into the 4 lanes of each group: reshape (128,4,16)->(128,16,2,2) so
+        # [row, grp, hi, lo] is col 4*grp + 2*hi + lo, then nested splits peel cols {0,1,2,3} per group.
+        g4 = x_blocks.reshape(128, 16, 2, 2)
+        p_lo0, p_lo1 = g4.split()   # lo=0 -> cols {0,2}; lo=1 -> cols {1,3}; each (128,16,2)
+        c0, c2 = p_lo0.split()      # (128,16): group cols 0 and 2
+        c1, c3 = p_lo1.split()      # (128,16): group cols 1 and 3
+        # e2m1x4 packs {$1..$4} with $1 in the HIGH nibble => little-endian b16 = [$4,$3,$2,$1], so feed
+        # the cols reversed to store the quad in element order [col0,col1,col2,col3].
+        q16 = tl.inline_asm_elementwise(
+            asm="cvt.rs.satfinite.e2m1x4.f32 $0, {$1, $2, $3, $4}, $5;",
+            constraints="=h,f,f,f,f,r", args=[c3, c2, c1, c0, rbits],
+            dtype=tl.int16, is_pure=True, pack=1,
+        )  # (128, 16): each int16 = 4 e2m1 nibbles = 2 packed bytes for one group
+        qu = q16.to(tl.uint16, bitcast=True)
+        # int16 group -> its 2 little-endian bytes [low=cols0/1, high=cols2/3]; interleave restores the
+        # (128, 32) packed-byte layout the RNE/sr paths produce (byte 2g=low, 2g+1=high).
+        q = tl.interleave((qu & 0xFF).to(tl.uint8), (qu >> 8).to(tl.uint8))  # (128, 32) packed bytes
+    else:
+        if ROUNDING == "sr":
+            # Software stochastic rounding (mirrors gold `_f32_to_packed_fp4_sr`): clamp to the fp4
+            # range, dither the 22 mantissa bits fp32->e2m1 drops with a uniform 22-bit value, then
+            # truncate them off. The hardware cvt below then RNE-encodes the result -- a no-op for
+            # normals (which now sit exactly on the e2m1 grid), and identical to gold's software encode
+            # on the subnormal ties the truncation creates (verified bit-exact once the scale uses
+            # div.rn above). The gold clamps BEFORE dithering, so we do too. Bit-matches via the same
+            # Philox stream.
+            x_blocks = tl.minimum(tl.maximum(x_blocks, -6.0), 6.0)
+            seed = tl.load(seed_ptr)  # first 32 bits of the Philox key, on-device
+            # Key the dither on each element's GLOBAL row-major flat index f = offs_m*N + col, matching
+            # the gold's `prng.bits(key, data_scaled.shape)` fill order (data_scaled is a contiguous
+            # reshape of x). N%64==0 so row_base = offs_m*N + pid_n*64 is a multiple of 4, hence f>>2 ==
+            # (row_base>>2) + (col>>2) and f&3 == col&3. randint4x on the per-4-element group counter,
+            # straight (r0,r1,r2,r3) lane order (same interleave idiom as _sr_bf16_global_kernel), gives
+            # rand[row, 4g+lane] == philox(seed, f>>2)[f&3] -- bit-for-bit the gold's per-element draw.
+            grp_counter = ((offs_m * N + pid_n * 64) >> 2) + tl.arange(0, 16)[None, :]  # (128, 16)
+            r0, r1, r2, r3 = tl.randint4x(seed, grp_counter)  # 4 streams, each (128, 16)
+            rand = tl.interleave(tl.interleave(r0, r2), tl.interleave(r1, r3))  # (128,64) -> (r0,r1,r2,r3)
+            dither = (rand & 0x3FFFFF).to(tl.int32).reshape(128, 4, 16)  # uniform low-22-bit dither
+            xi = (x_blocks.to(tl.int32, bitcast=True) + dither) & -4194304  # add, truncate low 22 bits
+            x_blocks = xi.to(tl.float32, bitcast=True)  # dithered+truncated data for the shared HW pack
+        # hardware fp4 pack (RNE + saturate): (128,4,16) -> (128,32,2) pairs -> (128,32) packed bytes.
+        q = _convert_fp32_to_fp4_packed(x_blocks.reshape(128, 32, 2).split())
     q_offs_n = pid_n * 32 + tl.arange(0, 32)[None, :]
     tl.store(q_ptr + offs_m * (N // 2) + q_offs_n, q)
 
 
-def nvfp4_triton(x, outer_scale, key=None, swizzle=False, enable_sr=False, **kwargs):
+def nvfp4_triton(x, outer_scale, key=None, swizzle=False, rounding="rtne", **kwargs):
     assert x.is_contiguous() and x.dim() == 2
     M, N = x.shape
     assert M % 128 == 0 and N % 64 == 0, "MSLK-style nvfp4 kernel needs M%128==0 and N%64==0"
     q = torch.empty(M, N // 2, dtype=torch.uint8, device=x.device)
-    # SR keys the dither on the (device-resident) first word of the Philox key; the RNE path never
-    # loads seed_ptr, so reuse outer_scale as a harmless placeholder pointer there.
-    seed = key.reshape(-1)[:1].view(torch.int32) if enable_sr else outer_scale
+    # Both SR modes key the dither on the (device-resident) first word of the Philox key; the RNE path
+    # never loads seed_ptr, so reuse outer_scale as a harmless placeholder pointer there.
+    seed = key.reshape(-1)[:1].view(torch.int32) if rounding in ("sr", "nvidia_sr") else outer_scale
     grid = (N // 64, M // 128)  # ONE grid for both paths: one 128x64 atom per program
     if swizzle:
         ncb = (N // 16) // 4  # == N // 64
         s = torch.empty(M // 128, ncb, 32, 16, dtype=torch.float8_e4m3fn, device=x.device)
         _nvfp4_kernel[grid](x, outer_scale, q, s, seed, x.stride(0), x.stride(1), 0, 0, M, N, ncb,
-                            SWIZZLE=True, ENABLE_SR=enable_sr)  # ss* unused on swizzle path
+                            SWIZZLE=True, ROUNDING=rounding)  # ss* unused on swizzle path
     else:
         s = torch.empty(M, N // 16, dtype=torch.float8_e4m3fn, device=x.device)
         _nvfp4_kernel[grid](x, outer_scale, q, s, seed, x.stride(0), x.stride(1), s.stride(0),
-                            s.stride(1), M, N, 0, SWIZZLE=False, ENABLE_SR=enable_sr)  # NCB unused
+                            s.stride(1), M, N, 0, SWIZZLE=False, ROUNDING=rounding)  # NCB unused
     return q.view(torch.float4_e2m1fn_x2), s
 
 
@@ -1452,11 +1491,16 @@ NVFP4 = QuantCastTritonRecipe.from_gold(
 NVFP4_SWIZZLE = QuantCastTritonRecipe.from_gold(
     Nvfp4GsSwizzleGold, triton_fn=functools.partial(nvfp4_triton, swizzle=True)
 )
-# NVFP4_SWIZZLE with stochastic rounding: same kernel/grid, gated by ENABLE_SR (see _nvfp4_kernel).
+# NVFP4_SWIZZLE with stochastic rounding: same kernel/grid, selected by ROUNDING (see _nvfp4_kernel).
 # The gold's aux order is (x, outer_scale, key), so `key` arrives positionally. Bit-matches the gold.
 NVFP4_SR_SWIZZLE = QuantCastTritonRecipe.from_gold(
     Nvfp4GsSRSwizzleGold,
-    triton_fn=functools.partial(nvfp4_triton, swizzle=True, enable_sr=True),
+    triton_fn=functools.partial(nvfp4_triton, swizzle=True, rounding="sr"),
+)
+# Same, but hardware SR via the Blackwell cvt.rs.satfinite.e2m1x4.f32 intrinsic (ROUNDING="nvidia_sr").
+NVFP4_NVIDIA_SR_SWIZZLE = QuantCastTritonRecipe.from_gold(
+    Nvfp4GsNVIDIASRSwizzleGold,
+    triton_fn=functools.partial(nvfp4_triton, swizzle=True, rounding="nvidia_sr"),
 )
 
 
@@ -1673,6 +1717,7 @@ ALL_RECIPES = [
     ("nvfp4", NVFP4),
     ("nvfp4_swizzle", NVFP4_SWIZZLE),
     ("nvfp4_sr_swizzle", NVFP4_SR_SWIZZLE),
+    ("nvfp4_nvidia_sr_swizzle", NVFP4_NVIDIA_SR_SWIZZLE),
     ("nvfp4_blocked_outer", NVFP4_BLOCKED_OUTER),
     # RHT
     ("bf16_rht", BF16_RHT),

@@ -1592,6 +1592,103 @@ Nvfp4GsSRSwizzleGold = QuantCastSingleKernelGold(
     perf_description="(1,16) block, fp4 qdata (stochastic rounding), swizzle",
 )
 
+# ---------------------------------------------------------------------------
+# Golden recipe: same swizzled nvfp4 activation cast as Nvfp4GsSRSwizzleGold, but the fp4 SR follows
+# the NVIDIA `cvt.rs.satfinite.e2m1x4.f32` HARDWARE intrinsic numerics instead of the portable
+# software add-dither-truncate. This is the bit-exact eager EMULATION of that intrinsic (no PTX yet;
+# a real cvt.rs kernel matching this gold comes later) -- the same emulation added to
+# experiments/stochastic_rounding_api/api.py (Rounding.STOCHASTIC_NVIDIA_SM100's `_reference_impl`),
+# reproduced here so the gold package stays self-contained (as _f32_to_packed_fp4_sr already
+# reproduces the SOFTWARE SR reference). Everything except the fp4 cast's rounding (outer/inner
+# scales, swizzle) is identical to the RNE / software-SR swizzle golds.
+#
+# How the emulation differs from software SR: the intrinsic feeds one 32-bit Philox word per GROUP of
+# 4 elements and hands each element a byte-interleaved 16-bit slice of it (vs software's one full
+# 32-bit word per element), then rounds with the exponent-dependent .rs carry rule tuned to the e2m1
+# grid (1 mantissa bit -> discard 22; exp bias 1 -> E_min=0; saturates at +-6). See the layout
+# breakdown in experiments/nvidia_rs_bit_probe. SR stays unbiased, so the round-trip SQNR clears the
+# same 12 dB fp4 floor as the other swizzle golds.
+# ---------------------------------------------------------------------------
+def _f32_to_packed_fp4_nvidia_sr(data_scaled, key):
+    """fp32 (already clamped to +-6) -> packed nvfp4 bytes with SR matching NVIDIA's
+    `cvt.rs.satfinite.e2m1x4.f32` intrinsic numerics, rather than the software add-dither-truncate of
+    `_f32_to_packed_fp4_sr`. Bit-exact eager emulation (no PTX): one Philox word per group of 4
+    elements, a byte-interleaved 16-bit random slice per element, then an exponent-dependent .rs carry
+    round on the e2m1 grid. Packs two e2m1 codes per byte like `_f32_to_packed_fp4_sr`."""
+    flat = data_scaled.contiguous().reshape(-1)
+    groups = flat.numel() // 4  # the x4 intrinsic converts 4 elements per 32-bit random word
+    n_words = ((groups + 3) // 4) * 4  # round up to whole Philox counters (4 words each)
+    bits = prng.bits(key, n_words, dtype=torch.uint32).to(torch.int64)
+    # word layout reproduces the triton kernel's tl.randint4x(seed, ctr) +
+    # interleave(interleave(r0,r1),interleave(r2,r3)): 4 consecutive groups take one counter's 4 words
+    # in perm order [0,2,1,3], which prng.bits lays as bits[4c + lane].
+    g = torch.arange(groups, device=flat.device)
+    perm = torch.tensor([0, 2, 1, 3], device=flat.device)
+    W = bits[4 * (g // 4) + perm[g % 4]]  # (groups,) one random word per group
+
+    # each element reads a byte-interleaved 16-bit slice of W (fp4's probe finding); with bytes
+    # b0..b3 and rev() a per-byte bit-reverse, the four elements of the group read:
+    b0, b1 = W & 0xFF, (W >> 8) & 0xFF
+    b2, b3 = (W >> 16) & 0xFF, (W >> 24) & 0xFF
+    rev = lambda bb: sum(((bb >> i) & 1) << (7 - i) for i in range(8))  # per-byte bit-reverse
+    R = torch.stack([
+        (b2 << 8) | b0,                    # element base+0: bytes 2&0, natural order
+        (rev(b0) << 8) | rev(b2),          # element base+1: bytes 0&2, bit-reversed
+        (b3 << 8) | b1,                    # element base+2: bytes 3&1, natural order
+        (rev(b1) << 8) | rev(b3),          # element base+3: bytes 1&3, bit-reversed
+    ], dim=1).reshape(-1).double()
+
+    # e2m1 .rs carry round: add the 16-bit slice R to the discarded mantissa field and round on the
+    # carry-out, with a drop width D that lands truncation on the e2m1 grid. Normals discard D=22 fp32
+    # mantissa bits; E_min=0, so each binade below it adds one -> D(E) = 22 + max(0, -E), aligning R to
+    # the top of the field (<< D-16). Exact for |x| >= 0.5 (D <= 23). The bottom bin |x| < 0.5 rounds
+    # between 0 and the subnormal ulp 2^-1 = 0.5 (a direct frac compare, not a mantissa truncation).
+    flat_c = flat.clamp(-F4_E2M1_MAX, F4_E2M1_MAX)  # satfinite (data_scaled is already clamped)
+    E = ((flat_c.abs().view(torch.int32).to(torch.int64) >> 23) & 0xFF) - 127  # fp32 exp of |x|
+    D = 22 + (-E).clamp(min=0)
+    Dc = D.clamp(max=23)  # D>23 only for |x|<0.5, overridden by the bottom-bin path below
+    xbits = flat_c.view(torch.int32).to(torch.int64)
+    xi = (xbits + (R.to(torch.int64) << (Dc - 16))) & -(torch.ones_like(Dc) << Dc)
+    out = xi.to(torch.int32).view(torch.float32)  # on the e2m1 grid for |x| >= 0.5
+    ax = flat.abs().double()
+    promote = ax * 2.0 + R / (1 << 16) >= 1.0  # frac = |x|/0.5; round away from zero on frac + R/2^16 >= 1
+    bottom = torch.sign(flat).double() * torch.where(
+        promote, torch.full_like(ax, 0.5), torch.zeros_like(ax)
+    )
+    out = torch.where(ax < 0.5, bottom.to(torch.float32), out)
+
+    # RNE-encode the on-grid result to e2m1 codes and pack two per byte (no-op RNE on grid points),
+    # packing along the last dim exactly like the software path.
+    return pack_uint4(f32_to_f4_unpacked(out.reshape(data_scaled.shape)))
+
+
+def nvfp4_gs_swizzle_nvidia_sr_f(x, outer_scale, key, **kwargs):
+    """`nvfp4_gs_swizzle_sr_f` but the fp4 qdata cast uses NVIDIA cvt.rs.e2m1x4 SR numerics
+    (`_f32_to_packed_fp4_nvidia_sr`) instead of the software SR. Scales/swizzle are unchanged; `key`
+    is a torch.func._random Philox key."""
+    *lead, last = x.shape
+    x_b = x.reshape(*lead, last // 16, 16)
+    local_amax = x_b.abs().amax(dim=-1, keepdim=True)
+    # inner e4m3 block scale, relative to the outer scale (identical to the RNE / software-SR paths).
+    inner = torch.clamp(
+        (local_amax.to(torch.float32) / F4_E2M1_MAX) * outer_scale,
+        min=E4M3_EPS, max=F8E4M3_MAX,
+    ).to(torch.float8_e4m3fn)
+    reciprocal = outer_scale / inner.to(torch.float32)
+    data_scaled = torch.clamp(x_b.to(torch.float32) * reciprocal, -F4_E2M1_MAX, F4_E2M1_MAX)
+    qdata_b = _f32_to_packed_fp4_nvidia_sr(data_scaled, key).view(torch.float4_e2m1fn_x2)  # cvt.rs SR
+    qdata = qdata_b.reshape(*lead, last // 2)
+    inner_swizzled = _to_blocked_4d(inner.squeeze(-1))
+    return qdata, inner_swizzled
+
+
+Nvfp4GsNVIDIASRSwizzleGold = QuantCastSingleKernelGold(
+    pt_ref_fn=nvfp4_gs_swizzle_nvidia_sr_f,
+    correctness_fn=_nvfp4_gs_swizzle_sr_correctness,  # same round-trip SQNR check as the software-SR gold
+    example_input_fn=_nvfp4_gs_swizzle_sr_inputs,     # same (x, 1/S, fixed Philox key) inputs
+    perf_description="(1,16) block, fp4 qdata (NVIDIA cvt.rs SR numerics), swizzle",
+)
+
 
 def nvfp4_gs_swizzle_dim_k_dim_m_rht_sr_f(
     x, outer_scale_k, outer_scale_m, rht, key_k, key_m, **kwargs
@@ -2162,6 +2259,7 @@ ALL_RECIPES = [
     ("nvfp4_dim_km_swizzle", Nvfp4GsDimKMSwizzleGold),
     ("nvfp4_dim_m_rht_swizzle", Nvfp4GsSwizzleDimMRHTGold),
     ("nvfp4_sr_swizzle", Nvfp4GsSRSwizzleGold),
+    ("nvfp4_nvidia_sr_swizzle", Nvfp4GsNVIDIASRSwizzleGold),
     ("nvfp4_dim_m_rht_sr_swizzle", Nvfp4GsDimMRHTSRSwizzleGold),
     ("nvfp4_swizzle_dim_k_dim_m_rht", Nvfp4GsSwizzle_DimK_DimMRHT_Gold),
     ("nvfp4_swizzle_dim_k_sr_dim_m_rht_sr", Nvfp4GsSwizzle_DimKSR_DimMRHTSR_Gold),
