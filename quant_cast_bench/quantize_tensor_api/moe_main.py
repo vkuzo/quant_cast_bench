@@ -16,8 +16,9 @@ rows / 4 cols) and (b) token groups padded to a multiple of the block size so ev
 block-aligned; the M-dim outputs are unpadded afterward. `torch._scaled_grouped_mm` is SM100-only --
 this box is SM100 (`torch.cuda.get_device_capability() == (10, 0)`), so the real op runs here.
 
-The token/weight quant casts (blocked-scale swizzle) live in `api.py`
-(`quantize_tensor_grouped` / `quantize_tensor` with a 3D per-expert input) over `moe_utils`; the
+The token/weight quant casts (blocked-scale swizzle) live in `api.py` (`quantize_tensor_grouped` for
+tokens; `quantize_tensor` on the per-expert weights reshaped `(E,rows,cols) -> (E*rows, cols)`, valid
+because a 1x32 block is row-local and each expert is 128-row-aligned) over `moe_utils`; the
 token-group padding (`_pad_token_groups`) and the M-dim unpad of the finished output stay here, as
 they're GEMM-shape steps that must agree across the co-operands of each GEMM, not casts. The
 plain-PyTorch emulated (dequantize-and-matmul) companion path lives in `moe_emulated.py`.
@@ -40,8 +41,8 @@ from quant_cast_bench.quant_cast_gold.recipes import _compute_error
 # ===========================================================================
 # Real (non-emulated) path: call the actual SM100 `torch._scaled_grouped_mm`.
 #
-# The token/weight casts (swizzle) live in `api.py` (`quantize_tensor_grouped` /
-# `quantize_tensor` with a 3D per-expert input) over the `moe_utils` helpers; the token-group
+# The token/weight casts (swizzle) live in `api.py` (`quantize_tensor_grouped` for tokens;
+# `quantize_tensor` on per-expert weights reshaped to 2D) over the `moe_utils` helpers; the token-group
 # padding and the M-dim unpad of the finished output stay here, as they're GEMM-shape steps, not casts.
 # ===========================================================================
 def _unpad_token_groups(
@@ -84,16 +85,22 @@ def mxfp8_fwd_real(
         scaling_type=ScalingType.BlockWise1x32,
         swizzle_type=SwizzleType.SWIZZLE_32_4_4,
     )
-    # Weight cast blocked 1x32 along K (the fwd contraction dim): passing the transposed view selects
-    # the dim-m cast, giving a (E,N,K) row-major buffer whose transpose (E,K,N) is the column-major
-    # mat2 view the real op requires.
-    w_e4m3, w_scale_blocked = quantize_tensor(
-        weight_t.transpose(-2, -1),
+    # Weight cast blocked 1x32 along K (the fwd contraction dim). The per-expert cast is just a batched
+    # 2D cast: (E,N,K) collapses to (E*N, K) since a 1x32-along-K block is row-local (never crosses the
+    # N or E boundary), and with N % 128 == 0 each expert occupies whole 128-row swizzle blocks, so the
+    # (E*N//128, ...) swizzled scale reshapes straight back to the per-expert (E, flat) layout. The
+    # (E,N,K) qdata's transpose (E,K,N) is the column-major mat2 view the real op requires.
+    E, K, N = weight_t.shape
+    assert N % 128 == 0, f"per-expert weight row count N must be a multiple of 128, got {N}"
+    w_q, w_scale = quantize_tensor(
+        weight_t.transpose(-2, -1).reshape(E * N, K),  # (E*N, K), 1x32 along K
         qdata_dtype=torch.float8_e4m3fn,
         inner_scale_calc=InnerScaleCalc.RCEIL_E8M0,
         scaling_type=ScalingType.BlockWise1x32,
         swizzle_type=SwizzleType.SWIZZLE_32_4_4,
-    )  # (E,N,K)
+    )
+    w_e4m3 = w_q.reshape(E, N, K)  # (E,N,K)
+    w_scale_blocked = w_scale.reshape(E, -1)  # (E, flat) per-expert blocked scale
     return torch._scaled_grouped_mm(
         act_fp8, w_e4m3.transpose(-2, -1), act_scale_blocked, w_scale_blocked,
         offs=padded_offs, out_dtype=out_dtype,
@@ -138,15 +145,22 @@ def mxfp8_bwd_real(
     )
 
     # === dgrad: grad_input = grouped_mm(grad_output, weight) ===
-    # Weight blocked 1x32 along N (the dgrad contraction dim). weight_t is (E,K,N) with N last, so
-    # NATURAL blocks along N directly; the transpose gives the (E,N,K) column-major mat2 view.
-    q_kn, w_scale_blocked = quantize_tensor(
-        weight_t,
+    # Weight blocked 1x32 along N (the dgrad contraction dim). weight_t is (E,K,N) with N last, so it
+    # blocks along N directly; the per-expert cast collapses to a single 2D call: (E,K,N) reshapes to
+    # (E*K, N) (a 1x32-along-N block is row-local), and with K % 128 == 0 each expert lands on whole
+    # 128-row swizzle blocks, so the swizzled scale reshapes back to the per-expert (E, flat) layout.
+    # The (E,K,N) qdata's transpose (E,N,K) is the column-major mat2 view.
+    E, K, N = weight_t.shape
+    assert K % 128 == 0, f"per-expert weight row count K must be a multiple of 128, got {K}"
+    q_kn_2d, w_scale = quantize_tensor(
+        weight_t.reshape(E * K, N),  # (E*K, N), 1x32 along N
         qdata_dtype=torch.float8_e4m3fn,
         inner_scale_calc=InnerScaleCalc.RCEIL_E8M0,
         scaling_type=ScalingType.BlockWise1x32,
         swizzle_type=SwizzleType.SWIZZLE_32_4_4,
-    )  # (E,K,N)
+    )
+    q_kn = q_kn_2d.reshape(E, K, N)  # (E,K,N)
+    w_scale_blocked = w_scale.reshape(E, -1)  # (E, flat) per-expert blocked scale
     w_e4m3 = q_kn.transpose(-2, -1)  # (E,N,K) column-major view
     grad_input = torch._scaled_grouped_mm(
         go_fp8, w_e4m3, go_scale_blocked, w_scale_blocked, offs=padded_offs, out_dtype=out_dtype

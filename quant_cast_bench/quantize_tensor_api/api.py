@@ -9,12 +9,10 @@ from quant_cast_bench.quantize_tensor_api.moe_utils import (
     BLOCK_SIZE,
     _to_blocked_2d_k_groups,
     _to_blocked_2d_m_groups,
-    _to_blocked_per_group_3d,
     quantize_2d_act,
 )
 from quant_cast_bench.quant_cast_gold.recipes import (
     mxfp4_f,
-    mxfp8_f,
     nvfp4_gs_f,
     nvfp4_gs_swizzle_dim_k_dim_m_rht_f,
     nvfp4_gs_swizzle_dim_k_dim_m_rht_sr_f,
@@ -84,9 +82,9 @@ def quantize_tensor(
     `quantize_tensor_dual`.
 
     Args:
-      input: 2D input tensor (bf16 or fp32) of shape (M, K), or 3D of shape (E, M, K).
+      input: 2D input tensor (bf16 or fp32) of shape (M, K).
       qdata_dtype: qdata element format -- torch.float8_e4m3fn (mxfp8) or torch.float4_e2m1fn_x2
-        (nvfp4, 2D only).
+        (nvfp4).
       inner_scale_calc: per-block scale strategy -- fixes the scale dtype and the amax->scale
         computation. InnerScaleCalc.RCEIL_E8M0 (mxfp8) or InnerScaleCalc.NVFP4_E4M3 (nvfp4).
       scaling_type: single-level formats pass a bare ScalingType -- BlockWise1x32 / BlockWise32x32
@@ -96,10 +94,10 @@ def quantize_tensor(
 
         The scaling axis follows the dims of the tensor you pass: for a (M, K) input with a 1x32
         block, the 1 maps to M and the 32 maps to K, so the scale runs along K (the "dim-k" cast).
-        To scale along the other dim ("dim-m"), pass a transposed view -- input.t() for 2D,
-        input.transpose(-2, -1) for 3D. The API detects the transpose, un-transposes it, and routes
-        to the specialized dim-m cast; the outputs are written transposed-contiguous.
-      swizzle_type: NO_SWIZZLE or SWIZZLE_32_4_4. Note that for 3d inputs, swizzle is applied per-expert.
+        To scale along the other dim ("dim-m"), pass a transposed view -- input.t(). The API detects
+        the transpose, un-transposes it, and routes to the specialized dim-m cast; the outputs are
+        written transposed-contiguous.
+      swizzle_type: NO_SWIZZLE or SWIZZLE_32_4_4.
       qdata_rounding_mode: RTNE or STOCHASTIC. STOCHASTIC is supported only by the per-tensor swizzled
         nvfp4 casts -- NATURAL (dim-k) and TRANSPOSED (dim-m, which then requires an rht_tensor) --
         and requires random_key; every other path is RTNE-only.
@@ -117,7 +115,7 @@ def quantize_tensor(
     Returns:
         2 tensors (qdata, scale)
     """
-    assert input.dim() in (2, 3), f"only 2D or 3D input supported, got {input.dim()}D"
+    assert input.dim() == 2, f"only 2D input supported, got {input.dim()}D"
     # scaling_type is a bare ScalingType for single-level formats, or a two-element [inner, outer]
     # list for two-level nvfp4 (the outer level names the outer_scale broadcast: TensorWise=per-tensor,
     # RowWise=per-token).
@@ -137,7 +135,6 @@ def quantize_tensor(
         raise ValueError("random_key is only used with qdata_rounding_mode=STOCHASTIC")
 
     if qdata_dtype == torch.float4_e2m1fn_x2:
-        assert input.dim() == 2, "fp4 quantization is only supported for 2D input"
         # dim-k (contiguous input, scale along the last dim) vs dim-m (a transposed view, scale along
         # the first dim): un-transpose the view and route to the specialized dim-m cast.
         if input.is_contiguous():
@@ -241,19 +238,6 @@ def quantize_tensor(
     assert rht_tensor is None, "rht_tensor is only used by nvfp4 (float4_e2m1fn_x2) quantization"
     assert qdata_rounding_mode == RoundingMode.RTNE, "stochastic rounding is not supported for mxfp8"
 
-    if input.dim() == 3:
-        # Per-expert (E, N, K) batching is a separate code path from the 2D casts below: each of the
-        # E slices is quantized independently (scaling never applies to the E dimension), swizzling is
-        # per-expert. The scale runs along the last dim of whatever view is passed, so the caller
-        # picks the axis by transposing (E,N,K) <-> (E,K,N); there is no separate dim-m branch.
-        if (inner_scaling_type, swizzle_type) != (ScalingType.BlockWise1x32, SwizzleType.SWIZZLE_32_4_4):
-            raise ValueError(
-                f"unsupported (scaling_type, swizzle_type)=({scaling_type!r}, {swizzle_type!r}); "
-                "quantize_tensor with 3D (E, N, K) input supports only (BlockWise1x32, SWIZZLE_32_4_4)"
-            )
-        q, s = mxfp8_f(input.contiguous())  # 1x32 along the last dim
-        return q, _to_blocked_per_group_3d(s)
-
     # 2D: dim-k (contiguous input, scale along the last dim) vs dim-m (a transposed view, scale along
     # the first dim). For dim-m un-transpose to the original contiguous tensor and use the specialized
     # dim-m kernel (numerically the same as casting the passed view along its last dim, but faster).
@@ -308,15 +292,14 @@ def quantize_tensor_dual(
     `quantize_tensor`.
 
     Args:
-      input: 2D input tensor (bf16 or fp32) of shape (M, K), or 3D of shape (E, M, K). nvfp4 is 2D
-        only.
+      input: 2D input tensor (bf16 or fp32) of shape (M, K).
       qdata_dtype: qdata element format -- torch.float8_e4m3fn (mxfp8) or torch.float4_e2m1fn_x2
         (nvfp4).
       inner_scale_calc: per-block scale strategy -- fixes the scale dtype and the amax->scale
         computation. InnerScaleCalc.RCEIL_E8M0 (mxfp8) or InnerScaleCalc.NVFP4_E4M3 (nvfp4).
       scaling_type: single-level formats pass a bare ScalingType -- BlockWise1x32 / BlockWise32x32
         (mxfp8). nvfp4 (per-tensor only here) passes [BlockWise1x16, TensorWise].
-      swizzle_type: NO_SWIZZLE or SWIZZLE_32_4_4. Note that for 3d inputs, swizzle is per-expert.
+      swizzle_type: NO_SWIZZLE or SWIZZLE_32_4_4.
       skip_transposed_qdata: emit only the natural qdata but BOTH scales (no transposed qdata).
         Square scaling types only; needed on hardware (such as Blackwell) where the second argument
         of a scaled gemm can be row-major. mxfp8 only.
@@ -338,7 +321,7 @@ def quantize_tensor_dual(
         4 tensors (qk, sk, qm, sm) normally -- natural (dim-K) pair then transposed (dim-M) pair
         3 tensors (qk, sk, sm) when skip_transposed_qdata is set
     """
-    assert input.dim() in (2, 3), f"only 2D or 3D input supported, got {input.dim()}D"
+    assert input.dim() == 2, f"only 2D input supported, got {input.dim()}D"
     # scaling_type is a bare ScalingType for single-level mxfp8, or a two-element [inner, outer] list
     # for two-level nvfp4 (per-tensor only here, so outer must be TensorWise).
     if isinstance(scaling_type, list):
@@ -371,7 +354,6 @@ def quantize_tensor_dual(
     if qdata_dtype == torch.float4_e2m1fn_x2:
         # Fused dual nvfp4 cast: dim-k is plain nvfp4 over |input|; dim-m nvfp4s input.t()
         # along the original M. No Triton kernel yet, so both map to gold references.
-        assert input.dim() == 2, "fp4 quantization is only supported for 2D input"
         assert input.is_contiguous(), "input must be contiguous"
         assert inner_scale_calc == InnerScaleCalc.NVFP4_E4M3, (
             f"float4_e2m1fn_x2 qdata requires inner_scale_calc=NVFP4_E4M3 (nvfp4), got {inner_scale_calc!r}"
@@ -446,24 +428,6 @@ def quantize_tensor_dual(
         "rht_tensor is only used by nvfp4 (float4_e2m1fn_x2) quantization"
     )
     assert qdata_rounding_mode == RoundingMode.RTNE, "stochastic rounding is not supported for mxfp8"
-
-    if input.dim() == 3:
-        # Per-expert (E, N, K) batching, quantized independently along N and K (never E).
-        if skip_transposed_qdata:
-            raise NotImplementedError(
-                "skip_transposed_qdata is not supported for 3D (E, N, K) input"
-            )
-        if (inner_scaling_type, swizzle_type) != (ScalingType.BlockWise1x32, SwizzleType.SWIZZLE_32_4_4):
-            raise ValueError(
-                f"unsupported (scaling_type, swizzle_type)=({scaling_type!r}, {swizzle_type!r}); "
-                "quantize_tensor_dual with 3D (E, N, K) input supports only "
-                "(BlockWise1x32, SWIZZLE_32_4_4)"
-            )
-        q_nat, s_nat = mxfp8_f(input.contiguous())  # (E,N,K), 1x32 along K
-        sb_nat = _to_blocked_per_group_3d(s_nat)
-        q_t, s_t = mxfp8_f(input.transpose(-2, -1).contiguous())  # (E,K,N), 1x32 along N
-        sb_t = _to_blocked_per_group_3d(s_t)
-        return q_nat, sb_nat, q_t, sb_t
 
     assert input.is_contiguous(), "input must be contiguous"
     spec = (inner_scaling_type, swizzle_type)

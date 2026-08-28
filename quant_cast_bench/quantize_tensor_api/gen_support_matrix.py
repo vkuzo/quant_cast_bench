@@ -40,11 +40,10 @@ from quant_cast_bench.quant_cast_gold.recipes import (
 
 # --- per-entry-point column layouts (status is always second-to-last, dispatch last) --------------
 COLUMNS = [
-    "format", "scl_tp", "orient", "swizzle_type", "rnd_md", "rht", "input",
-    "status", "dispatches to",
+    "format", "scl_tp", "orient", "swizzle_type", "rnd_md", "rht", "status", "dispatches to",
 ]
 COLUMNS_BI = [
-    "format", "scl_tp", "swizzle_type", "skip_tr", "rnd_md", "input", "status", "dispatches to",
+    "format", "scl_tp", "swizzle_type", "skip_tr", "rnd_md", "status", "dispatches to",
 ]
 COLUMNS_GROUPED = [
     "format", "scl_tp", "orient", "swizzle_type", "rnd_md", "status", "dispatches to",
@@ -97,7 +96,6 @@ OUTER = ["none", "scalar", "per_token"]  # None / per-tensor scalar / per-token 
 OUTER_BI = ["none", "pair"]  # None / (dim_k, dim_m) tuple of per-tensor scalars
 RHT = ["none", "rht"]  # None / 16x16 Hadamard
 RHT_BI = ["none", "dim_m"]  # None / (None, rht) -- RHT applies to the dim-m operand only
-INPUT_DIM = ["2d", "3d"]
 
 # --- how each axis value renders in the table -----------------------------------------------------
 SCALING_R = {ScalingType.BlockWise1x16: "1x16", ScalingType.BlockWise1x32: "1x32", ScalingType.BlockWise32x32: "32x32"}
@@ -106,7 +104,6 @@ SWIZZLE_R = {SwizzleType.NO_SWIZZLE: "NONE", SwizzleType.SWIZZLE_32_4_4: "32_4_4
 SKIP_R = {False: "no", True: "yes"}
 ROUNDING_R = {RoundingMode.RTNE: "RTNE", RoundingMode.STOCHASTIC: "RS"}
 RHT_R = {"none": "None", "rht": "16×16"}
-INPUT_R = {"2d": "2D", "3d": "3D `(E,N,K)`"}
 
 
 def _format_label(qdata_dtype, inner_scale_calc, outer_variant, rht_variant):
@@ -169,27 +166,18 @@ def _probe(thunk):
 
 
 def _build_inputs():
-    """Real CUDA tensors, one per input dim, plus the aux tensors keyed by (variant, dim)."""
+    """A real 2D CUDA input tensor plus the aux tensors (outer scale / RHT) keyed by variant."""
     dev = "cuda"
-    inputs = {
-        "2d": torch.randn(256, 512, dtype=torch.bfloat16, device=dev),
-        "3d": torch.randn(4, 256, 512, dtype=torch.bfloat16, device=dev),
+    x = torch.randn(256, 512, dtype=torch.bfloat16, device=dev)
+    sign = torch.tensor([1, -1] * 8, device=dev, dtype=x.dtype)  # fixed +/-1 sign vector
+    outer = {
+        "none": None,
+        "scalar": nvfp4_gs_scale(x),
+        "per_token": nvfp4_gs_per_token_scale(x),
     }
-    outer = {}
-    rht = {}
-    for dim, x in inputs.items():
-        outer[("none", dim)] = None
-        outer[("scalar", dim)] = nvfp4_gs_scale(x)
-        # per-token (M, 1) only makes sense for 2D; a 3D probe is rejected on the dim check first, so
-        # any (E, 1) placeholder is fine there.
-        outer[("per_token", dim)] = (
-            nvfp4_gs_per_token_scale(x) if x.dim() == 2 else torch.ones(x.shape[0], 1, dtype=torch.float32, device=dev)
-        )
-        rht[("none", dim)] = None
-        sign = torch.tensor([1, -1] * 8, device=dev, dtype=x.dtype)  # fixed +/-1 sign vector
-        rht[("rht", dim)] = hadamard_rht_matrix(sign, x.device, x.dtype)
+    rht = {"none": None, "rht": hadamard_rht_matrix(sign, x.device, x.dtype)}
     key = prng.key(0, device=dev)
-    return inputs, outer, rht, key
+    return x, outer, rht, key
 
 
 def _build_grouped_inputs():
@@ -201,16 +189,16 @@ def _build_grouped_inputs():
 
 
 def collect_quantize_tensor() -> list[tuple[str, ...]]:
-    inputs, outer, rht, key = _build_inputs()
+    x, outer, rht, key = _build_inputs()
     rows = set()
-    for qd, isc, st, orient, sw, rm, osv, rhv, dim in itertools.product(
-        QDATA, INNER, SCALING, ORIENT, SWIZZLE, ROUNDING, OUTER, RHT, INPUT_DIM
+    for qd, isc, st, orient, sw, rm, osv, rhv in itertools.product(
+        QDATA, INNER, SCALING, ORIENT, SWIZZLE, ROUNDING, OUTER, RHT
     ):
         # The outer scaling LEVEL is named explicitly now: bare (single-level) / [inner, TensorWise]
         # (per-tensor) / [inner, RowWise] (per-token), keyed off the OUTER axis 1:1 with outer_scale.
         st_arg = st if osv == "none" else [st, ScalingType.TensorWise if osv == "scalar" else ScalingType.RowWise]
         # dim-m is requested by passing a transposed view of the contiguous input (no orientation arg).
-        probe_in = inputs[dim] if orient == "dim_k" else inputs[dim].transpose(-2, -1)
+        probe_in = x if orient == "dim_k" else x.transpose(-2, -1)
         res = _probe(lambda: quantize_tensor(
             probe_in,
             qdata_dtype=qd,
@@ -219,36 +207,33 @@ def collect_quantize_tensor() -> list[tuple[str, ...]]:
             swizzle_type=sw,
             qdata_rounding_mode=rm,
             random_key=key if rm == RoundingMode.STOCHASTIC else None,
-            outer_scale=outer[(osv, dim)],
-            rht_tensor=rht[(rhv, dim)],
+            outer_scale=outer[osv],
+            rht_tensor=rht[rhv],
         ))
         if res is None:
             continue
         scl_tp = SCALING_R[st] if osv == "none" else f"{SCALING_R[st]}+{'TW' if osv == 'scalar' else 'RW'}"
         rows.add((
             _format_label(qd, isc, osv, rhv),
-            scl_tp, ORIENT_R[orient], SWIZZLE_R[sw], ROUNDING_R[rm],
-            RHT_R[rhv], INPUT_R[dim], *res,
+            scl_tp, ORIENT_R[orient], SWIZZLE_R[sw], ROUNDING_R[rm], RHT_R[rhv], *res,
         ))
     return sorted(rows)  # lexicographic order -> byte-stable output
 
 
 def collect_dual() -> list[tuple[str, ...]]:
-    inputs, outer, rht, key = _build_inputs()
+    x, outer, rht, key = _build_inputs()
     # outer_scale / rht_tensor are per-orientation (dim_k, dim_m) tuples here. Without an RHT both
     # orientations share the scalar (|input.t()| == |input|); the RHT applies to dim-m only.
-    outer_bi = {("none", d): None for d in inputs} | {
-        ("pair", d): (outer[("scalar", d)], outer[("scalar", d)]) for d in inputs
-    }
-    rht_bi = {("none", d): None for d in inputs} | {("dim_m", d): (None, rht[("rht", d)]) for d in inputs}
+    outer_bi = {"none": None, "pair": (outer["scalar"], outer["scalar"])}
+    rht_bi = {"none": None, "dim_m": (None, rht["rht"])}
     rows = set()
-    for qd, isc, st, sw, skip, rm, osv, rhv, dim in itertools.product(
-        QDATA, INNER, SCALING, SWIZZLE, SKIP, ROUNDING, OUTER_BI, RHT_BI, INPUT_DIM
+    for qd, isc, st, sw, skip, rm, osv, rhv in itertools.product(
+        QDATA, INNER, SCALING, SWIZZLE, SKIP, ROUNDING, OUTER_BI, RHT_BI
     ):
         # dual nvfp4 is per-tensor only; name the outer level TensorWise when outer_scale is set.
         st_arg = st if osv == "none" else [st, ScalingType.TensorWise]
         res = _probe(lambda: quantize_tensor_dual(
-            inputs[dim],
+            x,
             qdata_dtype=qd,
             inner_scale_calc=isc,
             scaling_type=st_arg,
@@ -256,8 +241,8 @@ def collect_dual() -> list[tuple[str, ...]]:
             skip_transposed_qdata=skip,
             qdata_rounding_mode=rm,
             random_key=key if rm == RoundingMode.STOCHASTIC else None,
-            outer_scale=outer_bi[(osv, dim)],
-            rht_tensor=rht_bi[(rhv, dim)],
+            outer_scale=outer_bi[osv],
+            rht_tensor=rht_bi[rhv],
         ))
         if res is None:
             continue
@@ -265,7 +250,7 @@ def collect_dual() -> list[tuple[str, ...]]:
             "nvfp4 (per-tensor, RHT)" if rhv == "dim_m" else "nvfp4 (per-tensor)"
         )
         scl_tp = SCALING_R[st] if osv == "none" else f"{SCALING_R[st]}+TW"
-        rows.add((fmt, scl_tp, SWIZZLE_R[sw], SKIP_R[skip], ROUNDING_R[rm], INPUT_R[dim], *res))
+        rows.add((fmt, scl_tp, SWIZZLE_R[sw], SKIP_R[skip], ROUNDING_R[rm], *res))
     return sorted(rows)
 
 
@@ -285,8 +270,8 @@ def collect_grouped() -> list[tuple[str, ...]]:
             swizzle_type=sw,
             qdata_rounding_mode=rm,
             random_key=key if rm == RoundingMode.STOCHASTIC else None,
-            outer_scale=outer[(osv, "2d")],
-            rht_tensor=rht[(rhv, "2d")],
+            outer_scale=outer[osv],
+            rht_tensor=rht[rhv],
         ))
         if res is None:
             continue
@@ -311,8 +296,8 @@ def collect_grouped_dual() -> list[tuple[str, ...]]:
             skip_transposed_qdata=skip,
             qdata_rounding_mode=rm,
             random_key=key if rm == RoundingMode.STOCHASTIC else None,
-            outer_scale=outer[(osv, "2d")],
-            rht_tensor=rht[(rhv, "2d")],
+            outer_scale=outer[osv],
+            rht_tensor=rht[rhv],
         ))
         if res is None:
             continue

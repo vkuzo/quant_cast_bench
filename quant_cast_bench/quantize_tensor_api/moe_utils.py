@@ -2,8 +2,9 @@
 GEMM wiring in `moe_main.py`.
 
 These are the low-level pieces those callers compose: the 1x32 e8m0 cast wrapper, the NVIDIA
-blocked/swizzled tcgen05 scale layouts (2D M-groups / 2D K-groups for token operands, per-expert 3D
-for weights), and `_pad_token_groups` (used by `moe_main.py` to block-align token groups before the
+blocked/swizzled tcgen05 scale layouts (2D M-groups / 2D K-groups for token operands; per-expert
+weight scales use the dense 2D swizzle in `api.py` on the reshaped weights, no helper here), and
+`_pad_token_groups` (used by `moe_main.py` to block-align token groups before the
 grouped GEMM, since padding is a GEMM-shape step shared across co-operands, not a cast). All are
 pure-PyTorch ports of torchao's `kernels/mxfp8/quant.py`, substituting this repo's `_to_blocked_4d`
 for torchao's `to_blocked` (bit-identical flat buffer) and `mxfp8_f` for the e8m0 cast primitive.
@@ -79,15 +80,6 @@ def _to_blocked_2d_m_groups(x_scales: torch.Tensor, group_offs: torch.Tensor) ->
         prev_start_row += group_blocked.shape[0]
         group_start_idx = group_end_idx
     return blocked_scales
-
-
-def _to_blocked_per_group_3d(scales: torch.Tensor) -> torch.Tensor:
-    """Blocked scale layout for a 3d weight `(E, rows, cols)`: swizzle each expert's 2d scale with
-    `_to_blocked_4d` and flatten. Port of torchao's `torch_to_blocked_per_group_3d`. Returns
-    `(E, flat_len)`."""
-    assert scales.ndim == 3, "scales must be 3D (E, rows, cols)"
-    per_expert = [_to_blocked_4d(scales[i]).reshape(-1) for i in range(scales.shape[0])]
-    return torch.stack(per_expert, dim=0).contiguous()
 
 
 def _to_blocked_2d_k_groups(x_scales: torch.Tensor, group_offs: torch.Tensor) -> torch.Tensor:
