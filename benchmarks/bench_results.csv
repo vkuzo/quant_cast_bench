@@ -46,8 +46,8 @@ mxfp8_32x32_qdata_dim_k_scale_dim_km_swizzle,triton,0.1340,6133.2,76.67
 fp8_deepseek_128x128,triton,0.1315,6124.2,76.55
 fp8_rowwise,triton,0.1294,6222.7,77.78
 fp8_colwise,triton,0.2217,3632.2,45.40
-nvfp4,triton,0.1284,5355.6,66.95
-nvfp4_swizzle,triton,0.1375,5004.3,62.55
+nvfp4,triton,0.1738,3956.8,49.46
+nvfp4_swizzle,triton,0.1610,4273.5,53.42
 bf16_rht,triton,0.1991,5392.2,67.40
 fp32_to_bf16_sr_global_offsets,triton,0.2565,6280.0,78.50
 relu (baseline),cute,0.1772,6059.2,75.74
@@ -88,3 +88,4 @@ fp8_deepseek_1x128_dim_m,flex_tile_map_triton,0.1461,5568.5,69.61
 mxfp8_dim_m,flex_tile_map_triton,0.1968,4133.6,51.67
 mxfp8_32x32,flex_tile_map_triton,0.1266,6360.6,79.51
 nvfp4,flex_tile_map_triton,0.1333,5161.9,64.52
+nvfp4_sr_swizzle,triton,0.3528,1949.7,24.37

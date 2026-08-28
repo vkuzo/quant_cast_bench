@@ -86,8 +86,9 @@ mxfp8_32x32_qdata_dim_k_scale_dim_km_swizzle          0.134  6133.2       76.7% 
 fp8_deepseek_128x128                                 0.1315  6124.2       76.6%  (128,128) block
 fp8_rowwise                                          0.1294  6222.7       77.8%  (1,-1) block
 fp8_colwise                                          0.2217  3632.2       45.4%  (-1,1) block, t-contig
-nvfp4                                                0.1284  5355.6       66.9%  (1,16) block, fp4 qdata, no swizzle
-nvfp4_swizzle                                        0.1375  5004.3       62.6%  (1,16) block, fp4 qdata, swizzle
+nvfp4                                                0.1738  3956.8       49.5%  (1,16) block, fp4 qdata, no swizzle
+nvfp4_swizzle                                        0.1610  4273.5       53.4%  (1,16) block, fp4 qdata, swizzle
+nvfp4_sr_swizzle                                     0.3528  1949.7       24.4%  (1,16) block, fp4 qdata (stochastic rounding), swizzle
 bf16_rht                                             0.1991  5392.2       67.4%  elementwise RHT
 fp32_to_bf16_sr_global_offsets                       0.2565    6280       78.5%  elementwise SR with stateless RNG
 ```
@@ -207,7 +208,8 @@ fp32_to_bf16_sr_global_offsets                       0.2565    6280       78.5% 
   is computed *once* and amortized over every group the lane visits (vs 2 in a 1-D-flatten mapping),
   and a whole row's scale bytes land in one 128-row swizzle atom. This beat a 1-D striped mapping
   (~58%, long-scoreboard-bound at 44% occ). Tuned WARPS=2, XSPLIT=4, ILP=4. Beats compile (23.5%)
-  and edges the repo's triton (62.7%) at peak; the identical ao#4517 kernel on this same swizzle
+  and now beats the repo's triton (53.4%, since its scale switched to correctly-rounded div.rn for
+  bit-exactness) at peak; the identical ao#4517 kernel on this same swizzle
   layout measures 58.5% (its striped mapping) / 63.1% (its wpr) here. (The swizzle scale-scatter is
   the ceiling: the *linear* scale layout hits ~70% on the same kernel, but our recipe needs the
   blocked swizzle.) (`nvfp4_blocked_outer` keeps the naive kernel — it wasn't the target.)
@@ -483,7 +485,7 @@ fp32_to_bf16_sr_global_offsets       0.2429  6631.7       82.9%  elementwise SR 
   memory-bound. Both `tl.dot` and `mma.sync` are bit-exact vs the reference (bf16×bf16 is exact in
   fp32, so the fp32 accumulation reproduces torch's bf16 matmul).
 
-* `nvfp4_swizzle` (compile) runs at only ~23% peak (vs the Triton kernel's 62.6%), because inductor
+* `nvfp4_swizzle` (compile) runs at only ~23% peak (vs the Triton kernel's 53.4%), because inductor
   splits it into **3 separate kernels** instead of one fused pass:
   1. per-16-block `amax` reduction (reads `x` → block amaxes),
   2. quantize: reads **`x` again** + outer scale + amaxes, computes the inner e4m3 scale and the fp4
@@ -493,7 +495,7 @@ fp32_to_bf16_sr_global_offsets       0.2429  6631.7       82.9%  elementwise SR 
   So `x` is streamed **twice** (the quantize can't fuse with the reduction it depends on) and the
   swizzle is a separate scatter. The hand-written Triton kernel collapses all of this into **one**
   pass — load each block once, reduce to amax in-register, quantize from those registers, and write
-  both the fp4 data and the swizzled scale — which is the bulk of the 62.6% vs 23% gap. Note the fp4
+  both the fp4 data and the swizzled scale — which is the bulk of the 53.4% vs 23% gap. Note the fp4
   encode itself is *not* the bottleneck (~60% in isolation); adding the hardware `cvt` (gated to
   compile via `inline_asm_elementwise`, like torchao's `_to_mx_rceil`) only moved it 20.7% → 23%.
   Fix direction: a single fused reduce+quantize+swizzle kernel (what Triton/CUDA do), which inductor
