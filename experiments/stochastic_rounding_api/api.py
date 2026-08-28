@@ -6,9 +6,13 @@ import torch.func._random as prng
 from kernels import (
     sr_bf16_hardware_triton,
     sr_bf16_software_triton,
+    sr_fp4_software_triton,
     sr_fp8_hardware_triton,
     sr_fp8_software_triton,
 )
+# fp4 has no direct `.to()` cast, so the eager reference reuses the gold's tested pure-PyTorch e2m1
+# encode + pack (bit-matched vs the kernel's _f32_to_f4_code_tl in the main package).
+from quant_cast_bench.quant_cast_gold.utils import f32_to_f4_unpacked, pack_uint4
 
 
 class Rounding(StrEnum):
@@ -27,14 +31,18 @@ def to(
     _reference_impl=False):
     """Cast `x` (fp32) to `dtype` with the requested rounding mode. 
 
-    As this is a POC, input must be fp32 and output is
-    bfloat16 or float8_e4m3fn.
+    As this is a POC, input must be fp32 and output is bfloat16, float8_e4m3fn, or
+    float4_e2m1fn_x2 (packed nvfp4, two e2m1 codes per byte -- the last dim halves, and it must be
+    even). fp4 is STOCHASTIC-only (there is no `.to()` fp4 cast for RTNE and no cvt.rs fp4 intrinsic),
+    and its software-SR kernel packs with the Blackwell cvt.rn.satfinite.e2m1x2.f32, so it needs
+    cuda capability (10, 0) -- unlike the portable bf16/fp8 software-SR kernels.
 
     Examples::
 
         to(x, torch.bfloat16)                                                       # RTNE (default)
         to(x, torch.bfloat16, rounding=Rounding.STOCHASTIC, key=k)                  # software SR
         to(x, torch.float8_e4m3fn, rounding=Rounding.STOCHASTIC, key=k)             # software SR, fp8
+        to(x, torch.float4_e2m1fn_x2, rounding=Rounding.STOCHASTIC, key=k)          # software SR, fp4
         to(x, torch.bfloat16, rounding=Rounding.STOCHASTIC_NVIDIA_SM100, key=k)     # hardware SR
         to(x, torch.float8_e4m3fn, rounding=Rounding.STOCHASTIC_NVIDIA_SM100, key=k) # hardware SR, fp8
 
@@ -53,9 +61,15 @@ def to(
     `_reference_impl` (debug only) computes the result with an eager-PyTorch reference, matches the triton kernels bitwise.
     """
     assert x.dtype == torch.float32, f"only fp32 input supported for now, got {x.dtype}"
-    assert dtype in (torch.bfloat16, torch.float8_e4m3fn), (
-        f"only bfloat16 / float8_e4m3fn output supported for now, got {dtype}"
+    assert dtype in (torch.bfloat16, torch.float8_e4m3fn, torch.float4_e2m1fn_x2), (
+        f"only bfloat16 / float8_e4m3fn / float4_e2m1fn_x2 output supported for now, got {dtype}"
     )
+    # float4_e2m1fn_x2 (packed nvfp4) is stochastic-only: there is no direct `.to()` fp4 cast for RTNE
+    # and no cvt.rs fp4 intrinsic for the hardware path -- only the software SR kernel supports it.
+    if dtype == torch.float4_e2m1fn_x2 and rounding != Rounding.STOCHASTIC:
+        raise NotImplementedError(
+            f"float4_e2m1fn_x2 output only supports rounding='{Rounding.STOCHASTIC}', not '{rounding}'"
+        )
 
     if rounding == Rounding.RTNE:
         if key is not None:
@@ -73,24 +87,39 @@ def to(
                 "that includes https://github.com/pytorch/pytorch/pull/190253."
             )
         if _reference_impl:
-            # number of mantissa bits to drop, by target dtype
-            drop = 16 if dtype == torch.bfloat16 else 20
+            # number of mantissa bits to drop, by target dtype: bf16 keeps 7, fp8_e4m3 keeps 3, fp4
+            # (e2m1) keeps 1, so fp32's 23 mantissa bits drop 16 / 20 / 22 respectively.
+            drop = {torch.bfloat16: 16, torch.float8_e4m3fn: 20, torch.float4_e2m1fn_x2: 22}[dtype]
 
             # `prng.bits` output matches an in-kernel `tl.randint4x` output with a predefined
-            # permutation as they call philox the same way, which is why we can bitwise match 
+            # permutation as they call philox the same way, which is why we can bitwise match
             # the randomness of eager vs triton
             b = prng.bits(key, x.numel(), dtype=torch.uint32).view(torch.int32).reshape(x.shape)
 
-            # eager mode reference of software stochastic rounding, with 32 bits of 
+            # fp4 saturates at +-6 (no `.to()` fp4 cast exists), so clamp before the dither exactly as
+            # the gold _f32_to_packed_fp4_sr / the fp4 kernel do; bf16/fp8 rely on the final cast to
+            # saturate, so they pass x through unclamped.
+            xf = x.contiguous()
+            if dtype == torch.float4_e2m1fn_x2:
+                xf = xf.clamp(-6.0, 6.0).contiguous()
+
+            # eager mode reference of software stochastic rounding, with 32 bits of
             # randomness per source element
             rand = (b & ((1 << drop) - 1)).to(torch.int32)
-            xi = (x.contiguous().view(torch.int32) + rand) & -(1 << drop)
-            return xi.view(torch.float32).to(dtype)
+            xi = (xf.view(torch.int32) + rand) & -(1 << drop)
+            x_sr = xi.view(torch.float32)  # sits on the target grid for normals (subnormals double-round)
+            if dtype == torch.float4_e2m1fn_x2:
+                # no `.to(fp4)`: RNE-encode the truncated value to e2m1 codes and pack two per byte
+                # (the RNE is a no-op for normals). Bit-matches the kernel's _f32_to_f4_code_tl.
+                return pack_uint4(f32_to_f4_unpacked(x_sr)).view(torch.float4_e2m1fn_x2)
+            return x_sr.to(dtype)
 
         else:
             seed = key.reshape(-1)[:1].view(torch.int32)
             if dtype == torch.bfloat16:
                 return sr_bf16_software_triton(x, seed)
+            elif dtype == torch.float4_e2m1fn_x2:
+                return sr_fp4_software_triton(x, seed)
             else:
                 assert dtype == torch.float8_e4m3fn, "unsupported"
                 return sr_fp8_software_triton(x, seed)

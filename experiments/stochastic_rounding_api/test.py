@@ -1,10 +1,11 @@
-"""Verify the `to()` stochastic-rounding API (fp32 -> bf16 / float8_e4m3fn) and its eager reference.
+"""Verify the `to()` stochastic-rounding API (fp32 -> bf16 / float8_e4m3fn / float4_e2m1fn_x2) and
+its eager reference.
 
 Checks, per mode:
   * rtne              -- bit-identical to the native `x.to(dtype)` and to the reference.
-  * stochastic        -- (both output dtypes) unbiased & two-neighbor (the canonical SR property),
-                         tile-invariant across block sizes, deterministic given a key, and bit-
-                         identical to the eager reference (both read the same raw Philox words via
+  * stochastic        -- (bf16, fp8, and packed fp4) unbiased & two-neighbor (the canonical SR
+                         property), tile-invariant across block sizes, deterministic given a key, and
+                         bit-identical to the eager reference (both read the same raw Philox words via
                          prng.bits).
   * stochastic-nvidia-sm100 -- (Blackwell only, both output dtypes) unbiased/two-neighbor +
                          deterministic. The eager reference is bit-identical to the cvt.rs.bf16x2.f32 /
@@ -23,7 +24,13 @@ import torch.func._random as prng
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from api import to  # noqa: E402
-from kernels import sr_bf16_software_triton, sr_fp8_software_triton  # noqa: E402
+from kernels import (  # noqa: E402
+    sr_bf16_software_triton,
+    sr_fp4_software_triton,
+    sr_fp8_software_triton,
+)
+# fp4 (float4_e2m1fn_x2) has no working `.float()`, so decode packed output the same way the gold does.
+from quant_cast_bench.quant_cast_gold.utils import f4_unpacked_to_f32, unpack_uint4  # noqa: E402
 
 N = 1 << 22  # 4,194,304 elements: large enough for a tight mean estimate; divisible by 2 and 4
 
@@ -32,14 +39,22 @@ def _check_sr(out, x, dtype):
     """SR's defining properties, checked per element against the fp32 input `x`: every output is one
     of the two `dtype` grid points bracketing its own input value, and SR is unbiased (the mean
     rounding error is ~= 0). The two neighbors come from the dtype's own finite grid (all 256 fp8
-    codes / all 2^16 bf16 codes, cast to fp32, then searchsorted) -- no hardcoded step, and it works
-    for float8_e4m3fn where torch.nextafter does not. Returns the mean rounding error."""
-    n_codes = 256 if dtype == torch.float8_e4m3fn else 1 << 16  # every bit pattern of the dtype
-    codes = torch.arange(n_codes, device=x.device).to(torch.uint8 if n_codes == 256 else torch.int16)
-    vals = codes.view(dtype).float()
+    codes / all 2^16 bf16 codes / all 16 fp4 e2m1 codes, cast to fp32, then searchsorted) -- no
+    hardcoded step, and it works for float8_e4m3fn / float4_e2m1fn_x2 where torch.nextafter and even
+    `.float()` do not. Returns the mean rounding error."""
+    if dtype == torch.float4_e2m1fn_x2:
+        # fp4 packs two codes/byte and has no working .float(); decode via the gold unpack+decode,
+        # and build the grid from all 16 e2m1 codes the same way (both feed f4_unpacked_to_f32).
+        vals = f4_unpacked_to_f32(torch.arange(16, device=x.device, dtype=torch.uint8))
+        dec = f4_unpacked_to_f32(unpack_uint4(out.view(torch.uint8)))
+    else:
+        n_codes = 256 if dtype == torch.float8_e4m3fn else 1 << 16  # every bit pattern of the dtype
+        codes = torch.arange(n_codes, device=x.device).to(torch.uint8 if n_codes == 256 else torch.int16)
+        vals = codes.view(dtype).float()
+        dec = out.float()
     grid = torch.unique(vals[torch.isfinite(vals)]).sort().values  # sorted finite grid, as fp32
     x = x.reshape(-1)
-    dec = out.float().reshape(-1)
+    dec = dec.reshape(-1)
     xc = x.clamp(grid[0].item(), grid[-1].item())
     idx = torch.searchsorted(grid, xc).clamp(max=grid.numel() - 1)  # first grid point >= xc
     up = grid[idx]                       # ceil neighbor
@@ -61,9 +76,16 @@ def _key(seed=0):
     return prng.key(seed, device="cuda")
 
 
-# --- software stochastic (both output dtypes: bf16 and fp8_e4m3fn) -----------------------------
+# --- software stochastic (output dtypes: bf16, fp8_e4m3fn, and fp4 float4_e2m1fn_x2) -----------
+# bf16/fp8 SR kernels are portable; the fp4 SR kernel packs with the Blackwell cvt.rn.satfinite.
+# e2m1x2.f32 (like the repo's nvfp4 kernels), so it is only collected on cuda capability (10, 0).
+_SW_DTYPES = [torch.bfloat16, torch.float8_e4m3fn]
+if torch.cuda.is_available() and torch.cuda.get_device_capability() == (10, 0):
+    _SW_DTYPES.append(torch.float4_e2m1fn_x2)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("dtype", _SW_DTYPES)
 def test_stochastic_unbiased(dtype):
     x = _x()
     out = to(x, dtype, rounding="stochastic", key=_key())
@@ -71,7 +93,7 @@ def test_stochastic_unbiased(dtype):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("dtype", _SW_DTYPES)
 def test_stochastic_reference_unbiased(dtype):
     x = _x()
     ref = to(x, dtype, rounding="stochastic", key=_key(), _reference_impl=True)
@@ -79,18 +101,22 @@ def test_stochastic_reference_unbiased(dtype):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("dtype", _SW_DTYPES)
 def test_stochastic_tile_invariant(dtype):
     x = _x()
     seed = _key().reshape(-1)[:1].view(torch.int32)
-    launch = sr_bf16_software_triton if dtype == torch.bfloat16 else sr_fp8_software_triton
+    launch = {
+        torch.bfloat16: sr_bf16_software_triton,
+        torch.float8_e4m3fn: sr_fp8_software_triton,
+        torch.float4_e2m1fn_x2: sr_fp4_software_triton,
+    }[dtype]
     a = launch(x, seed, block=256)
     b = launch(x, seed, block=1024)
     assert torch.equal(a.view(torch.uint8), b.view(torch.uint8)), "not tile-invariant across blocks"
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("dtype", _SW_DTYPES)
 def test_stochastic_deterministic(dtype):
     x = _x()
     a = to(x, dtype, rounding="stochastic", key=_key(7))
@@ -99,7 +125,7 @@ def test_stochastic_deterministic(dtype):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("dtype", _SW_DTYPES)
 def test_stochastic_matches_reference_bitwise(dtype):
     x = _x()
     out = to(x, dtype, rounding="stochastic", key=_key())
