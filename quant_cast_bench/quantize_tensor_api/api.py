@@ -42,7 +42,6 @@ class ScalingType(IntEnum):
     BlockWise1x32 = 3
     BlockWise1x128 = 4
     BlockWise128x128 = 5
-    BlockWise32x32 = 6  # LOCAL addition, not in core; needed for first-class 32x32 mxfp8.
 
 
 class RoundingMode(StrEnum):
@@ -74,6 +73,7 @@ def quantize_tensor(
     # 1. generalize size (today hardcodes 16x16)
     # 2. think through whether the input should be the sign vector or the RHT
     rht_tensor: Tensor | None = None,
+    scaling_type_square_block_and_expand: bool = False,
 ) -> tuple[Tensor, Tensor]:
     """Quantize `input` to a block-scaled low-precision format in one orientation: `qdata_dtype` qdata
     + one `inner_scale_calc` scale per block.
@@ -87,10 +87,10 @@ def quantize_tensor(
         (nvfp4).
       inner_scale_calc: per-block scale strategy -- fixes the scale dtype and the amax->scale
         computation. InnerScaleCalc.RCEIL_E8M0 (mxfp8) or InnerScaleCalc.NVFP4_E4M3 (nvfp4).
-      scaling_type: single-level formats pass a bare ScalingType -- BlockWise1x32 / BlockWise32x32
-        (mxfp8, mxfp4). Two-level nvfp4 passes [inner, outer]: [BlockWise1x16, TensorWise] for
-        per-tensor, [BlockWise1x16, RowWise] for per-token. The outer level names the outer_scale
-        broadcast directly (no shape guessing).
+      scaling_type: single-level formats pass a bare ScalingType -- BlockWise1x32 (mxfp8, mxfp4).
+        Two-level nvfp4 passes [inner, outer]: [BlockWise1x16, TensorWise] for per-tensor,
+        [BlockWise1x16, RowWise] for per-token. The outer level names the outer_scale broadcast
+        directly (no shape guessing).
 
         The scaling axis follows the dims of the tensor you pass: for a (M, K) input with a 1x32
         block, the 1 maps to M and the 32 maps to K, so the scale runs along K (the "dim-k" cast).
@@ -111,6 +111,9 @@ def quantize_tensor(
         dim-m swizzled nvfp4 cast (selected by passing a transposed view), where it applies the RHT
         to the un-transposed input before quantizing (the wgrad-operand cast of nvfp4 training); must
         be None for every other path.
+      scaling_type_square_block_and_expand: mxfp8 only. When True, compute one scale per 32x32
+        square block and expand it into the 1x32 layout the gemm consumes (requires
+        scaling_type=BlockWise1x32). Only the dim-k (contiguous input) NO_SWIZZLE cast is wired.
 
     Returns:
         2 tensors (qdata, scale)
@@ -126,6 +129,13 @@ def quantize_tensor(
         inner_scaling_type, outer_scaling_type = scaling_type
     else:
         inner_scaling_type, outer_scaling_type = scaling_type, None
+    # scaling_type_square_block_and_expand computes the scale over 32x32 square blocks and expands it
+    # into the 1x32 layout the gemm consumes, so the scaling_type must be the 1x32 it expands into.
+    if scaling_type_square_block_and_expand:
+        assert inner_scaling_type == ScalingType.BlockWise1x32, (
+            "scaling_type_square_block_and_expand requires scaling_type=BlockWise1x32, got "
+            f"{inner_scaling_type!r}"
+        )
     # SR is implemented only for the two nvfp4 swizzle casts below; every other path asserts RTNE
     # where it dispatches. random_key IS the SR entropy (a torch.func._random Philox key), so it and
     # STOCHASTIC must come together.
@@ -135,6 +145,9 @@ def quantize_tensor(
         raise ValueError("random_key is only used with qdata_rounding_mode=STOCHASTIC")
 
     if qdata_dtype == torch.float4_e2m1fn_x2:
+        assert not scaling_type_square_block_and_expand, (
+            "scaling_type_square_block_and_expand is only supported for mxfp8 (float8_e4m3fn)"
+        )
         # dim-k (contiguous input, scale along the last dim) vs dim-m (a transposed view, scale along
         # the first dim): un-transpose the view and route to the specialized dim-m cast.
         if input.is_contiguous():
@@ -238,6 +251,18 @@ def quantize_tensor(
     assert rht_tensor is None, "rht_tensor is only used by nvfp4 (float4_e2m1fn_x2) quantization"
     assert qdata_rounding_mode == RoundingMode.RTNE, "stochastic rounding is not supported for mxfp8"
 
+    if scaling_type_square_block_and_expand:
+        # 32x32 square-block mxfp8: one scale per 32x32 tile, expanded into the 1x32 layout the gemm
+        # consumes. Only the dim-k (contiguous input), NO_SWIZZLE cast has a kernel.
+        if input.is_contiguous() and swizzle_type == SwizzleType.NO_SWIZZLE:
+            assert input.shape[0] % 32 == 0, f"first dim must be a multiple of 32, got {input.shape[0]}"
+            assert input.shape[1] % 32 == 0, f"last dim must be a multiple of 32, got {input.shape[1]}"
+            return mxfp8_32x32_triton(input, swizzle=False)
+        raise ValueError(
+            "scaling_type_square_block_and_expand (32x32 mxfp8) supports only the dim-k "
+            "(contiguous input) NO_SWIZZLE cast"
+        )
+
     # 2D: dim-k (contiguous input, scale along the last dim) vs dim-m (a transposed view, scale along
     # the first dim). For dim-m un-transpose to the original contiguous tensor and use the specialized
     # dim-m kernel (numerically the same as casting the passed view along its last dim, but faster).
@@ -249,15 +274,11 @@ def quantize_tensor(
         if spec == (ScalingType.BlockWise1x32, SwizzleType.SWIZZLE_32_4_4):
             assert input.shape[1] % 32 == 0, f"last dim must be a multiple of 32, got {input.shape[1]}"
             return mxfp8_triton(input, swizzle=True)
-        if spec == (ScalingType.BlockWise32x32, SwizzleType.NO_SWIZZLE):
-            assert input.shape[0] % 32 == 0, f"first dim must be a multiple of 32, got {input.shape[0]}"
-            assert input.shape[1] % 32 == 0, f"last dim must be a multiple of 32, got {input.shape[1]}"
-            return mxfp8_32x32_triton(input, swizzle=False)
         raise ValueError(
             f"unsupported (scaling_type, swizzle_type)={spec!r} for the dim-k (contiguous input) "
-            "mxfp8 cast; supported: (BlockWise1x32, NO_SWIZZLE|SWIZZLE_32_4_4), "
-            "(BlockWise32x32, NO_SWIZZLE); for the fused dual-orientation cast use "
-            "quantize_tensor_dual"
+            "mxfp8 cast; supported: (BlockWise1x32, NO_SWIZZLE|SWIZZLE_32_4_4); for the 32x32 "
+            "square-block cast pass scaling_type_square_block_and_expand=True; for the fused "
+            "dual-orientation cast use quantize_tensor_dual"
         )
 
     x = input.transpose(-2, -1)  # un-transpose -> the original contiguous (M, K)
@@ -286,6 +307,7 @@ def quantize_tensor_dual(
     random_key: Tensor | None = None,
     outer_scale: tuple[Tensor | None, Tensor | None] | None = None,
     rht_tensor: tuple[Tensor | None, Tensor | None] | None = None,
+    scaling_type_square_block_and_expand: bool = False,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor] | tuple[Tensor, Tensor, Tensor]:
     """Fused dual-orientation cast: quantize `input` to a block-scaled low-precision format in BOTH
     the natural and transposed orientations in one pass. The single-orientation cast is
@@ -297,12 +319,13 @@ def quantize_tensor_dual(
         (nvfp4).
       inner_scale_calc: per-block scale strategy -- fixes the scale dtype and the amax->scale
         computation. InnerScaleCalc.RCEIL_E8M0 (mxfp8) or InnerScaleCalc.NVFP4_E4M3 (nvfp4).
-      scaling_type: single-level formats pass a bare ScalingType -- BlockWise1x32 / BlockWise32x32
-        (mxfp8). nvfp4 (per-tensor only here) passes [BlockWise1x16, TensorWise].
+      scaling_type: single-level formats pass a bare ScalingType -- BlockWise1x32 (mxfp8). nvfp4
+        (per-tensor only here) passes [BlockWise1x16, TensorWise].
       swizzle_type: NO_SWIZZLE or SWIZZLE_32_4_4.
       skip_transposed_qdata: emit only the natural qdata but BOTH scales (no transposed qdata).
-        Square scaling types only; needed on hardware (such as Blackwell) where the second argument
-        of a scaled gemm can be row-major. mxfp8 only.
+        Needed on hardware (such as Blackwell) where the second argument of a scaled gemm can be
+        row-major. mxfp8 only, and only with scaling_type_square_block_and_expand=True +
+        swizzle_type=SWIZZLE_32_4_4 (the 32x32 square-block cast).
       qdata_rounding_mode: RTNE or STOCHASTIC. STOCHASTIC is supported only by the RHT nvfp4 cast
         (rht_tensor=(None, rht)) -- the grad_output cast of nvfp4 training; mxfp8 and the plain
         no-RHT nvfp4 cast are RTNE only.
@@ -316,6 +339,10 @@ def quantize_tensor_dual(
         applied to the transposed (dim-m) cast (the wgrad-operand cast of nvfp4 training); dim-k never
         applies one. None for mxfp8 and for the plain (no-RHT) nvfp4 dim-km cast. Because the RHT is
         dim-m (second-operand) only, pass it as (None, rht) -- rht in the dim-k slot is rejected.
+      scaling_type_square_block_and_expand: mxfp8 only. When True, compute one scale per 32x32
+        square block and expand it into the 1x32 layout the gemm consumes (requires
+        scaling_type=BlockWise1x32). Only wired with skip_transposed_qdata=True +
+        swizzle_type=SWIZZLE_32_4_4.
 
     Returns:
         4 tensors (qk, sk, qm, sm) normally -- natural (dim-K) pair then transposed (dim-M) pair
@@ -331,6 +358,13 @@ def quantize_tensor_dual(
         inner_scaling_type, outer_scaling_type = scaling_type
     else:
         inner_scaling_type, outer_scaling_type = scaling_type, None
+    # scaling_type_square_block_and_expand computes the scale over 32x32 square blocks and expands it
+    # into the 1x32 layout the gemm consumes, so the scaling_type must be the 1x32 it expands into.
+    if scaling_type_square_block_and_expand:
+        assert inner_scaling_type == ScalingType.BlockWise1x32, (
+            "scaling_type_square_block_and_expand requires scaling_type=BlockWise1x32, got "
+            f"{inner_scaling_type!r}"
+        )
     # stochastic rounding and its entropy source are coupled: STOCHASTIC needs a random_key, and a
     # random_key is only meaningful under STOCHASTIC.
     if qdata_rounding_mode == RoundingMode.STOCHASTIC:
@@ -359,6 +393,9 @@ def quantize_tensor_dual(
             f"float4_e2m1fn_x2 qdata requires inner_scale_calc=NVFP4_E4M3 (nvfp4), got {inner_scale_calc!r}"
         )
         assert not skip_transposed_qdata, "skip_transposed_qdata is not supported for nvfp4"
+        assert not scaling_type_square_block_and_expand, (
+            "scaling_type_square_block_and_expand is only supported for mxfp8 (float8_e4m3fn)"
+        )
         assert outer_scaling_type is not None, (
             "nvfp4 is two-level; pass scaling_type=[BlockWise1x16, TensorWise]"
         )
@@ -432,13 +469,21 @@ def quantize_tensor_dual(
     assert input.is_contiguous(), "input must be contiguous"
     spec = (inner_scaling_type, swizzle_type)
     if skip_transposed_qdata:
-        if spec == (ScalingType.BlockWise32x32, SwizzleType.SWIZZLE_32_4_4):
+        # skip_transposed_qdata (natural qdata, both scales) is wired only for the 32x32 square-block
+        # cast (expanded into the swizzled 1x32 layout).
+        if scaling_type_square_block_and_expand and swizzle_type == SwizzleType.SWIZZLE_32_4_4:
             assert input.shape[0] % 32 == 0, f"first dim must be a multiple of 32, got {input.shape[0]}"
             assert input.shape[1] % 32 == 0, f"last dim must be a multiple of 32, got {input.shape[1]}"
             return mxfp8_32x32_qdata_dim_k_scale_dim_km_swizzle_triton(input)
         raise ValueError(
-            f"unsupported (scaling_type, swizzle_type)={spec!r} for skip_transposed_qdata; "
-            "supported: (BlockWise32x32, SWIZZLE_32_4_4)"
+            "skip_transposed_qdata requires scaling_type_square_block_and_expand=True with "
+            "swizzle_type=SWIZZLE_32_4_4 (the 32x32 square-block mxfp8 cast)"
+        )
+    if scaling_type_square_block_and_expand:
+        # The full both-orientation 32x32 cast (transposed qdata too) is expressible but unwired.
+        raise ValueError(
+            "scaling_type_square_block_and_expand (32x32 mxfp8) is only wired with "
+            "skip_transposed_qdata=True"
         )
     if spec == (ScalingType.BlockWise1x32, SwizzleType.NO_SWIZZLE):
         return mxfp8_dim_km_triton(input, swizzle=False)
@@ -446,8 +491,8 @@ def quantize_tensor_dual(
         return mxfp8_dim_km_triton(input, swizzle=True)
     raise ValueError(
         f"unsupported (scaling_type, swizzle_type)={spec!r}; supported: "
-        "(BlockWise1x32, NO_SWIZZLE|SWIZZLE_32_4_4), "
-        "or (BlockWise32x32, SWIZZLE_32_4_4) with skip_transposed_qdata"
+        "(BlockWise1x32, NO_SWIZZLE|SWIZZLE_32_4_4), or the 32x32 square-block cast "
+        "(scaling_type_square_block_and_expand=True, SWIZZLE_32_4_4, skip_transposed_qdata=True)"
     )
 
 
@@ -463,6 +508,7 @@ def quantize_tensor_grouped(
     random_key: Tensor | None = None,
     outer_scale: Tensor | None = None,
     rht_tensor: Tensor | None = None,
+    scaling_type_square_block_and_expand: bool = False,
 ) -> tuple[Tensor, Tensor]:
     """Single-orientation grouped cast to a block-scaled low-precision format. For the fused
     dual-orientation cast use `quantize_tensor_grouped_dual`.
@@ -495,6 +541,11 @@ def quantize_tensor_grouped(
         "quantize_tensor_grouped is single-level (mxfp8); pass a bare ScalingType"
     )
     inner_scaling_type = scaling_type
+    if scaling_type_square_block_and_expand:
+        # No grouped 32x32 kernel exists (the square-block cast is dense-only).
+        raise NotImplementedError(
+            "scaling_type_square_block_and_expand (32x32) is not supported by quantize_tensor_grouped"
+        )
     if qdata_rounding_mode == RoundingMode.STOCHASTIC:
         raise NotImplementedError("qdata_rounding_mode=STOCHASTIC is not implemented yet")
     if random_key is not None:
@@ -534,6 +585,7 @@ def quantize_tensor_grouped_dual(
     # set the natural (dim-k) and transposed (dim-m) casts independently. Not wired to a kernel yet.
     outer_scale: Tensor | None | tuple[Tensor | None, Tensor | None] = None,
     rht_tensor: Tensor | None | tuple[Tensor | None, Tensor | None] = None,
+    scaling_type_square_block_and_expand: bool = False,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     """Fused dual-orientation grouped cast: quantize `input` to a block-scaled low-precision format in
     BOTH the natural and transposed orientations in one read. The single-orientation cast is
@@ -573,6 +625,12 @@ def quantize_tensor_grouped_dual(
         "quantize_tensor_grouped_dual is single-level (mxfp8); pass a bare ScalingType"
     )
     inner_scaling_type = scaling_type
+    if scaling_type_square_block_and_expand:
+        # No grouped 32x32 kernel exists (the square-block cast is dense-only).
+        raise NotImplementedError(
+            "scaling_type_square_block_and_expand (32x32) is not supported by "
+            "quantize_tensor_grouped_dual"
+        )
     if qdata_rounding_mode == RoundingMode.STOCHASTIC:
         raise NotImplementedError("qdata_rounding_mode=STOCHASTIC is not implemented yet")
     if random_key is not None:

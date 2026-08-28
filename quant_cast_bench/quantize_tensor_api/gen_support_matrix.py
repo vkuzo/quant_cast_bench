@@ -40,10 +40,10 @@ from quant_cast_bench.quant_cast_gold.recipes import (
 
 # --- per-entry-point column layouts (status is always second-to-last, dispatch last) --------------
 COLUMNS = [
-    "format", "scl_tp", "orient", "swizzle_type", "rnd_md", "rht", "status", "dispatches to",
+    "format", "scl_tp", "orient", "swizzle_type", "sqex", "rnd_md", "rht", "status", "dispatches to",
 ]
 COLUMNS_BI = [
-    "format", "scl_tp", "swizzle_type", "skip_tr", "rnd_md", "status", "dispatches to",
+    "format", "scl_tp", "swizzle_type", "skip_tr", "sqex", "rnd_md", "status", "dispatches to",
 ]
 COLUMNS_GROUPED = [
     "format", "scl_tp", "orient", "swizzle_type", "rnd_md", "status", "dispatches to",
@@ -59,11 +59,11 @@ HEADER_ABBR = {
     "rnd_md": "qdata_rounding_mode",
     "rht": "rht_tensor",
     "skip_tr": "skip_transposed_qdata",
+    "sqex": "scaling_type_square_block_and_expand",
 }
 VALUE_ABBR = {
     "1x16": "BlockWise1x16",
     "1x32": "BlockWise1x32",
-    "32x32": "BlockWise32x32",
     "TW": "TensorWise",
     "RW": "RowWise",
     "NT": "NATURAL",
@@ -87,10 +87,11 @@ def _end(tag: str) -> str:
 # --- per-axis value grids (the argument cross-product we probe) -----------------------------------
 QDATA = [torch.float8_e4m3fn, torch.float4_e2m1fn_x2]
 INNER = [InnerScaleCalc.RCEIL_E8M0, InnerScaleCalc.NVFP4_E4M3]
-SCALING = [ScalingType.BlockWise1x16, ScalingType.BlockWise1x32, ScalingType.BlockWise32x32]
+SCALING = [ScalingType.BlockWise1x16, ScalingType.BlockWise1x32]
 ORIENT = ["dim_k", "dim_m"]  # dim_k = contiguous input; dim_m = a transposed view of it
 SWIZZLE = [SwizzleType.NO_SWIZZLE, SwizzleType.SWIZZLE_32_4_4]
 SKIP = [False, True]
+EXPAND = [False, True]  # scaling_type_square_block_and_expand (the 32x32 square-block mxfp8 cast)
 ROUNDING = [RoundingMode.RTNE, RoundingMode.STOCHASTIC]
 OUTER = ["none", "scalar", "per_token"]  # None / per-tensor scalar / per-token (M, 1)
 OUTER_BI = ["none", "pair"]  # None / (dim_k, dim_m) tuple of per-tensor scalars
@@ -98,10 +99,11 @@ RHT = ["none", "rht"]  # None / 16x16 Hadamard
 RHT_BI = ["none", "dim_m"]  # None / (None, rht) -- RHT applies to the dim-m operand only
 
 # --- how each axis value renders in the table -----------------------------------------------------
-SCALING_R = {ScalingType.BlockWise1x16: "1x16", ScalingType.BlockWise1x32: "1x32", ScalingType.BlockWise32x32: "32x32"}
+SCALING_R = {ScalingType.BlockWise1x16: "1x16", ScalingType.BlockWise1x32: "1x32"}
 ORIENT_R = {"dim_k": "NT", "dim_m": "TR"}
 SWIZZLE_R = {SwizzleType.NO_SWIZZLE: "NONE", SwizzleType.SWIZZLE_32_4_4: "32_4_4"}
 SKIP_R = {False: "no", True: "yes"}
+EXPAND_R = {False: "no", True: "yes"}
 ROUNDING_R = {RoundingMode.RTNE: "RTNE", RoundingMode.STOCHASTIC: "RS"}
 RHT_R = {"none": "None", "rht": "16×16"}
 
@@ -191,8 +193,8 @@ def _build_grouped_inputs():
 def collect_quantize_tensor() -> list[tuple[str, ...]]:
     x, outer, rht, key = _build_inputs()
     rows = set()
-    for qd, isc, st, orient, sw, rm, osv, rhv in itertools.product(
-        QDATA, INNER, SCALING, ORIENT, SWIZZLE, ROUNDING, OUTER, RHT
+    for qd, isc, st, orient, sw, ex, rm, osv, rhv in itertools.product(
+        QDATA, INNER, SCALING, ORIENT, SWIZZLE, EXPAND, ROUNDING, OUTER, RHT
     ):
         # The outer scaling LEVEL is named explicitly now: bare (single-level) / [inner, TensorWise]
         # (per-tensor) / [inner, RowWise] (per-token), keyed off the OUTER axis 1:1 with outer_scale.
@@ -205,6 +207,7 @@ def collect_quantize_tensor() -> list[tuple[str, ...]]:
             inner_scale_calc=isc,
             scaling_type=st_arg,
             swizzle_type=sw,
+            scaling_type_square_block_and_expand=ex,
             qdata_rounding_mode=rm,
             random_key=key if rm == RoundingMode.STOCHASTIC else None,
             outer_scale=outer[osv],
@@ -215,7 +218,7 @@ def collect_quantize_tensor() -> list[tuple[str, ...]]:
         scl_tp = SCALING_R[st] if osv == "none" else f"{SCALING_R[st]}+{'TW' if osv == 'scalar' else 'RW'}"
         rows.add((
             _format_label(qd, isc, osv, rhv),
-            scl_tp, ORIENT_R[orient], SWIZZLE_R[sw], ROUNDING_R[rm], RHT_R[rhv], *res,
+            scl_tp, ORIENT_R[orient], SWIZZLE_R[sw], EXPAND_R[ex], ROUNDING_R[rm], RHT_R[rhv], *res,
         ))
     return sorted(rows)  # lexicographic order -> byte-stable output
 
@@ -227,8 +230,8 @@ def collect_dual() -> list[tuple[str, ...]]:
     outer_bi = {"none": None, "pair": (outer["scalar"], outer["scalar"])}
     rht_bi = {"none": None, "dim_m": (None, rht["rht"])}
     rows = set()
-    for qd, isc, st, sw, skip, rm, osv, rhv in itertools.product(
-        QDATA, INNER, SCALING, SWIZZLE, SKIP, ROUNDING, OUTER_BI, RHT_BI
+    for qd, isc, st, sw, skip, ex, rm, osv, rhv in itertools.product(
+        QDATA, INNER, SCALING, SWIZZLE, SKIP, EXPAND, ROUNDING, OUTER_BI, RHT_BI
     ):
         # dual nvfp4 is per-tensor only; name the outer level TensorWise when outer_scale is set.
         st_arg = st if osv == "none" else [st, ScalingType.TensorWise]
@@ -239,6 +242,7 @@ def collect_dual() -> list[tuple[str, ...]]:
             scaling_type=st_arg,
             swizzle_type=sw,
             skip_transposed_qdata=skip,
+            scaling_type_square_block_and_expand=ex,
             qdata_rounding_mode=rm,
             random_key=key if rm == RoundingMode.STOCHASTIC else None,
             outer_scale=outer_bi[osv],
@@ -250,7 +254,7 @@ def collect_dual() -> list[tuple[str, ...]]:
             "nvfp4 (per-tensor, RHT)" if rhv == "dim_m" else "nvfp4 (per-tensor)"
         )
         scl_tp = SCALING_R[st] if osv == "none" else f"{SCALING_R[st]}+TW"
-        rows.add((fmt, scl_tp, SWIZZLE_R[sw], SKIP_R[skip], ROUNDING_R[rm], *res))
+        rows.add((fmt, scl_tp, SWIZZLE_R[sw], SKIP_R[skip], EXPAND_R[ex], ROUNDING_R[rm], *res))
     return sorted(rows)
 
 

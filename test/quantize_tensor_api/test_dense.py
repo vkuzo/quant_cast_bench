@@ -148,8 +148,9 @@ def test_32x32_matches_gold_bitwise(M, N, dtype):
         x,
         qdata_dtype=torch.float8_e4m3fn,
         inner_scale_calc=InnerScaleCalc.RCEIL_E8M0,
-        scaling_type=ScalingType.BlockWise32x32,
+        scaling_type=ScalingType.BlockWise1x32,
         swizzle_type=SwizzleType.NO_SWIZZLE,
+        scaling_type_square_block_and_expand=True,
     )
     q_ref, s_ref = mxfp8_32x32_f(x)
     assert torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8)), "qdata differs from gold"
@@ -231,9 +232,10 @@ def test_32x32_both_scales_natural_qdata_matches_gold_bitwise(M, N, dtype):
         x,
         qdata_dtype=torch.float8_e4m3fn,
         inner_scale_calc=InnerScaleCalc.RCEIL_E8M0,
-        scaling_type=ScalingType.BlockWise32x32,
+        scaling_type=ScalingType.BlockWise1x32,
         swizzle_type=SwizzleType.SWIZZLE_32_4_4,
         skip_transposed_qdata=True,
+        scaling_type_square_block_and_expand=True,
     )
     qk_ref, sk_ref, sm_ref = mxfp8_32x32_qdata_dim_k_scale_dim_km_swizzle_f(x)
     for got, ref in [(qk, qk_ref), (sk, sk_ref), (sm, sm_ref)]:
@@ -344,15 +346,17 @@ def test_unsupported_combo_raises():
             x.t(),  # dim-m: transposed view -> routes to the (absent) dim-m 32x32 kernel
             qdata_dtype=torch.float8_e4m3fn,
             inner_scale_calc=InnerScaleCalc.RCEIL_E8M0,
-            scaling_type=ScalingType.BlockWise32x32,
+            scaling_type=ScalingType.BlockWise1x32,
+            scaling_type_square_block_and_expand=True,
         )
     with pytest.raises(ValueError):  # 32x32 dual (full both) is expressible but unwired
         quantize_tensor_dual(
             x,
             qdata_dtype=torch.float8_e4m3fn,
             inner_scale_calc=InnerScaleCalc.RCEIL_E8M0,
-            scaling_type=ScalingType.BlockWise32x32,
+            scaling_type=ScalingType.BlockWise1x32,
             swizzle_type=SwizzleType.SWIZZLE_32_4_4,
+            scaling_type_square_block_and_expand=True,
         )
     with pytest.raises(ValueError):  # a core ScalingType we don't have a kernel for
         quantize_tensor(
@@ -373,10 +377,11 @@ def test_unsupported_combo_raises():
             x,
             qdata_dtype=torch.float8_e4m3fn,
             inner_scale_calc=InnerScaleCalc.RCEIL_E8M0,
-            scaling_type=ScalingType.BlockWise32x32,
-                swizzle_type=SwizzleType.SWIZZLE_32_4_4,
+            scaling_type=ScalingType.BlockWise1x32,
+            swizzle_type=SwizzleType.SWIZZLE_32_4_4,
+            scaling_type_square_block_and_expand=True,
         )
-    with pytest.raises(ValueError):  # skip_transposed_qdata is 32x32-only, not 1x32
+    with pytest.raises(ValueError):  # skip_transposed_qdata needs the 32x32 square-block flag
         quantize_tensor_dual(
             x,
             qdata_dtype=torch.float8_e4m3fn,
@@ -390,9 +395,10 @@ def test_unsupported_combo_raises():
             x,
             qdata_dtype=torch.float8_e4m3fn,
             inner_scale_calc=InnerScaleCalc.RCEIL_E8M0,
-            scaling_type=ScalingType.BlockWise32x32,
+            scaling_type=ScalingType.BlockWise1x32,
             swizzle_type=SwizzleType.NO_SWIZZLE,
             skip_transposed_qdata=True,
+            scaling_type_square_block_and_expand=True,
         )
 
 

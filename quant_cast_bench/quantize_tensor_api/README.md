@@ -29,6 +29,7 @@ def quantize_tensor(
     random_key: Tensor | None = None,
     outer_scale: Tensor | None = None,
     rht_tensor: Tensor | None = None,
+    scaling_type_square_block_and_expand: bool = False,
 ) -> tuple[Tensor, Tensor]:  # (qdata, scale)
 ```
 
@@ -37,13 +38,14 @@ def quantize_tensor(
 | `input` | 2D `(M, K)` bf16/fp32 tensor. |
 | `qdata_dtype` | qdata element format: `torch.float8_e4m3fn` (mxfp8) or `torch.float4_e2m1fn_x2` (nvfp4 / mxfp4). |
 | `inner_scale_calc` | per-block scale strategy (fixes scale dtype + amax→scale): `E8M0_RCEIL` (mxfp8/mxfp4) or `E4M3_NVFP4` (nvfp4, relative to a per-tensor fp32 outer scale). |
-| `scaling_type` | 2D scale block size: `BlockWise1x32` / `BlockWise32x32` (mxfp8), `BlockWise1x16` (nvfp4). |
+| `scaling_type` | 2D scale block size: `BlockWise1x32` (mxfp8), `BlockWise1x16` (nvfp4). |
 | `orientation` | how the block maps onto `(M, K)`: `NATURAL` = as given; `TRANSPOSED` = the `(K, M)` view, outputs written transposed-contiguous. |
 | `swizzle_type` | `NO_SWIZZLE` or `SWIZZLE_32_4_4` (the blocked scale layout GEMMs consume). |
 | `rounding_mode` | `RTNE` or `STOCHASTIC`. SR is wired only for the per-tensor swizzled nvfp4 casts (NATURAL, and TRANSPOSED which then needs `rht_tensor`); everything else is RTNE-only. |
 | `random_key` | SR entropy — a `torch.func._random` Philox key. Required **iff** `rounding_mode=STOCHASTIC`. |
 | `outer_scale` | precomputed fp32 outer scale, required for nvfp4 (must be `None` otherwise). A per-tensor scalar → per-tensor nvfp4 (swizzled kernel); an `(M, 1)` scale → per-token nvfp4 (gold reference). |
 | `rht_tensor` | optional 16×16 Random Hadamard Transform. Only the per-tensor dim-m (TRANSPOSED) swizzled nvfp4 cast uses it (applies RHT to `input.t()` — the wgrad-operand cast of nvfp4 training). |
+| `scaling_type_square_block_and_expand` | mxfp8 only. Compute one scale per 32×32 square block and expand it into the `BlockWise1x32` layout the GEMM consumes (keeps the public enum GEMM-centric). Only the dim-k (contiguous input) `NO_SWIZZLE` cast is wired. |
 
 Returns `(qdata, scale)`. For the fused both-orientation cast use `quantize_tensor_dual`;
 for MoE (`offs`-grouped) casts use `quantize_tensor_grouped` / `quantize_tensor_grouped_dual`.
@@ -55,7 +57,7 @@ for MoE (`offs`-grouped) casts use `quantize_tensor_grouped` / `quantize_tensor_
   * 🟡 could be supported: mxfp6, deepseek fp8
   * out of scope: affine quantization (has zero point)
 * By scaling type
-  * 🟢 already supported: 1x32, 1x16, 32x32, per-tensor or per-token outer scale
+  * 🟢 already supported: 1x32, 1x16, 32x32 (via `scaling_type_square_block_and_expand`), per-tensor or per-token outer scale
   * 🟡 could be supported: 16x16, any type of outer scale that can broadcast to inner data
 * By scaling calculation
   * 🟢 already supported: e8m0_rceil (for mx formats), nvfp4 (for nvfp4)
@@ -96,24 +98,24 @@ map (all `nvfp4` variants share the same pair):
 
 <!-- BEGIN GENERATED: support-matrix (python gen_support_matrix.py) -->
 
-| format | scl_tp | orient | swizzle_type | rnd_md | rht | status | dispatches to |
-|---|---|---|---|---|---|---|---|
-| mxfp4 | 1x32 | NT | NONE | RTNE | None | 🟡 reference | `mxfp4_f` |
-| mxfp8 | 1x32 | NT | 32_4_4 | RTNE | None | 🟢 kernel | `mxfp8_triton` |
-| mxfp8 | 1x32 | NT | NONE | RTNE | None | 🟢 kernel | `mxfp8_triton` |
-| mxfp8 | 1x32 | TR | 32_4_4 | RTNE | None | 🟢 kernel | `mxfp8_dim_m_triton` |
-| mxfp8 | 1x32 | TR | NONE | RTNE | None | 🟢 kernel | `mxfp8_dim_m_triton` |
-| mxfp8 | 32x32 | NT | NONE | RTNE | None | 🟢 kernel | `mxfp8_32x32_triton` |
-| nvfp4 (per-tensor) | 1x16+TW | NT | 32_4_4 | RS | None | 🟡 reference | `nvfp4_gs_swizzle_sr_f` |
-| nvfp4 (per-tensor) | 1x16+TW | NT | 32_4_4 | RTNE | None | 🟢 kernel | `nvfp4_triton` |
-| nvfp4 (per-tensor) | 1x16+TW | TR | 32_4_4 | RTNE | None | 🟡 reference | `nvfp4_gs_swizzle_dim_m_f` |
-| nvfp4 (per-tensor, RHT) | 1x16+TW | TR | 32_4_4 | RS | 16×16 | 🟡 reference | `nvfp4_gs_swizzle_dim_m_rht_sr_f` |
-| nvfp4 (per-tensor, RHT) | 1x16+TW | TR | 32_4_4 | RTNE | 16×16 | 🟡 reference | `nvfp4_gs_swizzle_dim_m_rht_f` |
-| nvfp4 (per-token) | 1x16+RW | NT | NONE | RTNE | None | 🟡 reference | `nvfp4_gs_f` |
+| format | scl_tp | orient | swizzle_type | sqex | rnd_md | rht | status | dispatches to |
+|---|---|---|---|---|---|---|---|---|
+| mxfp4 | 1x32 | NT | NONE | no | RTNE | None | 🟡 reference | `mxfp4_f` |
+| mxfp8 | 1x32 | NT | 32_4_4 | no | RTNE | None | 🟢 kernel | `mxfp8_triton` |
+| mxfp8 | 1x32 | NT | NONE | no | RTNE | None | 🟢 kernel | `mxfp8_triton` |
+| mxfp8 | 1x32 | NT | NONE | yes | RTNE | None | 🟢 kernel | `mxfp8_32x32_triton` |
+| mxfp8 | 1x32 | TR | 32_4_4 | no | RTNE | None | 🟢 kernel | `mxfp8_dim_m_triton` |
+| mxfp8 | 1x32 | TR | NONE | no | RTNE | None | 🟢 kernel | `mxfp8_dim_m_triton` |
+| nvfp4 (per-tensor) | 1x16+TW | NT | 32_4_4 | no | RS | None | 🟡 reference | `nvfp4_gs_swizzle_sr_f` |
+| nvfp4 (per-tensor) | 1x16+TW | NT | 32_4_4 | no | RTNE | None | 🟢 kernel | `nvfp4_triton` |
+| nvfp4 (per-tensor) | 1x16+TW | TR | 32_4_4 | no | RTNE | None | 🟡 reference | `nvfp4_gs_swizzle_dim_m_f` |
+| nvfp4 (per-tensor, RHT) | 1x16+TW | TR | 32_4_4 | no | RS | 16×16 | 🟡 reference | `nvfp4_gs_swizzle_dim_m_rht_sr_f` |
+| nvfp4 (per-tensor, RHT) | 1x16+TW | TR | 32_4_4 | no | RTNE | 16×16 | 🟡 reference | `nvfp4_gs_swizzle_dim_m_rht_f` |
+| nvfp4 (per-token) | 1x16+RW | NT | NONE | no | RTNE | None | 🟡 reference | `nvfp4_gs_f` |
 
-**Header abbreviations:** `scl_tp` = `scaling_type`, `orient` = `orientation`, `rnd_md` = `qdata_rounding_mode`, `rht` = `rht_tensor`, `skip_tr` = `skip_transposed_qdata`.
+**Header abbreviations:** `scl_tp` = `scaling_type`, `orient` = `orientation`, `rnd_md` = `qdata_rounding_mode`, `rht` = `rht_tensor`, `skip_tr` = `skip_transposed_qdata`, `sqex` = `scaling_type_square_block_and_expand`.
 
-**Value abbreviations:** `1x16` = `BlockWise1x16`, `1x32` = `BlockWise1x32`, `32x32` = `BlockWise32x32`, `TW` = `TensorWise`, `RW` = `RowWise`, `NT` = `NATURAL`, `TR` = `TRANSPOSED`, `NONE` = `NO_SWIZZLE`, `32_4_4` = `SWIZZLE_32_4_4`, `RS` = `STOCHASTIC`.
+**Value abbreviations:** `1x16` = `BlockWise1x16`, `1x32` = `BlockWise1x32`, `TW` = `TensorWise`, `RW` = `RowWise`, `NT` = `NATURAL`, `TR` = `TRANSPOSED`, `NONE` = `NO_SWIZZLE`, `32_4_4` = `SWIZZLE_32_4_4`, `RS` = `STOCHASTIC`.
 
 <!-- END GENERATED: support-matrix -->
 
@@ -125,14 +127,14 @@ but both scales). Abbreviations as in the `quantize_tensor` legend above.
 
 <!-- BEGIN GENERATED: support-matrix-dual (python gen_support_matrix.py) -->
 
-| format | scl_tp | swizzle_type | skip_tr | rnd_md | status | dispatches to |
-|---|---|---|---|---|---|---|
-| mxfp8 | 1x32 | 32_4_4 | no | RTNE | 🟢 kernel | `mxfp8_dim_km_triton` |
-| mxfp8 | 1x32 | NONE | no | RTNE | 🟢 kernel | `mxfp8_dim_km_triton` |
-| mxfp8 | 32x32 | 32_4_4 | yes | RTNE | 🟢 kernel | `mxfp8_32x32_qdata_dim_k_scale_dim_km_swizzle_triton` |
-| nvfp4 (per-tensor) | 1x16+TW | 32_4_4 | no | RTNE | 🟡 reference | `nvfp4_gs_swizzle_dim_km_f` |
-| nvfp4 (per-tensor, RHT) | 1x16+TW | 32_4_4 | no | RS | 🟡 reference | `nvfp4_gs_swizzle_dim_k_dim_m_rht_sr_f` |
-| nvfp4 (per-tensor, RHT) | 1x16+TW | 32_4_4 | no | RTNE | 🟡 reference | `nvfp4_gs_swizzle_dim_k_dim_m_rht_f` |
+| format | scl_tp | swizzle_type | skip_tr | sqex | rnd_md | status | dispatches to |
+|---|---|---|---|---|---|---|---|
+| mxfp8 | 1x32 | 32_4_4 | no | no | RTNE | 🟢 kernel | `mxfp8_dim_km_triton` |
+| mxfp8 | 1x32 | 32_4_4 | yes | yes | RTNE | 🟢 kernel | `mxfp8_32x32_qdata_dim_k_scale_dim_km_swizzle_triton` |
+| mxfp8 | 1x32 | NONE | no | no | RTNE | 🟢 kernel | `mxfp8_dim_km_triton` |
+| nvfp4 (per-tensor) | 1x16+TW | 32_4_4 | no | no | RTNE | 🟡 reference | `nvfp4_gs_swizzle_dim_km_f` |
+| nvfp4 (per-tensor, RHT) | 1x16+TW | 32_4_4 | no | no | RS | 🟡 reference | `nvfp4_gs_swizzle_dim_k_dim_m_rht_sr_f` |
+| nvfp4 (per-tensor, RHT) | 1x16+TW | 32_4_4 | no | no | RTNE | 🟡 reference | `nvfp4_gs_swizzle_dim_k_dim_m_rht_f` |
 
 <!-- END GENERATED: support-matrix-dual -->
 
