@@ -9,6 +9,7 @@ import sys
 
 import pytest
 import torch
+import torch.func._random as prng
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from qdata_utils import mismatch_fraction, qdata_and_scale_equal
@@ -30,9 +31,10 @@ except (ImportError, importlib.metadata.PackageNotFoundError):
 HAS_CUTEDSL = _cutedsl_version is not None and _cutedsl_version >= _MIN_CUTEDSL
 
 if HAS_CUTEDSL:
-    from quant_cast_bench.quant_cast_cute.recipes import ALL_RECIPES
+    from quant_cast_bench.quant_cast_cute.recipes import ALL_RECIPES, SR_F32_TO_BF16_GLOBAL
 else:
     ALL_RECIPES = []
+    SR_F32_TO_BF16_GLOBAL = None
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or not HAS_CUTEDSL,
@@ -98,3 +100,39 @@ def test_cute_matches_reference(name, recipe):
             f"{name} output {i}: {mismatch_fraction(t, r):.3%} of elements differ from the gold "
             f"reference -- expected bit-for-bit equality"
         )
+
+
+def test_bf16_sr_global_full_key():
+    """The bit-exact bf16 global-offsets SR kernel must reproduce its gold (`sr_bf16_global_f`) for
+    ANY Philox key, including an advanced one -- SR-specific, so it lives here rather than in the
+    parametrized sweep (which only uses the default key). The gold draws via `prng.bits(key, n)`,
+    which honors the FULL key: `key[0]` is the 64-bit seed and `key[1]` a base counter offset (in
+    Philox-block units). A kernel that reads only the low 32 bits of `key[0]` and starts counters at
+    `f>>2` (ignoring `key[1]`) still matches the DEFAULT key -- `prng.key(int)` yields
+    `[small_seed, 0]` -- but diverges once `fold_in`/`split` set BOTH words to full 64-bit values.
+    This guards that the kernel consumes the whole key (seed = key[0] 64-bit, counter = key[1] +
+    f>>2)."""
+    recipe = SR_F32_TO_BF16_GLOBAL
+    M, N = 512, 512
+    torch.manual_seed(0)
+    x, key = recipe.example_input_fn(M, N)  # key = prng.key(0) -> [0, 0]
+    tile_kwargs = {"global_row": 0, "global_col": 0, "num_col": N}
+
+    # default key: kernel and gold draw the same Philox stream -> bit-for-bit equal.
+    (ref0,) = recipe.pt_ref_fn(x, key, **tile_kwargs)
+    (cute0,) = recipe.cute_fn(x, key, **tile_kwargs)
+    assert qdata_and_scale_equal(cute0, ref0), (
+        f"default key: {mismatch_fraction(cute0, ref0):.3%} of elements differ -- expected "
+        f"bit-for-bit equality"
+    )
+
+    # advance the key: fold_in sets both words to full 64-bit values. gold's prng.bits honors them, so
+    # a kernel that drops key[1] or the high 32 bits of key[0] would diverge here.
+    key2 = prng.fold_in(key, 1)
+    assert int(key2[1]) != 0, "expected fold_in to set a nonzero base-offset word (key[1])"
+    (ref1,) = recipe.pt_ref_fn(x, key2, **tile_kwargs)
+    (cute1,) = recipe.cute_fn(x, key2, **tile_kwargs)
+    assert qdata_and_scale_equal(cute1, ref1), (
+        f"advanced key: {mismatch_fraction(cute1, ref1):.3%} of elements differ -- kernel must "
+        f"consume key[1] and the high 32 bits of key[0]; expected bit-for-bit equality"
+    )

@@ -2629,19 +2629,26 @@ def _sr_bf16_kernel(gX: cute.Tensor, gY: cute.Tensor, gSeed: cute.Tensor, cX: cu
                                       num_bits_per_copy=_SR_LD_BITS)
         st_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gY.element_type,
                                       num_bits_per_copy=_SR_ST_BITS)
-        frgSeed = cute.make_rmem_tensor(cute.make_layout(1), gSeed.element_type)
-        cute.copy(cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gSeed.element_type), gSeed, frgSeed)
-        seed = cute.recast_tensor(frgSeed, dtype=cutlass.Uint32)[0]  # bitcast the int32 key word
+        frgKey = cute.make_rmem_tensor(cute.make_layout(2), gSeed.element_type)
+        cute.copy(cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gSeed.element_type), gSeed, frgKey)
+        key64 = cute.recast_tensor(frgKey, dtype=cutlass.Uint64)  # [key[0] seed, key[1] base]
+        k0 = cutlass.Uint32(key64[0] & cutlass.Uint64(0xFFFFFFFF))  # Philox key word 0 = key[0] low 32
+        k1 = cutlass.Uint32(key64[0] >> 32)                         # Philox key word 1 = key[0] high 32
+        base = key64[1]                                             # base counter offset = key[1]
         frgX = cute.make_rmem_tensor(cute.get(tv_layout, mode=[1]), gX.element_type)
         cute.copy(ld_atom, thrX, frgX)
         p0 = thrC[0][0]                                   # flat index of this thread's first element
         frgXi = cute.recast_tensor(frgX, dtype=cutlass.Int32)  # reinterpret the f32 bits in place
         zero = cutlass.Uint32(0)
         # p0 is a multiple of VPT (hence of 4), so the thread's run splits into VPT//4 aligned groups
-        # of 4 global-consecutive elements; one Philox call (counter = flat//4) dithers each group.
+        # of 4 global-consecutive elements; one Philox call dithers each group. The gold's prng.bits
+        # keys group f>>2 on `key[1] + f>>2`, a 64-bit counter split into Philox words c0 (low) / c1
+        # (high) exactly as tl.randint4x does, so this bit-matches the gold for any key.
         for g in cutlass.range_constexpr(_SR_VPT // 4):
-            ctr = cutlass.Uint32(p0 // 4) + cutlass.Uint32(g)
-            r0, r1, r2, r3 = _philox_4x32(ctr, zero, zero, zero, seed, zero)
+            ctr = base + cutlass.Uint64(p0 // 4) + cutlass.Uint64(g)
+            c0 = cutlass.Uint32(ctr & cutlass.Uint64(0xFFFFFFFF))
+            c1 = cutlass.Uint32(ctr >> 32)
+            r0, r1, r2, r3 = _philox_4x32(c0, c1, zero, zero, k0, k1)
             b = g * 4
             # add the low-16-bit dither, then truncate the low 16 mantissa bits (-65536 == 0xFFFF0000).
             # LOW (not top) 16 bits so the dither is bit-identical to the gold/Triton path, which take
@@ -2669,9 +2676,11 @@ def _sr_bf16_jit(mX, mY, mSeed):
 
 def sr_bf16_global_cute(x, key, **kwargs):
     """Tiling-invariant fp32 -> bf16 stochastic rounding (mirrors sr_bf16_global_f). The kernel keys
-    Philox on each element's GLOBAL flat index (counter = f>>2, stream = f&3 -- see `p0 = thrC[0][0]`
-    and `ctr = p0//4 + g`), so it's tile-invariant AND bit-matches the gold. `key` is a Philox key
-    tensor; its first 32-bit word seeds the in-kernel dither (loaded on-device, no host sync).
+    Philox on each element's GLOBAL flat index (counter = key[1] + f>>2, stream = f&3 -- see
+    `p0 = thrC[0][0]` and `ctr = base + p0//4 + g`), so it's tile-invariant AND bit-matches the gold.
+    `key` is a Philox key tensor `[key[0], key[1]]`: key[0] is the 64-bit seed, key[1] a base counter
+    offset -- the kernel loads both words on-device (no host sync) and consumes them exactly like the
+    gold's `prng.bits`, so it matches for any (incl. fold_in/split-advanced) key.
     `global_row`/`global_col`/`num_col` are flex_tile_map artifacts a standalone kernel that owns its
     own tiling doesn't need. Returns `(out,)`."""
     assert x.dtype == torch.float32, f"SR bf16 expects fp32 input, got {x.dtype}"
@@ -2680,7 +2689,7 @@ def sr_bf16_global_cute(x, key, **kwargs):
     M, N = x.shape
     assert (M * N) % _SR_VPT == 0, f"sr_bf16 cute kernel needs numel % {_SR_VPT} == 0"
     y = torch.empty(M, N, dtype=torch.bfloat16, device=x.device)
-    seed = key.reshape(-1)[:1].view(torch.int32).reshape(-1)[:1]  # first 32 bits of the key (device)
+    seed = key.reshape(-1).view(torch.int64)  # full key [key[0], key[1]] on device (no host sync)
     # assumed_align=16 enables the 128-bit vectorized copies (torch allocations are >=256B aligned).
     mX = from_dlpack(x.reshape(-1), assumed_align=16).mark_layout_dynamic()  # flatten (elementwise)
     mY = from_dlpack(y.reshape(-1), assumed_align=16).mark_layout_dynamic()

@@ -965,9 +965,10 @@ BF16_RHT = QuantCastHelionRecipe.from_gold(HadamardRht, helion_fn=rht_helion)
 # filled with a one-hot weighted sum over the size-4 minor axis (`hl.arange(4)`) rather than strided
 # column indexing, which Helion rejects.
 #
-# `hl.tile_index` is the GLOBAL group index (flat index >> 2), independent of the block size, and the
-# four draws feed the group's four elements in straight order with the LOW 16 bits -- exactly the gold
-# `sr_bf16_global_f` scheme (counter = gidx>>2, stream = gidx&3), so this bit-matches the gold.
+# `hl.tile_index` is the GLOBAL group index (flat index >> 2), independent of the block size; adding
+# the key's base counter offset key[1] gives the group's Philox counter, and the four draws feed the
+# group's four elements in straight order with the LOW 16 bits -- exactly the gold `sr_bf16_global_f`
+# scheme (counter = key[1] + gidx>>2, stream = gidx&3), so this bit-matches the gold for any key.
 # Elementwise + bandwidth-bound (read fp32, write bf16) -> 81.9% peak. inline_triton is a raw-Triton
 # HOP that aborts autotune_effort="full", so the config below (block_sizes=[1024]) was found under
 # autotune_effort="none" and hand-pinned.
@@ -987,7 +988,8 @@ BF16_RHT = QuantCastHelionRecipe.from_gold(HadamardRht, helion_fn=rht_helion)
 def _sr_bf16_kernel(
     x: torch.Tensor,  # (n,) fp32 input, flattened (n divisible by 4)
     out: torch.Tensor,  # (n,) bf16 output, mutated in place
-    seed: int,  # Philox seed (first 32 bits of the key)
+    seed: int,  # Philox seed = key[0] (full 64 bits; tl.randint4x splits it into two 32-bit words)
+    base: int,  # base counter offset = key[1] (prng.bits keys draws on key[1] + f>>2)
 ) -> None:
     n, = x.shape
     nq = n // 4  # groups of 4 elements: one Philox round (4 draws) per group
@@ -997,7 +999,7 @@ def _sr_bf16_kernel(
         xrow = x4[tile, :]  # (t, 4) fp32
         xi32 = xrow.view(torch.int32)  # bitcast fp32 -> int32
         col = hl.arange(4)  # size-4 minor index, for the one-hot draw -> column scatter
-        offs = hl.tile_index(tile).to(torch.int64)  # (t,) per-group Philox offset
+        offs = hl.tile_index(tile).to(torch.int64) + base  # (t,) per-group Philox counter key[1]+f>>2
         # Raw Triton: one Philox round -> four random blocks (tl.randint4x). It returns uint32, so
         # bitcast each to int32 to match output_like / the downstream int32 math.
         r0, r1, r2, r3 = hl.inline_triton(
@@ -1024,15 +1026,19 @@ def _sr_bf16_kernel(
 
 def sr_bf16_helion(x, key, **kwargs):
     """Tiling-invariant fp32 -> bf16 stochastic rounding in Helion (mirrors `sr_bf16_global_f`). `key`
-    is a torch Philox key tensor; its first 32-bit word seeds `tl.randint4x`. SR is unbiased -- a value
-    between two bf16 grid points rounds up with probability (x-lo)/(hi-lo). Returns a 1-tuple `(out,)`.
-    `**kwargs` accepted and ignored (the kernel owns its tiling)."""
+    is a torch Philox key tensor `[key[0], key[1]]`: key[0] is the 64-bit Philox seed and key[1] is a
+    base counter offset (in Philox-block units) -- gold's `prng.bits` keys draw f on `key[1] + f>>2`,
+    so we consume BOTH words to bit-match it for any (incl. fold_in/split-advanced) key. SR is unbiased
+    -- a value between two bf16 grid points rounds up with probability (x-lo)/(hi-lo). Returns a
+    1-tuple `(out,)`. `**kwargs` accepted and ignored (the kernel owns its tiling)."""
     assert x.dtype == torch.float32, f"SR bf16 expects fp32 input, got {x.dtype}"
     assert x.is_contiguous()
     n = x.numel()
-    seed = int(key.reshape(-1)[0].item())  # first word of the key as a Philox seed (full 32 bits)
+    k = key.reshape(-1).view(torch.int64)  # [key[0], key[1]] as signed ints for tl.randint4x
+    seed = int(k[0].item())  # key[0]: full 64-bit Philox seed
+    base = int(k[1].item())  # key[1]: base counter offset added to every group index
     out = torch.empty_like(x, dtype=torch.bfloat16)
-    _sr_bf16_kernel(x.view(n), out.view(n), seed)
+    _sr_bf16_kernel(x.view(n), out.view(n), seed, base)
     return (out,)
 
 

@@ -1408,14 +1408,14 @@ def _nvfp4_kernel(x_ptr, outer_ptr, q_ptr, s_ptr, seed_ptr, sxm, sxn, ssm, ssn, 
         # `_f32_to_packed_fp4_nvidia_sr`): 4 f32 lanes + one 32-bit random word -> one b16 (4 packed
         # e2m1 nibbles). The intrinsic does the whole SR round + saturate itself (it slices the word
         # byte-interleaved across the 4 lanes internally), so we feed the scaled data unclamped.
-        seed = tl.load(seed_ptr)  # first 32 bits of the Philox key, on-device
+        seed, base = tl.split(tl.load(seed_ptr + tl.arange(0, 2)))  # full key: key[0] seed, key[1] base
         # One random WORD per group of 4 elements (not per element as the software path). The gold uses
-        # word gf -> philox(seed, gf//4)[perm[gf%4]] with perm=[0,2,1,3]; the hardware interleave
+        # word gf -> philox(seed, key[1] + gf//4)[perm[gf%4]] with perm=[0,2,1,3]; the hardware interleave
         # `interleave(interleave(r0,r1),interleave(r2,r3))` lays exactly that perm across each block of
         # 4 groups. Global group gf = f>>2 for f = offs_m*N + col; N%64==0 => row_base = offs_m*N +
         # pid_n*64 is a multiple of 16, so gf//4 == (row_base>>4) + (grp>>2) and gf%4 == grp%4 -- i.e.
-        # the 16 row-local groups split cleanly into 4 Philox counters starting at row_base>>4.
-        grp_ctr = ((offs_m * N + pid_n * 64) >> 4) + tl.arange(0, 4)[None, :]  # (128, 4) counters
+        # the 16 row-local groups split cleanly into 4 Philox counters starting at key[1] + row_base>>4.
+        grp_ctr = base + (((offs_m * N + pid_n * 64) >> 4) + tl.arange(0, 4)[None, :]).to(tl.int64)  # (128, 4)
         r0, r1, r2, r3 = tl.randint4x(seed, grp_ctr)  # 4 words per counter, each (128, 4)
         rbits = tl.interleave(tl.interleave(r0, r1), tl.interleave(r2, r3))  # (128, 16) one word/group
         # Split the 64 cols into the 4 lanes of each group: reshape (128,4,16)->(128,16,2,2) so
@@ -1445,14 +1445,15 @@ def _nvfp4_kernel(x_ptr, outer_ptr, q_ptr, s_ptr, seed_ptr, sxm, sxn, ssm, ssn, 
             # div.rn above). The gold clamps BEFORE dithering, so we do too. Bit-matches via the same
             # Philox stream.
             x_blocks = tl.minimum(tl.maximum(x_blocks, -6.0), 6.0)
-            seed = tl.load(seed_ptr)  # first 32 bits of the Philox key, on-device
+            seed, base = tl.split(tl.load(seed_ptr + tl.arange(0, 2)))  # full key: key[0] seed, key[1] base
             # Key the dither on each element's GLOBAL row-major flat index f = offs_m*N + col, matching
             # the gold's `prng.bits(key, data_scaled.shape)` fill order (data_scaled is a contiguous
             # reshape of x). N%64==0 so row_base = offs_m*N + pid_n*64 is a multiple of 4, hence f>>2 ==
-            # (row_base>>2) + (col>>2) and f&3 == col&3. randint4x on the per-4-element group counter,
+            # (row_base>>2) + (col>>2) and f&3 == col&3. prng.bits honors key[1] as a base counter
+            # offset, so the counter is key[1] + f>>2. randint4x on the per-4-element group counter,
             # straight (r0,r1,r2,r3) lane order (same interleave idiom as _sr_bf16_global_kernel), gives
-            # rand[row, 4g+lane] == philox(seed, f>>2)[f&3] -- bit-for-bit the gold's per-element draw.
-            grp_counter = ((offs_m * N + pid_n * 64) >> 2) + tl.arange(0, 16)[None, :]  # (128, 16)
+            # rand[row, 4g+lane] == philox(seed, key[1]+f>>2)[f&3] -- bit-for-bit the gold's per-element draw.
+            grp_counter = base + (((offs_m * N + pid_n * 64) >> 2) + tl.arange(0, 16)[None, :]).to(tl.int64)  # (128, 16)
             r0, r1, r2, r3 = tl.randint4x(seed, grp_counter)  # 4 streams, each (128, 16)
             rand = tl.interleave(tl.interleave(r0, r2), tl.interleave(r1, r3))  # (128,64) -> (r0,r1,r2,r3)
             dither = (rand & 0x3FFFFF).to(tl.int32).reshape(128, 4, 16)  # uniform low-22-bit dither
@@ -1469,9 +1470,10 @@ def nvfp4_triton(x, outer_scale, key=None, swizzle=False, rounding="rtne", **kwa
     M, N = x.shape
     assert M % 128 == 0 and N % 64 == 0, "MSLK-style nvfp4 kernel needs M%128==0 and N%64==0"
     q = torch.empty(M, N // 2, dtype=torch.uint8, device=x.device)
-    # Both SR modes key the dither on the (device-resident) first word of the Philox key; the RNE path
-    # never loads seed_ptr, so reuse outer_scale as a harmless placeholder pointer there.
-    seed = key.reshape(-1)[:1].view(torch.int32) if rounding in ("sr", "nvidia_sr") else outer_scale
+    # Both SR modes key the dither on the (device-resident) full Philox key [key[0], key[1]] (see the
+    # SR branches in _nvfp4_kernel); the RNE path never loads seed_ptr, so reuse outer_scale as a
+    # harmless placeholder pointer there.
+    seed = key.reshape(-1).view(torch.int64) if rounding in ("sr", "nvidia_sr") else outer_scale
     grid = (N // 64, M // 128)  # ONE grid for both paths: one 128x64 atom per program
     if swizzle:
         ncb = (N // 16) // 4  # == N // 64
