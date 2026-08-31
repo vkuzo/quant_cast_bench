@@ -198,7 +198,7 @@ def collect_quantize_tensor() -> list[tuple[str, ...]]:
         QDATA, INNER, SCALING, ORIENT, SWIZZLE, EXPAND, ROUNDING, OUTER, RHT
     ):
         # The outer scaling LEVEL is named explicitly now: bare (single-level) / [inner, TensorWise]
-        # (per-tensor) / [inner, RowWise] (per-token), keyed off the OUTER axis 1:1 with outer_scale.
+        # (per-tensor) / [inner, RowWise] (per-token), keyed off the OUTER axis 1:1 with outer_quant_scale.
         st_arg = st if osv == "none" else [st, ScalingType.TensorWise if osv == "scalar" else ScalingType.RowWise]
         # dim-m is requested by passing a transposed view of the contiguous input (no orientation arg).
         probe_in = x if orient == "dim_k" else x.transpose(-2, -1)
@@ -211,7 +211,7 @@ def collect_quantize_tensor() -> list[tuple[str, ...]]:
             scaling_type_square_block_and_expand=ex,
             qdata_rounding_mode=rm,
             random_key=key if rm == RoundingMode.STOCHASTIC else None,
-            outer_scale=outer[osv],
+            outer_quant_scale=outer[osv],
             rht_tensor=rht[rhv],
         ))
         if res is None:
@@ -226,7 +226,7 @@ def collect_quantize_tensor() -> list[tuple[str, ...]]:
 
 def collect_dual() -> list[tuple[str, ...]]:
     x, outer, rht, key = _build_inputs()
-    # outer_scale / rht_tensor are per-orientation (dim_k, dim_m) tuples here. Without an RHT both
+    # outer_quant_scale / rht_tensor are per-orientation (dim_k, dim_m) tuples here. Without an RHT both
     # orientations share the scalar (|input.t()| == |input|); the RHT applies to dim-m only.
     outer_bi = {"none": None, "pair": (outer["scalar"], outer["scalar"])}
     rht_bi = {"none": None, "dim_m": (None, rht["rht"])}
@@ -234,7 +234,7 @@ def collect_dual() -> list[tuple[str, ...]]:
     for qd, isc, st, sw, skip, ex, rm, osv, rhv in itertools.product(
         QDATA, INNER, SCALING, SWIZZLE, SKIP, EXPAND, ROUNDING, OUTER_BI, RHT_BI
     ):
-        # dual nvfp4 is per-tensor only; name the outer level TensorWise when outer_scale is set.
+        # dual nvfp4 is per-tensor only; name the outer level TensorWise when outer_quant_scale is set.
         st_arg = st if osv == "none" else [st, ScalingType.TensorWise]
         res = _probe(lambda: quantize_tensor_dual(
             x,
@@ -246,7 +246,7 @@ def collect_dual() -> list[tuple[str, ...]]:
             scaling_type_square_block_and_expand=ex,
             qdata_rounding_mode=rm,
             random_key=key if rm == RoundingMode.STOCHASTIC else None,
-            outer_scale=outer_bi[osv],
+            outer_quant_scale=outer_bi[osv],
             rht_tensor=rht_bi[rhv],
         ))
         if res is None:
@@ -275,7 +275,7 @@ def collect_grouped() -> list[tuple[str, ...]]:
             swizzle_type=sw,
             qdata_rounding_mode=rm,
             random_key=key if rm == RoundingMode.STOCHASTIC else None,
-            outer_scale=outer[osv],
+            outer_quant_scale=outer[osv],
             rht_tensor=rht[rhv],
         ))
         if res is None:
@@ -301,7 +301,7 @@ def collect_grouped_dual() -> list[tuple[str, ...]]:
             skip_transposed_qdata=skip,
             qdata_rounding_mode=rm,
             random_key=key if rm == RoundingMode.STOCHASTIC else None,
-            outer_scale=outer[osv],
+            outer_quant_scale=outer[osv],
             rht_tensor=rht[rhv],
         ))
         if res is None:
