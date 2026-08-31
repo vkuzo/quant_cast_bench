@@ -172,10 +172,11 @@ def _build_inputs():
     dev = "cuda"
     x = torch.randn(256, 512, dtype=torch.bfloat16, device=dev)
     sign = torch.tensor([1, -1] * 8, device=dev, dtype=x.dtype)  # fixed +/-1 sign vector
+    # The API consumes 1/S (the MSLK/torchao global_scale convention), so reciprocate the dequant scale.
     outer = {
         "none": None,
-        "scalar": nvfp4_gs_scale(x),
-        "per_token": nvfp4_gs_per_token_scale(x),
+        "scalar": nvfp4_gs_scale(x).reciprocal(),
+        "per_token": nvfp4_gs_per_token_scale(x).reciprocal(),
     }
     rht = {"none": None, "rht": hadamard_rht_matrix(sign, x.device, x.dtype)}
     key = prng.key(0, device=dev)

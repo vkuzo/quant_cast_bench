@@ -257,7 +257,8 @@ def test_nvfp4_matches_gold(M, N, dtype):
     torch.manual_seed(0)
     x = torch.randn(M, N, dtype=dtype, device="cuda")
     # nvfp4 is two-level: the per-tensor fp32 outer scale is a global reduction the caller precomputes.
-    outer_scale = nvfp4_gs_scale(x)
+    # The API and gold both consume 1/S (the MSLK/torchao global_scale convention), so reciprocate here.
+    outer_scale = nvfp4_gs_scale(x).reciprocal()
     q, s = quantize_tensor(
         x,
         qdata_dtype=torch.float4_e2m1fn_x2,
@@ -266,7 +267,7 @@ def test_nvfp4_matches_gold(M, N, dtype):
         swizzle_type=SwizzleType.SWIZZLE_32_4_4,
         outer_scale=outer_scale,
     )
-    q_ref, s_ref = nvfp4_gs_swizzle_f(x, outer_scale.reciprocal())  # gold takes 1/S; quantize_tensor took S
+    q_ref, s_ref = nvfp4_gs_swizzle_f(x, outer_scale)
     assert q.dtype == torch.float4_e2m1fn_x2
     assert s.dtype == torch.float8_e4m3fn  # nvfp4 inner scale is e4m3 (not e8m0)
     assert q.shape == (M, N // 2)  # two fp4 codes packed per byte
@@ -289,7 +290,7 @@ def test_nvfp4_per_token_matches_gold_bitwise(M, N, dtype):
     # Triton kernel yet, so the API maps it straight to the gold reference (nvfp4_gs_f, no swizzle)
     # -> byte-identical by construction. This runs eager on any CUDA device (bit-math fp4 path),
     # unlike the SM100-gated per-tensor kernel test above.
-    outer_scale = nvfp4_gs_per_token_scale(x)
+    outer_scale = nvfp4_gs_per_token_scale(x).reciprocal()  # API and gold both consume 1/S
     assert outer_scale.shape == (M, 1)
     q, s = quantize_tensor(
         x,
@@ -299,7 +300,7 @@ def test_nvfp4_per_token_matches_gold_bitwise(M, N, dtype):
         swizzle_type=SwizzleType.NO_SWIZZLE,
         outer_scale=outer_scale,
     )
-    q_ref, s_ref = nvfp4_gs_f(x, outer_scale.reciprocal())  # gold takes 1/S; quantize_tensor took S
+    q_ref, s_ref = nvfp4_gs_f(x, outer_scale)
     assert torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8)), "qdata differs from gold"
     assert torch.equal(s.view(torch.uint8), s_ref.view(torch.uint8)), "scale differs from gold"
     assert q.dtype == torch.float4_e2m1fn_x2
@@ -319,9 +320,9 @@ def test_nvfp4_dim_m_rht_matches_gold_bitwise(M, N, dtype):
     # -> byte-identical by construction; runs eager on any CUDA device (bit-math fp4 path).
     sign = torch.tensor([1, -1] * 8, device=x.device, dtype=x.dtype)  # fixed +/-1 RHT sign vector
     rht = hadamard_rht_matrix(sign, x.device, x.dtype)
-    # two-level outer scale is over |RHT(x.t())| (the RHT-domain amax), not |x|.
+    # two-level outer scale is over |RHT(x.t())| (the RHT-domain amax), not |x|. API and gold consume 1/S.
     (x_t_rht,) = hadamard_rht_f(x.t().contiguous(), rht)
-    outer_scale = x_t_rht.abs().to(torch.float32).amax() / (F8E4M3_MAX * F4_E2M1_MAX)
+    outer_scale = (x_t_rht.abs().to(torch.float32).amax() / (F8E4M3_MAX * F4_E2M1_MAX)).reciprocal()
     q, s = quantize_tensor(
         x.t(),  # dim-m: pass a transposed view; the API un-transposes and uses the dim-m kernel
         qdata_dtype=torch.float4_e2m1fn_x2,
@@ -331,7 +332,7 @@ def test_nvfp4_dim_m_rht_matches_gold_bitwise(M, N, dtype):
         outer_scale=outer_scale,
         rht_tensor=rht,
     )
-    q_ref, s_ref = nvfp4_gs_swizzle_dim_m_rht_f(x, outer_scale.reciprocal(), rht)  # gold takes 1/S; quantize_tensor took S
+    q_ref, s_ref = nvfp4_gs_swizzle_dim_m_rht_f(x, outer_scale, rht)
     assert torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8)), "qdata differs from gold"
     assert torch.equal(s.view(torch.uint8), s_ref.view(torch.uint8)), "scale differs from gold"
     assert q.dtype == torch.float4_e2m1fn_x2
@@ -631,7 +632,7 @@ class _Nvfp4LinearSingleDirection(torch.autograd.Function):
             inner_scale_calc=InnerScaleCalc.NVFP4_E4M3,
             scaling_type=[ScalingType.BlockWise1x16, ScalingType.TensorWise],
                 swizzle_type=SwizzleType.SWIZZLE_32_4_4,
-            outer_scale=x_gs_k,
+            outer_scale=x_gs_k.reciprocal(),  # API consumes 1/S; the scaled_mm below reuses x_gs_k as S
         )
         x_rht_q_m, x_rht_s_m = quantize_tensor(
             input.t(),  # dim-m: transposed view selects the dim-m cast
@@ -639,7 +640,7 @@ class _Nvfp4LinearSingleDirection(torch.autograd.Function):
             inner_scale_calc=InnerScaleCalc.NVFP4_E4M3,
             scaling_type=[ScalingType.BlockWise1x16, ScalingType.TensorWise],
             swizzle_type=SwizzleType.SWIZZLE_32_4_4,
-            outer_scale=x_rht_g_s_m,
+            outer_scale=x_rht_g_s_m.reciprocal(),
             rht_tensor=rht,
         )
         # Weight: row cast (blk K) feeds fwd; transposed row cast (blk N) is the dgrad col operand.
@@ -654,7 +655,7 @@ class _Nvfp4LinearSingleDirection(torch.autograd.Function):
             inner_scale_calc=InnerScaleCalc.NVFP4_E4M3,
             scaling_type=[ScalingType.BlockWise1x16, ScalingType.TensorWise],
                 swizzle_type=SwizzleType.SWIZZLE_32_4_4,
-            outer_scale=w_gs,
+            outer_scale=w_gs.reciprocal(),  # API consumes 1/S; the scaled_mm below reuses w_gs as S
         )
         w_q_n, w_s_n = quantize_tensor(
             weight.t(),  # dim-m: transposed view selects the dim-m cast
@@ -662,7 +663,7 @@ class _Nvfp4LinearSingleDirection(torch.autograd.Function):
             inner_scale_calc=InnerScaleCalc.NVFP4_E4M3,
             scaling_type=[ScalingType.BlockWise1x16, ScalingType.TensorWise],
             swizzle_type=SwizzleType.SWIZZLE_32_4_4,
-            outer_scale=w_gs,
+            outer_scale=w_gs.reciprocal(),
         )
         # fwd: (M,K) @ (K,N) -> (M,N). Each operand's scale is [1x16 block-wise e4m3 (the 4D swizzle
         # grid nvfp4_gs_swizzle_f emits, flattened as torchao does), tensor-wise fp32 outer scalar].
@@ -703,7 +704,7 @@ class _Nvfp4LinearSingleDirection(torch.autograd.Function):
             inner_scale_calc=InnerScaleCalc.NVFP4_E4M3,
             scaling_type=[ScalingType.BlockWise1x16, ScalingType.TensorWise],
                 swizzle_type=SwizzleType.SWIZZLE_32_4_4,
-            outer_scale=go_gs_k,
+            outer_scale=go_gs_k.reciprocal(),  # API consumes 1/S; the scaled_mm below reuses go_gs_k as S
             qdata_rounding_mode=RoundingMode.STOCHASTIC,
             random_key=key_k,
         )
@@ -713,7 +714,7 @@ class _Nvfp4LinearSingleDirection(torch.autograd.Function):
             inner_scale_calc=InnerScaleCalc.NVFP4_E4M3,
             scaling_type=[ScalingType.BlockWise1x16, ScalingType.TensorWise],
             swizzle_type=SwizzleType.SWIZZLE_32_4_4,
-            outer_scale=go_rht_g_s_m,
+            outer_scale=go_rht_g_s_m.reciprocal(),
             rht_tensor=rht,
             qdata_rounding_mode=RoundingMode.STOCHASTIC,
             random_key=key_m,
@@ -767,7 +768,7 @@ class _Nvfp4LinearBiDirection(torch.autograd.Function):
             inner_scale_calc=InnerScaleCalc.NVFP4_E4M3,
             scaling_type=[ScalingType.BlockWise1x16, ScalingType.TensorWise],
             swizzle_type=SwizzleType.SWIZZLE_32_4_4,
-            outer_scale=(x_gs_k, x_rht_g_s_m),
+            outer_scale=(x_gs_k.reciprocal(), x_rht_g_s_m.reciprocal()),  # API consumes 1/S per orientation
             rht_tensor=(None, rht),
         )
         # Weight: row cast (blk K) feeds fwd; transposed row cast (blk N) is the dgrad col operand.
@@ -782,7 +783,7 @@ class _Nvfp4LinearBiDirection(torch.autograd.Function):
             inner_scale_calc=InnerScaleCalc.NVFP4_E4M3,
             scaling_type=[ScalingType.BlockWise1x16, ScalingType.TensorWise],
             swizzle_type=SwizzleType.SWIZZLE_32_4_4,
-            outer_scale=(w_gs, w_gs),
+            outer_scale=(w_gs.reciprocal(), w_gs.reciprocal()),  # API consumes 1/S per orientation
         )
         # fwd: (M,K) @ (K,N) -> (M,N). Each operand's scale is [1x16 block-wise e4m3 (the 4D swizzle
         # grid nvfp4_gs_swizzle_f emits, flattened as torchao does), tensor-wise fp32 outer scalar].
@@ -823,7 +824,7 @@ class _Nvfp4LinearBiDirection(torch.autograd.Function):
             inner_scale_calc=InnerScaleCalc.NVFP4_E4M3,
             scaling_type=[ScalingType.BlockWise1x16, ScalingType.TensorWise],
             swizzle_type=SwizzleType.SWIZZLE_32_4_4,
-            outer_scale=(go_gs_k, go_rht_g_s_m),
+            outer_scale=(go_gs_k.reciprocal(), go_rht_g_s_m.reciprocal()),  # API consumes 1/S per orientation
             rht_tensor=(None, rht),
             qdata_rounding_mode=RoundingMode.STOCHASTIC,
             random_key=key,
