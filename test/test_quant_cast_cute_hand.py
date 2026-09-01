@@ -27,7 +27,7 @@ except (ImportError, importlib.metadata.PackageNotFoundError):
 HAS_CUTEDSL = _cutedsl_version is not None and _cutedsl_version >= _MIN_CUTEDSL
 
 if HAS_CUTEDSL:
-    from quant_cast_bench.quant_cast_cute_hand.recipes import ALL_RECIPES
+    from quant_cast_bench.quant_cast_cute_hand.recipes import ALL_RECIPES, add_v0
 else:
     ALL_RECIPES = []
 
@@ -43,15 +43,28 @@ def _get_recipe(recipe_name):
     _recipe_name, recipe = [x for x in ALL_RECIPES if x[0] == recipe_name][0]
     return recipe
 
+def test_add_v0():
+    M, K = 2, 64
+    inputs = torch.arange(M * K, device="cuda", dtype=torch.float32).view(M, K)
+    print(inputs.shape)
+    print(inputs)
+
+    num = 1.0
+    outputs = add_v0(inputs, num)
+    print(outputs)
+    assert torch.equal(outputs, inputs + num)
+
 def test_deepseek_1x128():
     recipe = _get_recipe("deepseek_1x128")
     # inputs = recipe.example_input_fn(512, 512)
     # print(inputs)
 
-    inputs = torch.arange(32, device="cuda")
+    inputs = torch.arange(32, device="cuda").unsqueeze(0)
+    print(inputs.shape)
     print(inputs)
 
-    recipe.cute_fn(inputs)
+    outputs = recipe.cute_fn(inputs)
+    print(outputs)
 
 
 
