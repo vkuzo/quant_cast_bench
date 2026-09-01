@@ -33,6 +33,7 @@ _REQUIRES_SM100 = frozenset({
     "nvfp4_nvidia_sr_swizzle",  # cvt.rs.satfinite.e2m1x4.f32 is Blackwell-only PTX
     "mxfp8_dim_m",
     "mxfp8_dim_m_swizzle",
+    "mxfp8_32x32_dim_km_swizzle",
 })
 
 

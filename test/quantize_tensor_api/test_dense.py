@@ -95,7 +95,10 @@ def test_mxfp4_matches_gold_bitwise(M, N, dtype):
     assert q.shape == (M, N // 2) and s.shape == (M, N // 32)  # two fp4 codes packed per byte
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and torch.cuda.get_device_capability() == (10, 0)),
+    reason="mxfp8 dim-m kernel emits Blackwell-only PTX (cvt...ue8m0x2); requires SM100",
+)
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("M,N", SHAPES_128)
 def test_colwise_matches_gold_bitwise(M, N, dtype):
@@ -181,7 +184,10 @@ def test_rowwise_swizzle_matches_gold_bitwise(M, N, dtype):
     assert q.shape == (M, N)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and torch.cuda.get_device_capability() == (10, 0)),
+    reason="mxfp8 dim-m kernel emits Blackwell-only PTX (cvt...ue8m0x2); requires SM100",
+)
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("M,N", SHAPES_128)
 def test_colwise_swizzle_matches_gold_bitwise(M, N, dtype):

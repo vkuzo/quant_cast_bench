@@ -200,6 +200,7 @@ def test_triton_template_deepseek_dim_m_non_square_compiled():
     assert torch.equal(s, sr)
 
 
+@pytest.mark.skipif(not SM100, reason="mxfp8 e8m0 scale cvt (cvt.ue8m0x2) requires SM100")
 def test_triton_template_mxfp8_dim_m_compiled():
     # mxfp8 dim-M: same transposed group-reduction shape as deepseek, but a 32-row group and
     # an e8m0 (uint8) power-of-two scale. Exercises the emitter's e8m0 exponent extraction --
@@ -253,6 +254,7 @@ def test_triton_template_nvfp4_compiled():
     assert qdata_and_scale_equal(s, sr)
 
 
+@pytest.mark.skipif(not SM100, reason="mxfp8 e8m0 scale cvt (cvt.ue8m0x2) requires SM100")
 def test_triton_template_mxfp8_32x32_compiled():
     # mxfp8 32x32 exercises the emitter's block_2d path: the traced `f` splits BOTH dims into
     # 32x32 blocks (a rank-4 reshape + permute swapping the two middle axes), flattens each block to

@@ -44,11 +44,19 @@ pytestmark = pytest.mark.skipif(
     ),
 )
 
-# Recipes whose CuTeDSL kernels emit the Blackwell-only fp4 E2M1 cvt (`cvt.e2m1x2.f32`); ptxas
-# rejects it below sm_100, so gate them to cuda capability 10.0.
+# Recipes whose CuTeDSL kernels emit Blackwell-only PTX cvt instructions -- the fp4 E2M1 cvt
+# (`cvt.e2m1x2.f32`) for the nvfp4 casts, and the MX E8M0 scale cvt (`cvt...ue8m0x2`) for the mxfp8
+# casts. ptxas rejects these below sm_100, so gate them to cuda capability 10.0.
 _REQUIRES_SM100 = frozenset({
     "nvfp4_swizzle",
     "nvfp4_blocked_outer",
+    "mxfp8",
+    "mxfp8_swizzle",
+    "mxfp8_dim_m",
+    "mxfp8_dim_m_swizzle",
+    "mxfp8_dim_km",
+    "mxfp8_dim_km_swizzle",
+    "mxfp8_32x32",
 })
 
 
