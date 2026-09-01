@@ -27,7 +27,7 @@ except (ImportError, importlib.metadata.PackageNotFoundError):
 HAS_CUTEDSL = _cutedsl_version is not None and _cutedsl_version >= _MIN_CUTEDSL
 
 if HAS_CUTEDSL:
-    from quant_cast_bench.quant_cast_cute_hand.recipes import ALL_RECIPES, add_v0
+    from quant_cast_bench.quant_cast_cute_hand.recipes import ALL_RECIPES, add_v0, add_v1
 else:
     ALL_RECIPES = []
 
@@ -51,6 +51,17 @@ def test_add_v0():
 
     num = 1.0
     outputs = add_v0(inputs, num)
+    print(outputs)
+    assert torch.equal(outputs, inputs + num)
+
+def test_add_v1():
+    M, K = 2, 64
+    inputs = torch.arange(M * K, device="cuda", dtype=torch.float32).view(M, K)
+    print(inputs.shape)
+    print(inputs)
+
+    num = 1.0
+    outputs = add_v1(inputs, num)
     print(outputs)
     assert torch.equal(outputs, inputs + num)
 

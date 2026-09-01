@@ -93,10 +93,102 @@ def add_v0_jit(input: cute.Tensor, num: float, output: cute.Tensor):
 
 
 def add_v0(input: torch.Tensor, num: float):
+    # elementwise add, each thread handles one element
+
     output = torch.empty_like(input) 
     input_cute = from_dlpack(input)
     output_cute = from_dlpack(output)
     add_v0_jit(input_cute, num, output_cute)
+    return output
+
+
+@cute.kernel
+def add_v1_kernel(gA: cute.Tensor, num: cutlass.Float32, gB: cute.Tensor):
+    tidx, _, _ = cute.arch.thread_idx()  # thread index in block (0 to bdim-1)
+    bidx, _, _ = cute.arch.block_idx()  # block index in grid (0 to grid_dim -1)
+    bdim, _, _ = cute.arch.block_dim()  # threads per block
+
+
+    thread_idx = bidx * bdim + tidx
+
+
+    # map thread index to logical index of input tensor, in unit of vector
+    m, n = gA.shape[1]
+    num_threads = cute.size(gA, mode=1)
+    # if tidx == 0 and bidx == 0:
+    #     cute.printf("thread 0 block 0")
+    #     cute.printf("m %d n %d", m, n)
+    #     cute.printf("num_threads %d", num_threads)
+
+    # only calculate for in bounds tiles
+    if thread_idx < num_threads:
+
+        ni = thread_idx % n
+        mi = thread_idx // n
+
+        # map logical index to physical address via tensor layout
+        a_val = gA[(None, (mi, ni))].load()
+        if tidx == 0 and bidx == 0:
+            # tensor<ptr<f32, gmem> o ((1,4)):((0,1))>
+            # print(f"sliced gA = {gA[(None, (mi, ni))]}")
+            # tensor_value<vector<4xf32> o ((1, 4),)>
+            # print(a_val)
+            pass
+
+        gB[(None, (mi, ni))] = a_val + num
+
+
+
+@cute.jit
+def add_v1_jit(mA: cute.Tensor, num: float, mB: cute.Tensor):
+
+    m, n = mA.shape
+    numel = m * n
+    num_threads = numel
+
+    # 256 is a reasonable default
+    num_threads_per_block = 256
+
+    # tensor<ptr<f32, gmem> o (2,64):(64,1)>
+    # print("mA", mA)
+
+    # we are in fp32, so 4 elements per thread to get 128 bit load/store
+    el_per_thread = 4
+    gA = cute.zipped_divide(mA, (1, el_per_thread))
+    gB = cute.zipped_divide(mB, (1, el_per_thread))
+    # mA - "m=source matrix A, in global memory"
+    # gA - "g=global memory of matrix A, tiled by convention"
+
+    # gA tensor<ptr<f32, gmem> o ((1,4),(2,16)):((0,1),(64,4))>
+    #                               |------ mode0--|
+    #                                     |--------mode1--|
+    #                             shape0,shape1:strides0,strides1
+    # print("gA", gA)
+    # print("gB", gB)
+
+    # print(f'numel: {numel}, num_threads: {cute.size(gA, mode=[1])}, el_per_thread: {cute.size(gA, mode=[0])}')
+
+    num_blocks = _ceil_div(cute.size(gA, mode=[1]), num_threads_per_block)
+    add_v1_kernel(gA, num, gB).launch(
+        # grid - number of thread blocks (CTAs) per launch
+        grid=(num_blocks, 1, 1),
+        # block - number of threads per thread_block. Each block runs on one SM,
+        # and threads execute in warps of 32.
+        block=(num_threads_per_block, 1, 1),
+    )
+
+
+def add_v1(input: torch.Tensor, num: float):
+    # naive v1 - each thread does a 128-bit load and store
+    # for fp32, that's 4 elements per thread
+
+    # for now, no ragged shapes
+    assert input.numel() % 4 == 0, "unsupported"
+
+    output = torch.empty_like(input) 
+    input_cute = from_dlpack(input, assumed_align=16)
+    output_cute = from_dlpack(output, assumed_align=16)
+    add_v1_jit(input_cute, num, output_cute)
     return output
 
 

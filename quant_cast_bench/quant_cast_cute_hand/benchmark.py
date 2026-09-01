@@ -17,7 +17,7 @@ import torch
 from torch._inductor.utils import do_bench_using_profiling
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-from quant_cast_bench.quant_cast_cute_hand.recipes import add_v0
+from quant_cast_bench.quant_cast_cute_hand.recipes import add_v0, add_v1
 
 # H100 SXM5 HBM3 peak: 3.35 TB/s. (PCIe H100 is ~2 TB/s -- adjust if benching on that part.)
 H100_PEAK_BW_GBPS = 3350.0
@@ -40,10 +40,28 @@ def _bench_add_v0(M, K):
     bytes_per_iter = x.numel() * x.element_size() + out.numel() * out.element_size()
     return run, bytes_per_iter
 
+def _bench_add_v1(M, K):
+    # read input (M*K bf16) + write output (M*K bf16); a trivially memory-bound + 1 elementwise op.
+    torch.manual_seed(0)
+    x = torch.randn(M, K, dtype=torch.float32, device="cuda")
+
+    def run():
+        return add_v1(x, 1.0)
+
+    out = run()
+    # Guard against a kernel that "runs" but doesn't touch the whole tensor (e.g. a grid that
+    # covers only one block): without this the timing is just launch overhead and the reported
+    # bandwidth is fictional. Require the result to actually equal x + 1 across all elements.
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out.float(), x.float() + 1.0)
+    bytes_per_iter = x.numel() * x.element_size() + out.numel() * out.element_size()
+    return run, bytes_per_iter
+
 
 # name -> builder returning (run_fn, bytes_per_iter). Add new playground kernels here.
 _KERNELS = {
     "add_v0": _bench_add_v0,
+    "add_v1": _bench_add_v1,
 }
 
 
