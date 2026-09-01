@@ -183,7 +183,8 @@ def add_v1(input: torch.Tensor, num: float):
     # for fp32, that's 4 elements per thread
 
     # for now, no ragged shapes
-    assert input.numel() % 4 == 0, "unsupported"
+    assert len(input.shape) == 2, "unsupported"
+    assert input.shape[-1] % 4 == 0, "unsupported"
 
     output = torch.empty_like(input) 
     input_cute = from_dlpack(input, assumed_align=16)
