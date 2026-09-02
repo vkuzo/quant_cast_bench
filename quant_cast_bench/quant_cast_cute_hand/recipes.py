@@ -179,7 +179,7 @@ def add_v1_jit(mA: cute.Tensor, num: float, mB: cute.Tensor):
 
 
 def add_v1(input: torch.Tensor, num: float):
-    # naive v1 - each thread does a 128-bit load and store
+    # v1 - each thread does a 128-bit load and store
     # for fp32, that's 4 elements per thread
 
     # for now, no ragged shapes
@@ -192,6 +192,141 @@ def add_v1(input: torch.Tensor, num: float):
     add_v1_jit(input_cute, num, output_cute)
     return output
 
+
+
+@cute.kernel
+def add_v2_kernel(
+    gA: cute.Tensor, 
+    num: cutlass.Float32, 
+    gB: cute.Tensor, 
+    gIdA: cute.Tensor,
+    tv_layout: cute.Layout,
+    orig_shape: cute.Shape,
+):
+    # prints in this function are for input M, N == 4, 1024
+
+    tidx, _, _ = cute.arch.thread_idx()  # thread index in block (0 to bdim-1)
+    bidx, _, _ = cute.arch.block_idx()  # block index in grid (0 to grid_dim -1)
+    # bdim, _, _ = cute.arch.block_dim()  # threads per block
+
+    # slice for thread-block level view
+    # note: "select everything in the 1d tile, for tile index bidx"
+    blk_coord = ((None,), bidx)
+
+    # logical coord -> address
+    blkA = gA[blk_coord]  # (1024,) -> physical address
+    blkB = gB[blk_coord]
+    blkIdA = gIdA[blk_coord]
+
+    # compose for thread-index & value-index to physical mapping
+    # blockA: (1024,) logical index in tile -> physical address
+    # tv_layout: (tid, vid) -> (1024,) logical index in tile
+    # Note: composition(blkA, tv_layout) is blkA(tv_layout(input)), NOT tv_layout(blkA(input))
+    tidfrgA = cute.composition(blkA, tv_layout)
+    tidfrgB = cute.composition(blkB, tv_layout)
+    tidfrgIdA = cute.composition(blkIdA, tv_layout)
+
+    if False and (tidx == 0 and bidx == 0):
+        # raw_ptr(0x00007f12d9e00000: f32, gmem, align<16>) o ((1024),(4)):((1),(1024))
+        cute.printf("gA {}", gA)
+        # ((_),0)
+        cute.printf("blk_coord {}", blk_coord)
+        # raw_ptr(0x00007f12d9e00000: f32, gmem, align<16>) o (1024):(1)
+        cute.printf("blkA {}", blkA)
+
+        # print("Composed with TV layout:")
+        # tidfrgA: tensor<ptr<f32, gmem, align<16>> o (256,4):(4,1)>
+        # print(f"  tidfrgA: {tidfrgA}")
+        pass
+
+
+    # slice for thread-level view
+    thr_coord = (tidx, None)
+
+    # mask out of bounds
+    thrCrd = tidfrgIdA[thr_coord]
+    if cute.elem_less(thrCrd[0], orig_shape):
+
+        # slice for threads: vid -> address
+        thrA = tidfrgA[thr_coord]
+        thrB = tidfrgB[thr_coord]
+        thrB[None] = thrA.load() + num
+
+
+@cute.jit
+def add_v2_jit(mA: cute.Tensor, num: float, mB: cute.Tensor):
+    # 256 is a reasonable default
+    num_threads_per_block = 256
+
+    # build the tv layout
+
+    # 1. thread arrangement over the tile -> (256):(1)
+    # shape (256,): the block's 256 threads laid out as 256 cols
+    # order (0,) means 0th column is fastest
+    thr_layout = cute.make_ordered_layout((num_threads_per_block,), order=(0,))
+    # (256):(1)
+    # print('thr_layout', thr_layout)
+    assert cute.size(thr_layout) == num_threads_per_block
+
+    # 2. each thread's private chunk, expressed in elements
+    # Note: this will have to change for different dtypes.
+    # Can modify to bytes (as tutorials do) to stay independent of dtype.
+    val_layout = cute.make_ordered_layout((4,), order=(0,))
+    # (4):(1)
+    # print('val_layout', val_layout)
+
+    # fuse thread-arrangement x per-thread-values into the TV layout + tiler
+    tiler_mn, tv_layout = cute.make_layout_tv(thr_layout, val_layout)
+
+    # (1024,)
+    # - note: (1024,) = (256*4,), i.e. product of thr_layout.shape and val_layout.shape
+    # i.e. the MxN region of the source that one CTA (256 threads x 4 values each) covers
+    # print('tiler_mn', tiler_mn)
+
+    # (256,4):(4,1) == (thread, value) -> offset into the (1024,) tile
+    #   mode0 (256):(4) = THREAD (size 256): a linear tid splits to (tid%256);
+    #   mode1 4:1 = VALUE (size 4): a thread's 4 values step by 1
+    # print('tv_layout', tv_layout)
+
+    # tensor<ptr<f32, gmem, align<16>> o (128):(1)>
+    # print('mA', mA)
+
+    # identity version of the original tensor
+    mIdA = cute.make_identity_tensor(mA.shape)
+
+    # ((TileM,), (RestM,))
+    gA = cute.zipped_divide(mA, tiler_mn)
+    gB = cute.zipped_divide(mB, tiler_mn)
+    gIdA = cute.zipped_divide(mIdA, tiler_mn)
+
+
+    # tensor<ptr<f32, gmem, align<16>> o ((1024),(1)):((1),(0))>
+    # mode0 (1024):(1) = one tile, mode 1 (1):(0) - grid of tiles
+    # print('gA', gA)
+
+    # identity tensor for out of bounds check
+    # print('gIdA', gIdA)
+
+    add_v2_kernel(gA, num, gB, gIdA, tv_layout, mA.shape).launch(
+        # grid - number of thread blocks (CTAs) per launch
+        grid=(cute.size(gA, mode=[1]), 1, 1),
+        # block - number of threads per thread_block
+        block=(cute.size(tv_layout, mode=[0]), 1, 1),
+    )
+
+
+def add_v2(input: torch.Tensor, num: float):
+    # v2 - same as v1, but using tv layout
+    assert len(input.shape) == 2, "unsupported"
+    assert input.shape[-1] % 4 == 0, "unsupported"
+    assert input.is_contiguous(), "unsupported"
+    M, N = input.shape
+    input = input.view(-1)
+    output = torch.empty_like(input) 
+    input_cute = from_dlpack(input, assumed_align=16)
+    output_cute = from_dlpack(output, assumed_align=16)
+    add_v2_jit(input_cute, num, output_cute)
+    return output.view(M, N)
 
 @cute.kernel
 def fp8_deepseek_1x128_kernel(input: cute.Tensor, output: cute.Tensor):
