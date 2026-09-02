@@ -41,6 +41,8 @@ pytestmark = pytest.mark.skipif(
     ),
 )
 
+torch.manual_seed(0)
+
 def _get_recipe(recipe_name):
     _recipe_name, recipe = [x for x in ALL_RECIPES if x[0] == recipe_name][0]
     return recipe
@@ -81,20 +83,19 @@ def test_add_v2():
 
 def test_deepseek_1x128():
     recipe = _get_recipe("deepseek_1x128")
-    # inputs = recipe.example_input_fn(512, 512)
-    # print(inputs)
-
-    inputs = torch.arange(32, device="cuda").unsqueeze(0)
-    print(inputs.shape)
+    inputs = recipe.example_input_fn(2, 2048)
+    print(inputs[0].shape)
     print(inputs)
 
-    outputs = recipe.cute_fn(inputs)
+    outputs = recipe.cute_fn(*inputs)
     print(outputs)
+    tile_kwargs = {"global_row": 0, "global_col": 0, "num_col": inputs[0].shape[-1]}
+    ref_outputs = recipe.pt_ref_fn(*inputs, **tile_kwargs)
+    print(ref_outputs)
+    recipe.correctness_fn(inputs, outputs)
 
 
 
-# TODO(re-enable this after numerics work)
-@pytest.mark.skip()
 @pytest.mark.parametrize("name, recipe", ALL_RECIPES, ids=[n for n, _ in ALL_RECIPES])
 def test_cute_hand_matches_reference(name, recipe):
     # the CuTeDSL kernel should reproduce the gold reference bit-for-bit (identical fp32 math + RNE

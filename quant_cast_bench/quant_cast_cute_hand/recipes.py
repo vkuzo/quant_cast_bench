@@ -3,11 +3,19 @@
 # Started from FP8_DEEPSEEK_1X128, copied verbatim from quant_cast_cute/recipes.py; this is the
 # playground where we iterate on it.
 
+import os
+
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
 import torch
+
+# Gate debug output (host trace-time `print` + device `cute.printf`) behind an env var, read once
+# at import. Gate with `cutlass.const_expr(_DEBUG)` inside kernels so that when off the tracer takes
+# neither branch -- the printf ops are never emitted (no dead ops, no values kept live). Run with
+# `CUTE_DEBUG=1 python -m ...` to enable.
+_DEBUG = os.environ.get("CUTE_DEBUG", "0") == "1"
 
 from quant_cast_bench.quant_cast_cute.recipes import QuantCastCuteRecipe
 from quant_cast_bench.quant_cast_gold.recipes import Deepseek1x128Gold
@@ -328,21 +336,161 @@ def add_v2(input: torch.Tensor, num: float):
     add_v2_jit(input_cute, num, output_cute)
     return output.view(M, N)
 
-@cute.kernel
-def fp8_deepseek_1x128_kernel(input: cute.Tensor, output: cute.Tensor):
-    # TODO(later): fill me out
-    pass
 
+@cute.kernel
+def fp8_deepseek_1x128_kernel(
+    gInput: cute.Tensor,
+    gOutput: cute.Tensor,
+    gScale: cute.Tensor,
+    gId: cute.Tensor,
+    input_tv_layout: cute.Layout,
+    scale_tv_layout: cute.Layout,
+    orig_shape: cute.Shape,
+):
+    tidx, _, _ = cute.arch.thread_idx()  # thread index in block (0 to bdim-1)
+    bidx, _, _ = cute.arch.block_idx()  # block index in grid (0 to grid_dim -1)
+    # bdim, _, _ = cute.arch.block_dim()  # threads per block
+
+    # slice for thread-block level view
+    # note: "select everything in the 1d tile, for tile index bidx"
+    blk_coord = ((None,), bidx)
+
+    # logical coord -> address
+    blkInput = gInput[blk_coord]  # (1024,) -> physical address
+    blkOutput = gOutput[blk_coord]
+    blkId = gId[blk_coord]
+    blkScale = gScale[blk_coord]
+
+    # compose for thread-index & value-index to physical mapping
+    # blkInput: (1024,) logical index in tile -> physical address
+    # input_tv_layout: (tid, vid) -> (1024,) logical index in tile
+    # Note: composition(blkInput, input_tv_layout) is blkInput(input_tv_layout(input)), NOT input_tv_layout(blkInput(input))
+    tidfrgInput = cute.composition(blkInput, input_tv_layout)
+    tidfrgOutput = cute.composition(blkOutput, input_tv_layout)
+    tidfrgId = cute.composition(blkId, input_tv_layout)
+    tidfrgScale = cute.composition(blkScale, scale_tv_layout)
+
+    # slice for thread-level view
+    thr_coord = (tidx, None)
+
+    # mask out of bounds
+    thrId = tidfrgId[thr_coord]
+    if cute.elem_less(thrId[0], orig_shape):
+
+        # reference:
+        #
+        # def deepseek_1x128_f(x, **kwargs):
+        #     fp8_max = torch.finfo(torch.float8_e4m3fn).max  # 448.0
+        #     *lead, last = x.shape
+        #     x_b = x.reshape(*lead, last // 128, 128)
+        #     amax = x_b.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12).to(torch.float32)
+        #     scale = (amax / fp8_max).to(torch.float32)  # forward scale
+        #     qdata = (x_b.to(torch.float32) * (1.0 / scale)).to(torch.float8_e4m3fn)
+        #     return qdata.reshape(*lead, last), scale.squeeze(-1)
+        #
+        # Each thread owns 8 elements, 128 // 8 = 16, so every 16 threads
+        # calculate a 1x128 block
+
+        # Load the fragment, slice for threads: vid -> address
+        thrInput = tidfrgInput[thr_coord].load()
+
+        # docs: https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/cute_dsl_api/cute_math.html#cutlass.cute.math.abs
+        thrA_abs = cute.math.absf(thrInput)
+        # thread-local max with clamp
+        thrA_amax8 = thrA_abs.reduce(cute.ReductionOp.MAX, init_val=1e-12, reduction_profile=1)
+        # intra-thread max
+        thrA_amax128 = cute.arch.warp_reduction_max(thrA_amax8, threads_in_group=16)
+        # convert bf16 -> fp32
+        thrA_amax128_fp32 = cutlass.Float32(thrA_amax128)
+        # calculate scale
+        scale = (thrA_amax128_fp32 * cutlass.Float32(1.0 / 448.0))
+        # calculate qdata
+        qdata = (thrInput.to(cutlass.Float32) * (1.0 / scale)).to(cutlass.Float8E4M3FN)
+
+        if cutlass.const_expr(_DEBUG):
+            print('thrA_amax8 static type', thrA_amax8.type)
+            print('thrA_amax128_fp32 static type', thrA_amax128_fp32.dtype)
+            print('scale static type', scale.dtype)
+            if tidx == 0 and bidx == 0:
+                cute.printf(
+                    "thrInput {}, {}, {}, {}, {}, {}, {}, {}",
+                    thrInput[0], thrInput[1], thrInput[2], thrInput[3],
+                    thrInput[4], thrInput[5], thrInput[6], thrInput[7],
+                )
+                cute.printf(
+                    "thrA_abs {}, {}, {}, {}, {}, {}, {}, {}",
+                    thrA_abs[0], thrA_abs[1], thrA_abs[2], thrA_abs[3],
+                    thrA_abs[4], thrA_abs[5], thrA_abs[6], thrA_abs[7],
+                )
+                cute.printf("thrA_amax8 {}", thrA_amax8)
+                cute.printf("thrA_amax128 {}", thrA_amax128)
+                cute.printf("scale {}", scale)
+                cute.printf(
+                    "qdata {}, {}, {}, {}, {}, {}, {}, {}",
+                    qdata[0], qdata[1], qdata[2], qdata[3],
+                    qdata[4], qdata[5], qdata[6], qdata[7],
+                )
+
+        # store qdata
+        thrOutput = tidfrgOutput[thr_coord]
+        thrOutput[None] = qdata
+        # every 16'th thread stores scale
+        if tidx % 16 == 0:
+            tidfrgScale[tidx] = scale
 
 
 @cute.jit
-def fp8_deepseek_1x128_jit(input: cute.Tensor, output: cute.Tensor):
-    # TODO(later): fill me out
-    pass
+def fp8_deepseek_1x128_jit(mInput: cute.Tensor, mOutput: cute.Tensor, mScale: cute.Tensor):
+    # 256 is a reasonable default
+    num_threads_per_block = 256
 
-def fp8_deepseek_1x128(input: torch.Tensor):
-    # TODO(later): fill me out
-    pass
+    # build the tv layout
+    # thr: (256):(1)
+    thr_layout = cute.make_ordered_layout((num_threads_per_block,), order=(0,))
+    # val: (8):(1)
+    val_layout = cute.make_ordered_layout((8,), order=(0,))
+    # (2048,)  (256,8):(8,1)
+    tiler_mn, input_tv_layout = cute.make_layout_tv(thr_layout, val_layout)
+    # ((TileM,), (RestM,))
+    gInput = cute.zipped_divide(mInput, tiler_mn)
+    gOutput = cute.zipped_divide(mOutput, tiler_mn)
+    mId = cute.make_identity_tensor(mInput.shape)
+    gId = cute.zipped_divide(mId, tiler_mn)
+
+    # scale tv layout
+    # mode 0 - every 16 threads all write to the same location (only one writes)
+    # mode 1 - scales are one element apart
+    scale_tv_layout = cute.make_layout((16, 16), stride=(0, 1))   # (16,16):(0,1)
+    # scale_tiler_mn is the number of scale slots written to by a CTA
+    scale_tiler_mn = (cute.cosize(scale_tv_layout),)  # (16,)
+    gScale = cute.zipped_divide(mScale, scale_tiler_mn)
+
+    if cutlass.const_expr(_DEBUG):
+        print('scale_tv_layout', scale_tv_layout)
+        print('scale_tiler_mn', scale_tiler_mn)
+        print('mScale', mScale)
+        print('gScale', gScale)
+
+    fp8_deepseek_1x128_kernel(
+        gInput, gOutput, gScale, gId, input_tv_layout, scale_tv_layout, mInput.shape
+    ).launch(
+        grid=(cute.size(gInput, mode=[1]), 1, 1),
+        block=(cute.size(input_tv_layout, mode=[0]), 1, 1),
+    )
+
+def fp8_deepseek_1x128(input: torch.Tensor, **kwargs):
+    assert len(input.shape) == 2, "unsupported"
+    assert input.shape[-1] % 128 == 0, "unsupported"
+    assert input.is_contiguous(), "unsupported"
+    M, N = input.shape
+    input = input.view(-1)
+    output = torch.empty(input.shape, dtype=torch.float8_e4m3fn, device=input.device) 
+    scale = torch.empty(M * (N // 128), dtype=torch.float32, device=input.device)
+    input_cute = from_dlpack(input, assumed_align=16)
+    output_cute = from_dlpack(output, assumed_align=16)
+    scale_cute = from_dlpack(scale, assumed_align=16)
+    fp8_deepseek_1x128_jit(input_cute, output_cute, scale_cute)
+    return output.view(M, N), scale.view(M, N // 128)
 
 
 FP8_DEEPSEEK_1X128 = QuantCastCuteRecipe.from_gold(

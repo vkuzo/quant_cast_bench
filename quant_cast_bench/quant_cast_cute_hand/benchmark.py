@@ -17,7 +17,9 @@ import torch
 from torch._inductor.utils import do_bench_using_profiling
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-from quant_cast_bench.quant_cast_cute_hand.recipes import add_v0, add_v1, add_v2
+from quant_cast_bench.quant_cast_cute_hand.recipes import (
+    add_v0, add_v1, add_v2, fp8_deepseek_1x128,
+)
 
 # H100 SXM5 HBM3 peak: 3.35 TB/s. (PCIe H100 is ~2 TB/s -- adjust if benching on that part.)
 H100_PEAK_BW_GBPS = 3350.0
@@ -75,11 +77,50 @@ def _bench_add_v2(M, K):
     return run, bytes_per_iter
 
 
+def _deepseek_1x128_ref(x):
+    # torch reference for the deepseek 1x128 quant-cast. Matches the kernel bit-for-bit, including
+    # the scale step: `amax / 448.0` with a Python-float divisor on a CUDA tensor is lowered by
+    # torch to multiply-by-reciprocal, and the kernel deliberately does the same (`amax * f32(1/448)`)
+    # rather than an honest div.rn. Used as the "did the kernel actually run" guard below.
+    M, K = x.shape
+    x_b = x.reshape(M, K // 128, 128)
+    amax = x_b.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12).to(torch.float32)
+    scale = (amax / 448.0).to(torch.float32)
+    qdata = (x_b.to(torch.float32) * (1.0 / scale)).to(torch.float8_e4m3fn)
+    return qdata.reshape(M, K), scale.squeeze(-1)
+
+
+def _bench_fp8_deepseek_1x128(M, K):
+    # read input (M*K bf16) + write qdata (M*K fp8) + write scale (M*(K/128) fp32). Memory-bound
+    # 1x128 blockwise quant-cast.
+    torch.manual_seed(0)
+    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+
+    def run():
+        return fp8_deepseek_1x128(x)
+
+    q, s = run()
+    # Guard against a kernel that "runs" but doesn't touch the whole tensor. The kernel is bit-exact
+    # vs the torch reference (scale via reciprocal-multiply, matching torch's CUDA lowering), so
+    # require exact equality on both outputs.
+    torch.cuda.synchronize()
+    q_ref, s_ref = _deepseek_1x128_ref(x)
+    assert torch.equal(s, s_ref), "scale mismatch vs reference"
+    assert torch.equal(q.float(), q_ref.float()), "qdata mismatch vs reference"
+    bytes_per_iter = (
+        x.numel() * x.element_size()   # bf16 input read
+        + q.numel() * q.element_size() # fp8 qdata write
+        + s.numel() * s.element_size() # fp32 scale write
+    )
+    return run, bytes_per_iter
+
+
 # name -> builder returning (run_fn, bytes_per_iter). Add new playground kernels here.
 _KERNELS = {
     "add_v0": _bench_add_v0,
     "add_v1": _bench_add_v1,
     "add_v2": _bench_add_v2,
+    "fp8_deepseek_1x128": _bench_fp8_deepseek_1x128,
 }
 
 
