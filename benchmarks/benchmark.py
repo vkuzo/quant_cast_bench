@@ -1,7 +1,8 @@
 """Memory-bandwidth benchmark for quant_cast_gold recipes.
 
 Each recipe is a memory-bound cast, so the signal we care about is achieved memory bandwidth
-vs. the B200 ceiling (8 TB/s). Per `mode`, we either torch.compile each gold recipe's reference
+vs. the GPU's HBM ceiling (B200: 8 TB/s, H100 SXM5: 3.35 TB/s -- selected from the device name).
+Per `mode`, we either torch.compile each gold recipe's reference
 fn ("compile", the default) or run its hand-written Triton kernel ("triton"), time it with
 `do_bench_using_profiling`, and report latency + GB/s + % of peak. Structured after
 flexquant/benchmark.py.
@@ -19,7 +20,21 @@ from torch._inductor.utils import do_bench_using_profiling
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from quant_cast_bench.quant_cast_gold.recipes import ALL_RECIPES
 
-B200_PEAK_BW_GBPS = 8000.0  # 8 TB/s
+# Peak HBM bandwidth per GPU family (GB/s), used for the "% of peak" column. Matched by substring
+# against torch.cuda.get_device_name(0); H100 is the SXM5 HBM3 part (PCIe H100 is ~2 TB/s).
+_PEAK_BW_GBPS = {
+    "B200": 8000.0,  # 8 TB/s
+    "H100": 3350.0,  # 3.35 TB/s
+}
+
+
+def _peak_bw_gbps(device_name):
+    for family, bw in _PEAK_BW_GBPS.items():
+        if family in device_name:
+            return bw
+    raise AssertionError(
+        f"unsupported GPU {device_name!r}; known families: {sorted(_PEAK_BW_GBPS)}"
+    )
 
 # Recipes excluded from the benchmark entirely -- not relevant here (they still run in the
 # gold tests). Filtered out before the sweep, so they never appear in the results table.
@@ -38,7 +53,7 @@ def _bytes_moved(inputs, outputs):
     return sum(t.numel() * t.element_size() for t in tensors)
 
 
-def _bench_relu(M, K):
+def _bench_relu(M, K, peak_bw):
     # eager torch.relu baseline: a trivially memory-bound op (read x, write relu(x), both bf16)
     # that anchors the achievable-bandwidth ceiling for this shape.
     torch.manual_seed(0)
@@ -56,11 +71,11 @@ def _bench_relu(M, K):
 
     gpu_time_ms = do_bench_using_profiling(run)
     gbps = bytes_per_iter / (gpu_time_ms * 1e-3) / 1e9
-    pct_peak = gbps / B200_PEAK_BW_GBPS * 100
+    pct_peak = gbps / peak_bw * 100
     return gpu_time_ms, gbps, pct_peak
 
 
-def _bench_one(recipe, M, K, mode):
+def _bench_one(recipe, M, K, mode, peak_bw):
     torch.manual_seed(0)
     torch._dynamo.reset()
     inputs = recipe.example_input_fn(M, K)  # (x, *aux)
@@ -132,7 +147,7 @@ def _bench_one(recipe, M, K, mode):
 
     gpu_time_ms = do_bench_using_profiling(run)
     gbps = bytes_per_iter / (gpu_time_ms * 1e-3) / 1e9
-    pct_peak = gbps / B200_PEAK_BW_GBPS * 100
+    pct_peak = gbps / peak_bw * 100
     return gpu_time_ms, gbps, pct_peak
 
 
@@ -152,7 +167,7 @@ def main(
     just updates its rows in place (idempotent, no duplicates).
     """
     device_name = torch.cuda.get_device_name(0)
-    assert "B200" in device_name, f"this benchmark assumes B200, got {device_name!r}"
+    peak_bw = _peak_bw_gbps(device_name)
 
     mode = mode or "compile"
     assert mode in ("compile", "triton", "cute", "helion", "flex_tile_map_triton"), (
@@ -204,7 +219,7 @@ def main(
 
     # relu baseline anchors the bandwidth ceiling; shown on a full sweep (no filter).
     if recipe_name_filter is None:
-        ms, gbps, pct = _bench_relu(M, K)
+        ms, gbps, pct = _bench_relu(M, K, peak_bw)
         rows.append(("relu (baseline)", f"{ms:.4f}", f"{gbps:.1f}", f"{pct:.1f}%", ""))
         csv_rows.append(("relu (baseline)", mode, ms, gbps, pct))
 
@@ -213,7 +228,7 @@ def main(
         # torch.compile, swizzle grids, SR's fp32/const input). Skip failures for now so the
         # sweep still reports the ones that work; revisit each skipped recipe.
         try:
-            ms, gbps, pct = _bench_one(recipe, M, K, mode)
+            ms, gbps, pct = _bench_one(recipe, M, K, mode, peak_bw)
         except Exception as e:
             reason = f"SKIPPED: {type(e).__name__}: {str(e).splitlines()[0][:60]}"
             rows.append((name, reason, "", "", recipe.perf_description))
@@ -221,7 +236,10 @@ def main(
         rows.append((name, f"{ms:.4f}", f"{gbps:.1f}", f"{pct:.1f}%", recipe.perf_description))
         csv_rows.append((name, mode, ms, gbps, pct))
 
-    print(f"shape: ({M}, {K})  mode: {mode}")
+    print(
+        f"shape: ({M}, {K})  mode: {mode}  "
+        f"device: {device_name} (peak {peak_bw / 1000:.2f} TB/s)"
+    )
     print(
         tabulate.tabulate(
             rows,
