@@ -391,21 +391,21 @@ def transpose_v0_jit(mA: cute.Tensor, mB: cute.Tensor):
 
     # for now, a simple 2d layout
 
-    # thr: (1,256):(0,1)
-    thrA_layout = cute.make_ordered_layout((1, num_threads_per_block,), order=(1, 0))
+    # thr: (128,2):(2,1)
+    thrA_layout = cute.make_ordered_layout((128, num_threads_per_block // 128,), order=(1, 0))
     # val: (1,8):(0,1)
     valA_layout = cute.make_ordered_layout((1, 8,), order=(1, 0))
-    # (1,2048)  (256,8):(8,1)
+    # (128,16)  ((2,128),8):((1024,1),128)
     tilerA_mn, A_tv_layout = cute.make_layout_tv(thrA_layout, valA_layout)
     # ((TileM,), (RestM,))
     gA = cute.zipped_divide(mA, tilerA_mn)
 
     # layout of B is transpose of layout of A
-    # thr: (256,1):(1,0)
-    thrB_layout = cute.make_ordered_layout((num_threads_per_block, 1), order=(1, 0))
+    # thr: (2,128):(1,2)
+    thrB_layout = cute.make_ordered_layout((num_threads_per_block // 128, 128), order=(0, 1))
     # val: (8,1):(1,0)
-    valB_layout = cute.make_ordered_layout((8, 1), order=(1, 0))
-    # (2048,1) (256,8):(8,1)
+    valB_layout = cute.make_ordered_layout((8, 1), order=(0, 1))
+    # (16,128) (256,8):(8,1)
     tilerB_mn, B_tv_layout = cute.make_layout_tv(thrB_layout, valB_layout)
     gB = cute.zipped_divide(mB, tilerB_mn)
 
@@ -430,9 +430,10 @@ def transpose_v0_jit(mA: cute.Tensor, mB: cute.Tensor):
 
 def transpose_v0(input: torch.Tensor):
     assert len(input.shape) == 2, "unsupported"
-    assert input.shape[-1] % 2048 == 0, "unsupported"
     assert input.is_contiguous(), "unsupported"
     M, N = input.shape
+    assert M % 128 == 0, "unsupported"
+    assert N % 16 == 0, "unsupported"
     output = torch.empty(N, M, dtype=input.dtype, device=input.device)
     input_cute = from_dlpack(input, assumed_align=16)
     output_cute = from_dlpack(output, assumed_align=16)

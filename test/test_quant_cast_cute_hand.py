@@ -95,7 +95,8 @@ def test_deepseek_1x128():
     recipe.correctness_fn(inputs, outputs)
 
 def test_transpose_v0():
-    M, K = 2, 2048 * 2
+    # 128x16 tile: M must be a multiple of 128, K a multiple of 16.
+    M, K = 128, 256
     inputs = torch.arange(M * K, device="cuda", dtype=torch.bfloat16).view(M, K)
     # print(inputs.shape)
     print('\n', inputs.shape, inputs)
