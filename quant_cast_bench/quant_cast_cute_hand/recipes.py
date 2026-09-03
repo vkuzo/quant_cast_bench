@@ -338,6 +338,109 @@ def add_v2(input: torch.Tensor, num: float):
 
 
 @cute.kernel
+def transpose_v0_kernel(
+    gA: cute.Tensor, 
+    A_tv_layout: cute.Layout,
+    gB: cute.Tensor, 
+    B_tv_layout: cute.Layout,
+):
+    tidx, _, _ = cute.arch.thread_idx()  # thread index in block (0 to bdim-1)
+    bidx, bidy, _ = cute.arch.block_idx()  # block index in grid (0 to grid_dim -1)
+    # bdim, _, _ = cute.arch.block_dim()  # threads per block
+
+    # select everything in the 2d tile, for tile index (bidx, bidy)
+    blk_coord_A = ((None, None), (bidx, bidy))
+    # logical coord -> address
+    blkA = gA[blk_coord_A]
+
+    # output - swap block indices to transpose the tiles
+    blk_coord_B = ((None, None), (bidy, bidx))
+    blkB = gB[blk_coord_B]
+
+    tidfrgA = cute.composition(blkA, A_tv_layout)
+    tidfrgB = cute.composition(blkB, B_tv_layout)
+
+    # slice for thread-level view
+    thr_coord = (tidx, None)
+
+    # do the transpose, the in-tile value transpose is handled with
+    # the layout
+    thrA = tidfrgA[thr_coord]
+    thrB = tidfrgB[thr_coord]
+    thrB[None] = thrA.load()
+
+    if cutlass.const_expr(_DEBUG):
+        # entire tensor
+        # tensor<ptr<bf16, gmem, align<16>> o ((1,2048),(2,2)):((0,1),(4096,2048))>
+        print('gA', gA)
+        # the current block
+        # tensor<ptr<bf16, gmem, align<16>> o (1,2048):(0,1)>
+        print('blkA', blkA)
+        # the current block, in tv-layout
+        # tensor<ptr<bf16, gmem, align<16>> o (256,8):(8,1)>
+        print('tidfrgA', tidfrgA)
+        # the current thread's data
+        # tensor<ptr<bf16, gmem, align<16>> o (8):(1)>
+        print('thrA', thrA)
+
+
+@cute.jit
+def transpose_v0_jit(mA: cute.Tensor, mB: cute.Tensor):
+    # 256 is a reasonable default
+    num_threads_per_block = 256
+
+    # for now, a simple 2d layout
+
+    # thr: (1,256):(0,1)
+    thrA_layout = cute.make_ordered_layout((1, num_threads_per_block,), order=(1, 0))
+    # val: (1,8):(0,1)
+    valA_layout = cute.make_ordered_layout((1, 8,), order=(1, 0))
+    # (1,2048)  (256,8):(8,1)
+    tilerA_mn, A_tv_layout = cute.make_layout_tv(thrA_layout, valA_layout)
+    # ((TileM,), (RestM,))
+    gA = cute.zipped_divide(mA, tilerA_mn)
+
+    # layout of B is transpose of layout of A
+    # thr: (256,1):(1,0)
+    thrB_layout = cute.make_ordered_layout((num_threads_per_block, 1), order=(1, 0))
+    # val: (8,1):(1,0)
+    valB_layout = cute.make_ordered_layout((8, 1), order=(1, 0))
+    # (2048,1) (256,8):(8,1)
+    tilerB_mn, B_tv_layout = cute.make_layout_tv(thrB_layout, valB_layout)
+    gB = cute.zipped_divide(mB, tilerB_mn)
+
+    if cutlass.const_expr(_DEBUG):
+        print('thrA_layout', thrA_layout)
+        print('valA_layout', valA_layout)
+        print('tilerA_mn', tilerA_mn)
+        print('A_tv_layout', A_tv_layout)
+        print('thrB_layout', thrB_layout)
+        print('valB_layout', valB_layout)
+        print('tilerB_mn', tilerB_mn)
+        print('B_tv_layout', B_tv_layout)
+        print('gA', gA)
+        print('gB', gB)
+
+    transpose_v0_kernel(gA, A_tv_layout, gB, B_tv_layout).launch(
+        # grid - number of thread blocks (CTAs) per launch
+        grid=(cute.size(gA, mode=[1, 0]), cute.size(gA, mode=[1, 1]), 1),
+        # block - threads per block instance
+        block=(cute.size(A_tv_layout, mode=[0]), 1, 1),
+    )
+
+def transpose_v0(input: torch.Tensor):
+    assert len(input.shape) == 2, "unsupported"
+    assert input.shape[-1] % 2048 == 0, "unsupported"
+    assert input.is_contiguous(), "unsupported"
+    M, N = input.shape
+    output = torch.empty(N, M, dtype=input.dtype, device=input.device)
+    input_cute = from_dlpack(input, assumed_align=16)
+    output_cute = from_dlpack(output, assumed_align=16)
+    transpose_v0_jit(input_cute, output_cute)
+    return output
+
+
+@cute.kernel
 def fp8_deepseek_1x128_kernel(
     gInput: cute.Tensor,
     gOutput: cute.Tensor,

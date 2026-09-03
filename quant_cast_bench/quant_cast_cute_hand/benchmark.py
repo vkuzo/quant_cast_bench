@@ -18,7 +18,7 @@ from torch._inductor.utils import do_bench_using_profiling
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from quant_cast_bench.quant_cast_cute_hand.recipes import (
-    add_v0, add_v1, add_v2, fp8_deepseek_1x128,
+    add_v0, add_v1, add_v2, fp8_deepseek_1x128, transpose_v0,
 )
 
 # H100 SXM5 HBM3 peak: 3.35 TB/s. (PCIe H100 is ~2 TB/s -- adjust if benching on that part.)
@@ -115,12 +115,31 @@ def _bench_fp8_deepseek_1x128(M, K):
     return run, bytes_per_iter
 
 
+def _bench_transpose_v0(M, K):
+    # read input (M*K bf16) + write transposed output (K*M bf16); a memory-bound 2D transpose.
+    # v0 is the naive path: coalesced vectorized read, scattered (strided) column write.
+    torch.manual_seed(0)
+    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+
+    def run():
+        return transpose_v0(x)
+
+    out = run()
+    # Guard against a kernel that "runs" but doesn't touch the whole tensor. A transpose is a pure
+    # data movement, so require exact equality with the reference transpose across all elements.
+    torch.cuda.synchronize()
+    assert torch.equal(out, x.t().contiguous()), "transpose mismatch vs reference"
+    bytes_per_iter = x.numel() * x.element_size() + out.numel() * out.element_size()
+    return run, bytes_per_iter
+
+
 # name -> builder returning (run_fn, bytes_per_iter). Add new playground kernels here.
 _KERNELS = {
     "add_v0": _bench_add_v0,
     "add_v1": _bench_add_v1,
     "add_v2": _bench_add_v2,
     "fp8_deepseek_1x128": _bench_fp8_deepseek_1x128,
+    "transpose_v0": _bench_transpose_v0,
 }
 
 

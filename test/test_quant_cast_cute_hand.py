@@ -28,7 +28,7 @@ HAS_CUTEDSL = _cutedsl_version is not None and _cutedsl_version >= _MIN_CUTEDSL
 
 if HAS_CUTEDSL:
     from quant_cast_bench.quant_cast_cute_hand.recipes import (
-        ALL_RECIPES, add_v0, add_v1, add_v2
+        ALL_RECIPES, add_v0, add_v1, add_v2, transpose_v0
     )
 else:
     ALL_RECIPES = []
@@ -94,6 +94,15 @@ def test_deepseek_1x128():
     print(ref_outputs)
     recipe.correctness_fn(inputs, outputs)
 
+def test_transpose_v0():
+    M, K = 2, 2048 * 2
+    inputs = torch.arange(M * K, device="cuda", dtype=torch.bfloat16).view(M, K)
+    # print(inputs.shape)
+    print('\n', inputs.shape, inputs)
+
+    outputs = transpose_v0(inputs)
+    print(outputs.shape, outputs)
+    assert torch.equal(outputs, inputs.t().contiguous())
 
 
 @pytest.mark.parametrize("name, recipe", ALL_RECIPES, ids=[n for n, _ in ALL_RECIPES])
