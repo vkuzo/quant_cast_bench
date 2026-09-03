@@ -442,6 +442,150 @@ def transpose_v0(input: torch.Tensor):
 
 
 @cute.kernel
+def transpose_v1_kernel(
+    gA: cute.Tensor, 
+    A_tv_layout: cute.Layout,
+    gB: cute.Tensor, 
+    B_tv_layout: cute.Layout,
+    sScratch_layout: cute.Layout,
+    sScratchT_layout: cute.Layout,
+):
+    tidx, _, _ = cute.arch.thread_idx()  # thread index in block (0 to bdim-1)
+    bidx, bidy, _ = cute.arch.block_idx()  # block index in grid (0 to grid_dim -1)
+    # bdim, _, _ = cute.arch.block_dim()  # threads per block
+
+    # slice for thread-level view
+    thr_coord = (tidx, None)
+
+    # create shared memory scratchpad
+    # raw smem allocation: cosize() = footprint in elements (2048 here), 16 is alignment hint
+    sScratch_ptr = cute.arch.alloc_smem(cutlass.BFloat16, cute.cosize(sScratch_layout), 16)
+    sScratch = cute.make_tensor(sScratch_ptr, sScratch_layout)
+
+    # select everything in the 2d tile, for tile index (bidx, bidy)
+    blk_coord_A = ((None, None), (bidx, bidy))
+    # logical coord -> address
+    blkA = gA[blk_coord_A]
+    tidfrgA = cute.composition(blkA, A_tv_layout)
+    thrA = tidfrgA[thr_coord]
+
+    # write to scratchpad
+    tidfrgScratch = cute.composition(sScratch, A_tv_layout)
+    thrScratch = tidfrgScratch[thr_coord]
+    thrScratch[None] = thrA.load()
+
+    # sync this CTA's threads
+    cute.arch.sync_threads()
+
+    # end of phase 1, start of phase 2
+
+    # transpose the scratch pad
+    sScratchT = cute.make_tensor(sScratch_ptr, sScratchT_layout)
+
+    # select this thread's scratchpad region
+    tidfrgScratchT = cute.composition(sScratchT, B_tv_layout)
+    thrScratchT = tidfrgScratchT[thr_coord]
+
+    # select the write region, with transposed block indices
+    blk_coord_B = ((None, None), (bidy, bidx))
+    blkB = gB[blk_coord_B]
+    tidfrgB = cute.composition(blkB, B_tv_layout)
+    thrB = tidfrgB[thr_coord]
+
+    # do the write
+    thrB[None] = thrScratchT.load()
+
+    if cutlass.const_expr(_DEBUG):
+        # entire tensor
+        # tensor<ptr<bf16, gmem, align<16>> o ((1,2048),(2,2)):((0,1),(4096,2048))>
+        print('gA', gA)
+        # the current block
+        # tensor<ptr<bf16, gmem, align<16>> o (1,2048):(0,1)>
+        print('blkA', blkA)
+        # the current block, in tv-layout
+        # tensor<ptr<bf16, gmem, align<16>> o (256,8):(8,1)>
+        print('tidfrgA', tidfrgA)
+        # the current thread's data
+        # tensor<ptr<bf16, gmem, align<16>> o (8):(1)>
+        print('thrA', thrA)
+        
+        print('sScratch_layout', sScratch_layout)
+        print('sScratch', sScratch)
+        print('sScratchT', sScratchT)
+        print('thrScratch', thrScratch)
+        if tidx == 0 and bidx == 0 and bidy == 0:
+            cute.printf('thrScratch {} {} {} {}', thrScratch[0], thrScratch[1], thrScratch[2], thrScratch[3])
+
+
+@cute.jit
+def transpose_v1_jit(mA: cute.Tensor, mB: cute.Tensor):
+    # 256 is a reasonable default
+    num_threads_per_block = 256
+
+    # for now, a simple 2d layout
+
+    # thr: (16,16):(16,1)
+    thrA_layout = cute.make_ordered_layout((16, num_threads_per_block // 16,), order=(1, 0))
+    # val: (1,8):(0,1)
+    valA_layout = cute.make_ordered_layout((1, 8,), order=(1, 0))
+    # (16,128)  ((16,16),8):((128,1),16)
+    tilerA_mn, A_tv_layout = cute.make_layout_tv(thrA_layout, valA_layout)
+    # ((TileM,), (RestM,))
+    gA = cute.zipped_divide(mA, tilerA_mn)
+
+    # layout of the shared memory scratchpad
+    sScratch_layout = cute.make_ordered_layout(tilerA_mn, order=(1, 0))
+    sScratchT_layout = cute.make_ordered_layout((tilerA_mn[1], tilerA_mn[0]), order=(0, 1))
+
+    # now, thinking through the read-write of stage 2
+    # scratchpad shape: (16*1, 16*8) = (16, 128) = (TM, TN)
+    # scratchpad write for phase 1: thr (16,16):(16,1), val (1,8):(0,1)
+    # transpose scratchpad (TM, TN) -> (TN, TM)
+    # scratchpad read for phase 2: = (TN, TM) = (128, 16)
+    #   each thread handles 8 values
+    #   thr (128,2):(2,1), val (1,8):(0,1)
+    thrB_layout = cute.make_ordered_layout((128, num_threads_per_block // 128), order=(1, 0))
+    valB_layout = cute.make_ordered_layout((1, 8), order=(1, 0))
+    tilerB_mn, B_tv_layout = cute.make_layout_tv(thrB_layout, valB_layout)
+    gB = cute.zipped_divide(mB, tilerB_mn)
+
+    if cutlass.const_expr(_DEBUG):
+        print('thrA_layout', thrA_layout)
+        print('valA_layout', valA_layout)
+        print('tilerA_mn', tilerA_mn, type(tilerA_mn))
+        print('A_tv_layout', A_tv_layout, type(A_tv_layout))
+        print('thrB_layout', thrB_layout)
+        print('valB_layout', valB_layout)
+        print('tilerB_mn', tilerB_mn)
+        print('B_tv_layout', B_tv_layout)
+        print('sScratch_layout', sScratch_layout)
+        print('sScratchT_layout', sScratchT_layout)
+        print('gA', gA)
+        print('gB', gB)
+
+    transpose_v1_kernel(
+        gA, A_tv_layout, gB, B_tv_layout, sScratch_layout, sScratchT_layout
+    ).launch(
+        # grid - number of thread blocks (CTAs) per launch
+        grid=(cute.size(gA, mode=[1, 0]), cute.size(gA, mode=[1, 1]), 1),
+        # block - threads per block instance
+        block=(cute.size(A_tv_layout, mode=[0]), 1, 1),
+    )
+
+def transpose_v1(input: torch.Tensor):
+    assert len(input.shape) == 2, "unsupported"
+    assert input.is_contiguous(), "unsupported"
+    M, N = input.shape
+    assert M % 16 == 0, "unsupported"
+    assert N % 128 == 0, "unsupported"
+    output = torch.empty(N, M, dtype=input.dtype, device=input.device)
+    input_cute = from_dlpack(input, assumed_align=16)
+    output_cute = from_dlpack(output, assumed_align=16)
+    transpose_v1_jit(input_cute, output_cute)
+    return output
+
+
+@cute.kernel
 def fp8_deepseek_1x128_kernel(
     gInput: cute.Tensor,
     gOutput: cute.Tensor,
