@@ -7,6 +7,8 @@ import os
 
 import cutlass
 import cutlass.cute as cute
+import cutlass.utils as utils
+from cutlass.cute.nvgpu import cpasync  # TMA (bulk-tensor) copy ops + tma_partition
 from cutlass.cute.runtime import from_dlpack
 
 import torch
@@ -942,8 +944,278 @@ FP8_DEEPSEEK_1X128_DIM_M = QuantCastCuteRecipe.from_gold(
     Deepseek1x128DimMGold, cute_fn=fp8_deepseek_1x128_dim_m
 )
 
+# ---------------------------------------------------------------------------
+# v2: direct copy-paste of quant_cast_cute/recipes.py::fp8_deepseek_1x128_dim_m_v2 and its
+# implementation, self-contained here (no code reused from the original module). We will make it more
+# readable later; for now it is a faithful copy so we can iterate on it in this playground.
+#
+# deepseek fp8 1x128 dim-M: reduce 128-row blocks down M, transposed outputs (N, M) / (N, M//128).
+# The direct analog of `mxfp8_dim_m` (warp-specialized TMA), with a 128-row block (not 32) and
+# an fp32 amax/448 scale (not an e8m0 byte). Feeding a transposed x.t() to the scalar kernel makes
+# every load uncoalesced (~7% peak); instead:
+#   - TMA G2S loads a (TM, TN) row-major tile of x into smem (sInput), TM a multiple of 128;
+#   - the (TM/128 x TN) scale-groups are split across threads; each owns one (128-row block, col),
+#     scans its 128 rows down a column of sInput for the amax (scalar accumulate -> low registers,
+#     keeps occupancy high), computes scale = max(amax,1e-12)/448, then re-reads the column to
+#     quantize and write the 128 fp8 values as a CONTIGUOUS run into sOutput laid out (TN, TM) -- the
+#     transpose happens in the register->smem write (no col-major TMA, which the DSL can't drive);
+#   - TMA S2G stores sOutput into the (TN, TM) tile of the row-major (N, M) output at (n_tile, m_tile).
+# The fp32 scale is scattered straight to gmem scales (N, M//128). Barrier follows the same
+# arrive-and-expect-tx pattern (single arrival, warp-0 gated) required for a multi-warp block.
+# ---------------------------------------------------------------------------
+COMPILE_CACHE: dict = {}
+
+
+def _compiled(key, jit_fn, *cute_args):
+    fn = COMPILE_CACHE.get(key)
+    if fn is None:
+        fn = cute.compile(jit_fn, *cute_args)
+        COMPILE_CACHE[key] = fn
+    return fn
+
+
+_DSM_TM, _DSM_TN, _DSM_WARPS = 128, 128, 4         # tuned on B200 @ 16384 (needs M%TM==0, N%TN==0)
+_DSM_THREADS = _DSM_WARPS * 32  # 128
+_DSM_RB = _DSM_TM // 128                            # 1 128-row block per tile
+_DSM_CHUNKS = 128 // 32                              # 4 32-wide chunks per 128-row block (vectorize)
+_DSM_GROUPS = _DSM_TN * _DSM_RB                     # 128 (col, row-block) scale groups
+_DSM_ITERS = (_DSM_GROUPS + _DSM_THREADS - 1) // _DSM_THREADS  # 1 iter
+_DSM_IN_BYTES = _DSM_TM * _DSM_TN * 2               # 128*128*2 bf16 tile bytes for the TMA expect-tx
+
+
+@cute.struct
+class _DeepseekDimMSmem:
+    tma_bar: cute.struct.MemRange[cutlass.Int64, 1]
+    sInput: cute.struct.Align[cute.struct.MemRange[cutlass.BFloat16, _DSM_TM * _DSM_TN], 1024]
+    sOutput: cute.struct.Align[cute.struct.MemRange[cutlass.Float8E4M3FN, _DSM_TM * _DSM_TN], 1024]
+
+
+@cute.kernel
+def fp8_deepseek_1x128_dim_m_v2_kernel(
+    input_tma_atom: cute.CopyAtom,
+    input_tma_tensor: cute.Tensor,
+    output_tma_atom: cute.CopyAtom,
+    output_tma_tensor: cute.Tensor,
+    mScale: cute.Tensor,
+    input_smem_layout: cute.Layout,
+    output_smem_layout: cute.Layout,
+    M: cutlass.Int64,
+):
+    tidx, _, _ = cute.arch.thread_idx()
+    bidx, bidy, _ = cute.arch.block_idx()   # bidx = m_tile, bidy = n_tile
+
+    # compiler hint that warp_idx does not change across a warp
+    warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+
+    # allocator over this CTA's smem region
+    smem = utils.SmemAllocator()
+    # allocate the struct in smem
+    st = smem.allocate(_DeepseekDimMSmem)
+    # get the barrier pointer
+    tma_bar_ptr = st.tma_bar.data_ptr()
+    if tidx == 0:
+        # initializes the mbarrier so that it takes 1 arrival to complete the current phase
+        # that arrival comes from mbarrier_arrive_and_expect_tx below; the TMA copy separately
+        # signals completion via the expected transaction-byte count (_DSM_IN_BYTES)
+        cute.arch.mbarrier_init(tma_bar_ptr, 1)
+
+    # publish the mbarrier write above before any mbarrier op
+    cute.arch.mbarrier_init_fence()
+    # sync threads
+    cute.arch.sync_threads()
+
+    # TMA smem staging buffers (TMA will copy into sInput, and later out of sOutput)
+    sInput = st.sInput.get_tensor(input_smem_layout)            # (TM, TN) row-major
+    sOutput = st.sOutput.get_tensor(output_smem_layout)         # (TN, TM) row-major (transposed)
+    # TMA gmem tile views, for now for entire tensor (not yet for current block)
+    gInput = cute.local_tile(input_tma_tensor, (_DSM_TM, _DSM_TN), (None, None))
+    gOutput = cute.local_tile(output_tma_tensor, (_DSM_TN, _DSM_TM), (None, None))
+
+    # produce the final partitioned views that cute.copy actually consumes — 
+    # one pair for the input (G2S) copy, one for the output (S2G) copy.
+    # Note: tma_partition returns (smem-side, gmem-side) views; the tXsX/tXgX form is t + copy-op + mem +
+    #   operand (so the operand word appears twice, mirroring the tAsA/tAgA convention).
+    tInputsInput, tInputgInput = cpasync.tma_partition(
+        input_tma_atom,  # TMA descriptor
+        0,   # cta coord
+        cute.make_layout(1),  # 1 CTA per transfer
+        cute.group_modes(sInput, 0, 2),  # smem tensor, modes 0..2 grouped into one
+        cute.group_modes(gInput, 0, 2),  # gmem tensor, modes 0..2 grouped into one
+    )
+    tOutputsOutput, tOutputgOutput = cpasync.tma_partition(
+        output_tma_atom, 0, cute.make_layout(1),
+        cute.group_modes(sOutput, 0, 2), cute.group_modes(gOutput, 0, 2))
+
+    # one warp inits the copy
+    if warp == 0:
+        # one thread arms the barrier for the copy
+        with cute.arch.elect_one():
+            # arrive: contributes the 1 expected arrival that mbarrier_init(tma_bar_ptr, 1) is waiting for
+            # expect_tx: expect _DSM_IN_BYTES bytes to be delivered before this phase completes.
+            # Note: TMA will decrement remaining bytes as data arrives
+            cute.arch.mbarrier_arrive_and_expect_tx(tma_bar_ptr, _DSM_IN_BYTES)
+        # Fires the actual G2S bulk copy
+        # Note: internally the "only use one elected thread" info is in the TMA descriptor, so no-op for any non-elected thread
+        cute.copy(input_tma_atom, tInputgInput[(None, bidx, bidy)], tInputsInput, tma_bar_ptr=tma_bar_ptr)
+
+    # All block here until the barrier's phase flips.
+    # After this line returns, sInput is guaranteed fully populated
+    cute.arch.mbarrier_wait(tma_bar_ptr, 0)
+
+    # these are for manual indexing into scale, would go away
+    # if scale was using a proper layout
+    m0 = bidx * _DSM_TM  # bidx * 128
+    n0 = bidy * _DSM_TN  # bidy * 128
+    mblk = M // 128
+
+    # this loops over thread-groups in columns of a 128x128 tile. Since
+    # right now we are using 128 threads per CTA, number of iterations is 1.
+    # If we had 64 threads / CTA, it would be 2, etc.
+    for it in cutlass.range_constexpr(_DSM_ITERS):
+
+        g = tidx + it * _DSM_THREADS
+        if g < _DSM_GROUPS:
+            # this indexing should be rewritten with layouts
+            col = g % _DSM_TN
+            rb = g // _DSM_TN
+            r0 = rb * 128
+
+            # pass 1: amax over the 128 rows down this column, in 4 chunks of 32 (vector reduce,
+            # only 32 f32 live at a time -> low registers, high occupancy).
+            amax = cutlass.Float32(0.0)
+            # loops 4 times over 128 rows in a column, processing 32 elements each time
+            # reason: keep register usage low
+            for c in cutlass.range_constexpr(_DSM_CHUNKS):
+                rInput = cute.make_rmem_tensor(cute.make_layout(32), cutlass.Float32)
+                for r in cutlass.range_constexpr(32):
+                    rInput[r] = sInput[r0 + c * 32 + r, col].to(cutlass.Float32)
+                v = rInput.load()
+                amax = cutlass.max(amax, cute.where(v < 0, -v, v).reduce(
+                    cute.ReductionOp.MAX, cutlass.Float32(0.0), 0))
+            scale = cutlass.max(amax, cutlass.Float32(1e-12)) * (1.0 / 448.0)  # recip-mul: gold's
+            inv = 1.0 / scale                        # `/ 448.0` (tensor/py-scalar) lowers to *(1/448)
+            # pass 2: re-read (cheap smem), quantize each chunk (vectorized f32->fp8), transpose in
+            # the register->smem write (contiguous run into sOutput).
+            for c in cutlass.range_constexpr(_DSM_CHUNKS):
+                rInput = cute.make_rmem_tensor(cute.make_layout(32), cutlass.Float32)
+                for r in cutlass.range_constexpr(32):
+                    rInput[r] = sInput[r0 + c * 32 + r, col].to(cutlass.Float32)
+                rOutput = cute.make_rmem_tensor(cute.make_layout(32), cutlass.Float8E4M3FN)
+                rOutput.store((rInput.load() * inv).to(cutlass.Float8E4M3FN))
+                for r in cutlass.range_constexpr(32):
+                    sOutput[col, r0 + c * 32 + r] = rOutput[r]
+            # this should be a layout write
+            mScale[(n0 + col) * mblk + (m0 // 128 + rb)] = scale.to(mScale.element_type)
+
+    # make the register->smem writes to sOutput visible to the async (TMA) proxy...
+    cute.arch.fence_proxy("async.shared", space="cta")
+    # ...and wait for all threads to finish writing sOutput before the store-TMA reads it
+    cute.arch.sync_threads()
+    # kick off TMA qdata write
+    if warp == 0:
+        cute.copy(output_tma_atom, tOutputsOutput, tOutputgOutput[(None, bidy, bidx)])  # y tile (n_tile, m_tile)
+
+
+@cute.jit
+def fp8_deepseek_1x128_dim_m_v2_jit(mInput, mOutput, mScale, M: cutlass.Constexpr):
+    # _DSM_TM, DSM_TN = 128, 128
+
+    # (128,128):(128,1)
+    input_smem_layout = cute.make_layout((_DSM_TM, _DSM_TN), stride=(_DSM_TN, 1))
+    # (128,128):(128,1)
+    output_smem_layout = cute.make_layout((_DSM_TN, _DSM_TM), stride=(_DSM_TM, 1))
+
+    # input_tma_atom Copy Atom
+    # ThrID:         1:0                 - a single thread participates, shape 1 stride 0
+    # TV Layout Src: (1,16384):(0,1)     - 1 single thread owns all the 128*128 src elements
+    # TV Layout Dst: (1,16384):(0,1)     - 1 single thread owns all the 128*128 dst elements
+    # Value type:    bf16
+    # input_tma_tensor tensor<(0,0) o (?,?{div=16}):(1@1,1@0)>
+    #   <engine o layout>
+    #   (0,0) — the "engine" (iterator) is a coordinate (0,0), not a raw pointer. 
+    #     TMA addresses data by coordinates into the descriptor, so this tensor 
+    #     carries a base coord instead of a memory address. When you later do
+    #     local_tile(input_tma_tensor, (128,128), (bidx, bidy)), you're indexing 
+    #     in that coordinate space.
+    #   (?,?{div=16}) — the shape: two dynamic modes (M and N), both ? (runtime values, 
+    #     because we called .mark_layout_dynamic(...)). The {div=16} on the 
+    #     second mode (N) is the divisibility guarantee from
+    #     .mark_compact_shape_dynamic(mode=1, divisibility=16) — 
+    #     it promises N is a multiple of 16, which TMA needs for alignment.
+    #   :(1@1,1@0) — the strides in scaled-basis notation. 
+    #     k@j means "stride k along coordinate axis j". 
+    #     So mode 0 (M) → 1@1 (advances descriptor axis 1), 
+    #     mode 1 (N) → 1@0 (advances descriptor axis 0). The axis indices are
+    #     swapped relative to the logical (M, N) listing because we marked 
+    #     leading_dim=1: N is the contiguous dimension, and a TMA descriptor 
+    #     puts the contiguous dim on axis 0. So N↔axis0, M↔axis1 — exactly what the basis strides
+    #     encode. It's the coordinate-space way of saying "row-major with N innermost."
+    # atom - the transfer op description
+    # tma_tensor - the data being addressed
+    input_tma_atom, input_tma_tensor = cpasync.make_tiled_tma_atom(
+        cpasync.CopyBulkTensorTileG2SOp(),  # op kind: bulk-tensor Global→Shared
+        mInput,  
+        input_smem_layout,  # (128,128):(128,1) — the smem tile it lands in
+        (_DSM_TM, _DSM_TN),  # (128, 128) — the box/tile shape TMA moves
+    )
+    # output_tma_atom Copy Atom
+    # ThrID:         1:0
+    # TV Layout Src: (1,16384):(0,1)
+    # TV Layout Dst: (1,16384):(0,1)
+    # Value type:    f8E4M3FN
+    # output_tma_tensor tensor<(0,0) o (?,?{div=16}):(1@1,1@0)>
+    output_tma_atom, output_tma_tensor = cpasync.make_tiled_tma_atom(
+        cpasync.CopyBulkTensorTileS2GOp(), 
+        mOutput, 
+        output_smem_layout, 
+        (_DSM_TN, _DSM_TM),
+    )
+    M2, N2 = mInput.shape
+
+    fp8_deepseek_1x128_dim_m_v2_kernel(
+        input_tma_atom, input_tma_tensor, output_tma_atom, output_tma_tensor, mScale,
+        input_smem_layout, output_smem_layout, cutlass.Int64(M),
+    ).launch(
+        # (ceil_div(M, 128), ceil_div(N, 128), 1)
+        grid=(_ceil_div(M2, _DSM_TM), _ceil_div(N2, _DSM_TN), 1),
+        # (4*32, 1, 1) = (128, 1, 1)
+        block=(_DSM_THREADS, 1, 1),
+    )
+
+    if cutlass.const_expr(_DEBUG):
+        print('input_smem_layout', input_smem_layout)
+        print('output_smem_layout', output_smem_layout)
+        print('input_tma_atom', input_tma_atom)
+        print('input_tma_tensor', input_tma_tensor)
+        print('output_tma_atom', output_tma_atom)
+        print('output_tma_tensor', output_tma_tensor)
+
+
+def fp8_deepseek_1x128_dim_m_v2(input, **kwargs):
+    assert input.is_contiguous() and input.dim() == 2
+    M, N = input.shape
+    assert M % _DSM_TM == 0 and N % _DSM_TN == 0, \
+        f"deepseek_1x128_dim_m cute kernel needs M%{_DSM_TM}==0 and N%{_DSM_TN}==0"
+    output = torch.empty(N, M, dtype=torch.float8_e4m3fn, device=input.device)  # transposed row-major output
+    scale = torch.empty(N, M // 128, dtype=torch.float32, device=input.device)
+    # TMA needs full layout/divisibility marking (leading dim contiguous, 16-elem aligned).
+    mInput = (from_dlpack(input, assumed_align=16).mark_layout_dynamic(leading_dim=1)
+              .mark_compact_shape_dynamic(mode=1, divisibility=16))
+    mOutput = (from_dlpack(output, assumed_align=16).mark_layout_dynamic(leading_dim=1)
+               .mark_compact_shape_dynamic(mode=1, divisibility=16))
+    mScale = from_dlpack(scale.reshape(-1)).mark_layout_dynamic()
+    fn = _compiled(("deepseek_1x128_dim_m_v2", M, N), fp8_deepseek_1x128_dim_m_v2_jit, mInput, mOutput, mScale, M)
+    fn(mInput, mOutput, mScale)
+    return output, scale
+
+
+FP8_DEEPSEEK_1X128_DIM_M_V2 = QuantCastCuteRecipe.from_gold(
+    Deepseek1x128DimMGold, cute_fn=fp8_deepseek_1x128_dim_m_v2
+)
+
 
 ALL_RECIPES = [
     ("deepseek_1x128", FP8_DEEPSEEK_1X128),
     ("deepseek_1x128_dim_m", FP8_DEEPSEEK_1X128_DIM_M),
+    ("deepseek_1x128_dim_m_v2", FP8_DEEPSEEK_1X128_DIM_M_V2),
 ]

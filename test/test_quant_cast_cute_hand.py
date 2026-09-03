@@ -131,6 +131,20 @@ def test_deepseek_1x128_dim_m():
     print(ref_outputs)
     recipe.correctness_fn(inputs, outputs)
 
+def test_deepseek_1x128_dim_m_v2():
+    recipe = _get_recipe("deepseek_1x128_dim_m_v2")
+    inputs = recipe.example_input_fn(256, 512)
+    print(inputs[0].shape)
+    print(inputs)
+
+    outputs = recipe.cute_fn(*inputs)
+    print(outputs)
+
+    tile_kwargs = {"global_row": 0, "global_col": 0, "num_col": inputs[0].shape[-1]}
+    ref_outputs = recipe.pt_ref_fn(*inputs, **tile_kwargs)
+    print(ref_outputs)
+    recipe.correctness_fn(inputs, outputs)
+
 @pytest.mark.parametrize("name, recipe", ALL_RECIPES, ids=[n for n, _ in ALL_RECIPES])
 def test_cute_hand_matches_reference(name, recipe):
     # the CuTeDSL kernel should reproduce the gold reference bit-for-bit (identical fp32 math + RNE

@@ -19,7 +19,7 @@ from torch._inductor.utils import do_bench_using_profiling
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from quant_cast_bench.quant_cast_cute_hand.recipes import (
     add_v0, add_v1, add_v2, fp8_deepseek_1x128, fp8_deepseek_1x128_dim_m,
-    transpose_v0, transpose_v1,
+    fp8_deepseek_1x128_dim_m_v2, transpose_v0, transpose_v1,
 )
 
 # H100 SXM5 HBM3 peak: 3.35 TB/s. (PCIe H100 is ~2 TB/s -- adjust if benching on that part.)
@@ -154,6 +154,32 @@ def _bench_fp8_deepseek_1x128_dim_m(M, K):
     return run, bytes_per_iter
 
 
+def _bench_fp8_deepseek_1x128_dim_m_v2(M, K):
+    # read input (M*K bf16) + write qdata (K*M fp8) + write scale (K*(M/128) fp32). Same dim-M 1x128
+    # quant-cast as _bench_fp8_deepseek_1x128_dim_m, but the v2 kernel is the TMA warp-specialized
+    # variant (128-row block staged through smem, transpose in the register->smem write). Same
+    # transposed (N,M) outputs, so it shares the torch reference and bit-exact guard.
+    torch.manual_seed(0)
+    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+
+    def run():
+        return fp8_deepseek_1x128_dim_m_v2(x)
+
+    q, s = run()
+    # Guard against a kernel that "runs" but doesn't touch the whole tensor. Bit-exact vs the torch
+    # reference (reciprocal-multiply scale), so require exact equality on both outputs.
+    torch.cuda.synchronize()
+    q_ref, s_ref = _deepseek_1x128_dim_m_ref(x)
+    assert torch.equal(s, s_ref), "scale mismatch vs reference"
+    assert torch.equal(q.float(), q_ref.float()), "qdata mismatch vs reference"
+    bytes_per_iter = (
+        x.numel() * x.element_size()   # bf16 input read
+        + q.numel() * q.element_size() # fp8 qdata write
+        + s.numel() * s.element_size() # fp32 scale write
+    )
+    return run, bytes_per_iter
+
+
 def _bench_transpose_v0(M, K):
     # read input (M*K bf16) + write transposed output (K*M bf16); a memory-bound 2D transpose.
     # v0 is the naive path: coalesced vectorized read, scattered (strided) column write.
@@ -198,6 +224,7 @@ _KERNELS = {
     "add_v2": _bench_add_v2,
     "fp8_deepseek_1x128": _bench_fp8_deepseek_1x128,
     "fp8_deepseek_1x128_dim_m": _bench_fp8_deepseek_1x128_dim_m,
+    "fp8_deepseek_1x128_dim_m_v2": _bench_fp8_deepseek_1x128_dim_m_v2,
     "transpose_v0": _bench_transpose_v0,
     "transpose_v1": _bench_transpose_v1,
 }
