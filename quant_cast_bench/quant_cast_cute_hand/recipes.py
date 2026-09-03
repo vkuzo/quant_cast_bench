@@ -771,8 +771,8 @@ def fp8_deepseek_1x128_dim_m_kernel(
     Input_tv_layout: cute.Layout,
     Output_tv_layout: cute.Layout,
     Scale_tv_layout: cute.Layout,
-    sScratch_layout: cute.Layout,
-    sScratchT_layout: cute.Layout,
+    sScratch_layout: cute.typing.ComposedLayout,
+    sScratchT_layout: cute.typing.ComposedLayout,
 ):
     tidx, _, _ = cute.arch.thread_idx()  # thread index in block (0 to bdim-1)
     bidx, bidy, _ = cute.arch.block_idx()  # block index in grid (0 to grid_dim -1)
@@ -856,9 +856,21 @@ def fp8_deepseek_1x128_dim_m_jit(mInput: cute.Tensor, mOutput: cute.Tensor, mSca
     tilerInput_mn, Input_tv_layout = cute.make_layout_tv(thrInput_layout, valInput_layout)
     gInput = cute.zipped_divide(mInput, tilerInput_mn)
 
-    # layout of the shared memory scratchpad
-    sScratch_layout = cute.make_ordered_layout(tilerInput_mn, order=(1, 0))
-    sScratchT_layout = cute.make_ordered_layout((tilerInput_mn[1], tilerInput_mn[0]), order=(0, 1))
+    # layout of the shared memory scratchpad.
+    # Phase 2 reads this scratchpad transposed (down columns) -> 16-way bank conflicts that pin the
+    # L1/TEX pipe at ~93% while DRAM sits at ~34% (ncu). We swizzle the physical buffer to scatter
+    # those column reads across banks. The SAME swizzle wraps both the write-view (sScratch) and the
+    # transposed read-view (sScratchT): a swizzle is a bijection on the offset, and both views compute
+    # the same base offset for a given logical element, so the transpose aliasing is preserved
+    # bit-exactly. Swizzle<3,3,5> protects the low 3 bits (the 128-bit vector store stays intact) and
+    # XORs the colliding row bits (at stride 128 = bit 7) into the bank bits. See transpose_v1.
+    smem_swizzle = cute.make_swizzle(3, 3, 5)
+    sScratch_layout = cute.make_composed_layout(
+        smem_swizzle, 0, cute.make_ordered_layout(tilerInput_mn, order=(1, 0))
+    )
+    sScratchT_layout = cute.make_composed_layout(
+        smem_swizzle, 0, cute.make_ordered_layout((tilerInput_mn[1], tilerInput_mn[0]), order=(0, 1))
+    )
 
     # now, thinking through the read-write of stage 2
     # scratchad shape: (128,16):(16,1) = (128, 16) = (TM, TN)
