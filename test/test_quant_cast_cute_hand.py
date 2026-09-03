@@ -28,7 +28,7 @@ HAS_CUTEDSL = _cutedsl_version is not None and _cutedsl_version >= _MIN_CUTEDSL
 
 if HAS_CUTEDSL:
     from quant_cast_bench.quant_cast_cute_hand.recipes import (
-        ALL_RECIPES, add_v0, add_v1, add_v2, transpose_v0
+        ALL_RECIPES, add_v0, add_v1, add_v2, transpose_v0, transpose_v1
     )
 else:
     ALL_RECIPES = []
@@ -102,6 +102,17 @@ def test_transpose_v0():
     print('\n', inputs.shape, inputs)
 
     outputs = transpose_v0(inputs)
+    print(outputs.shape, outputs)
+    assert torch.equal(outputs, inputs.t().contiguous())
+
+def test_transpose_v1():
+    # 128x16 tile: M must be a multiple of 128, K a multiple of 16.
+    M, K = 128, 256
+    inputs = torch.arange(M * K, device="cuda", dtype=torch.bfloat16).view(M, K)
+    # print(inputs.shape)
+    print('\n', inputs.shape, inputs)
+
+    outputs = transpose_v1(inputs)
     print(outputs.shape, outputs)
     assert torch.equal(outputs, inputs.t().contiguous())
 
