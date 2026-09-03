@@ -573,6 +573,24 @@ def transpose_v1_jit(mA: cute.Tensor, mB: cute.Tensor):
     )
 
 def transpose_v1(input: torch.Tensor):
+    # Phase 2 reads the smem scratchpad down columns (the transpose) -> classic bank conflicts
+    # (~2.17M shared-load conflicts). A Swizzle<3,3,5> over the scratchpad kills them (~30x), diff:
+    #   https://gist.github.com/vkuzo/487b4f2ede42be8167638f13182d235c
+    # Padding (row pitch W+pad) did NOT work: the read has two collisions -- (1) an inter-group
+    # collision that padding only *shifts* by (4*pad) mod 32 banks (so pad=8 was a null shift; pad=4
+    # only halved 4-way -> 2-way), and (2) two bf16 elements sharing one 32-bit bank word, which no
+    # pad can separate (it acts at >=4-byte granularity). pad=1 fixed the shift but its odd pitch
+    # misaligned the 128-bit store -> ~4.5M store conflicts. Swizzle sidesteps all of this.
+    # We did NOT include the swizzle: it is not a win for our 16x128 tile (v1 is DRAM-bandwidth-bound
+    # there, so the conflicts hide behind gmem), only helping tall-skinny (conflict-bound) tiles.
+    # A tile sweep at 16384x16384 (noted for future reference):
+    #   tile (TM x TN)   swizzle OFF   swizzle ON      d
+    #   8 x 256          29.7%         29.9%          +0.2
+    #   16 x 128         85.3%         85.4%          ~0    <- our tile
+    #   32 x 64          84.6%         84.9%          +0.3
+    #   64 x 32          66.3%         74.1%          +7.8
+    #   128 x 16         48.4%         72.9%          +24.5
+    #   256 x 8          26.2%         62.6%          +36.4
     assert len(input.shape) == 2, "unsupported"
     assert input.is_contiguous(), "unsupported"
     M, N = input.shape
