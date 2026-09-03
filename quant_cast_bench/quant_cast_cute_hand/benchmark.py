@@ -18,7 +18,8 @@ from torch._inductor.utils import do_bench_using_profiling
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from quant_cast_bench.quant_cast_cute_hand.recipes import (
-    add_v0, add_v1, add_v2, fp8_deepseek_1x128, transpose_v0, transpose_v1,
+    add_v0, add_v1, add_v2, fp8_deepseek_1x128, fp8_deepseek_1x128_dim_m,
+    transpose_v0, transpose_v1,
 )
 
 # H100 SXM5 HBM3 peak: 3.35 TB/s. (PCIe H100 is ~2 TB/s -- adjust if benching on that part.)
@@ -115,6 +116,44 @@ def _bench_fp8_deepseek_1x128(M, K):
     return run, bytes_per_iter
 
 
+def _deepseek_1x128_dim_m_ref(x):
+    # torch reference for the dim-M 1x128 quant-cast. Reduces 128-row blocks along dim-M and returns
+    # transposed outputs (N,M) / (N,M//128), matching Deepseek1x128DimMGold. Scale via `amax / 448.0`
+    # (torch lowers the python-float divide to multiply-by-reciprocal, which the kernel mirrors).
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max  # 448.0
+    M, N = x.shape
+    x_b = x.reshape(M // 128, 128, N)
+    amax = x_b.abs().amax(dim=1, keepdim=True).clamp(min=1e-12).to(torch.float32)
+    scale = (amax / fp8_max).to(torch.float32)
+    qdata = (x_b.to(torch.float32) * (1.0 / scale)).to(torch.float8_e4m3fn).reshape(M, N)
+    return qdata.t().contiguous(), scale.squeeze(1).t().contiguous()
+
+
+def _bench_fp8_deepseek_1x128_dim_m(M, K):
+    # read input (M*K bf16) + write qdata (K*M fp8) + write scale (K*(M/128) fp32). Memory-bound
+    # 128x1 blockwise quant-cast that stages the tile through shared memory to transpose it, so the
+    # dim-M reduction becomes the contiguous dim-K pattern and both outputs are written coalesced.
+    torch.manual_seed(0)
+    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+
+    def run():
+        return fp8_deepseek_1x128_dim_m(x)
+
+    q, s = run()
+    # Guard against a kernel that "runs" but doesn't touch the whole tensor. Bit-exact vs the torch
+    # reference (reciprocal-multiply scale), so require exact equality on both outputs.
+    torch.cuda.synchronize()
+    q_ref, s_ref = _deepseek_1x128_dim_m_ref(x)
+    assert torch.equal(s, s_ref), "scale mismatch vs reference"
+    assert torch.equal(q.float(), q_ref.float()), "qdata mismatch vs reference"
+    bytes_per_iter = (
+        x.numel() * x.element_size()   # bf16 input read
+        + q.numel() * q.element_size() # fp8 qdata write
+        + s.numel() * s.element_size() # fp32 scale write
+    )
+    return run, bytes_per_iter
+
+
 def _bench_transpose_v0(M, K):
     # read input (M*K bf16) + write transposed output (K*M bf16); a memory-bound 2D transpose.
     # v0 is the naive path: coalesced vectorized read, scattered (strided) column write.
@@ -158,6 +197,7 @@ _KERNELS = {
     "add_v1": _bench_add_v1,
     "add_v2": _bench_add_v2,
     "fp8_deepseek_1x128": _bench_fp8_deepseek_1x128,
+    "fp8_deepseek_1x128_dim_m": _bench_fp8_deepseek_1x128_dim_m,
     "transpose_v0": _bench_transpose_v0,
     "transpose_v1": _bench_transpose_v1,
 }
