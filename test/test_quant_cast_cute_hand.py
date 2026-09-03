@@ -116,6 +116,20 @@ def test_transpose_v1():
     print(outputs.shape, outputs)
     assert torch.equal(outputs, inputs.t().contiguous())
 
+def test_deepseek_1x128_dim_m():
+    recipe = _get_recipe("deepseek_1x128_dim_m")
+    inputs = recipe.example_input_fn(256, 512)
+    print(inputs[0].shape)
+    print(inputs)
+
+    outputs = recipe.cute_fn(*inputs)
+    print(outputs)
+
+    # return
+    tile_kwargs = {"global_row": 0, "global_col": 0, "num_col": inputs[0].shape[-1]}
+    ref_outputs = recipe.pt_ref_fn(*inputs, **tile_kwargs)
+    print(ref_outputs)
+    recipe.correctness_fn(inputs, outputs)
 
 @pytest.mark.parametrize("name, recipe", ALL_RECIPES, ids=[n for n, _ in ALL_RECIPES])
 def test_cute_hand_matches_reference(name, recipe):

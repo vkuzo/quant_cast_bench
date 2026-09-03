@@ -18,7 +18,7 @@ import torch
 _DEBUG = os.environ.get("CUTE_DEBUG", "0") == "1"
 
 from quant_cast_bench.quant_cast_cute.recipes import QuantCastCuteRecipe
-from quant_cast_bench.quant_cast_gold.recipes import Deepseek1x128Gold
+from quant_cast_bench.quant_cast_gold.recipes import Deepseek1x128Gold, Deepseek1x128DimMGold
 
 def _ceil_div(num, den):
     return (num + den - 1) // den
@@ -763,7 +763,175 @@ FP8_DEEPSEEK_1X128 = QuantCastCuteRecipe.from_gold(
     Deepseek1x128Gold, cute_fn=fp8_deepseek_1x128
 )
 
+@cute.kernel
+def fp8_deepseek_1x128_dim_m_kernel(
+    gInput: cute.Tensor,
+    gOutput: cute.Tensor,
+    gScale: cute.Tensor,
+    Input_tv_layout: cute.Layout,
+    Output_tv_layout: cute.Layout,
+    Scale_tv_layout: cute.Layout,
+    sScratch_layout: cute.Layout,
+    sScratchT_layout: cute.Layout,
+):
+    tidx, _, _ = cute.arch.thread_idx()  # thread index in block (0 to bdim-1)
+    bidx, bidy, _ = cute.arch.block_idx()  # block index in grid (0 to grid_dim -1)
+    # bdim, _, _ = cute.arch.block_dim()  # threads per block
+
+    # slice for thread-level view
+    thr_coord = (tidx, None)
+
+    # create shared memory scratchpad
+    # raw smem allocation: cosize() = footprint in elements (2048 here), 16 is alignment hint
+    sScratch_ptr = cute.arch.alloc_smem(cutlass.BFloat16, cute.cosize(sScratch_layout), 16)
+    sScratch = cute.make_tensor(sScratch_ptr, sScratch_layout)
+
+    # select everything in the 2d tile, for tile index (bidx, bidy)
+    blk_coord_Input = ((None, None), (bidx, bidy))
+    # logical coord -> address
+    blkInput = gInput[blk_coord_Input]
+    tidfrgInput = cute.composition(blkInput, Input_tv_layout)
+    thrInput = tidfrgInput[thr_coord]
+
+    # write to scratchpad
+    tidfrgScratch = cute.composition(sScratch, Input_tv_layout)
+    thrScratch = tidfrgScratch[thr_coord]
+    thrScratch[None] = thrInput.load()
+
+    # sync this CTA's threads
+    cute.arch.sync_threads()
+
+    # end of phase 1, start of phase 2
+
+    # transpose the scratch pad
+    sScratchT = cute.make_tensor(sScratch_ptr, sScratchT_layout)
+
+    # select this thread's scratchpad region
+    tidfrgScratchT = cute.composition(sScratchT, Output_tv_layout)
+    thrScratchT = tidfrgScratchT[thr_coord].load()
+
+    # do the fp8 deepseek 1x128 calculation
+    thrA_abs = cute.math.absf(thrScratchT)
+    thrA_amax8 = thrA_abs.reduce(cute.ReductionOp.MAX, init_val=1e-12, reduction_profile=1)
+    thrA_amax128 = cute.arch.warp_reduction_max(thrA_amax8, threads_in_group=16)
+    thrA_amax128_fp32 = cutlass.Float32(thrA_amax128)
+    scale = (thrA_amax128_fp32 * cutlass.Float32(1.0 / 448.0))
+    qdata = (thrScratchT.to(cutlass.Float32) * (1.0 / scale)).to(cutlass.Float8E4M3FN)
+
+    # select the write region, with transposed block indices
+    blk_coord_Output = ((None, None), (bidy, bidx))
+
+    blkOutput = gOutput[blk_coord_Output]
+    tidfrgOutput = cute.composition(blkOutput, Output_tv_layout)
+    thrOutput = tidfrgOutput[thr_coord]
+
+    blkScale = gScale[blk_coord_Output]
+    tidfrgScale = cute.composition(blkScale, Scale_tv_layout)
+
+    # store qdata
+    thrOutput[None] = qdata
+
+    # every 16'th thread stores scale
+    if tidx % 16 == 0:
+        tidfrgScale[tidx] = scale
+
+    if cutlass.const_expr(_DEBUG):
+        pass
+
+
+@cute.jit
+def fp8_deepseek_1x128_dim_m_jit(mInput: cute.Tensor, mOutput: cute.Tensor, mScale: cute.Tensor):
+    # 256 is a reasonable default
+    num_threads_per_block = 256
+
+    # NEW
+
+    # * input is bf16, so 8 values per thread for a 128 bit load
+    # * quant_block size is 128, 128 / 8 = 16, so we need 16 threads to cover a quant_block
+
+    # input tv-layout
+    # first element must be at least 128 in the line below to cover quant block size 128 along dim-m
+    thrInput_layout = cute.make_ordered_layout((128, num_threads_per_block // 128), order=(1, 0))
+    valInput_layout = cute.make_ordered_layout((1, 8), order=(1, 0))
+    tilerInput_mn, Input_tv_layout = cute.make_layout_tv(thrInput_layout, valInput_layout)
+    gInput = cute.zipped_divide(mInput, tilerInput_mn)
+
+    # layout of the shared memory scratchpad
+    sScratch_layout = cute.make_ordered_layout(tilerInput_mn, order=(1, 0))
+    sScratchT_layout = cute.make_ordered_layout((tilerInput_mn[1], tilerInput_mn[0]), order=(0, 1))
+
+    # now, thinking through the read-write of stage 2
+    # scratchad shape: (128,16):(16,1) = (128, 16) = (TM, TN)
+    # scratchT shape: (16,128)
+    #   each thread handles 8 values
+    #   thr (16,16):(16,1), val (1,8):(0,1)
+    thrOutput_layout = cute.make_ordered_layout((16, num_threads_per_block // 16), order=(1, 0))
+    valOutput_layout = cute.make_ordered_layout((1, 8), order=(1, 0))
+    tilerOutput_mn, Output_tv_layout = cute.make_layout_tv(thrOutput_layout, valOutput_layout)
+    gOutput = cute.zipped_divide(mOutput, tilerOutput_mn)
+
+    # scale tv layout
+    # mode 0 - every 16 threads all write to the same location (only one writes)
+    # mode 1 - scales are one element apart
+    Scale_tv_layout = cute.make_layout((16, 16), stride=(0, 1))   # (16,16):(0,1)
+    # scale_tiler_mn is the number of scale slots written to by a CTA
+    Scale_tiler_mn = (cute.cosize(Scale_tv_layout), 1)  # (16,1)
+    gScale = cute.zipped_divide(mScale, Scale_tiler_mn)
+
+    fp8_deepseek_1x128_dim_m_kernel(
+        gInput, gOutput, gScale, Input_tv_layout, Output_tv_layout, Scale_tv_layout,
+        sScratch_layout, sScratchT_layout
+    ).launch(
+        # grid - number of thread blocks (CTAs) per launch
+        grid=(cute.size(gInput, mode=[1, 0]), cute.size(gInput, mode=[1, 1]), 1),
+        # block - threads per block instance
+        block=(cute.size(Input_tv_layout, mode=[0]), 1, 1),
+    )
+
+    # TODO implement the rest
+
+
+    if cutlass.const_expr(_DEBUG):
+        print('mInput', mInput)
+        print('mOutput', mOutput)
+        print('thrInput_layout', thrInput_layout)
+        print('valInput_layout', valInput_layout)
+        print('tilerInput_mn', tilerInput_mn)
+        print('Input_tv_layout', Input_tv_layout)
+        print('gInput', gInput)
+        print('sScratch_layout', sScratch_layout)
+        print('sScratchT_layout', sScratchT_layout)
+        print('thrOutput_layout', thrOutput_layout)
+        print('valOutput_layout', valOutput_layout)
+        print('tilerOutput_mn', tilerOutput_mn)
+        print('Output_tv_layout', Output_tv_layout)
+        print('gOutput', gOutput)
+        print('mScale', mScale)
+        print('Scale_tv_layout', Scale_tv_layout)
+        print('Scale_tiler_mn', Scale_tiler_mn)
+        print('gScale', gScale)
+
+
+def fp8_deepseek_1x128_dim_m(input: torch.Tensor, **kwargs):
+    assert len(input.shape) == 2, "unsupported"
+    assert input.shape[0] % 128 == 0, "unsupported"
+    assert input.shape[1] % 16 == 0, "unsupported"
+    assert input.is_contiguous(), "unsupported"
+    M, N = input.shape
+    output = torch.empty(N, M, dtype=torch.float8_e4m3fn, device=input.device) 
+    scale = torch.empty(N, M // 128, dtype=torch.float32, device=input.device)
+    input_cute = from_dlpack(input, assumed_align=16)
+    output_cute = from_dlpack(output, assumed_align=16)
+    scale_cute = from_dlpack(scale, assumed_align=16)
+    fp8_deepseek_1x128_dim_m_jit(input_cute, output_cute, scale_cute)
+    return output, scale
+
+FP8_DEEPSEEK_1X128_DIM_M = QuantCastCuteRecipe.from_gold(
+    Deepseek1x128DimMGold, cute_fn=fp8_deepseek_1x128_dim_m
+)
+
 
 ALL_RECIPES = [
     ("deepseek_1x128", FP8_DEEPSEEK_1X128),
+    ("deepseek_1x128_dim_m", FP8_DEEPSEEK_1X128_DIM_M),
 ]
