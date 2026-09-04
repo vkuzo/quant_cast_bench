@@ -1,8 +1,9 @@
 """Memory-bandwidth benchmark for the handwritten CuTeDSL playground kernels.
 
 Each kernel here is a memory-bound elementwise cast/op, so the signal we care about is achieved
-memory bandwidth vs. the H100 ceiling (3.35 TB/s HBM3, SXM5). We build a bf16 (M, K) input, run
-the selected kernel, time it with `do_bench_using_profiling`, and report GPU time + GB/s + % of peak.
+memory bandwidth vs. the GPU's HBM ceiling (B200: 8 TB/s, H100 SXM5: 3.35 TB/s -- selected from the
+device name). We build a bf16 (M, K) input, run the selected kernel, time it with
+`do_bench_using_profiling`, and report GPU time + GB/s + % of peak.
 
     python -m quant_cast_bench.quant_cast_cute_hand.benchmark --kernel add_v0
     python -m quant_cast_bench.quant_cast_cute_hand.benchmark --kernel add_v0 --M 8192 --K 8192
@@ -22,8 +23,21 @@ from quant_cast_bench.quant_cast_cute_hand.recipes import (
     transpose_v0, transpose_v1,
 )
 
-# H100 SXM5 HBM3 peak: 3.35 TB/s. (PCIe H100 is ~2 TB/s -- adjust if benching on that part.)
-H100_PEAK_BW_GBPS = 3350.0
+# Peak HBM bandwidth per GPU family (GB/s), used for the "% of peak" column. Matched by substring
+# against torch.cuda.get_device_name(0); H100 is the SXM5 HBM3 part (PCIe H100 is ~2 TB/s).
+_PEAK_BW_GBPS = {
+    "B200": 8000.0,  # 8 TB/s
+    "H100": 3350.0,  # 3.35 TB/s
+}
+
+
+def _peak_bw_gbps(device_name):
+    for family, bw in _PEAK_BW_GBPS.items():
+        if family in device_name:
+            return bw
+    raise AssertionError(
+        f"unsupported GPU {device_name!r}; known families: {sorted(_PEAK_BW_GBPS)}"
+    )
 
 
 def _bench_add_v0(M, K):
@@ -210,7 +224,7 @@ def main(
 ):
     """Benchmark one handwritten CuTeDSL kernel and print GPU time + achieved memory bandwidth."""
     device_name = torch.cuda.get_device_name(0)
-    assert "H100" in device_name, f"this benchmark assumes H100, got {device_name!r}"
+    peak_bw = _peak_bw_gbps(device_name)
 
     if kernel not in _KERNELS:
         raise ValueError(f"unknown kernel {kernel!r}; have {sorted(_KERNELS)}")
@@ -224,9 +238,10 @@ def main(
 
     gpu_time_ms = do_bench_using_profiling(run)
     gbps = bytes_per_iter / (gpu_time_ms * 1e-3) / 1e9
-    pct_peak = gbps / H100_PEAK_BW_GBPS * 100
+    pct_peak = gbps / peak_bw * 100
 
     print(f"kernel: {kernel}  shape: ({M}, {K})  dtype: bfloat16")
+    print(f"device: {device_name} (peak {peak_bw / 1000:.2f} TB/s)")
     print(
         tabulate.tabulate(
             [[kernel, f"{gpu_time_ms:.4f}", f"{gbps:.1f}", f"{pct_peak:.1f}%"]],
