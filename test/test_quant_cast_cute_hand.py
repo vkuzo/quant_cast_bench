@@ -12,6 +12,7 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from qdata_utils import mismatch_fraction, qdata_and_scale_equal
+from quant_cast_bench.quant_cast_gold.recipes import _from_blocked_4d
 
 # The CuTeDSL kernels import `_maybe_recast_from_f4_f6` (the fp4/fp6 register-packing helper) from
 # cutlass.cute.testing. That is the nvidia-cutlass-dsl >= 4.5.2 name; gate the whole module on the
@@ -151,7 +152,7 @@ def test_mxfp8_swizzle_v3():
 
 def test_mxfp8_swizzle_v4():
     # Same 2-D 32x128 tile + 16 bf16/thread as v3, but the load is two plain 8-elem fragment .load()s
-    # (each an LDG.128) concat'd in registers -- no uint32-word path. M % 128 == 0 and N % 128 == 0.
+    # (each an LDG.128) concat'd in registers -- no uint32-word path.
     if "mxfp8_swizzle_v4" in _REQUIRES_SM100 and torch.cuda.get_device_capability() != (10, 0):
         pytest.skip("mxfp8_swizzle_v4 emits Blackwell-only PTX; requires cuda capability 10.0")
     recipe = _get_recipe("mxfp8_swizzle_v4")
@@ -164,9 +165,40 @@ def test_mxfp8_swizzle_v4():
     recipe.correctness_fn(inputs, outputs)
 
 
+@pytest.mark.parametrize("M,K", [(1, 32), (31, 96), (33, 160), (127, 64), (129, 160)])
+def test_mxfp8_swizzle_v4_padding(M, K):
+    if "mxfp8_swizzle_v4" in _REQUIRES_SM100 and torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip("mxfp8_swizzle_v4 emits Blackwell-only PTX; requires cuda capability 10.0")
+    recipe = _get_recipe("mxfp8_swizzle_v4")
+    inputs = recipe.example_input_fn(M, K)
+
+    outputs = recipe.cute_fn(*inputs)
+    ref_outputs = recipe.pt_ref_fn(*inputs)
+    assert qdata_and_scale_equal(outputs[0], ref_outputs[0])
+    assert qdata_and_scale_equal(outputs[1], ref_outputs[1])
+    assert outputs[0].shape == (M, K)
+
+    ngc = K // 32
+    nrb, ncb = (M + 127) // 128, (ngc + 3) // 4
+    assert outputs[1].shape == (nrb, ncb, 32, 16)
+    padded = _from_blocked_4d(outputs[1], nrb * 128, ncb * 4).view(torch.uint8)
+    assert torch.count_nonzero(padded[M:, :]) == 0
+    assert torch.count_nonzero(padded[:M, ngc:]) == 0
+
+
+@pytest.mark.parametrize("M,K", [(0, 32), (1, 0), (1, 31), (1, 33)])
+def test_mxfp8_swizzle_v4_rejects_invalid_shapes(M, K):
+    if "mxfp8_swizzle_v4" in _REQUIRES_SM100 and torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip("mxfp8_swizzle_v4 emits Blackwell-only PTX; requires cuda capability 10.0")
+    recipe = _get_recipe("mxfp8_swizzle_v4")
+    inputs = recipe.example_input_fn(M, K)
+    with pytest.raises(AssertionError):
+        recipe.cute_fn(*inputs)
+
+
 def test_mxfp8_swizzle_v5():
     # Best of v1 and v4: v1's flat 1-D grid + v4's 16-elem/thread load (two LDG.128 concat'd in
-    # registers) and single STG.128 store. M % 128 == 0 and (N // 32) % 4 == 0.
+    # registers) and single STG.128 store.
     if "mxfp8_swizzle_v5" in _REQUIRES_SM100 and torch.cuda.get_device_capability() != (10, 0):
         pytest.skip("mxfp8_swizzle_v5 emits Blackwell-only PTX; requires cuda capability 10.0")
     recipe = _get_recipe("mxfp8_swizzle_v5")
@@ -177,6 +209,37 @@ def test_mxfp8_swizzle_v5():
     tile_kwargs = {"global_row": 0, "global_col": 0, "num_col": inputs[0].shape[-1]}
     ref_outputs = recipe.pt_ref_fn(*inputs, **tile_kwargs)
     recipe.correctness_fn(inputs, outputs)
+
+
+@pytest.mark.parametrize("M,K", [(1, 32), (31, 96), (33, 160), (127, 64), (129, 160)])
+def test_mxfp8_swizzle_v5_padding(M, K):
+    if "mxfp8_swizzle_v5" in _REQUIRES_SM100 and torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip("mxfp8_swizzle_v5 emits Blackwell-only PTX; requires cuda capability 10.0")
+    recipe = _get_recipe("mxfp8_swizzle_v5")
+    inputs = recipe.example_input_fn(M, K)
+
+    outputs = recipe.cute_fn(*inputs)
+    ref_outputs = recipe.pt_ref_fn(*inputs)
+    assert qdata_and_scale_equal(outputs[0], ref_outputs[0])
+    assert qdata_and_scale_equal(outputs[1], ref_outputs[1])
+    assert outputs[0].shape == (M, K)
+
+    ngc = K // 32
+    nrb, ncb = (M + 127) // 128, (ngc + 3) // 4
+    assert outputs[1].shape == (nrb, ncb, 32, 16)
+    padded = _from_blocked_4d(outputs[1], nrb * 128, ncb * 4).view(torch.uint8)
+    assert torch.count_nonzero(padded[M:, :]) == 0
+    assert torch.count_nonzero(padded[:M, ngc:]) == 0
+
+
+@pytest.mark.parametrize("M,K", [(0, 32), (1, 0), (1, 31), (1, 33)])
+def test_mxfp8_swizzle_v5_rejects_invalid_shapes(M, K):
+    if "mxfp8_swizzle_v5" in _REQUIRES_SM100 and torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip("mxfp8_swizzle_v5 emits Blackwell-only PTX; requires cuda capability 10.0")
+    recipe = _get_recipe("mxfp8_swizzle_v5")
+    inputs = recipe.example_input_fn(M, K)
+    with pytest.raises(AssertionError):
+        recipe.cute_fn(*inputs)
 
 
 def test_transpose_v0():
