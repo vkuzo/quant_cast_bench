@@ -8,8 +8,11 @@ import os
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils as utils
+from cutlass._mlir import ir
+from cutlass._mlir.dialects import arith, llvm, nvvm, vector  # typed NVVM e8m0 cvt ops
 from cutlass.cute.nvgpu import cpasync  # TMA (bulk-tensor) copy ops + tma_partition
 from cutlass.cute.runtime import from_dlpack
+from cutlass.cutlass_dsl import T, dsl_user_op
 
 import torch
 
@@ -20,7 +23,9 @@ import torch
 _DEBUG = os.environ.get("CUTE_DEBUG", "0") == "1"
 
 from quant_cast_bench.quant_cast_cute.recipes import QuantCastCuteRecipe
-from quant_cast_bench.quant_cast_gold.recipes import Deepseek1x128Gold, Deepseek1x128DimMGold
+from quant_cast_bench.quant_cast_gold.recipes import (
+    Deepseek1x128Gold, Deepseek1x128DimMGold, Mxfp8SwizzleGold,
+)
 
 def _ceil_div(num, den):
     return (num + den - 1) // den
@@ -1208,9 +1213,933 @@ def fp8_deepseek_1x128_dim_m_v2(input, **kwargs):
     fn(mInput, mOutput, mScale)
     return output, scale
 
-
 FP8_DEEPSEEK_1X128_DIM_M_V2 = QuantCastCuteRecipe.from_gold(
     Deepseek1x128DimMGold, cute_fn=fp8_deepseek_1x128_dim_m_v2
+)
+
+
+# ---------------------------------------------------------------------------
+# mxfp8_swizzle: FP8_DEEPSEEK_1X128 with mxfp8 numerics. Same launch grid (256 threads x 8 vals =
+# a 2048-element tile over the flattened input), so the only real changes are the block size
+# (1x32 instead of 1x128 -> 4 threads cooperate instead of 16), the scale format (e8m0 RCEIL byte
+# instead of an fp32 amax/448), and the scale store (a swizzled scatter instead of a contiguous
+# TV-layout write).
+# ---------------------------------------------------------------------------
+
+
+# e8m0 RCEIL helper (device): amax (f32 scalar) -> (rcp_f32, biased_uint8). Direct port of
+# torchao/prototype/moe_training/kernels/mxfp8/cute_utils.py -- the canonical CuTeDSL mxfp8 kernel.
+# Unlike our earlier inline-asm version this uses the typed NVVM cvt ops:
+#   f32 -> e8m0 : nvvm.cvt_packfloat_f32(UE8M0x2, rnd=RP)   (RP == RCEIL, high input 0.0, sat NONE)
+#   e8m0 -> f32 : nvvm.cvt_packfloat(UE8M0x2 -> BF16x2, rnd=RN) then bf16 -> f32  (supported path)
+# and the reciprocal is a real e8m0->f32 cast (reciprocal_biased = 254 - biased in uint8), matching
+# torchao `_reciprocal_scale` -- no manual <<23 exponent-shift and no byte-0/255 special cases (the
+# hardware cvt handles them). `view_as`/`pack`/`unpack` are the scalar bitcast/pack helpers.
+@dsl_user_op
+def view_as(x, dtype, *, loc=None, ip=None):
+    """Bitcast one scalar to another scalar of equal width."""
+    assert type(x).width == dtype.width
+    # bitcast wants a signed IR type even for unsigned CUTLASS types.
+    dst_type = (
+        T.i(dtype.width) if ir.IntegerType.isinstance(dtype.mlir_type) else dtype.mlir_type
+    )
+    return dtype(arith.bitcast(dst_type, x.ir_value(loc=loc, ip=ip), loc=loc, ip=ip))
+
+
+@dsl_user_op
+def unpack(x, dtype, *, loc=None, ip=None):
+    """Unpack an integer carrier into a tuple of scalar values."""
+    x = cute.typing.as_numeric(x)
+    carrier_dtype = type(x)
+    assert ir.IntegerType.isinstance(carrier_dtype.mlir_type)
+    assert carrier_dtype.width % dtype.width == 0
+    num_lanes = carrier_dtype.width // dtype.width
+    # integer vector lanes: vector<N x FP8> can crash the compiler (NVIDIA/cutlass#3342).
+    lanes = llvm.bitcast(
+        T.vector(num_lanes, T.i(dtype.width)), x.ir_value(loc=loc, ip=ip), loc=loc, ip=ip
+    )
+    return tuple(
+        view_as(
+            cute.typing.as_numeric(
+                vector.extract(lanes, dynamic_position=[], static_position=[i], loc=loc, ip=ip)
+            ),
+            dtype, loc=loc, ip=ip,
+        )
+        for i in range(num_lanes)
+    )
+
+
+@dsl_user_op
+def pack(*values, carrier=None, loc=None, ip=None):
+    """Pack same-typed scalar values into an integer carrier."""
+    assert len(values) > 0
+    lane_dtype = type(values[0])
+    assert all(type(value) is lane_dtype for value in values)
+    lane_type = T.i(lane_dtype.width)
+    lanes = vector.from_elements(
+        T.vector(len(values), lane_type),
+        tuple(arith.bitcast(lane_type, value.ir_value(loc=loc, ip=ip), loc=loc, ip=ip) for value in values),
+        loc=loc, ip=ip,
+    )
+    packed_width = len(values) * lane_dtype.width
+    packed = llvm.bitcast(T.i(packed_width), lanes, loc=loc, ip=ip)
+    if carrier is None:
+        return cute.typing.as_numeric(packed)
+    assert ir.IntegerType.isinstance(carrier.mlir_type)
+    assert carrier.width == packed_width
+    return carrier(packed)
+
+
+@dsl_user_op
+def _cvt_f32_to_ue8m0(x, *, rounding_mode, loc=None, ip=None):
+    """Convert x to a single E8M0 value without saturation (high input 0.0)."""
+    # this cutlass binding infers the result type (no leading result-type arg): (a, b, c, to, ...).
+    packed = nvvm.cvt_packfloat_f32(
+        cutlass.Float32(0.0).ir_value(loc=loc, ip=ip),
+        cutlass.Float32(x).ir_value(loc=loc, ip=ip),
+        cutlass.Int32(0).ir_value(loc=loc, ip=ip),
+        nvvm.CVTPackFloatKind.UE8M0x2,
+        rnd=rounding_mode,
+        sat=nvvm.SaturationModeKind.NONE,
+        loc=loc, ip=ip,
+    )
+    return unpack(cutlass.Int32(packed), cutlass.Float8E8M0FNU, loc=loc, ip=ip)[0]
+
+
+@dsl_user_op
+def _cvt_ue8m0_to_f32(x, *, loc=None, ip=None):
+    """Convert a single E8M0 value to f32 through the supported BF16 path."""
+    x_e8m0x2 = pack(x, cutlass.Float8E8M0FNU(0), loc=loc, ip=ip)
+    x_u32 = llvm.zext(T.i32(), x_e8m0x2.ir_value(loc=loc, ip=ip), loc=loc, ip=ip)
+    bf16x2_bits = nvvm.cvt_packfloat(
+        x_u32,
+        cutlass.Int32(0).ir_value(loc=loc, ip=ip),
+        nvvm.CVTPackFloatKind.UE8M0x2,
+        nvvm.CVTPackFloatKind.BF16x2,
+        rnd=nvvm.FPRoundingMode.RN,
+        sat=nvvm.SaturationModeKind.NONE,
+        loc=loc, ip=ip,
+    )
+    low_bf16 = unpack(cutlass.Int32(bf16x2_bits), cutlass.BFloat16, loc=loc, ip=ip)[0]
+    return low_bf16.to(cutlass.Float32)
+
+
+@cute.jit
+def _reciprocal_scale(scale_e8m0):
+    scale_biased = view_as(scale_e8m0, cutlass.Uint8)
+    reciprocal_biased = cutlass.Uint8(254) - scale_biased
+    return _cvt_ue8m0_to_f32(view_as(reciprocal_biased, cutlass.Float8E8M0FNU))
+
+
+@cute.jit
+def _e8m0(amax):
+    # torchao compute_scale_rceil: descale = amax * (1/448), RP-round to e8m0, then reciprocal.
+    descale = amax * cutlass.Float32(1.0 / 448.0)
+    scale_e8m0 = _cvt_f32_to_ue8m0(descale, rounding_mode=nvvm.FPRoundingMode.RP)
+    rcp = _reciprocal_scale(scale_e8m0)
+    return rcp, view_as(scale_e8m0, cutlass.Uint8)
+
+
+# swizzle offset (device): pre-swizzle scale position (row, col) -> flat offset into the 4D
+# (nrb, ncb, 32, 16) block grid, i.e. ((row//128 * ncb + col//4) * 32 + row%128%32) * 16
+# + ((row%128)//32 * 4 + col%4). Copied from quant_cast_cute/recipes.py `_swizzle_flat`; an exact
+# port of the gold `_to_blocked_4d` index math. `col` is the 32-group (block-column) index.
+@cute.jit
+def _swizzle_flat(row, col, ncb: cutlass.Int32):
+    br = row // 128
+    r128 = row % 128
+    a = r128 // 32
+    b = r128 % 32
+    bc = col // 4
+    c4 = col % 4
+    return ((br * ncb + bc) * 32 + b) * 16 + (a * 4 + c4)
+
+
+@cute.kernel
+def mxfp8_swizzle_kernel(
+    gInput: cute.Tensor,
+    gOutput: cute.Tensor,
+    mScale: cute.Tensor,
+    gId: cute.Tensor,
+    input_tv_layout: cute.Layout,
+    orig_shape: cute.Shape,
+    gpr: cutlass.Constexpr,  # 32-element groups per row == N // 32
+    ncb: cutlass.Constexpr,  # swizzle column-blocks == (N // 32) // 4
+):
+    tidx, _, _ = cute.arch.thread_idx()  # thread index in block (0 to bdim-1)
+    bidx, _, _ = cute.arch.block_idx()  # block index in grid (0 to grid_dim -1)
+
+    # slice for thread-block level view
+    # note: "select everything in the 1d tile, for tile index bidx"
+    blk_coord = ((None,), bidx)
+
+    # logical coord -> address
+    blkInput = gInput[blk_coord]
+    blkOutput = gOutput[blk_coord]
+    blkId = gId[blk_coord]
+
+    # compose for thread-index & value-index to physical mapping
+    tidfrgInput = cute.composition(blkInput, input_tv_layout)
+    tidfrgOutput = cute.composition(blkOutput, input_tv_layout)
+    tidfrgId = cute.composition(blkId, input_tv_layout)
+
+    # slice for thread-level view
+    thr_coord = (tidx, None)
+
+    # mask out of bounds
+    thrId = tidfrgId[thr_coord]
+    if cute.elem_less(thrId[0], orig_shape):
+
+        # reference:
+        #
+        # def mxfp8_f(x, **kwargs):
+        #     *lead, last = x.shape
+        #     x_b = x.reshape(*lead, last // 32, 32)
+        #     amax = x_b.abs().amax(dim=-1, keepdim=True)   # NOTE: no clamp, unlike deepseek
+        #     scale_e8m0 = _amax_to_e8m0_rceil(amax)
+        #     qdata = (x_b.to(torch.float32)
+        #              * _e8m0_scale_to_reciprocal_fp32(scale_e8m0)).to(torch.float8_e4m3fn)
+        #     return qdata.reshape(*lead, last), scale_e8m0.squeeze(-1)
+        # def mxfp8_swizzle_f(x, **kwargs):
+        #     qdata, scale_e8m0 = mxfp8_f(x)
+        #     return qdata, _to_blocked_4d(scale_e8m0)
+        #
+        # Each thread owns 8 elements, 32 // 8 = 4, so every 4 threads
+        # calculate a 1x32 block
+
+        # Load the fragment, slice for threads: vid -> address
+        thrInput = tidfrgInput[thr_coord].load()
+
+        # Cast to fp32 here, for 2 reasons:
+        # 1. cute.math.absf is fp32 
+        # 2. warp reduction uses fp32 registers
+        thrInput = thrInput.to(cutlass.Float32)
+
+        thrA_abs = cute.math.absf(thrInput)
+        # thread-local max. init_val is 0.0, NOT deepseek's 1e-12: mxfp8 does not clamp amax, and
+        # an all-zero block must produce biased == 0 (1e-12 would give descale 2.2e-15 -> ~78).
+        thrA_amax8 = thrA_abs.reduce(cute.ReductionOp.MAX, init_val=0.0, reduction_profile=1)
+        # intra-thread max. 4, not 16: warp_reduction_max is a butterfly shuffle clamped to the
+        # warp, so it reduces within ALIGNED 4-lane groups -- and val_layout (8):(1) gives each
+        # thread a contiguous 8-run, so lanes 4k..4k+3 own exactly one 1x32 block.
+        thrA_amax32 = cute.arch.warp_reduction_max(thrA_amax8, threads_in_group=4)
+        # convert bf16 -> fp32
+        # thrA_amax32_fp32 = cutlass.Float32(thrA_amax32)
+        thrA_amax32_fp32 = thrA_amax32
+        # calculate the e8m0 scale byte and its fp32 reciprocal pow2 factor
+        rcp, biased = _e8m0(thrA_amax32_fp32)
+        # calculate qdata -- multiply by the reciprocal, matching torchao's _to_mx_rceil
+        qdata = (thrInput.to(cutlass.Float32) * rcp).to(cutlass.Float8E4M3FN)
+
+        if cutlass.const_expr(_DEBUG):
+            print('thrA_amax8 static type', thrA_amax8.type)
+            print('thrA_amax32_fp32 static type', thrA_amax32_fp32.dtype)
+            print('rcp static type', rcp.dtype)
+            if tidx == 0 and bidx == 0:
+                cute.printf(
+                    "thrInput {}, {}, {}, {}, {}, {}, {}, {}",
+                    thrInput[0], thrInput[1], thrInput[2], thrInput[3],
+                    thrInput[4], thrInput[5], thrInput[6], thrInput[7],
+                )
+                cute.printf("thrA_amax8 {}", thrA_amax8)
+                cute.printf("thrA_amax32 {}", thrA_amax32)
+                cute.printf("biased {}, rcp {}", biased, rcp)
+                cute.printf(
+                    "qdata {}, {}, {}, {}, {}, {}, {}, {}",
+                    qdata[0], qdata[1], qdata[2], qdata[3],
+                    qdata[4], qdata[5], qdata[6], qdata[7],
+                )
+
+        # store qdata
+        thrOutput = tidfrgOutput[thr_coord]
+        thrOutput[None] = qdata
+        # every 4'th thread stores scale. Unlike deepseek we cannot use a scale TV layout +
+        # zipped_divide: that works only because deepseek's scale is dense row-major in the same
+        # order as the input tile, whereas the swizzled destination is scattered. So compute the
+        # global 1x32 block index directly and scatter. (Deriving it from bidx/tidx rather than
+        # thrId[0] keeps it a plain integer -- a rank-1 identity tensor yields a coordinate.)
+        if tidx % 4 == 0:
+            tile = cute.size(input_tv_layout)  # 2048 flat elements per CTA (static)
+            vpt = cute.size(input_tv_layout, mode=[1])  # 8 elements per thread (static)
+            gblk = (bidx * tile + tidx * vpt) // 32  # global 1x32 block index
+            row, col = gblk // gpr, gblk % gpr  # pre-swizzle scale coords
+            mScale[_swizzle_flat(row, col, ncb)] = biased.to(mScale.element_type)
+
+
+@cute.jit
+def mxfp8_swizzle_jit(
+    mInput: cute.Tensor,
+    mOutput: cute.Tensor,
+    mScale: cute.Tensor,
+    gpr: cutlass.Constexpr,
+    ncb: cutlass.Constexpr,
+):
+    # 256 is a reasonable default
+    num_threads_per_block = 256
+
+    # build the tv layout
+    # thr: (256):(1)
+    thr_layout = cute.make_ordered_layout((num_threads_per_block,), order=(0,))
+    # val: (8):(1)
+    val_layout = cute.make_ordered_layout((8,), order=(0,))
+    # (2048,)  (256,8):(8,1)
+    tiler_mn, input_tv_layout = cute.make_layout_tv(thr_layout, val_layout)
+    # ((TileM,), (RestM,))
+    gInput = cute.zipped_divide(mInput, tiler_mn)
+    gOutput = cute.zipped_divide(mOutput, tiler_mn)
+    mId = cute.make_identity_tensor(mInput.shape)
+    gId = cute.zipped_divide(mId, tiler_mn)
+
+    # no scale tv layout here -- the swizzled scale is scattered, see the kernel's scale store.
+
+    if cutlass.const_expr(_DEBUG):
+        print('mInput', mInput)
+        print('gInput', gInput)
+        print('mOutput', mOutput)
+        print('gpr', gpr)
+        print('ncb', ncb)
+        print('mScale', mScale)
+
+    mxfp8_swizzle_kernel(
+        gInput, gOutput, mScale, gId, input_tv_layout, mInput.shape, gpr, ncb
+    ).launch(
+        grid=(cute.size(gInput, mode=[1]), 1, 1),
+        block=(cute.size(input_tv_layout, mode=[0]), 1, 1),
+    )
+
+def mxfp8_swizzle(input: torch.Tensor, **kwargs):
+    assert len(input.shape) == 2, "unsupported"
+    assert input.shape[-1] % 32 == 0, "unsupported"
+    assert input.is_contiguous(), "unsupported"
+    M, N = input.shape
+    ngc = N // 32  # 32-element groups per row
+    # Whole 128x4 swizzle atoms only, so every slot of the scale grid is written and there is no
+    # padding to reason about. This also implies N % 128 == 0, hence (M*N) % 2048 == 0, so every
+    # 2048-element tile is fully in bounds -- which matters because warp_reduction_max below uses
+    # a full-warp mask inside the out-of-bounds guard.
+    assert M % 128 == 0 and ngc % 4 == 0, "unsupported"
+    nrb, ncb = M // 128, ngc // 4
+    input = input.view(-1)
+    output = torch.empty(input.shape, dtype=torch.float8_e4m3fn, device=input.device)
+    scale = torch.zeros(nrb * ncb * 32 * 16, dtype=torch.uint8, device=input.device)
+    input_cute = from_dlpack(input, assumed_align=16)
+    output_cute = from_dlpack(output, assumed_align=16)
+    scale_cute = from_dlpack(scale)
+    mxfp8_swizzle_jit(input_cute, output_cute, scale_cute, ngc, ncb)
+    return output.view(M, N), scale.view(nrb, ncb, 32, 16).view(torch.float8_e8m0fnu)
+
+
+MXFP8_SWIZZLE = QuantCastCuteRecipe.from_gold(
+    Mxfp8SwizzleGold, cute_fn=mxfp8_swizzle
+)
+
+
+# ---------------------------------------------------------------------------
+# mxfp8_swizzle_v3: 2-D 32x128 tile + 16-elem/thread aligned WORD load. This started as v1's
+# numerics on a 2-D tile with an 8-elem LDG.128 (isolating the tiling change; that regressed to
+# 55.6% -- see the memory note), then adopted the other perf lever: 16 elems/thread via an explicit
+# uint32-word load path.
+#
+# Why the word load and not a plain 16-wide fragment .load(): at 16 bf16 (=32B=2xLDG.128) the TV
+# fragment .load() FAILS to vectorize -- it serializes to 1 sector/element (268M vs 16.8M sectors,
+# L1TEX pipe saturates). The word load sidesteps this by viewing the input as uint32 (mWords),
+# issuing 128-bit CopyUniversal atoms into 4 u32 registers, and unpacking bf16x2 -> f32x2 in
+# registers. The host must mark the row stride divisible by 4 words so the compiler proves 128-bit
+# alignment.
+#
+# Tile = 32 rows x 128 cols. At 16 elems/thread that is 256 threads/CTA. A tile row of 128 cols is
+# 8 threads = 4 blocks (1x32) x 2 lanes. So warp_reduction_max(threads_in_group=2) -- ONE shuffle
+# stage (vs v1's 4-lane / two-stage), the other saving. Every 2nd lane stores the scale.
+#
+# The qdata STORE stays v3's TV-composition store (thrOutput[None] = qdata): 16 fp8 = 16B = one
+# STG.128, mapped to contiguous columns, so it coalesces without a packed-uint32 store path.
+#
+# Grid is (N/128, M/32) -- a CTA's tile origin is a plain 2-D coordinate, so the scale scatter
+# computes (row, col) directly.
+_MXS3_TM, _MXS3_TN = 32, 128          # 2-D tile (rows x cols); needs M%32==0, N%128==0
+_MXS3_VPT = 16                         # elements per thread (2xLDG.128 for bf16, via word load)
+_MXS3_TPR = _MXS3_TN // _MXS3_VPT      # 8 threads per tile row
+_MXS3_THREADS = _MXS3_TM * _MXS3_TPR   # 256 threads/CTA
+_MXS3_LANES = 32 // _MXS3_VPT          # 2 lanes per 1x32 block
+
+
+@dsl_user_op
+def _bf16x2_to_f32x2(word, *, loc=None, ip=None):
+    # Unpack a uint32 holding two bf16 lanes into (lo_f32, hi_f32). bf16 -> f32 is lossless: shift
+    # each bf16 into the high 16 bits of a 32-bit word and reinterpret as fp32.
+    lo_bits = cutlass.Int32((word & cutlass.Uint32(0xFFFF)) << cutlass.Uint32(16))
+    hi_bits = cutlass.Int32(word & cutlass.Uint32(0xFFFF0000))
+    lo = cutlass.Float32(llvm.bitcast(T.f32(), lo_bits.ir_value(loc=loc, ip=ip), loc=loc, ip=ip))
+    hi = cutlass.Float32(llvm.bitcast(T.f32(), hi_bits.ir_value(loc=loc, ip=ip), loc=loc, ip=ip))
+    return lo, hi
+
+
+@cute.jit
+def _load_bf16x16_as_f32(mWords: cute.Tensor, row, col_start):
+    # Load 16 contiguous bf16 from row `row`, starting at column `col_start`, as 16 f32 -- via two
+    # 128-bit uint32 copy atoms (8 bf16 each) + register unpack. `mWords` is the input reinterpreted
+    # as uint32 with a divisibility-4 row stride, so 128-bit copies are provably aligned.
+    values = cute.make_rmem_tensor(16, cutlass.Float32)
+    src_words = cute.tiled_divide(mWords[row, None], (4,))  # ((4,), n_word_groups)
+    dst = cute.make_rmem_tensor(4, cutlass.Uint32)
+    copy_atom = cute.make_copy_atom(
+        cute.nvgpu.CopyUniversalOp(), cutlass.Uint32, num_bits_per_copy=128
+    )
+    # 16 bf16 = 8 uint32 words = two 4-word (128-bit) copies. word column = col_start // 2.
+    word_col0 = col_start // 2
+    for grp in cutlass.range_constexpr(2):
+        cute.copy(copy_atom, src_words[None, (word_col0 + grp * 4) // 4], dst)
+        for w in cutlass.range_constexpr(4):
+            lo, hi = _bf16x2_to_f32x2(dst[w])
+            values[grp * 8 + w * 2 + 0] = lo
+            values[grp * 8 + w * 2 + 1] = hi
+    return values
+
+
+@cute.kernel
+def mxfp8_swizzle_v3_kernel(
+    mWords: cute.Tensor,   # 2-D (M, N//2) uint32 view of the bf16 input (div-4 row stride)
+    gOutput: cute.Tensor,
+    mScale: cute.Tensor,
+    input_tv_layout: cute.Layout,
+    ncb: cutlass.Constexpr,  # swizzle column-blocks == (N // 32) // 4
+):
+    tidx, _, _ = cute.arch.thread_idx()
+    bidx, bidy, _ = cute.arch.block_idx()   # bidx = n-tile (cols), bidy = m-tile (rows)
+
+    # this thread's (row, col_start) in global coords -- 16 contiguous cols starting at col_start.
+    # M%128==0 and N%128==0 => every 32x128 tile is fully in bounds, so no per-thread guard is needed
+    # (the warp_reduction_max below also assumes a full aligned group, like v1).
+    row = bidy * _MXS3_TM + tidx // _MXS3_TPR
+    col_start = bidx * _MXS3_TN + (tidx % _MXS3_TPR) * _MXS3_VPT
+
+    # 16-elem aligned word load (2x LDG.128), unpacked to f32 in registers.
+    rInput = _load_bf16x16_as_f32(mWords, row, col_start)
+    thrInput = rInput.load()
+
+    thrA_abs = cute.math.absf(thrInput)
+    # no clamp (mxfp8), init_val 0.0 so an all-zero block -> biased 0.
+    thrA_amax16 = thrA_abs.reduce(cute.ReductionOp.MAX, init_val=0.0, reduction_profile=1)
+    # 2 lanes per 1x32 block -> ONE shuffle stage over aligned 2-lane groups.
+    thrA_amax32 = cute.arch.warp_reduction_max(thrA_amax16, threads_in_group=_MXS3_LANES)
+    rcp, biased = _e8m0(thrA_amax32)
+    qdata = (thrInput * rcp).to(cutlass.Float8E4M3FN)
+
+    # store qdata via the TV composition (16 fp8 = one STG.128, contiguous columns).
+    blkOutput = gOutput[((None, None), (bidy, bidx))]
+    tidfrgOutput = cute.composition(blkOutput, input_tv_layout)
+    tidfrgOutput[(tidx, None)] = qdata
+
+    # every 2nd lane owns the leading 16 elems of a 1x32 block -> writes its scale.
+    if tidx % _MXS3_LANES == 0:
+        col = col_start // 32   # global 1x32 block col
+        mScale[_swizzle_flat(row, col, ncb)] = biased.to(mScale.element_type)
+
+
+@cute.jit
+def mxfp8_swizzle_v3_jit(
+    mWords: cute.Tensor,   # 2-D (M, N//2) uint32
+    mOutput: cute.Tensor,  # 2-D (M, N) fp8
+    mScale: cute.Tensor,
+    M: cutlass.Constexpr,
+    N: cutlass.Constexpr,
+    ncb: cutlass.Constexpr,
+):
+    tiler_mn = (_MXS3_TM, _MXS3_TN)
+
+    # Output TV layout: domain ((thr), (val)) -> COORDINATE into the (32,128) tile. Composition
+    # decodes it column-major (row-fastest), then the tile's row-major strides map to memory. To walk
+    # contiguous COLUMNS the val stride is TM (=32) -> memory stride 1 (the STG.128 axis).
+    #   val v      -> column +v        -> stride TM      (=32; contiguous 16-run -> STG.128)
+    #   t_lo=t%8   -> column-run +VPT  -> stride TM*VPT  (=512)
+    #   t_hi=t//8  -> row +1           -> stride 1
+    input_tv_layout = cute.make_layout(
+        ((_MXS3_TPR, _MXS3_TM), (_MXS3_VPT,)),
+        stride=((_MXS3_TM * _MXS3_VPT, 1), (_MXS3_TM,)),
+    )
+
+    gOutput = cute.zipped_divide(mOutput, tiler_mn)
+
+    if cutlass.const_expr(_DEBUG):
+        print('mWords', mWords)
+        print('mOutput', mOutput)
+        print('input_tv_layout', input_tv_layout)
+
+    mxfp8_swizzle_v3_kernel(
+        mWords, gOutput, mScale, input_tv_layout, ncb
+    ).launch(
+        grid=(N // _MXS3_TN, M // _MXS3_TM, 1),
+        block=(_MXS3_THREADS, 1, 1),
+    )
+
+
+def mxfp8_swizzle_v3(input: torch.Tensor, **kwargs):
+    assert len(input.shape) == 2, "unsupported"
+    assert input.is_contiguous(), "unsupported"
+    assert input.dtype == torch.bfloat16, "v3 word load is bf16-only"
+    M, N = input.shape
+    ngc = N // 32
+    # 32x128 tile + whole 128x4 swizzle atoms: M%32==0 and N%128==0 (=> ngc%4==0). Keep M%128==0 to
+    # match v1/gold's dense scale layout. N%128==0 => the uint32 row stride (N//2) is a multiple of 4.
+    assert M % 128 == 0 and N % _MXS3_TN == 0, "unsupported"
+    nrb, ncb = M // 128, ngc // 4
+    output = torch.empty(M, N, dtype=torch.float8_e4m3fn, device=input.device)
+    scale = torch.zeros(nrb * ncb * 32 * 16, dtype=torch.uint8, device=input.device)
+    # uint32 view of the bf16 input: (M, N//2). Mark the row stride divisible by 4 words so the
+    # compiler proves the 128-bit (4-word) copy atoms are aligned -- this is what makes the load
+    # vectorize (the aligned-word load path).
+    words = input.view(torch.uint32)  # (M, N//2)
+    mWords = (from_dlpack(words, assumed_align=16)
+              .mark_layout_dynamic(leading_dim=1)
+              .mark_compact_shape_dynamic(mode=1, divisibility=4))
+    output_cute = from_dlpack(output, assumed_align=16)
+    scale_cute = from_dlpack(scale)
+    mxfp8_swizzle_v3_jit(mWords, output_cute, scale_cute, M, N, ncb)
+    return output, scale.view(nrb, ncb, 32, 16).view(torch.float8_e8m0fnu)
+
+
+MXFP8_SWIZZLE_V3 = QuantCastCuteRecipe.from_gold(
+    Mxfp8SwizzleGold, cute_fn=mxfp8_swizzle_v3
+)
+
+
+# ---------------------------------------------------------------------------
+# mxfp8_swizzle_v4: same 2-D 32x128 tile, same 16 bf16/thread, same numerics as v3 -- but WITHOUT the
+# uint32-word load. It turns out mWords was never necessary.
+#
+# What differs from v3 (the ONLY difference -- everything downstream is identical):
+#   v3:  loads 16 bf16 as one 128-bit uint32-word copy path (mWords: input viewed as uint32 with a
+#        divisibility=4 row stride, two CopyUniversalOp atoms into 4 u32 regs each, _bf16x2_to_f32x2
+#        register unpack). This exists only because a SINGLE 16-wide bf16 fragment .load() fails to
+#        vectorize (it serializes to 1 sector/element, 268M sectors) -- the compiler won't fuse it
+#        into 2xLDG.128 without a proven-aligned pointer.
+#   v4:  feeds the bf16 input DIRECTLY (no uint32 view, no host divisibility marking) and issues TWO
+#        separate 8-elem fragment .load()s. Each 8-bf16 run is 16B = one LDG.128 (the v1 case, which
+#        always vectorizes); the second load's +16B offset is a static constant added to a 16-aligned
+#        base, and the compiler propagates that alignment on its own -> both loads emit LDG.128.
+#
+# The catch and its fix: the two loads must be CONCAT'd back into a single 16-wide value before the
+# reduce/cast, or you pay for it. There is no SSA-level concat, so the concat goes through a register
+# fragment: the two LDG.128s write adjacent halves of one 16-elem rmem tensor, then a single .load()
+# reads it back as one 16-wide SSA value -- restoring v3's single 16-wide reduce, single fp8 cast, and
+# single STG.128 store. (An earlier attempt that kept the halves split -- two 8-wide reduces + a
+# cute.max, and two STG.64 stores -- cost ~1.7pt: the store did NOT coalesce as two STG.64, and the
+# split compute added latency this near-roofline kernel couldn't hide.)
+#
+# Result (16384^2, B200, cutlass-dsl 4.6.0): v4 = 81.1% vs v3 = 80.7% -- a hair FASTER, and much
+# simpler. ncu: load 8.39M sectors and store 2.36M sectors, both IDENTICAL to v3 (two LDG.128 + one
+# STG.128), 29 vs 28 regs. So the whole word-load apparatus (mWords / divisibility=4 /
+# _bf16x2_to_f32x2 / _load_bf16x16_as_f32) is dead weight; v4 deletes it. Bit-exact vs v3 and gold.
+_MXS4_HALF = _MXS3_VPT // 2   # 8 elems per sub-load (2 halves of the 16-elem/thread run)
+
+
+@cute.kernel
+def mxfp8_swizzle_v4_kernel(
+    gInput: cute.Tensor,   # 2-D bf16 input, zipped_divide'd into (32,128) tiles
+    gOutput: cute.Tensor,
+    mScale: cute.Tensor,
+    input_tv_layout: cute.Layout,
+    ncb: cutlass.Constexpr,
+):
+    tidx, _, _ = cute.arch.thread_idx()
+    bidx, bidy, _ = cute.arch.block_idx()
+
+    row = bidy * _MXS3_TM + tidx // _MXS3_TPR
+    col_start = bidx * _MXS3_TN + (tidx % _MXS3_TPR) * _MXS3_VPT
+
+    # TWO separate 8-elem fragment loads (each a clean LDG.128), concat'd into one 16-elem rmem
+    # fragment via adjacent register writes, then read back as a SINGLE 16-wide SSA value so the whole
+    # downstream (reduce, mul, fp8 cast, store) is v3's single-16-wide path -- no per-half cute.max or
+    # store-side concat. There is no SSA-level concat; the concat has to happen through a register
+    # fragment.
+    blkInput = gInput[((None, None), (bidy, bidx))]
+    tidfrgInput = cute.composition(blkInput, input_tv_layout)
+    thrFrg = tidfrgInput[(tidx, None)]              # this thread's 16 contiguous cols
+    frg2 = cute.tiled_divide(thrFrg, (_MXS4_HALF,))  # ((8,), 2): two 8-elem sub-runs
+    rIn = cute.make_rmem_tensor(_MXS3_VPT, cutlass.BFloat16)
+    ri2 = cute.tiled_divide(rIn, (_MXS4_HALF,))
+    ri2[(None, 0)] = frg2[(None, 0)].load()   # cols 0..7  -> LDG.128 into regs
+    ri2[(None, 1)] = frg2[(None, 1)].load()   # cols 8..15 -> LDG.128 into regs
+
+    thrInput = rIn.load().to(cutlass.Float32)      # one 16-wide SSA value
+    thrA_abs = cute.math.absf(thrInput)
+    thrA_amax16 = thrA_abs.reduce(cute.ReductionOp.MAX, init_val=0.0, reduction_profile=1)
+    thrA_amax32 = cute.arch.warp_reduction_max(thrA_amax16, threads_in_group=_MXS3_LANES)
+    rcp, biased = _e8m0(thrA_amax32)
+    qdata = (thrInput * rcp).to(cutlass.Float8E4M3FN)
+
+    blkOutput = gOutput[((None, None), (bidy, bidx))]
+    tidfrgOutput = cute.composition(blkOutput, input_tv_layout)
+    tidfrgOutput[(tidx, None)] = qdata
+
+    if tidx % _MXS3_LANES == 0:
+        col = col_start // 32
+        mScale[_swizzle_flat(row, col, ncb)] = biased.to(mScale.element_type)
+
+
+@cute.jit
+def mxfp8_swizzle_v4_jit(
+    mInput: cute.Tensor,
+    mOutput: cute.Tensor,
+    mScale: cute.Tensor,
+    M: cutlass.Constexpr,
+    N: cutlass.Constexpr,
+    ncb: cutlass.Constexpr,
+):
+    tiler_mn = (_MXS3_TM, _MXS3_TN)
+    input_tv_layout = cute.make_layout(
+        ((_MXS3_TPR, _MXS3_TM), (_MXS3_VPT,)),
+        stride=((_MXS3_TM * _MXS3_VPT, 1), (_MXS3_TM,)),
+    )
+    gInput = cute.zipped_divide(mInput, tiler_mn)
+    gOutput = cute.zipped_divide(mOutput, tiler_mn)
+    mxfp8_swizzle_v4_kernel(
+        gInput, gOutput, mScale, input_tv_layout, ncb
+    ).launch(
+        grid=(N // _MXS3_TN, M // _MXS3_TM, 1),
+        block=(_MXS3_THREADS, 1, 1),
+    )
+
+
+def mxfp8_swizzle_v4(input: torch.Tensor, **kwargs):
+    assert len(input.shape) == 2, "unsupported"
+    assert input.is_contiguous(), "unsupported"
+    assert input.dtype == torch.bfloat16, "v4 is bf16-only"
+    M, N = input.shape
+    ngc = N // 32
+    assert M % 128 == 0 and N % _MXS3_TN == 0, "unsupported"
+    nrb, ncb = M // 128, ngc // 4
+    output = torch.empty(M, N, dtype=torch.float8_e4m3fn, device=input.device)
+    scale = torch.zeros(nrb * ncb * 32 * 16, dtype=torch.uint8, device=input.device)
+    input_cute = from_dlpack(input, assumed_align=16)
+    output_cute = from_dlpack(output, assumed_align=16)
+    scale_cute = from_dlpack(scale)
+    mxfp8_swizzle_v4_jit(input_cute, output_cute, scale_cute, M, N, ncb)
+    return output, scale.view(nrb, ncb, 32, 16).view(torch.float8_e8m0fnu)
+
+
+MXFP8_SWIZZLE_V4 = QuantCastCuteRecipe.from_gold(
+    Mxfp8SwizzleGold, cute_fn=mxfp8_swizzle_v4
+)
+
+
+# ---------------------------------------------------------------------------
+# mxfp8_swizzle_v5: the best of v1 and v4.
+#   from v1: the FLAT 1-D grid -- input flattened to 1-D, tile = one contiguous run, so each CTA's
+#            memory footprint is a single contiguous slab (v1's DRAM-locality advantage; v4's 2-D
+#            32x128 tile scatters each CTA across 32 rows).
+#   from v4: 16 bf16/thread loaded as TWO 8-elem fragment .load()s (each a clean LDG.128) concat'd in
+#            a register fragment into one 16-wide value, and a single 16-fp8 STG.128 store. (No
+#            uint32-word path: two plain loads vectorize where a single 16-wide .load() would not.)
+#
+# At 256 threads x 16 elems the flat tile is 4096 contiguous elements. val_layout = (16):(1) gives
+# each thread a contiguous 16-run; a 1x32 block is 2 threads, so warp_reduction_max(threads_in_group=2)
+# (ONE shuffle stage) and every 2nd thread stores the scale -- same block arithmetic as v4, but on the
+# flat tile. The OOB guard / identity tensor / flat scale-index math are v1's, verbatim.
+_MXS5_VPT = 16                        # elems/thread (16 bf16 = 2x LDG.128 / 1x STG.128)
+_MXS5_THREADS = 256
+_MXS5_HALF = _MXS5_VPT // 2           # 8 elems per sub-load
+_MXS5_LANES = 32 // _MXS5_VPT         # 2 threads per 1x32 block
+
+
+@cute.kernel
+def mxfp8_swizzle_v5_kernel(
+    gInput: cute.Tensor,
+    gOutput: cute.Tensor,
+    mScale: cute.Tensor,
+    gId: cute.Tensor,
+    input_tv_layout: cute.Layout,
+    orig_shape: cute.Shape,
+    gpr: cutlass.Constexpr,  # 32-element groups per row == N // 32
+    ncb: cutlass.Constexpr,  # swizzle column-blocks == (N // 32) // 4
+):
+    tidx, _, _ = cute.arch.thread_idx()
+    bidx, _, _ = cute.arch.block_idx()
+
+    blk_coord = ((None,), bidx)
+    blkInput = gInput[blk_coord]
+    blkOutput = gOutput[blk_coord]
+    blkId = gId[blk_coord]
+    tidfrgInput = cute.composition(blkInput, input_tv_layout)
+    tidfrgOutput = cute.composition(blkOutput, input_tv_layout)
+    tidfrgId = cute.composition(blkId, input_tv_layout)
+
+    thr_coord = (tidx, None)
+    thrId = tidfrgId[thr_coord]
+    if cute.elem_less(thrId[0], orig_shape):
+        # v4's load: two 8-elem LDG.128 concat'd in a register fragment -> one 16-wide value.
+        thrFrg = tidfrgInput[thr_coord]                   # this thread's 16 contiguous elems
+        frg2 = cute.tiled_divide(thrFrg, (_MXS5_HALF,))   # ((8,), 2)
+        rIn = cute.make_rmem_tensor(_MXS5_VPT, cutlass.BFloat16)
+        ri2 = cute.tiled_divide(rIn, (_MXS5_HALF,))
+        ri2[(None, 0)] = frg2[(None, 0)].load()           # elems 0..7  -> LDG.128 into regs
+        ri2[(None, 1)] = frg2[(None, 1)].load()           # elems 8..15 -> LDG.128 into regs
+
+        thrInput = rIn.load().to(cutlass.Float32)         # one 16-wide SSA value
+        thrA_abs = cute.math.absf(thrInput)
+        thrA_amax16 = thrA_abs.reduce(cute.ReductionOp.MAX, init_val=0.0, reduction_profile=1)
+        # 2 threads per 1x32 block -> ONE shuffle stage over aligned 2-lane groups.
+        thrA_amax32 = cute.arch.warp_reduction_max(thrA_amax16, threads_in_group=_MXS5_LANES)
+        rcp, biased = _e8m0(thrA_amax32)
+        qdata = (thrInput * rcp).to(cutlass.Float8E4M3FN)
+
+        # single 16-fp8 STG.128.
+        thrOutput = tidfrgOutput[thr_coord]
+        thrOutput[None] = qdata
+
+        # every 2nd thread owns the leading 16 elems of a 1x32 block -> stores its scale. Flat
+        # scale-index math from v1 (derived from bidx/tidx to stay a plain integer).
+        if tidx % _MXS5_LANES == 0:
+            tile = cute.size(input_tv_layout)             # flat elements per CTA (static)
+            vpt = cute.size(input_tv_layout, mode=[1])    # elements per thread (static)
+            gblk = (bidx * tile + tidx * vpt) // 32       # global 1x32 block index
+            row, col = gblk // gpr, gblk % gpr            # pre-swizzle scale coords
+            mScale[_swizzle_flat(row, col, ncb)] = biased.to(mScale.element_type)
+
+
+@cute.jit
+def mxfp8_swizzle_v5_jit(
+    mInput: cute.Tensor,
+    mOutput: cute.Tensor,
+    mScale: cute.Tensor,
+    gpr: cutlass.Constexpr,
+    ncb: cutlass.Constexpr,
+):
+    thr_layout = cute.make_ordered_layout((_MXS5_THREADS,), order=(0,))   # (256):(1)
+    val_layout = cute.make_ordered_layout((_MXS5_VPT,), order=(0,))       # (16):(1)
+    tiler_mn, input_tv_layout = cute.make_layout_tv(thr_layout, val_layout)  # (4096,) (256,16):(16,1)
+    gInput = cute.zipped_divide(mInput, tiler_mn)
+    gOutput = cute.zipped_divide(mOutput, tiler_mn)
+    mId = cute.make_identity_tensor(mInput.shape)
+    gId = cute.zipped_divide(mId, tiler_mn)
+
+    mxfp8_swizzle_v5_kernel(
+        gInput, gOutput, mScale, gId, input_tv_layout, mInput.shape, gpr, ncb
+    ).launch(
+        grid=(cute.size(gInput, mode=[1]), 1, 1),
+        block=(cute.size(input_tv_layout, mode=[0]), 1, 1),
+    )
+
+
+def mxfp8_swizzle_v5(input: torch.Tensor, **kwargs):
+    assert len(input.shape) == 2, "unsupported"
+    assert input.shape[-1] % 32 == 0, "unsupported"
+    assert input.is_contiguous(), "unsupported"
+    assert input.dtype == torch.bfloat16, "v5 is bf16-only"
+    M, N = input.shape
+    ngc = N // 32
+    # Whole 128x4 swizzle atoms (=> N%128==0). N%128==0 and 16 elems/thread => every 4096-elem tile is
+    # in bounds AND 16-elem/thread runs are 32B-aligned, so both LDG.128s vectorize.
+    assert M % 128 == 0 and ngc % 4 == 0, "unsupported"
+    nrb, ncb = M // 128, ngc // 4
+    input = input.view(-1)
+    output = torch.empty(input.shape, dtype=torch.float8_e4m3fn, device=input.device)
+    scale = torch.zeros(nrb * ncb * 32 * 16, dtype=torch.uint8, device=input.device)
+    input_cute = from_dlpack(input, assumed_align=16)
+    output_cute = from_dlpack(output, assumed_align=16)
+    scale_cute = from_dlpack(scale)
+    mxfp8_swizzle_v5_jit(input_cute, output_cute, scale_cute, ngc, ncb)
+    return output.view(M, N), scale.view(nrb, ncb, 32, 16).view(torch.float8_e8m0fnu)
+
+
+MXFP8_SWIZZLE_V5 = QuantCastCuteRecipe.from_gold(
+    Mxfp8SwizzleGold, cute_fn=mxfp8_swizzle_v5
+)
+
+
+# ---------------------------------------------------------------------------
+# mxfp8_swizzle_v2: TMA (bulk-tensor) load/store of the main data, mxfp8 dim-K numerics.
+#
+# Structured on fp8_deepseek_1x128_dim_m_v2 (the warp-specialized TMA kernel above) -- same 128x128
+# tile, same mbarrier arrive-and-expect-tx handshake, warp-0-gated G2S/S2G copies. The differences
+# are all in the CALCULATION, because mxfp8_swizzle reduces along K (a 1x32 block within a row), not
+# down M like deepseek dim-M:
+#   - block is 1x32 (not a 128-row column), so a 128x128 tile holds 128 rows x 4 col-blocks = 512
+#     scale groups (vs deepseek's 128). With 128 threads that is 4 iters.
+#   - each thread-group owns one (row, col-block): the 32 CONTIGUOUS columns sInput[row, cb*32:+32].
+#   - scale is an e8m0 RCEIL byte (_e8m0), scattered to the swizzled (nrb,ncb,32,16) grid
+#     (_swizzle_flat), exactly like the scalar v1 above.
+#   - the output is NOT transposed (dim-K keeps (M,N)); sOutput reuses the (TM,TN) row-major layout
+#     and the S2G box is (TM,TN), so no register->smem transpose is needed.
+# TMA note: the (128,128) box is a static descriptor tile; the last row/col tiles of a ragged tensor
+# would be hardware-masked (G2S zero-fills, S2G drops OOB) -- but we assert M%128==0, N%128==0 so
+# every tile is full and the swizzled scale scatter never addresses a padding slot.
+#
+# PERF REGRESSION (TODO, nvidia-cutlass-dsl 4.6.2): this kernel is STILL BIT-EXACT on 4.6.2 but its
+# throughput collapsed from ~72.6% peak (0.140ms @ 16384^2, on 4.5.2) to ~14% (0.72ms). ncu shows
+# smem bank conflicts exploded ~10x (13.3M ld + 2.6M st -> 126M ld + 60M st) and the L1TEX pipe
+# saturates at 98% while DRAM sits at 14%. The source is unchanged, so 4.6 is compiling the scalar
+# smem access in the two-phase compute loop (sInput[lrow,c0+r] / sOutput[lrow,c0+r]) into a much
+# worse (conflicting) access than 4.5 did. A speculative fix (replace the scalar loops with
+# cute.autovec_copy over a 32-elem smem slice, LDS.128/STS.128) did NOT recover perf. Not yet root
+# caused -- chase down later. v1 (mxfp8_swizzle) is unaffected: ~63% peak on 4.6.2, perf-neutral.
+_MXS_TM, _MXS_TN, _MXS_WARPS = 128, 128, 4          # B200 tile; needs M%TM==0, N%TN==0
+_MXS_THREADS = _MXS_WARPS * 32                       # 128
+_MXS_BPR = _MXS_TN // 32                             # 4 col-blocks (1x32) across a 128-wide tile row
+_MXS_GROUPS = _MXS_TM * _MXS_BPR                     # 128 rows * 4 = 512 (row, col-block) scale groups
+_MXS_ITERS = (_MXS_GROUPS + _MXS_THREADS - 1) // _MXS_THREADS  # 4
+_MXS_IN_BYTES = _MXS_TM * _MXS_TN * 2                # 128*128 bf16 tile bytes for expect-tx
+
+
+@cute.struct
+class _MxfpSwizzleSmem:
+    # only ONE full-tile buffer: the fp8 output aliases the front of sInput (see the kernel). The
+    # bf16 input tile (32KB) is >= the fp8 output tile (16KB), so the output view fits inside it. This
+    # drops per-CTA smem from ~51KB to ~35KB, lifting the smem-bound occupancy from 4 to 6 blocks/SM.
+    tma_bar: cute.struct.MemRange[cutlass.Int64, 1]
+    sInput: cute.struct.Align[cute.struct.MemRange[cutlass.BFloat16, _MXS_TM * _MXS_TN], 1024]
+
+
+@cute.kernel
+def mxfp8_swizzle_v2_kernel(
+    input_tma_atom: cute.CopyAtom,
+    input_tma_tensor: cute.Tensor,
+    output_tma_atom: cute.CopyAtom,
+    output_tma_tensor: cute.Tensor,
+    mScale: cute.Tensor,
+    input_smem_layout: cute.Layout,
+    output_smem_layout: cute.Layout,
+    gpr: cutlass.Constexpr,  # 32-element col-groups per row == N // 32
+    ncb: cutlass.Constexpr,  # swizzle column-blocks == (N // 32) // 4
+):
+    tidx, _, _ = cute.arch.thread_idx()
+    bidx, bidy, _ = cute.arch.block_idx()   # bidx = m_tile, bidy = n_tile
+    warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+
+    smem = utils.SmemAllocator()
+    st = smem.allocate(_MxfpSwizzleSmem)
+    tma_bar_ptr = st.tma_bar.data_ptr()
+    if tidx == 0:
+        cute.arch.mbarrier_init(tma_bar_ptr, 1)
+    cute.arch.mbarrier_init_fence()
+    cute.arch.sync_threads()
+
+    sInput = st.sInput.get_tensor(input_smem_layout)      # (TM, TN) bf16 row-major
+    # sOutput ALIASES the same smem base as sInput, reinterpreted as fp8. Safe because (a) the fp8
+    # tile (16KB) fits inside the bf16 tile (32KB), and (b) the kernel reads ALL of sInput into
+    # registers and sync_threads() BEFORE any thread writes fp8 back over it (see the two-phase loop).
+    sOutput = cute.make_tensor(
+        cute.recast_ptr(st.sInput.data_ptr(), dtype=cutlass.Float8E4M3FN), output_smem_layout
+    )
+    gInput = cute.local_tile(input_tma_tensor, (_MXS_TM, _MXS_TN), (None, None))
+    gOutput = cute.local_tile(output_tma_tensor, (_MXS_TM, _MXS_TN), (None, None))
+
+    tInputsInput, tInputgInput = cpasync.tma_partition(
+        input_tma_atom, 0, cute.make_layout(1),
+        cute.group_modes(sInput, 0, 2), cute.group_modes(gInput, 0, 2))
+    tOutputsOutput, tOutputgOutput = cpasync.tma_partition(
+        output_tma_atom, 0, cute.make_layout(1),
+        cute.group_modes(sOutput, 0, 2), cute.group_modes(gOutput, 0, 2))
+
+    # G2S: one elected thread arms the barrier + fires the bulk copy; all threads wait for the tile.
+    if warp == 0:
+        with cute.arch.elect_one():
+            cute.arch.mbarrier_arrive_and_expect_tx(tma_bar_ptr, _MXS_IN_BYTES)
+        cute.copy(input_tma_atom, tInputgInput[(None, bidx, bidy)], tInputsInput, tma_bar_ptr=tma_bar_ptr)
+    cute.arch.mbarrier_wait(tma_bar_ptr, 0)
+
+    m0 = bidx * _MXS_TM   # tile's first global row
+    n0 = bidy * _MXS_TN   # tile's first global col
+
+    # Because sOutput aliases sInput's storage, the read of sInput and the write of fp8 must be
+    # separated by a barrier: EVERY thread must finish reading its bf16 out of smem before ANY thread
+    # overwrites that region with fp8. So this is two phases with the quantized bytes held in registers
+    # across the sync.
+    #   phase A: read sInput -> compute amax/scale/qdata, keep the 32 fp8 per group in registers,
+    #            scatter the scale (untouched by the aliasing -- it goes to gmem).
+    #   phase B (after sync): write the register-held fp8 into the aliased sOutput.
+    # Each thread owns _MXS_ITERS groups (4), so it holds _MXS_ITERS x 32 fp8 registers across the sync.
+    rQ = [cute.make_rmem_tensor(cute.make_layout(32), cutlass.Float8E4M3FN)
+          for _ in range(_MXS_ITERS)]
+
+    for it in cutlass.range_constexpr(_MXS_ITERS):
+        g = tidx + it * _MXS_THREADS
+        if g < _MXS_GROUPS:
+            lrow = g // _MXS_BPR          # local row in [0,128)
+            cb = g % _MXS_BPR             # col-block in [0,4)
+            c0 = cb * 32                  # first local column of this 1x32 block
+
+            # amax over the 32 contiguous columns of this row (block is along K).
+            rInput = cute.make_rmem_tensor(cute.make_layout(32), cutlass.Float32)
+            for r in cutlass.range_constexpr(32):
+                rInput[r] = sInput[lrow, c0 + r].to(cutlass.Float32)
+            v = rInput.load()
+            amax = cute.math.absf(v).reduce(cute.ReductionOp.MAX, cutlass.Float32(0.0), 0)
+
+            # e8m0 RCEIL scale byte + fp32 reciprocal (no clamp -- mxfp8 semantics, matches v1).
+            rcp, biased = _e8m0(amax)
+
+            # quantize into registers (NOT into smem yet -- smem still holds bf16 other threads read).
+            rQ[it].store((v * rcp).to(cutlass.Float8E4M3FN))
+
+            # scatter the e8m0 scale to its swizzled slot (gmem, independent of the smem aliasing).
+            row = m0 + lrow
+            col = (n0 // 32) + cb
+            mScale[_swizzle_flat(row, col, ncb)] = biased.to(mScale.element_type)
+
+    # barrier: all bf16 reads complete before we overwrite the shared buffer with fp8.
+    cute.arch.sync_threads()
+
+    for it in cutlass.range_constexpr(_MXS_ITERS):
+        g = tidx + it * _MXS_THREADS
+        if g < _MXS_GROUPS:
+            lrow = g // _MXS_BPR
+            cb = g % _MXS_BPR
+            c0 = cb * 32
+            for r in cutlass.range_constexpr(32):
+                sOutput[lrow, c0 + r] = rQ[it][r]
+
+    # publish sOutput to the async proxy, sync, then S2G store the (TM,TN) fp8 tile.
+    cute.arch.fence_proxy("async.shared", space="cta")
+    cute.arch.sync_threads()
+    if warp == 0:
+        cute.copy(output_tma_atom, tOutputsOutput, tOutputgOutput[(None, bidx, bidy)])
+
+
+@cute.jit
+def mxfp8_swizzle_v2_jit(mInput, mOutput, mScale, gpr: cutlass.Constexpr, ncb: cutlass.Constexpr):
+    # both input (bf16) and output (fp8) tiles are (TM, TN) row-major -- dim-K keeps orientation.
+    input_smem_layout = cute.make_layout((_MXS_TM, _MXS_TN), stride=(_MXS_TN, 1))
+    output_smem_layout = cute.make_layout((_MXS_TM, _MXS_TN), stride=(_MXS_TN, 1))
+
+    input_tma_atom, input_tma_tensor = cpasync.make_tiled_tma_atom(
+        cpasync.CopyBulkTensorTileG2SOp(), mInput, input_smem_layout, (_MXS_TM, _MXS_TN))
+    output_tma_atom, output_tma_tensor = cpasync.make_tiled_tma_atom(
+        cpasync.CopyBulkTensorTileS2GOp(), mOutput, output_smem_layout, (_MXS_TM, _MXS_TN))
+    M2, N2 = mInput.shape
+
+    mxfp8_swizzle_v2_kernel(
+        input_tma_atom, input_tma_tensor, output_tma_atom, output_tma_tensor, mScale,
+        input_smem_layout, output_smem_layout, gpr, ncb,
+    ).launch(
+        grid=(_ceil_div(M2, _MXS_TM), _ceil_div(N2, _MXS_TN), 1),
+        block=(_MXS_THREADS, 1, 1),
+    )
+
+
+def mxfp8_swizzle_v2(input: torch.Tensor, **kwargs):
+    assert len(input.shape) == 2, "unsupported"
+    assert input.is_contiguous(), "unsupported"
+    M, N = input.shape
+    ngc = N // 32
+    # 128x128 TMA tile + whole 128x4 swizzle atoms: M%128==0 and N%128==0 (=> ngc%4==0).
+    assert M % _MXS_TM == 0 and N % _MXS_TN == 0, "unsupported"
+    nrb, ncb = M // 128, ngc // 4
+    output = torch.empty(M, N, dtype=torch.float8_e4m3fn, device=input.device)
+    scale = torch.zeros(nrb * ncb * 32 * 16, dtype=torch.uint8, device=input.device)
+    # TMA needs full layout/divisibility marking (leading dim contiguous, 16-elem aligned).
+    mInput = (from_dlpack(input, assumed_align=16).mark_layout_dynamic(leading_dim=1)
+              .mark_compact_shape_dynamic(mode=1, divisibility=16))
+    mOutput = (from_dlpack(output, assumed_align=16).mark_layout_dynamic(leading_dim=1)
+               .mark_compact_shape_dynamic(mode=1, divisibility=16))
+    mScale = from_dlpack(scale).mark_layout_dynamic()
+    fn = _compiled(("mxfp8_swizzle_v2", M, N), mxfp8_swizzle_v2_jit, mInput, mOutput, mScale, ngc, ncb)
+    fn(mInput, mOutput, mScale)
+    return output, scale.view(nrb, ncb, 32, 16).view(torch.float8_e8m0fnu)
+
+
+MXFP8_SWIZZLE_V2 = QuantCastCuteRecipe.from_gold(
+    Mxfp8SwizzleGold, cute_fn=mxfp8_swizzle_v2
 )
 
 
@@ -1218,4 +2147,9 @@ ALL_RECIPES = [
     ("deepseek_1x128", FP8_DEEPSEEK_1X128),
     ("deepseek_1x128_dim_m", FP8_DEEPSEEK_1X128_DIM_M),
     ("deepseek_1x128_dim_m_v2", FP8_DEEPSEEK_1X128_DIM_M_V2),
+    ("mxfp8_swizzle", MXFP8_SWIZZLE),
+    ("mxfp8_swizzle_v2", MXFP8_SWIZZLE_V2),
+    ("mxfp8_swizzle_v3", MXFP8_SWIZZLE_V3),
+    ("mxfp8_swizzle_v4", MXFP8_SWIZZLE_V4),
+    ("mxfp8_swizzle_v5", MXFP8_SWIZZLE_V5),
 ]

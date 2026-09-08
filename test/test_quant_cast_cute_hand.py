@@ -43,6 +43,17 @@ pytestmark = pytest.mark.skipif(
 
 torch.manual_seed(0)
 
+# The mxfp8 cast emits the Blackwell-only `cvt.rp.ue8m0x2.f32` (the MX E8M0 scale cvt); ptxas
+# rejects it below sm_100, so gate those recipes to cuda capability 10.0. Mirrors the
+# _REQUIRES_SM100 set in test_quant_cast_cute.py.
+_REQUIRES_SM100 = frozenset({
+    "mxfp8_swizzle",
+    "mxfp8_swizzle_v2",
+    "mxfp8_swizzle_v3",
+    "mxfp8_swizzle_v4",
+    "mxfp8_swizzle_v5",
+})
+
 def _get_recipe(recipe_name):
     _recipe_name, recipe = [x for x in ALL_RECIPES if x[0] == recipe_name][0]
     return recipe
@@ -93,6 +104,80 @@ def test_deepseek_1x128():
     ref_outputs = recipe.pt_ref_fn(*inputs, **tile_kwargs)
     print(ref_outputs)
     recipe.correctness_fn(inputs, outputs)
+
+def test_mxfp8_swizzle():
+    # M % 128 == 0 and (N // 32) % 4 == 0: whole 128x4 swizzle atoms (ngc=16, ncb=4).
+    if "mxfp8_swizzle" in _REQUIRES_SM100 and torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip("mxfp8_swizzle emits Blackwell-only PTX; requires cuda capability 10.0")
+    recipe = _get_recipe("mxfp8_swizzle")
+    inputs = recipe.example_input_fn(128, 512)
+    print(inputs[0].shape)
+    # print(inputs)
+
+    outputs = recipe.cute_fn(*inputs)
+    # print(outputs)
+    tile_kwargs = {"global_row": 0, "global_col": 0, "num_col": inputs[0].shape[-1]}
+    ref_outputs = recipe.pt_ref_fn(*inputs, **tile_kwargs)
+    # print(ref_outputs)
+    recipe.correctness_fn(inputs, outputs)
+
+def test_mxfp8_swizzle_v2():
+    # TMA (bulk-tensor) load/store variant. 128x128 tile: M%128==0 and N%128==0. Use 256x256 so the
+    # grid is 2x2 (exercises multiple m/n tiles), still all full tiles.
+    if "mxfp8_swizzle_v2" in _REQUIRES_SM100 and torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip("mxfp8_swizzle_v2 emits Blackwell-only PTX; requires cuda capability 10.0")
+    recipe = _get_recipe("mxfp8_swizzle_v2")
+    inputs = recipe.example_input_fn(256, 256)
+    print(inputs[0].shape)
+
+    outputs = recipe.cute_fn(*inputs)
+    tile_kwargs = {"global_row": 0, "global_col": 0, "num_col": inputs[0].shape[-1]}
+    ref_outputs = recipe.pt_ref_fn(*inputs, **tile_kwargs)
+    recipe.correctness_fn(inputs, outputs)
+
+def test_mxfp8_swizzle_v3():
+    # 2-D 32x128-tile variant of v1 with a 16-elem/thread aligned uint32-word load (2x LDG.128).
+    # M % 128 == 0 and N % 128 == 0: whole 128x4 swizzle atoms, tile fits (ngc=16, ncb=4).
+    if "mxfp8_swizzle_v3" in _REQUIRES_SM100 and torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip("mxfp8_swizzle_v3 emits Blackwell-only PTX; requires cuda capability 10.0")
+    recipe = _get_recipe("mxfp8_swizzle_v3")
+    inputs = recipe.example_input_fn(128, 512)
+    print(inputs[0].shape)
+
+    outputs = recipe.cute_fn(*inputs)
+    tile_kwargs = {"global_row": 0, "global_col": 0, "num_col": inputs[0].shape[-1]}
+    ref_outputs = recipe.pt_ref_fn(*inputs, **tile_kwargs)
+    recipe.correctness_fn(inputs, outputs)
+
+def test_mxfp8_swizzle_v4():
+    # Same 2-D 32x128 tile + 16 bf16/thread as v3, but the load is two plain 8-elem fragment .load()s
+    # (each an LDG.128) concat'd in registers -- no uint32-word path. M % 128 == 0 and N % 128 == 0.
+    if "mxfp8_swizzle_v4" in _REQUIRES_SM100 and torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip("mxfp8_swizzle_v4 emits Blackwell-only PTX; requires cuda capability 10.0")
+    recipe = _get_recipe("mxfp8_swizzle_v4")
+    inputs = recipe.example_input_fn(128, 512)
+    print(inputs[0].shape)
+
+    outputs = recipe.cute_fn(*inputs)
+    tile_kwargs = {"global_row": 0, "global_col": 0, "num_col": inputs[0].shape[-1]}
+    ref_outputs = recipe.pt_ref_fn(*inputs, **tile_kwargs)
+    recipe.correctness_fn(inputs, outputs)
+
+
+def test_mxfp8_swizzle_v5():
+    # Best of v1 and v4: v1's flat 1-D grid + v4's 16-elem/thread load (two LDG.128 concat'd in
+    # registers) and single STG.128 store. M % 128 == 0 and (N // 32) % 4 == 0.
+    if "mxfp8_swizzle_v5" in _REQUIRES_SM100 and torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip("mxfp8_swizzle_v5 emits Blackwell-only PTX; requires cuda capability 10.0")
+    recipe = _get_recipe("mxfp8_swizzle_v5")
+    inputs = recipe.example_input_fn(128, 512)
+    print(inputs[0].shape)
+
+    outputs = recipe.cute_fn(*inputs)
+    tile_kwargs = {"global_row": 0, "global_col": 0, "num_col": inputs[0].shape[-1]}
+    ref_outputs = recipe.pt_ref_fn(*inputs, **tile_kwargs)
+    recipe.correctness_fn(inputs, outputs)
+
 
 def test_transpose_v0():
     # 128x16 tile: M must be a multiple of 128, K a multiple of 16.
@@ -149,6 +234,8 @@ def test_deepseek_1x128_dim_m_v2():
 def test_cute_hand_matches_reference(name, recipe):
     # the CuTeDSL kernel should reproduce the gold reference bit-for-bit (identical fp32 math + RNE
     # cast). example_input_fn builds the full positional inputs (x, *aux).
+    if name in _REQUIRES_SM100 and torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip(f"{name} emits Blackwell-only PTX; requires cuda capability 10.0")
     torch.manual_seed(0)
     inputs = recipe.example_input_fn(512, 512)
 

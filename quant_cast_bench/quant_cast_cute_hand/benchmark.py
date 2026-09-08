@@ -20,8 +20,11 @@ from torch._inductor.utils import do_bench_using_profiling
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from quant_cast_bench.quant_cast_cute_hand.recipes import (
     add_v0, add_v1, add_v2, fp8_deepseek_1x128, fp8_deepseek_1x128_dim_m,
-    fp8_deepseek_1x128_dim_m_v2, transpose_v0, transpose_v1,
+    fp8_deepseek_1x128_dim_m_v2, mxfp8_swizzle, mxfp8_swizzle_v2, mxfp8_swizzle_v3, mxfp8_swizzle_v4,
+    mxfp8_swizzle_v5,
+    transpose_v0, transpose_v1,
 )
+from quant_cast_bench.quant_cast_gold.recipes import mxfp8_swizzle_f
 
 # Peak HBM bandwidth per GPU family (GB/s), used for the "% of peak" column. Matched by substring
 # against torch.cuda.get_device_name(0); H100 is the SXM5 HBM3 part (PCIe H100 is ~2 TB/s).
@@ -194,6 +197,133 @@ def _bench_fp8_deepseek_1x128_dim_m_v2(M, K):
     return run, bytes_per_iter
 
 
+def _bench_mxfp8_swizzle(M, K):
+    # read input (M*K bf16) + write qdata (M*K fp8) + write scale ((M/128)*(K/32/4)*32*16 e8m0
+    # bytes). Memory-bound 1x32 blockwise mxfp8 quant-cast whose e8m0 scale is stored in the NVIDIA
+    # 128x4 -> 32x16 swizzled layout. Requires cuda capability 10.0 (Blackwell-only scale cvt).
+    torch.manual_seed(0)
+    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+
+    def run():
+        return mxfp8_swizzle(x)
+
+    q, s = run()
+    # Guard against a kernel that "runs" but doesn't touch the whole tensor. The kernel is bit-exact
+    # vs the gold reference (hardware `cvt.rp.ue8m0x2.f32` matches the gold's software e8m0 RCEIL),
+    # so require exact equality on qdata and on the raw scale bytes.
+    torch.cuda.synchronize()
+    q_ref, s_ref = mxfp8_swizzle_f(x)
+    assert torch.equal(s.view(torch.uint8), s_ref.view(torch.uint8)), "scale mismatch vs reference"
+    assert torch.equal(q.float(), q_ref.float()), "qdata mismatch vs reference"
+    bytes_per_iter = (
+        x.numel() * x.element_size()   # bf16 input read
+        + q.numel() * q.element_size() # fp8 qdata write
+        + s.numel() * s.element_size() # e8m0 (1-byte) scale write
+    )
+    return run, bytes_per_iter
+
+
+def _bench_mxfp8_swizzle_v2(M, K):
+    # Same 1x32 blockwise mxfp8 quant-cast + swizzled e8m0 scale as _bench_mxfp8_swizzle, but the v2
+    # kernel uses TMA (bulk-tensor) for the main-data load/store on a 128x128 tile (dim-K, no
+    # transpose). Same outputs, so it shares the gold reference and bit-exact guard. Requires cuda
+    # capability 10.0 (Blackwell-only scale cvt). Needs M%128==0 and K%128==0 for the TMA tile.
+    torch.manual_seed(0)
+    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+
+    def run():
+        return mxfp8_swizzle_v2(x)
+
+    q, s = run()
+    # Guard against a kernel that "runs" but doesn't touch the whole tensor. Bit-exact vs the gold
+    # reference (hardware e8m0 RCEIL cvt), so require exact equality on qdata and raw scale bytes.
+    torch.cuda.synchronize()
+    q_ref, s_ref = mxfp8_swizzle_f(x)
+    assert torch.equal(s.view(torch.uint8), s_ref.view(torch.uint8)), "scale mismatch vs reference"
+    assert torch.equal(q.float(), q_ref.float()), "qdata mismatch vs reference"
+    bytes_per_iter = (
+        x.numel() * x.element_size()   # bf16 input read
+        + q.numel() * q.element_size() # fp8 qdata write
+        + s.numel() * s.element_size() # e8m0 (1-byte) scale write
+    )
+    return run, bytes_per_iter
+
+
+def _bench_mxfp8_swizzle_v3(M, K):
+    # Same 1x32 blockwise mxfp8 quant-cast + swizzled e8m0 scale as _bench_mxfp8_swizzle, but the v3
+    # kernel uses a 2-D 32x128 tile + a 16-elem/thread aligned uint32-word load (2x LDG.128,
+    # register bf16->f32 unpack) and a single 2-lane shuffle. Same outputs, so it shares the gold
+    # reference and bit-exact guard. Requires cuda capability 10.0 (Blackwell-only scale cvt). Needs
+    # M%128==0 and K%128==0. v3 is bf16-only (the word load reinterprets the input as uint32).
+    torch.manual_seed(0)
+    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+
+    def run():
+        return mxfp8_swizzle_v3(x)
+
+    q, s = run()
+    # Guard against a kernel that "runs" but doesn't touch the whole tensor. Bit-exact vs the gold
+    # reference (hardware e8m0 RCEIL cvt), so require exact equality on qdata and raw scale bytes.
+    torch.cuda.synchronize()
+    q_ref, s_ref = mxfp8_swizzle_f(x)
+    assert torch.equal(s.view(torch.uint8), s_ref.view(torch.uint8)), "scale mismatch vs reference"
+    assert torch.equal(q.float(), q_ref.float()), "qdata mismatch vs reference"
+    bytes_per_iter = (
+        x.numel() * x.element_size()   # bf16 input read
+        + q.numel() * q.element_size() # fp8 qdata write
+        + s.numel() * s.element_size() # e8m0 (1-byte) scale write
+    )
+    return run, bytes_per_iter
+
+
+def _bench_mxfp8_swizzle_v4(M, K):
+    # Same 2-D 32x128 tile + 16 bf16/thread as v3, but the load is two plain 8-elem fragment .load()s
+    # (each an LDG.128) concat'd in registers -- no uint32-word path. Same outputs (bit-exact vs v3 and
+    # the gold), so it shares the gold reference and bit-exact guard. Requires cuda capability 10.0.
+    # Needs M%128==0 and K%128==0; bf16-only.
+    torch.manual_seed(0)
+    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+
+    def run():
+        return mxfp8_swizzle_v4(x)
+
+    q, s = run()
+    torch.cuda.synchronize()
+    q_ref, s_ref = mxfp8_swizzle_f(x)
+    assert torch.equal(s.view(torch.uint8), s_ref.view(torch.uint8)), "scale mismatch vs reference"
+    assert torch.equal(q.float(), q_ref.float()), "qdata mismatch vs reference"
+    bytes_per_iter = (
+        x.numel() * x.element_size()   # bf16 input read
+        + q.numel() * q.element_size() # fp8 qdata write
+        + s.numel() * s.element_size() # e8m0 (1-byte) scale write
+    )
+    return run, bytes_per_iter
+
+
+def _bench_mxfp8_swizzle_v5(M, K):
+    # Best of v1 and v4: v1's flat 1-D grid + v4's 16-elem/thread load (two LDG.128 concat'd in
+    # registers) and single STG.128 store. Same outputs (bit-exact vs v1 and the gold), so it shares
+    # the gold reference and bit-exact guard. Requires cuda capability 10.0. Needs M%128==0 and
+    # K%128==0; bf16-only.
+    torch.manual_seed(0)
+    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+
+    def run():
+        return mxfp8_swizzle_v5(x)
+
+    q, s = run()
+    torch.cuda.synchronize()
+    q_ref, s_ref = mxfp8_swizzle_f(x)
+    assert torch.equal(s.view(torch.uint8), s_ref.view(torch.uint8)), "scale mismatch vs reference"
+    assert torch.equal(q.float(), q_ref.float()), "qdata mismatch vs reference"
+    bytes_per_iter = (
+        x.numel() * x.element_size()   # bf16 input read
+        + q.numel() * q.element_size() # fp8 qdata write
+        + s.numel() * s.element_size() # e8m0 (1-byte) scale write
+    )
+    return run, bytes_per_iter
+
+
 def _bench_transpose_v0(M, K):
     # read input (M*K bf16) + write transposed output (K*M bf16); a memory-bound 2D transpose.
     # v0 is the naive path: coalesced vectorized read, scattered (strided) column write.
@@ -239,6 +369,11 @@ _KERNELS = {
     "fp8_deepseek_1x128": _bench_fp8_deepseek_1x128,
     "fp8_deepseek_1x128_dim_m": _bench_fp8_deepseek_1x128_dim_m,
     "fp8_deepseek_1x128_dim_m_v2": _bench_fp8_deepseek_1x128_dim_m_v2,
+    "mxfp8_swizzle": _bench_mxfp8_swizzle,
+    "mxfp8_swizzle_v2": _bench_mxfp8_swizzle_v2,
+    "mxfp8_swizzle_v3": _bench_mxfp8_swizzle_v3,
+    "mxfp8_swizzle_v4": _bench_mxfp8_swizzle_v4,
+    "mxfp8_swizzle_v5": _bench_mxfp8_swizzle_v5,
     "transpose_v0": _bench_transpose_v0,
     "transpose_v1": _bench_transpose_v1,
 }
