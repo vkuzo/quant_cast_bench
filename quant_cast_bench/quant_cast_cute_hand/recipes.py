@@ -1737,9 +1737,8 @@ _MXS4_HALF = _MXS3_VPT // 2   # 8 elems per sub-load (2 halves of the 16-elem/th
 def mxfp8_swizzle_v4_kernel(
     gInput: cute.Tensor,   # 2-D bf16 input, zipped_divide'd into (32,128) tiles
     gOutput: cute.Tensor,
-    mScale: cute.Tensor,
+    mScaleLogical: cute.Tensor,
     input_tv_layout: cute.Layout,
-    ncb: cutlass.Constexpr,
 ):
     tidx, _, _ = cute.arch.thread_idx()
     bidx, bidy, _ = cute.arch.block_idx()
@@ -1774,7 +1773,7 @@ def mxfp8_swizzle_v4_kernel(
 
     if tidx % _MXS3_LANES == 0:
         col = col_start // 32
-        mScale[_swizzle_flat(row, col, ncb)] = biased.to(mScale.element_type)
+        mScaleLogical[(row, col)] = biased.to(mScaleLogical.element_type)
 
 
 @cute.jit
@@ -1793,8 +1792,20 @@ def mxfp8_swizzle_v4_jit(
     )
     gInput = cute.zipped_divide(mInput, tiler_mn)
     gOutput = cute.zipped_divide(mOutput, tiler_mn)
+
+    # Logical (row, 1x32-col-group) view over the physical (nrb,ncb,32,16) scale buffer. The
+    # hierarchical modes split row into (b, a, br) and col into (c4, bc), and their strides encode
+    # the blocked/swizzled destination directly, so the kernel need not calculate a physical offset.
+    # This also saves one register versus the explicit _swizzle_flat address calculation.
+    nrb = cute.size(mScale) // (ncb * 32 * 16)
+    scale_layout = cute.make_layout(
+        ((32, 4, nrb), (4, ncb)),
+        stride=((16, 4, ncb * 32 * 16), (1, 32 * 16)),
+    )
+    mScaleLogical = cute.make_tensor(mScale.iterator, scale_layout)
+
     mxfp8_swizzle_v4_kernel(
-        gInput, gOutput, mScale, input_tv_layout, ncb
+        gInput, gOutput, mScaleLogical, input_tv_layout
     ).launch(
         grid=(N // _MXS3_TN, M // _MXS3_TM, 1),
         block=(_MXS3_THREADS, 1, 1),
@@ -1846,12 +1857,10 @@ _MXS5_LANES = 32 // _MXS5_VPT         # 2 threads per 1x32 block
 def mxfp8_swizzle_v5_kernel(
     gInput: cute.Tensor,
     gOutput: cute.Tensor,
-    mScale: cute.Tensor,
+    mScaleLogical: cute.Tensor,
     gId: cute.Tensor,
     input_tv_layout: cute.Layout,
     orig_shape: cute.Shape,
-    gpr: cutlass.Constexpr,  # 32-element groups per row == N // 32
-    ncb: cutlass.Constexpr,  # swizzle column-blocks == (N // 32) // 4
 ):
     tidx, _, _ = cute.arch.thread_idx()
     bidx, _, _ = cute.arch.block_idx()
@@ -1887,14 +1896,15 @@ def mxfp8_swizzle_v5_kernel(
         thrOutput = tidfrgOutput[thr_coord]
         thrOutput[None] = qdata
 
-        # every 2nd thread owns the leading 16 elems of a 1x32 block -> stores its scale. Flat
-        # scale-index math from v1 (derived from bidx/tidx to stay a plain integer).
+        # Every 2nd thread owns one 1x32 block. Form one flat logical group coordinate so the compiler
+        # can reuse the input's flat CTA/thread index; this saves one register versus composing a
+        # per-CTA scale tile. mScaleLogical's CuTe layout maps that coordinate to the NVIDIA
+        # blocked/swizzled physical position.
         if tidx % _MXS5_LANES == 0:
-            tile = cute.size(input_tv_layout)             # flat elements per CTA (static)
-            vpt = cute.size(input_tv_layout, mode=[1])    # elements per thread (static)
-            gblk = (bidx * tile + tidx * vpt) // 32       # global 1x32 block index
-            row, col = gblk // gpr, gblk % gpr            # pre-swizzle scale coords
-            mScale[_swizzle_flat(row, col, ncb)] = biased.to(mScale.element_type)
+            tile = cute.size(input_tv_layout)
+            vpt = cute.size(input_tv_layout, mode=[1])
+            gblk = (bidx * tile + tidx * vpt) // 32
+            mScaleLogical[gblk] = biased.to(mScaleLogical.element_type)
 
 
 @cute.jit
@@ -1902,7 +1912,6 @@ def mxfp8_swizzle_v5_jit(
     mInput: cute.Tensor,
     mOutput: cute.Tensor,
     mScale: cute.Tensor,
-    gpr: cutlass.Constexpr,
     ncb: cutlass.Constexpr,
 ):
     thr_layout = cute.make_ordered_layout((_MXS5_THREADS,), order=(0,))   # (256):(1)
@@ -1913,8 +1922,20 @@ def mxfp8_swizzle_v5_jit(
     mId = cute.make_identity_tensor(mInput.shape)
     gId = cute.zipped_divide(mId, tiler_mn)
 
+    # Give the physically flat (nrb,ncb,32,16) scale buffer a rank-1 LOGICAL view in row-major
+    # (row, 1x32-col-group) order. A scalar logical coordinate is decomposed colexicographically as
+    #   (c4, bc, b, a, br),
+    # where row = br*128 + a*32 + b and col = bc*4 + c4. The strides then map it directly to the
+    # physical blocked layout [br, bc, b, a*4+c4], replacing the explicit _swizzle_flat arithmetic.
+    nrb = cute.size(mScale) // (ncb * 32 * 16)
+    scale_layout = cute.make_layout(
+        ((4, ncb, 32, 4, nrb),),
+        stride=((1, 32 * 16, 16, 4, ncb * 32 * 16),),
+    )
+    mScaleLogical = cute.make_tensor(mScale.iterator, scale_layout)
+
     mxfp8_swizzle_v5_kernel(
-        gInput, gOutput, mScale, gId, input_tv_layout, mInput.shape, gpr, ncb
+        gInput, gOutput, mScaleLogical, gId, input_tv_layout, mInput.shape
     ).launch(
         grid=(cute.size(gInput, mode=[1]), 1, 1),
         block=(cute.size(input_tv_layout, mode=[0]), 1, 1),
@@ -1938,7 +1959,7 @@ def mxfp8_swizzle_v5(input: torch.Tensor, **kwargs):
     input_cute = from_dlpack(input, assumed_align=16)
     output_cute = from_dlpack(output, assumed_align=16)
     scale_cute = from_dlpack(scale)
-    mxfp8_swizzle_v5_jit(input_cute, output_cute, scale_cute, ngc, ncb)
+    mxfp8_swizzle_v5_jit(input_cute, output_cute, scale_cute, ncb)
     return output.view(M, N), scale.view(nrb, ncb, 32, 16).view(torch.float8_e8m0fnu)
 
 
