@@ -1730,6 +1730,8 @@ MXFP8_SWIZZLE_V3 = QuantCastCuteRecipe.from_gold(
 # simpler. ncu: load 8.39M sectors and store 2.36M sectors, both IDENTICAL to v3 (two LDG.128 + one
 # STG.128), 29 vs 28 regs. So the whole word-load apparatus (mWords / divisibility=4 /
 # _bf16x2_to_f32x2 / _load_bf16x16_as_f32) is dead weight; v4 deletes it. Bit-exact vs v3 and gold.
+# Ragged M and K%128 tails launch over complete padded 128x128 swizzle atoms. Padded lanes load zero,
+# skip qdata stores, and explicitly write zero scale bytes; the aligned specialization stays unchanged.
 _MXS4_HALF = _MXS3_VPT // 2   # 8 elems per sub-load (2 halves of the 16-elem/thread run)
 
 
@@ -1739,6 +1741,9 @@ def mxfp8_swizzle_v4_kernel(
     gOutput: cute.Tensor,
     mScaleLogical: cute.Tensor,
     input_tv_layout: cute.Layout,
+    M: cutlass.Constexpr,
+    N: cutlass.Constexpr,
+    ragged: cutlass.Constexpr,
 ):
     tidx, _, _ = cute.arch.thread_idx()
     bidx, bidy, _ = cute.arch.block_idx()
@@ -1754,26 +1759,72 @@ def mxfp8_swizzle_v4_kernel(
     blkInput = gInput[((None, None), (bidy, bidx))]
     tidfrgInput = cute.composition(blkInput, input_tv_layout)
     thrFrg = tidfrgInput[(tidx, None)]              # this thread's 16 contiguous cols
-    frg2 = cute.tiled_divide(thrFrg, (_MXS4_HALF,))  # ((8,), 2): two 8-elem sub-runs
-    rIn = cute.make_rmem_tensor(_MXS3_VPT, cutlass.BFloat16)
-    ri2 = cute.tiled_divide(rIn, (_MXS4_HALF,))
-    ri2[(None, 0)] = frg2[(None, 0)].load()   # cols 0..7  -> LDG.128 into regs
-    ri2[(None, 1)] = frg2[(None, 1)].load()   # cols 8..15 -> LDG.128 into regs
-
-    thrInput = rIn.load().to(cutlass.Float32)      # one 16-wide SSA value
-    thrA_abs = cute.math.absf(thrInput)
-    thrA_amax16 = thrA_abs.reduce(cute.ReductionOp.MAX, init_val=0.0, reduction_profile=1)
-    thrA_amax32 = cute.arch.warp_reduction_max(thrA_amax16, threads_in_group=_MXS3_LANES)
-    rcp, biased = _e8m0(thrA_amax32)
-    qdata = (thrInput * rcp).to(cutlass.Float8E4M3FN)
-
     blkOutput = gOutput[((None, None), (bidy, bidx))]
     tidfrgOutput = cute.composition(blkOutput, input_tv_layout)
-    tidfrgOutput[(tidx, None)] = qdata
 
-    if tidx % _MXS3_LANES == 0:
-        col = col_start // 32
-        mScaleLogical[(row, col)] = biased.to(mScaleLogical.element_type)
+    # The compile-time term makes every CTA take the full path for aligned shapes. For ragged shapes,
+    # the remaining test is CTA-uniform and confines zero-fill/predication to boundary CTAs.
+    use_full_tile = cutlass.const_expr(not ragged) or (
+        ((bidy + 1) * _MXS3_TM <= M) & ((bidx + 1) * _MXS3_TN <= N)
+    )
+    # Keep each complete path inside this branch: CuTe cannot carry the mutable rmem fragment across
+    # dynamic control flow, and folding the bounds into per-thread load/store predicates slows every
+    # interior CTA of a ragged launch.
+    if use_full_tile:
+        frg2 = cute.tiled_divide(thrFrg, (_MXS4_HALF,))
+        rIn = cute.make_rmem_tensor(_MXS3_VPT, cutlass.BFloat16)
+        ri2 = cute.tiled_divide(rIn, (_MXS4_HALF,))
+        ri2[(None, 0)] = frg2[(None, 0)].load()
+        ri2[(None, 1)] = frg2[(None, 1)].load()
+
+        thrInput = rIn.load().to(cutlass.Float32)
+        thrA_abs = cute.math.absf(thrInput)
+        thrA_amax16 = thrA_abs.reduce(
+            cute.ReductionOp.MAX, init_val=0.0, reduction_profile=1
+        )
+        thrA_amax32 = cute.arch.warp_reduction_max(
+            thrA_amax16, threads_in_group=_MXS3_LANES
+        )
+        rcp, biased = _e8m0(thrA_amax32)
+        tidfrgOutput[(tidx, None)] = (thrInput * rcp).to(cutlass.Float8E4M3FN)
+
+        if tidx % _MXS3_LANES == 0:
+            mScaleLogical[(row, col_start // 32)] = biased.to(mScaleLogical.element_type)
+    else:
+        # Every lane must participate in the reduction, but padded lanes must not dereference qdata.
+        frg2 = cute.tiled_divide(thrFrg, (_MXS4_HALF,))
+        rIn = cute.make_rmem_tensor(_MXS3_VPT, cutlass.BFloat16)
+        rIn.fill(0)
+        ri2 = cute.tiled_divide(rIn, (_MXS4_HALF,))
+        if row < M:
+            if col_start < N:
+                ri2[(None, 0)] = frg2[(None, 0)].load()
+                ri2[(None, 1)] = frg2[(None, 1)].load()
+
+        thrInput = rIn.load().to(cutlass.Float32)
+        thrA_abs = cute.math.absf(thrInput)
+        thrA_amax16 = thrA_abs.reduce(
+            cute.ReductionOp.MAX, init_val=0.0, reduction_profile=1
+        )
+        thrA_amax32 = cute.arch.warp_reduction_max(
+            thrA_amax16, threads_in_group=_MXS3_LANES
+        )
+        rcp, biased = _e8m0(thrA_amax32)
+        qdata = (thrInput * rcp).to(cutlass.Float8E4M3FN)
+
+        if row < M:
+            if col_start < N:
+                tidfrgOutput[(tidx, None)] = qdata
+
+        if tidx % _MXS3_LANES == 0:
+            col = col_start // 32
+            if row < M:
+                if col_start < N:
+                    mScaleLogical[(row, col)] = biased.to(mScaleLogical.element_type)
+                else:
+                    mScaleLogical[(row, col)] = cutlass.Uint8(0)
+            else:
+                mScaleLogical[(row, col)] = cutlass.Uint8(0)
 
 
 @cute.jit
@@ -1785,6 +1836,8 @@ def mxfp8_swizzle_v4_jit(
     N: cutlass.Constexpr,
     ncb: cutlass.Constexpr,
 ):
+    padded_M = _ceil_div(M, 128) * 128
+    padded_N = _ceil_div(N, 128) * 128
     tiler_mn = (_MXS3_TM, _MXS3_TN)
     input_tv_layout = cute.make_layout(
         ((_MXS3_TPR, _MXS3_TM), (_MXS3_VPT,)),
@@ -1805,9 +1858,12 @@ def mxfp8_swizzle_v4_jit(
     mScaleLogical = cute.make_tensor(mScale.iterator, scale_layout)
 
     mxfp8_swizzle_v4_kernel(
-        gInput, gOutput, mScaleLogical, input_tv_layout
+        gInput, gOutput, mScaleLogical, input_tv_layout, M, N,
+        M != padded_M or N != padded_N,
     ).launch(
-        grid=(N // _MXS3_TN, M // _MXS3_TM, 1),
+        # Walk every slot of the padded scale grid. Predicates prevent padded coordinates from
+        # touching the unpadded qdata input/output.
+        grid=(padded_N // _MXS3_TN, padded_M // _MXS3_TM, 1),
         block=(_MXS3_THREADS, 1, 1),
     )
 
@@ -1817,11 +1873,12 @@ def mxfp8_swizzle_v4(input: torch.Tensor, **kwargs):
     assert input.is_contiguous(), "unsupported"
     assert input.dtype == torch.bfloat16, "v4 is bf16-only"
     M, N = input.shape
+    assert M > 0 and N > 0, "v4 requires non-empty dimensions"
+    assert N % 32 == 0, "v4 requires K % 32 == 0"
     ngc = N // 32
-    assert M % 128 == 0 and N % _MXS3_TN == 0, "unsupported"
-    nrb, ncb = M // 128, ngc // 4
+    nrb, ncb = _ceil_div(M, 128), _ceil_div(ngc, 4)
     output = torch.empty(M, N, dtype=torch.float8_e4m3fn, device=input.device)
-    scale = torch.zeros(nrb * ncb * 32 * 16, dtype=torch.uint8, device=input.device)
+    scale = torch.empty(nrb * ncb * 32 * 16, dtype=torch.uint8, device=input.device)
     input_cute = from_dlpack(input, assumed_align=16)
     output_cute = from_dlpack(output, assumed_align=16)
     scale_cute = from_dlpack(scale)
@@ -1846,7 +1903,8 @@ MXFP8_SWIZZLE_V4 = QuantCastCuteRecipe.from_gold(
 # At 256 threads x 16 elems the flat tile is 4096 contiguous elements. val_layout = (16):(1) gives
 # each thread a contiguous 16-run; a 1x32 block is 2 threads, so warp_reduction_max(threads_in_group=2)
 # (ONE shuffle stage) and every 2nd thread stores the scale -- same block arithmetic as v4, but on the
-# flat tile. The OOB guard / identity tensor / flat scale-index math are v1's, verbatim.
+# flat tile. Ragged shapes use a padded logical flat view: padded lanes load zero, skip qdata stores,
+# and explicitly write zero scale bytes; the aligned specialization keeps the original contiguous view.
 _MXS5_VPT = 16                        # elems/thread (16 bf16 = 2x LDG.128 / 1x STG.128)
 _MXS5_THREADS = 256
 _MXS5_HALF = _MXS5_VPT // 2           # 8 elems per sub-load
@@ -1861,50 +1919,137 @@ def mxfp8_swizzle_v5_kernel(
     gId: cute.Tensor,
     input_tv_layout: cute.Layout,
     orig_shape: cute.Shape,
+    M: cutlass.Constexpr,
+    N: cutlass.Constexpr,
+    padded_N: cutlass.Constexpr,
+    ragged: cutlass.Constexpr,
 ):
     tidx, _, _ = cute.arch.thread_idx()
     bidx, _, _ = cute.arch.block_idx()
 
-    blk_coord = ((None,), bidx)
-    blkInput = gInput[blk_coord]
-    blkOutput = gOutput[blk_coord]
-    blkId = gId[blk_coord]
-    tidfrgInput = cute.composition(blkInput, input_tv_layout)
-    tidfrgOutput = cute.composition(blkOutput, input_tv_layout)
-    tidfrgId = cute.composition(blkId, input_tv_layout)
+    if cutlass.const_expr(ragged):
+        blk_coord = ((None,), bidx)
+        tidfrgInput = cute.composition(gInput[blk_coord], input_tv_layout)
+        tidfrgOutput = cute.composition(gOutput[blk_coord], input_tv_layout)
+        thr_coord = (tidx, None)
+        padded_tile = cute.size(input_tv_layout)
+        padded_vpt = cute.size(input_tv_layout, mode=[1])
+        flat_idx = bidx * padded_tile + tidx * padded_vpt
+        row = flat_idx // padded_N
+        col_start = flat_idx % padded_N
 
-    thr_coord = (tidx, None)
-    thrId = tidfrgId[thr_coord]
-    if cute.elem_less(thrId[0], orig_shape):
-        # v4's load: two 8-elem LDG.128 concat'd in a register fragment -> one 16-wide value.
-        thrFrg = tidfrgInput[thr_coord]                   # this thread's 16 contiguous elems
-        frg2 = cute.tiled_divide(thrFrg, (_MXS5_HALF,))   # ((8,), 2)
-        rIn = cute.make_rmem_tensor(_MXS5_VPT, cutlass.BFloat16)
-        ri2 = cute.tiled_divide(rIn, (_MXS5_HALF,))
-        ri2[(None, 0)] = frg2[(None, 0)].load()           # elems 0..7  -> LDG.128 into regs
-        ri2[(None, 1)] = frg2[(None, 1)].load()           # elems 8..15 -> LDG.128 into regs
+        thrFrg = tidfrgInput[thr_coord]
+        tile_start = bidx * padded_tile
+        tile_end = tile_start + padded_tile - 1
+        if cutlass.const_expr(N == padded_N):
+            # With no column padding, the real matrix is one contiguous prefix of the padded grid.
+            use_full_tile = tile_end < M * N
+        elif cutlass.const_expr(padded_N <= padded_tile):
+            # A flat CTA spans at least one entire padded row, so every CTA includes its column tail.
+            use_full_tile = False
+        else:
+            first_row = tile_start // padded_N
+            last_row = tile_end // padded_N
+            use_full_tile = (
+                (last_row < M) & (first_row == last_row) & (tile_end % padded_N < N)
+            )
 
-        thrInput = rIn.load().to(cutlass.Float32)         # one 16-wide SSA value
-        thrA_abs = cute.math.absf(thrInput)
-        thrA_amax16 = thrA_abs.reduce(cute.ReductionOp.MAX, init_val=0.0, reduction_profile=1)
-        # 2 threads per 1x32 block -> ONE shuffle stage over aligned 2-lane groups.
-        thrA_amax32 = cute.arch.warp_reduction_max(thrA_amax16, threads_in_group=_MXS5_LANES)
-        rcp, biased = _e8m0(thrA_amax32)
-        qdata = (thrInput * rcp).to(cutlass.Float8E4M3FN)
+        if use_full_tile:
+            frg2 = cute.tiled_divide(thrFrg, (_MXS5_HALF,))
+            rIn = cute.make_rmem_tensor(_MXS5_VPT, cutlass.BFloat16)
+            ri2 = cute.tiled_divide(rIn, (_MXS5_HALF,))
+            ri2[(None, 0)] = frg2[(None, 0)].load()
+            ri2[(None, 1)] = frg2[(None, 1)].load()
 
-        # single 16-fp8 STG.128.
-        thrOutput = tidfrgOutput[thr_coord]
-        thrOutput[None] = qdata
+            thrInput = rIn.load().to(cutlass.Float32)
+            thrA_amax16 = cute.math.absf(thrInput).reduce(
+                cute.ReductionOp.MAX, init_val=0.0, reduction_profile=1
+            )
+            thrA_amax32 = cute.arch.warp_reduction_max(
+                thrA_amax16, threads_in_group=_MXS5_LANES
+            )
+            rcp, biased = _e8m0(thrA_amax32)
+            tidfrgOutput[thr_coord] = (thrInput * rcp).to(cutlass.Float8E4M3FN)
 
-        # Every 2nd thread owns one 1x32 block. Form one flat logical group coordinate so the compiler
-        # can reuse the input's flat CTA/thread index; this saves one register versus composing a
-        # per-CTA scale tile. mScaleLogical's CuTe layout maps that coordinate to the NVIDIA
-        # blocked/swizzled physical position.
-        if tidx % _MXS5_LANES == 0:
-            tile = cute.size(input_tv_layout)
-            vpt = cute.size(input_tv_layout, mode=[1])
-            gblk = (bidx * tile + tidx * vpt) // 32
-            mScaleLogical[gblk] = biased.to(mScaleLogical.element_type)
+            if tidx % _MXS5_LANES == 0:
+                mScaleLogical[flat_idx // 32] = biased.to(mScaleLogical.element_type)
+        else:
+            # All threads execute the two-lane reduction. Padded lanes contribute zero but never
+            # dereference qdata; K%32 makes both lanes of a quantization group equally valid.
+            frg2 = cute.tiled_divide(thrFrg, (_MXS5_HALF,))
+            rIn = cute.make_rmem_tensor(_MXS5_VPT, cutlass.BFloat16)
+            rIn.fill(0)
+            ri2 = cute.tiled_divide(rIn, (_MXS5_HALF,))
+            if row < M:
+                if col_start < N:
+                    ri2[(None, 0)] = frg2[(None, 0)].load()
+                    ri2[(None, 1)] = frg2[(None, 1)].load()
+
+            thrInput = rIn.load().to(cutlass.Float32)
+            thrA_amax16 = cute.math.absf(thrInput).reduce(
+                cute.ReductionOp.MAX, init_val=0.0, reduction_profile=1
+            )
+            thrA_amax32 = cute.arch.warp_reduction_max(
+                thrA_amax16, threads_in_group=_MXS5_LANES
+            )
+            rcp, biased = _e8m0(thrA_amax32)
+            qdata = (thrInput * rcp).to(cutlass.Float8E4M3FN)
+
+            if row < M:
+                if col_start < N:
+                    tidfrgOutput[thr_coord] = qdata
+
+            # The grid covers the complete padded scale tensor, so every scale byte is initialized
+            # even though the host allocation uses torch.empty.
+            if tidx % _MXS5_LANES == 0:
+                gblk = flat_idx // 32
+                if row < M:
+                    if col_start < N:
+                        mScaleLogical[gblk] = biased.to(mScaleLogical.element_type)
+                    else:
+                        mScaleLogical[gblk] = cutlass.Uint8(0)
+                else:
+                    mScaleLogical[gblk] = cutlass.Uint8(0)
+    else:
+        # Keep the aligned specialization identical to the original v5 kernel.
+        blk_coord = ((None,), bidx)
+        blkInput = gInput[blk_coord]
+        blkOutput = gOutput[blk_coord]
+        blkId = gId[blk_coord]
+        tidfrgInput = cute.composition(blkInput, input_tv_layout)
+        tidfrgOutput = cute.composition(blkOutput, input_tv_layout)
+        tidfrgId = cute.composition(blkId, input_tv_layout)
+
+        thr_coord = (tidx, None)
+        thrId = tidfrgId[thr_coord]
+        if cute.elem_less(thrId[0], orig_shape):
+            # v4's load: two 8-elem LDG.128 concat'd in a register fragment -> one 16-wide value.
+            aThrFrg = tidfrgInput[thr_coord]
+            aFrg2 = cute.tiled_divide(aThrFrg, (_MXS5_HALF,))
+            aRIn = cute.make_rmem_tensor(_MXS5_VPT, cutlass.BFloat16)
+            aRi2 = cute.tiled_divide(aRIn, (_MXS5_HALF,))
+            aRi2[(None, 0)] = aFrg2[(None, 0)].load()
+            aRi2[(None, 1)] = aFrg2[(None, 1)].load()
+
+            aThrInput = aRIn.load().to(cutlass.Float32)
+            aThrA_abs = cute.math.absf(aThrInput)
+            aThrA_amax16 = aThrA_abs.reduce(
+                cute.ReductionOp.MAX, init_val=0.0, reduction_profile=1
+            )
+            aThrA_amax32 = cute.arch.warp_reduction_max(
+                aThrA_amax16, threads_in_group=_MXS5_LANES
+            )
+            aRcp, aBiased = _e8m0(aThrA_amax32)
+            aQdata = (aThrInput * aRcp).to(cutlass.Float8E4M3FN)
+
+            aThrOutput = tidfrgOutput[thr_coord]
+            aThrOutput[None] = aQdata
+
+            if tidx % _MXS5_LANES == 0:
+                aTile = cute.size(input_tv_layout)
+                aVpt = cute.size(input_tv_layout, mode=[1])
+                aGblk = (bidx * aTile + tidx * aVpt) // 32
+                mScaleLogical[aGblk] = aBiased.to(mScaleLogical.element_type)
 
 
 @cute.jit
@@ -1912,30 +2057,47 @@ def mxfp8_swizzle_v5_jit(
     mInput: cute.Tensor,
     mOutput: cute.Tensor,
     mScale: cute.Tensor,
+    M: cutlass.Constexpr,
+    N: cutlass.Constexpr,
     ncb: cutlass.Constexpr,
 ):
+    nrb = cute.size(mScale) // (ncb * 32 * 16)
+    padded_M = nrb * 128
+    padded_N = ncb * 128
+    ragged = M != padded_M or N != padded_N
+
     thr_layout = cute.make_ordered_layout((_MXS5_THREADS,), order=(0,))   # (256):(1)
     val_layout = cute.make_ordered_layout((_MXS5_VPT,), order=(0,))       # (16):(1)
     tiler_mn, input_tv_layout = cute.make_layout_tv(thr_layout, val_layout)  # (4096,) (256,16):(16,1)
-    gInput = cute.zipped_divide(mInput, tiler_mn)
-    gOutput = cute.zipped_divide(mOutput, tiler_mn)
-    mId = cute.make_identity_tensor(mInput.shape)
-    gId = cute.zipped_divide(mId, tiler_mn)
 
     # Give the physically flat (nrb,ncb,32,16) scale buffer a rank-1 LOGICAL view in row-major
     # (row, 1x32-col-group) order. A scalar logical coordinate is decomposed colexicographically as
     #   (c4, bc, b, a, br),
     # where row = br*128 + a*32 + b and col = bc*4 + c4. The strides then map it directly to the
     # physical blocked layout [br, bc, b, a*4+c4], replacing the explicit _swizzle_flat arithmetic.
-    nrb = cute.size(mScale) // (ncb * 32 * 16)
     scale_layout = cute.make_layout(
         ((4, ncb, 32, 4, nrb),),
         stride=((1, 32 * 16, 16, 4, ncb * 32 * 16),),
     )
     mScaleLogical = cute.make_tensor(mScale.iterator, scale_layout)
 
+    if cutlass.const_expr(ragged):
+        # Rank-1 logical views over the padded matrix. Real rows retain stride N; padded coordinates
+        # may form pointers outside storage but are never dereferenced by the predicated kernel.
+        padded_layout = cute.make_layout(((padded_N, padded_M),), stride=((1, N),))
+        mInputGrid = cute.make_tensor(mInput.iterator, padded_layout)
+        mOutputGrid = cute.make_tensor(mOutput.iterator, padded_layout)
+    else:
+        mInputGrid = mInput
+        mOutputGrid = mOutput
+
+    gInput = cute.zipped_divide(mInputGrid, tiler_mn)
+    gOutput = cute.zipped_divide(mOutputGrid, tiler_mn)
+    mId = cute.make_identity_tensor(mInputGrid.shape)
+    gId = cute.zipped_divide(mId, tiler_mn)
     mxfp8_swizzle_v5_kernel(
-        gInput, gOutput, mScaleLogical, gId, input_tv_layout, mInput.shape
+        gInput, gOutput, mScaleLogical, gId, input_tv_layout, mInputGrid.shape,
+        M, N, padded_N, ragged,
     ).launch(
         grid=(cute.size(gInput, mode=[1]), 1, 1),
         block=(cute.size(input_tv_layout, mode=[0]), 1, 1),
@@ -1944,22 +2106,20 @@ def mxfp8_swizzle_v5_jit(
 
 def mxfp8_swizzle_v5(input: torch.Tensor, **kwargs):
     assert len(input.shape) == 2, "unsupported"
-    assert input.shape[-1] % 32 == 0, "unsupported"
     assert input.is_contiguous(), "unsupported"
     assert input.dtype == torch.bfloat16, "v5 is bf16-only"
     M, N = input.shape
+    assert M > 0 and N > 0, "v5 requires non-empty dimensions"
+    assert N % 32 == 0, "v5 requires K % 32 == 0"
     ngc = N // 32
-    # Whole 128x4 swizzle atoms (=> N%128==0). N%128==0 and 16 elems/thread => every 4096-elem tile is
-    # in bounds AND 16-elem/thread runs are 32B-aligned, so both LDG.128s vectorize.
-    assert M % 128 == 0 and ngc % 4 == 0, "unsupported"
-    nrb, ncb = M // 128, ngc // 4
+    nrb, ncb = _ceil_div(M, 128), _ceil_div(ngc, 4)
     input = input.view(-1)
     output = torch.empty(input.shape, dtype=torch.float8_e4m3fn, device=input.device)
-    scale = torch.zeros(nrb * ncb * 32 * 16, dtype=torch.uint8, device=input.device)
+    scale = torch.empty(nrb * ncb * 32 * 16, dtype=torch.uint8, device=input.device)
     input_cute = from_dlpack(input, assumed_align=16)
     output_cute = from_dlpack(output, assumed_align=16)
     scale_cute = from_dlpack(scale)
-    mxfp8_swizzle_v5_jit(input_cute, output_cute, scale_cute, ncb)
+    mxfp8_swizzle_v5_jit(input_cute, output_cute, scale_cute, M, N, ncb)
     return output.view(M, N), scale.view(nrb, ncb, 32, 16).view(torch.float8_e8m0fnu)
 
 

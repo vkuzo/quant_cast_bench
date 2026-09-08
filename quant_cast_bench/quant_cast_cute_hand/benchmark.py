@@ -280,7 +280,7 @@ def _bench_mxfp8_swizzle_v4(M, K):
     # Same 2-D 32x128 tile + 16 bf16/thread as v3, but the load is two plain 8-elem fragment .load()s
     # (each an LDG.128) concat'd in registers -- no uint32-word path. Same outputs (bit-exact vs v3 and
     # the gold), so it shares the gold reference and bit-exact guard. Requires cuda capability 10.0.
-    # Needs M%128==0 and K%128==0; bf16-only.
+    # K must be divisible by 32; ragged M and partial 128-column tiles are supported. bf16-only.
     torch.manual_seed(0)
     x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
 
@@ -303,8 +303,8 @@ def _bench_mxfp8_swizzle_v4(M, K):
 def _bench_mxfp8_swizzle_v5(M, K):
     # Best of v1 and v4: v1's flat 1-D grid + v4's 16-elem/thread load (two LDG.128 concat'd in
     # registers) and single STG.128 store. Same outputs (bit-exact vs v1 and the gold), so it shares
-    # the gold reference and bit-exact guard. Requires cuda capability 10.0. Needs M%128==0 and
-    # K%128==0; bf16-only.
+    # the gold reference and bit-exact guard. Requires cuda capability 10.0. K must be divisible by
+    # 32; ragged M and partial 128-column tiles are supported. bf16-only.
     torch.manual_seed(0)
     x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
 
