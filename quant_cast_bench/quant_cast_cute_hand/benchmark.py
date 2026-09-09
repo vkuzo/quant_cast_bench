@@ -20,11 +20,13 @@ from torch._inductor.utils import do_bench_using_profiling
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from quant_cast_bench.quant_cast_cute_hand.recipes import (
     add_v0, add_v1, add_v2, fp8_deepseek_1x128, fp8_deepseek_1x128_dim_m,
-    fp8_deepseek_1x128_dim_m_v2, mxfp8_swizzle, mxfp8_swizzle_v2, mxfp8_swizzle_v3, mxfp8_swizzle_v4,
-    mxfp8_swizzle_v5,
+    fp8_deepseek_1x128_dim_m_v2, mxfp8_swizzle, mxfp8_swizzle_v2,
+    mxfp8_swizzle_v3, mxfp8_swizzle_v4, mxfp8_swizzle_v5,
     transpose_v0, transpose_v1,
 )
-from quant_cast_bench.quant_cast_gold.recipes import mxfp8_swizzle_f
+from quant_cast_bench.quant_cast_gold.recipes import (
+    mxfp8_dim_km_swizzle_f, mxfp8_dim_m_swizzle_f, mxfp8_swizzle_f,
+)
 
 # Peak HBM bandwidth per GPU family (GB/s), used for the "% of peak" column. Matched by substring
 # against torch.cuda.get_device_name(0); H100 is the SXM5 HBM3 part (PCIe H100 is ~2 TB/s).
@@ -324,6 +326,58 @@ def _bench_mxfp8_swizzle_v5(M, K):
     return run, bytes_per_iter
 
 
+def _bench_mxfp8_dim_m_swizzle_impl(M, K, kernel_fn):
+    torch.manual_seed(0)
+    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+
+    def run():
+        return kernel_fn(x)
+
+    q, s = run()
+    torch.cuda.synchronize()
+    q_ref, s_ref = mxfp8_dim_m_swizzle_f(x)
+    assert torch.equal(s.view(torch.uint8), s_ref.view(torch.uint8)), "scale mismatch vs reference"
+    assert torch.equal(q.float(), q_ref.float()), "qdata mismatch vs reference"
+    bytes_per_iter = (
+        x.numel() * x.element_size()
+        + q.numel() * q.element_size()
+        + s.numel() * s.element_size()
+    )
+    return run, bytes_per_iter
+
+
+def _bench_mxfp8_dim_m_swizzle_tma(M, K):
+    return _bench_mxfp8_dim_m_swizzle_impl(
+        M, K, lambda x: mxfp8_swizzle_v2(x, mode="dim_m")
+    )
+
+
+def _bench_mxfp8_dim_km_swizzle_impl(M, K, kernel_fn):
+    torch.manual_seed(0)
+    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+
+    def run():
+        return kernel_fn(x)
+
+    outputs = run()
+    torch.cuda.synchronize()
+    ref_outputs = mxfp8_dim_km_swizzle_f(x)
+    for output, ref_output in zip(outputs, ref_outputs):
+        assert torch.equal(
+            output.view(torch.uint8), ref_output.view(torch.uint8)
+        ), "output mismatch vs reference"
+    bytes_per_iter = x.numel() * x.element_size() + sum(
+        output.numel() * output.element_size() for output in outputs
+    )
+    return run, bytes_per_iter
+
+
+def _bench_mxfp8_dim_km_swizzle_tma(M, K):
+    return _bench_mxfp8_dim_km_swizzle_impl(
+        M, K, lambda x: mxfp8_swizzle_v2(x, mode="dim_km")
+    )
+
+
 def _bench_transpose_v0(M, K):
     # read input (M*K bf16) + write transposed output (K*M bf16); a memory-bound 2D transpose.
     # v0 is the naive path: coalesced vectorized read, scattered (strided) column write.
@@ -374,6 +428,8 @@ _KERNELS = {
     "mxfp8_swizzle_v3": _bench_mxfp8_swizzle_v3,
     "mxfp8_swizzle_v4": _bench_mxfp8_swizzle_v4,
     "mxfp8_swizzle_v5": _bench_mxfp8_swizzle_v5,
+    "mxfp8_dim_m_swizzle_tma": _bench_mxfp8_dim_m_swizzle_tma,
+    "mxfp8_dim_km_swizzle_tma": _bench_mxfp8_dim_km_swizzle_tma,
     "transpose_v0": _bench_transpose_v0,
     "transpose_v1": _bench_transpose_v1,
 }
