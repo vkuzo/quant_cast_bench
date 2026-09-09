@@ -10,7 +10,7 @@ import cutlass.cute as cute
 import cutlass.utils as utils
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import arith, llvm, nvvm, vector  # typed NVVM e8m0 cvt ops
-from cutlass.cute.nvgpu import cpasync  # TMA (bulk-tensor) copy ops + tma_partition
+from cutlass.cute.nvgpu import cpasync, tcgen05  # TMA copies + Blackwell smem layouts
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
 
@@ -2131,44 +2131,53 @@ MXFP8_SWIZZLE_V5 = QuantCastCuteRecipe.from_gold(
 # ---------------------------------------------------------------------------
 # mxfp8_swizzle_v2: TMA (bulk-tensor) load/store of the main data, mxfp8 dim-K numerics.
 #
-# Structured on fp8_deepseek_1x128_dim_m_v2 (the warp-specialized TMA kernel above) -- same 128x128
-# tile, same mbarrier arrive-and-expect-tx handshake, warp-0-gated G2S/S2G copies. The differences
-# are all in the CALCULATION, because mxfp8_swizzle reduces along K (a 1x32 block within a row), not
-# down M like deepseek dim-M:
-#   - block is 1x32 (not a 128-row column), so a 128x128 tile holds 128 rows x 4 col-blocks = 512
-#     scale groups (vs deepseek's 128). With 128 threads that is 4 iters.
-#   - each thread-group owns one (row, col-block): the 32 CONTIGUOUS columns sInput[row, cb*32:+32].
-#   - scale is an e8m0 RCEIL byte (_e8m0), scattered to the swizzled (nrb,ncb,32,16) grid
-#     (_swizzle_flat), exactly like the scalar v1 above.
-#   - the output is NOT transposed (dim-K keeps (M,N)); sOutput reuses the (TM,TN) row-major layout
-#     and the S2G box is (TM,TN), so no register->smem transpose is needed.
-# TMA note: the (128,128) box is a static descriptor tile; the last row/col tiles of a ragged tensor
-# would be hardware-masked (G2S zero-fills, S2G drops OOB) -- but we assert M%128==0, N%128==0 so
-# every tile is full and the swizzled scale scatter never addresses a padding slot.
+# Structured on fp8_deepseek_1x128_dim_m_v2 (the warp-specialized TMA kernel above) -- the same
+# mbarrier arrive-and-expect-tx handshake and warp-0-gated G2S/S2G copies. The M tile stays 128 while
+# N is selected from 32/64/128: small problems gain CTAs, while large problems retain the efficient
+# 128x128 transfer. The calculation differs because mxfp8_swizzle reduces along K (a 1x32 block
+# within a row), not down M like deepseek dim-M:
+#   - a 128xN tile holds 128 x (N/32) scale groups. With 128 threads, each thread owns one row and
+#     visits its N/32 contiguous 1x32 groups.
+#   - scale is an e8m0 RCEIL byte (_e8m0), written through a logical layout that maps directly onto
+#     the swizzled (nrb,ncb,32,16) grid.
+#   - the output is NOT transposed (dim-K keeps (M,N)); sOutput has the same logical (TM,TN) shape
+#     and the S2G box matches the selected tile, so no register->smem transpose is needed.
+# TMA handles ragged edge tiles directly: G2S zero-fills out-of-bounds input lanes and S2G drops
+# out-of-bounds qdata stores. The scale grid is rounded up to complete 128x4 swizzle atoms, and
+# boundary CTAs explicitly write zero to its padded slots.
 #
-# PERF REGRESSION (TODO, nvidia-cutlass-dsl 4.6.2): this kernel is STILL BIT-EXACT on 4.6.2 but its
-# throughput collapsed from ~72.6% peak (0.140ms @ 16384^2, on 4.5.2) to ~14% (0.72ms). ncu shows
-# smem bank conflicts exploded ~10x (13.3M ld + 2.6M st -> 126M ld + 60M st) and the L1TEX pipe
-# saturates at 98% while DRAM sits at 14%. The source is unchanged, so 4.6 is compiling the scalar
-# smem access in the two-phase compute loop (sInput[lrow,c0+r] / sOutput[lrow,c0+r]) into a much
-# worse (conflicting) access than 4.5 did. A speculative fix (replace the scalar loops with
-# cute.autovec_copy over a 32-elem smem slice, LDS.128/STS.128) did NOT recover perf. Not yet root
-# caused -- chase down later. v1 (mxfp8_swizzle) is unaffected: ~63% peak on 4.6.2, perf-neutral.
-_MXS_TM, _MXS_TN, _MXS_WARPS = 128, 128, 4          # B200 tile; needs M%TM==0, N%TN==0
-_MXS_THREADS = _MXS_WARPS * 32                       # 128
-_MXS_BPR = _MXS_TN // 32                             # 4 col-blocks (1x32) across a 128-wide tile row
-_MXS_GROUPS = _MXS_TM * _MXS_BPR                     # 128 rows * 4 = 512 (row, col-block) scale groups
-_MXS_ITERS = (_MXS_GROUPS + _MXS_THREADS - 1) // _MXS_THREADS  # 4
-_MXS_IN_BYTES = _MXS_TM * _MXS_TN * 2                # 128*128 bf16 tile bytes for expect-tx
+# PERF REGRESSION/WORKAROUND (nvidia-cutlass-dsl 4.6.x): 4.6 stopped vectorizing the scalar
+# sInput/sOutput loops that 4.5.2 lowered to LDS.128/STS.128. That changed 16 LDS.128 + 8 STS.128
+# into 128 LDS.U16 + 128 STS.U8, raised bank conflicts from 13.3M ld + 2.6M st to 126M ld + 60M st,
+# and dropped 16384^2 throughput from ~72.6% peak (0.140ms) to ~14% (0.72ms). The explicit 128-bit
+# CopyUniversal atoms below restore the original 16/8 vector instructions and ~72-73% peak on 4.6.
+# A plain cute.autovec_copy did not work; the explicit copy width is what prevents scalarization.
+# Independent bf16/fp8 K_SW128 views cut the remaining ld/st conflicts from 13.4M/2.7M to 5.0M/0.4M
+# without changing the ~0.140ms runtime; their lifetimes are separated by the aliasing barrier.
+# Scheduling adjacent N tiles together is the larger win: an N-major grid with N-oriented CTA
+# clusters improves row-major DRAM locality. Row-owned work makes each thread's scale bytes
+# contiguous in a packed store and cuts shared-load conflicts without increasing registers.
+# Together with skipping the redundant scale memset: 0.1375 -> 0.1213 ms at 16384^2 on B200.
+_MXS_TM, _MXS_MAX_TN, _MXS_WARPS = 128, 128, 4
+_MXS_THREADS = _MXS_WARPS * 32                       # 128, one thread per tile row
 
 
-@cute.struct
-class _MxfpSwizzleSmem:
-    # only ONE full-tile buffer: the fp8 output aliases the front of sInput (see the kernel). The
-    # bf16 input tile (32KB) is >= the fp8 output tile (16KB), so the output view fits inside it. This
-    # drops per-CTA smem from ~51KB to ~35KB, lifting the smem-bound occupancy from 4 to 6 blocks/SM.
-    tma_bar: cute.struct.MemRange[cutlass.Int64, 1]
-    sInput: cute.struct.Align[cute.struct.MemRange[cutlass.BFloat16, _MXS_TM * _MXS_TN], 1024]
+def _mxfp8_swizzle_v2_tile_n(M, N):
+    """Choose the measured B200 N tile from the padded 128x128 CTA count."""
+    num_128_tiles = _ceil_div(M, _MXS_TM) * _ceil_div(N, _MXS_MAX_TN)
+    if num_128_tiles <= 64:
+        tile_n = 32
+    elif num_128_tiles <= 512:
+        tile_n = 64
+    else:
+        tile_n = 128
+
+    # Do not compute padding merely to reach the selected width for very narrow matrices.
+    if N <= 32:
+        return 32
+    if N <= 64:
+        return min(tile_n, 64)
+    return tile_n
 
 
 @cute.kernel
@@ -2177,33 +2186,67 @@ def mxfp8_swizzle_v2_kernel(
     input_tma_tensor: cute.Tensor,
     output_tma_atom: cute.CopyAtom,
     output_tma_tensor: cute.Tensor,
-    mScale: cute.Tensor,
-    input_smem_layout: cute.Layout,
-    output_smem_layout: cute.Layout,
-    gpr: cutlass.Constexpr,  # 32-element col-groups per row == N // 32
-    ncb: cutlass.Constexpr,  # swizzle column-blocks == (N // 32) // 4
+    mScaleLogical: cute.Tensor,
+    input_smem_layout: cute.ComposedLayout,
+    output_smem_layout: cute.ComposedLayout,
+    data_tv_layout: cute.Layout,
+    scale_tv_layout: cute.Layout,
+    tile_n: cutlass.Constexpr,
+    ncb: cutlass.Constexpr,
+    M: cutlass.Constexpr,
+    N: cutlass.Constexpr,
+    ragged: cutlass.Constexpr,
 ):
     tidx, _, _ = cute.arch.thread_idx()
-    bidx, bidy, _ = cute.arch.block_idx()   # bidx = m_tile, bidy = n_tile
+    n_tile, m_tile, _ = cute.arch.block_idx()
     warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
     smem = utils.SmemAllocator()
-    st = smem.allocate(_MxfpSwizzleSmem)
-    tma_bar_ptr = st.tma_bar.data_ptr()
+    tma_bar_ptr = smem.allocate_array(cutlass.Int64, 1)
+    # Allocate only the selected tile width. The fp8 output aliases this bf16 allocation and is at
+    # most half its size, just as in the original fixed 128x128 implementation.
+    smem_storage = smem.allocate_array(
+        cutlass.BFloat16, _MXS_TM * tile_n, byte_alignment=1024
+    )
     if tidx == 0:
         cute.arch.mbarrier_init(tma_bar_ptr, 1)
     cute.arch.mbarrier_init_fence()
     cute.arch.sync_threads()
 
-    sInput = st.sInput.get_tensor(input_smem_layout)      # (TM, TN) bf16 row-major
-    # sOutput ALIASES the same smem base as sInput, reinterpreted as fp8. Safe because (a) the fp8
-    # tile (16KB) fits inside the bf16 tile (32KB), and (b) the kernel reads ALL of sInput into
-    # registers and sync_threads() BEFORE any thread writes fp8 back over it (see the two-phase loop).
-    sOutput = cute.make_tensor(
-        cute.recast_ptr(st.sInput.data_ptr(), dtype=cutlass.Float8E4M3FN), output_smem_layout
+    # Keep the XOR transform on the pointer and the logical tile shape on the tensor layout. This is
+    # the representation expected by both ordinary smem accesses and the TMA atom built below.
+    sInput = cute.make_tensor(
+        cute.recast_ptr(
+            smem_storage, input_smem_layout.inner, dtype=cutlass.BFloat16
+        ),
+        input_smem_layout.outer,
     )
-    gInput = cute.local_tile(input_tma_tensor, (_MXS_TM, _MXS_TN), (None, None))
-    gOutput = cute.local_tile(output_tma_tensor, (_MXS_TM, _MXS_TN), (None, None))
+    # sOutput ALIASES the same smem base as sInput, reinterpreted as fp8. It occupies half as many
+    # bytes, and the kernel reads ALL of sInput into registers and sync_threads() BEFORE any thread
+    # writes fp8 back over it (see the two-phase loop).
+    sOutput = cute.make_tensor(
+        cute.recast_ptr(
+            smem_storage, output_smem_layout.inner, dtype=cutlass.Float8E4M3FN
+        ),
+        output_smem_layout.outer,
+    )
+    bpr = tile_n // 32
+    iters = bpr
+    # The data TV layout maps (thread, (element-in-group, iteration)) so each thread owns one row
+    # and all 1x32 groups across the selected N tile. Tensor fragments preserve independent bf16/fp8
+    # swizzles while the explicit copy atoms preserve 128-bit instructions.
+    tidfrgInput = cute.composition(sInput, data_tv_layout)
+    tidfrgOutput = cute.composition(sOutput, data_tv_layout)
+    thrInputGroups = tidfrgInput[(tidx, None)]
+    thrOutputGroups = tidfrgOutput[(tidx, None)]
+    smem_load_atom = cute.make_copy_atom(
+        cute.nvgpu.CopyUniversalOp(), cutlass.BFloat16, num_bits_per_copy=128
+    )
+    smem_store_atom = cute.make_copy_atom(
+        cute.nvgpu.CopyUniversalOp(), cutlass.Float8E4M3FN, num_bits_per_copy=128
+    )
+    gInput = cute.local_tile(input_tma_tensor, (_MXS_TM, tile_n), (None, None))
+    gOutput = cute.local_tile(output_tma_tensor, (_MXS_TM, tile_n), (None, None))
 
     tInputsInput, tInputgInput = cpasync.tma_partition(
         input_tma_atom, 0, cute.make_layout(1),
@@ -2215,12 +2258,24 @@ def mxfp8_swizzle_v2_kernel(
     # G2S: one elected thread arms the barrier + fires the bulk copy; all threads wait for the tile.
     if warp == 0:
         with cute.arch.elect_one():
-            cute.arch.mbarrier_arrive_and_expect_tx(tma_bar_ptr, _MXS_IN_BYTES)
-        cute.copy(input_tma_atom, tInputgInput[(None, bidx, bidy)], tInputsInput, tma_bar_ptr=tma_bar_ptr)
+            cute.arch.mbarrier_arrive_and_expect_tx(tma_bar_ptr, _MXS_TM * tile_n * 2)
+        cute.copy(
+            input_tma_atom,
+            tInputgInput[(None, m_tile, n_tile)],
+            tInputsInput,
+            tma_bar_ptr=tma_bar_ptr,
+        )
     cute.arch.mbarrier_wait(tma_bar_ptr, 0)
 
-    m0 = bidx * _MXS_TM   # tile's first global row
-    n0 = bidy * _MXS_TN   # tile's first global col
+    # Tile the logical (row, 1x32-col-group) scale tensor and apply the matching thread/value
+    # ownership layout. Each thread receives one scale slot for each of its data groups.
+    scaleTile = cute.local_tile(mScaleLogical, (_MXS_TM, bpr), (m_tile, n_tile))
+    tidfrgScale = cute.composition(scaleTile, scale_tv_layout)
+    thrScale = tidfrgScale[(tidx, None)]
+    rScale = cute.make_rmem_tensor(iters, cutlass.Uint8)
+    scale_store_atom = cute.make_copy_atom(
+        cute.nvgpu.CopyUniversalOp(), cutlass.Uint8, num_bits_per_copy=iters * 8
+    )
 
     # Because sOutput aliases sInput's storage, the read of sInput and the write of fp8 must be
     # separated by a barrier: EVERY thread must finish reading its bf16 out of smem before ANY thread
@@ -2229,92 +2284,190 @@ def mxfp8_swizzle_v2_kernel(
     #   phase A: read sInput -> compute amax/scale/qdata, keep the 32 fp8 per group in registers,
     #            scatter the scale (untouched by the aliasing -- it goes to gmem).
     #   phase B (after sync): write the register-held fp8 into the aliased sOutput.
-    # Each thread owns _MXS_ITERS groups (4), so it holds _MXS_ITERS x 32 fp8 registers across the sync.
-    rQ = [cute.make_rmem_tensor(cute.make_layout(32), cutlass.Float8E4M3FN)
-          for _ in range(_MXS_ITERS)]
+    # Each thread owns one 1x32 group per tile segment and keeps its quantized bytes in registers.
+    rQ = cute.make_rmem_tensor(
+        cute.make_layout((32, iters), stride=(1, 32)), cutlass.Float8E4M3FN
+    )
 
-    for it in cutlass.range_constexpr(_MXS_ITERS):
-        g = tidx + it * _MXS_THREADS
-        if g < _MXS_GROUPS:
-            lrow = g // _MXS_BPR          # local row in [0,128)
-            cb = g % _MXS_BPR             # col-block in [0,4)
-            c0 = cb * 32                  # first local column of this 1x32 block
+    for it in cutlass.range_constexpr(iters):
+        # Four layout-aware 8-bf16 fragments, each copied by one explicit LDS.128.
+        sGroup = thrInputGroups[((None, it),)]
+        sGroup8 = cute.tiled_divide(sGroup, (8,))
+        rInput = cute.make_rmem_tensor(cute.make_layout(32), cutlass.BFloat16)
+        rInput8 = cute.tiled_divide(rInput, (8,))
+        for vec in cutlass.range_constexpr(4):
+            cute.copy(smem_load_atom, sGroup8[(None, vec)], rInput8[(None, vec)])
+        v = rInput.load().to(cutlass.Float32)
+        amax = cute.math.absf(v).reduce(cute.ReductionOp.MAX, cutlass.Float32(0.0), 0)
 
-            # amax over the 32 contiguous columns of this row (block is along K).
-            rInput = cute.make_rmem_tensor(cute.make_layout(32), cutlass.Float32)
-            for r in cutlass.range_constexpr(32):
-                rInput[r] = sInput[lrow, c0 + r].to(cutlass.Float32)
-            v = rInput.load()
-            amax = cute.math.absf(v).reduce(cute.ReductionOp.MAX, cutlass.Float32(0.0), 0)
+        # e8m0 RCEIL scale byte + fp32 reciprocal (no clamp -- mxfp8 semantics, matches v1).
+        rcp, biased = _e8m0(amax)
 
-            # e8m0 RCEIL scale byte + fp32 reciprocal (no clamp -- mxfp8 semantics, matches v1).
-            rcp, biased = _e8m0(amax)
+        # Quantize into the iteration mode of one nested register tensor; smem still holds bf16.
+        rQ[(None, it)].store((v * rcp).to(cutlass.Float8E4M3FN))
+        rScale[it] = biased.to(rScale.element_type)
 
-            # quantize into registers (NOT into smem yet -- smem still holds bf16 other threads read).
-            rQ[it].store((v * rcp).to(cutlass.Float8E4M3FN))
+    # Adjacent scale bytes become one packed global store. TMA masks the qdata boundary for us, but
+    # the padded scale allocation is ordinary global memory, so boundary CTAs explicitly replace
+    # missing rows/column-groups with zero before performing the same packed store.
+    use_full_tile = cutlass.const_expr(not ragged) or (
+        ((m_tile + 1) * _MXS_TM <= M) & ((n_tile + 1) * tile_n <= N)
+    )
+    if use_full_tile:
+        cute.copy(scale_store_atom, rScale, thrScale)
+    else:
+        row = m_tile * _MXS_TM + tidx
+        rScalePadded = cute.make_rmem_tensor(iters, cutlass.Uint8)
+        rScalePadded.fill(0)
+        if row < M:
+            for it in cutlass.range_constexpr(iters):
+                if n_tile * bpr + it < N // 32:
+                    rScalePadded[it] = rScale[it]
+        cute.copy(scale_store_atom, rScalePadded, thrScale)
 
-            # scatter the e8m0 scale to its swizzled slot (gmem, independent of the smem aliasing).
-            row = m0 + lrow
-            col = (n0 // 32) + cb
-            mScale[_swizzle_flat(row, col, ncb)] = biased.to(mScale.element_type)
+    # Narrow adaptive tiles can cover all real K groups before reaching the end of the enclosing
+    # four-group scale atom. Have the final N tile initialize those remaining scale-only slots.
+    grid_n = _ceil_div(N, tile_n)
+    covered_groups = grid_n * bpr
+    if cutlass.const_expr(covered_groups < ncb * 4):
+        if n_tile == grid_n - 1:
+            row = m_tile * _MXS_TM + tidx
+            for offset in cutlass.range_constexpr(3):
+                col = covered_groups + offset
+                if cutlass.const_expr(col < ncb * 4):
+                    mScaleLogical[(row, col)] = cutlass.Uint8(0)
 
     # barrier: all bf16 reads complete before we overwrite the shared buffer with fp8.
     cute.arch.sync_threads()
 
-    for it in cutlass.range_constexpr(_MXS_ITERS):
-        g = tidx + it * _MXS_THREADS
-        if g < _MXS_GROUPS:
-            lrow = g // _MXS_BPR
-            cb = g % _MXS_BPR
-            c0 = cb * 32
-            for r in cutlass.range_constexpr(32):
-                sOutput[lrow, c0 + r] = rQ[it][r]
+    for it in cutlass.range_constexpr(iters):
+        # Two layout-aware 16-fp8 fragments, each copied by one explicit STS.128.
+        rQ16 = cute.tiled_divide(rQ[(None, it)], (16,))
+        sGroup16 = cute.tiled_divide(thrOutputGroups[((None, it),)], (16,))
+        for vec in cutlass.range_constexpr(2):
+            cute.copy(smem_store_atom, rQ16[(None, vec)], sGroup16[(None, vec)])
 
     # publish sOutput to the async proxy, sync, then S2G store the (TM,TN) fp8 tile.
     cute.arch.fence_proxy("async.shared", space="cta")
     cute.arch.sync_threads()
     if warp == 0:
-        cute.copy(output_tma_atom, tOutputsOutput, tOutputgOutput[(None, bidx, bidy)])
+        cute.copy(output_tma_atom, tOutputsOutput, tOutputgOutput[(None, m_tile, n_tile)])
 
 
 @cute.jit
-def mxfp8_swizzle_v2_jit(mInput, mOutput, mScale, gpr: cutlass.Constexpr, ncb: cutlass.Constexpr):
-    # both input (bf16) and output (fp8) tiles are (TM, TN) row-major -- dim-K keeps orientation.
-    input_smem_layout = cute.make_layout((_MXS_TM, _MXS_TN), stride=(_MXS_TN, 1))
-    output_smem_layout = cute.make_layout((_MXS_TM, _MXS_TN), stride=(_MXS_TN, 1))
+def mxfp8_swizzle_v2_jit(
+    mInput,
+    mOutput,
+    mScale,
+    M: cutlass.Constexpr,
+    N: cutlass.Constexpr,
+    ncb: cutlass.Constexpr,
+    tile_n: cutlass.Constexpr,
+    cluster_n: cutlass.Constexpr,
+):
+    padded_M = _ceil_div(M, _MXS_TM) * _MXS_TM
+    padded_N = _ceil_div(N, tile_n) * tile_n
+    bpr = tile_n // 32
+    iters = bpr
+    # Match the swizzle width to the selected tile. The logical 128xN shape is unchanged while the
+    # layout-aware fragments below see the conflict-reduced physical mapping.
+    if cutlass.const_expr(tile_n == 32):
+        input_smem_kind = tcgen05.SmemLayoutAtomKind.K_SW64
+        output_smem_kind = tcgen05.SmemLayoutAtomKind.K_SW32
+    elif cutlass.const_expr(tile_n == 64):
+        input_smem_kind = tcgen05.SmemLayoutAtomKind.K_SW128
+        output_smem_kind = tcgen05.SmemLayoutAtomKind.K_SW64
+    else:
+        input_smem_kind = tcgen05.SmemLayoutAtomKind.K_SW128
+        output_smem_kind = tcgen05.SmemLayoutAtomKind.K_SW128
+    input_smem_atom = tcgen05.make_smem_layout_atom(input_smem_kind, cutlass.BFloat16)
+    input_smem_layout = cute.coalesce(
+        cute.tile_to_shape(input_smem_atom, (_MXS_TM, tile_n), order=(0, 1)),
+        target_profile=(1, 1),
+    )
+    # The output phase aliases the same allocation but uses its own dtype-appropriate swizzle. Its
+    # lifetime starts only after the bf16-read barrier, so the two interpretations cannot overlap.
+    output_smem_atom = tcgen05.make_smem_layout_atom(output_smem_kind, cutlass.Float8E4M3FN)
+    output_smem_layout = cute.coalesce(
+        cute.tile_to_shape(output_smem_atom, (_MXS_TM, tile_n), order=(0, 1)),
+        target_profile=(1, 1),
+    )
+    # (thread, value) -> logical coordinate in the 128xN tile. Each thread owns one row.
+    data_tv_layout = cute.make_layout(
+        ((_MXS_THREADS,), (32, iters)),
+        stride=((1,), (_MXS_TM, _MXS_TM * 32)),
+    )
+    # The corresponding logical scale tile gives each thread N/32 adjacent columns.
+    scale_tv_layout = cute.make_layout(
+        ((_MXS_THREADS,), (iters,)),
+        stride=((1,), (_MXS_TM,)),
+    )
 
     input_tma_atom, input_tma_tensor = cpasync.make_tiled_tma_atom(
-        cpasync.CopyBulkTensorTileG2SOp(), mInput, input_smem_layout, (_MXS_TM, _MXS_TN))
+        cpasync.CopyBulkTensorTileG2SOp(), mInput, input_smem_layout, (_MXS_TM, tile_n))
     output_tma_atom, output_tma_tensor = cpasync.make_tiled_tma_atom(
-        cpasync.CopyBulkTensorTileS2GOp(), mOutput, output_smem_layout, (_MXS_TM, _MXS_TN))
-    M2, N2 = mInput.shape
+        cpasync.CopyBulkTensorTileS2GOp(), mOutput, output_smem_layout, (_MXS_TM, tile_n))
+
+    # Logical (row, 1x32-col-group) view over the physical (nrb,ncb,32,16) scale buffer. The
+    # hierarchical modes encode the blocked/swizzled destination, removing address arithmetic from
+    # the kernel's scale store.
+    # Manual _swizzle_flat indexing uses 76 registers versus 80 for this clearer layout-based form.
+    nrb = cute.size(mScale) // (ncb * 32 * 16)
+    scale_layout = cute.make_layout(
+        ((32, 4, nrb), (4, ncb)),
+        stride=((16, 4, ncb * 32 * 16), (1, 32 * 16)),
+    )
+    mScaleLogical = cute.make_tensor(mScale.iterator, scale_layout)
 
     mxfp8_swizzle_v2_kernel(
-        input_tma_atom, input_tma_tensor, output_tma_atom, output_tma_tensor, mScale,
-        input_smem_layout, output_smem_layout, gpr, ncb,
+        input_tma_atom, input_tma_tensor, output_tma_atom, output_tma_tensor, mScaleLogical,
+        input_smem_layout, output_smem_layout, data_tv_layout, scale_tv_layout,
+        tile_n, ncb, M, N, M != padded_M or N != padded_N,
     ).launch(
-        grid=(_ceil_div(M2, _MXS_TM), _ceil_div(N2, _MXS_TN), 1),
+        # Make the fast-changing grid dimension follow contiguous columns. Clustering those CTAs
+        # further preserves that locality in hardware scheduling.
+        grid=(padded_N // tile_n, padded_M // _MXS_TM, 1),
         block=(_MXS_THREADS, 1, 1),
+        cluster=(cluster_n, 1, 1),
     )
 
 
 def mxfp8_swizzle_v2(input: torch.Tensor, **kwargs):
     assert len(input.shape) == 2, "unsupported"
     assert input.is_contiguous(), "unsupported"
+    assert input.dtype == torch.bfloat16, "v2 is bf16-only"
     M, N = input.shape
+    assert M > 0 and N > 0, "v2 requires non-empty dimensions"
+    assert N % 32 == 0, "v2 requires K % 32 == 0"
     ngc = N // 32
-    # 128x128 TMA tile + whole 128x4 swizzle atoms: M%128==0 and N%128==0 (=> ngc%4==0).
-    assert M % _MXS_TM == 0 and N % _MXS_TN == 0, "unsupported"
-    nrb, ncb = M // 128, ngc // 4
+    nrb, ncb = _ceil_div(M, 128), _ceil_div(ngc, 4)
+    # Smaller N tiles expose more CTAs when the 128x128 grid cannot fill the B200. Once there are
+    # enough 128x128 tiles, their lower TMA/setup overhead wins.
+    tile_n = _mxfp8_swizzle_v2_tile_n(M, N)
+    grid_n = _ceil_div(N, tile_n)
+    # Preserve the tuned cluster sizes where possible while requiring exact grid divisibility.
+    cluster_n = next(c for c in (16, 8, 4, 2, 1) if c <= ncb and grid_n % c == 0)
     output = torch.empty(M, N, dtype=torch.float8_e4m3fn, device=input.device)
-    scale = torch.zeros(nrb * ncb * 32 * 16, dtype=torch.uint8, device=input.device)
+    # Every slot is written by the kernel, so zero-initialization would launch a redundant memset.
+    scale = torch.empty(nrb * ncb * 32 * 16, dtype=torch.uint8, device=input.device)
     # TMA needs full layout/divisibility marking (leading dim contiguous, 16-elem aligned).
     mInput = (from_dlpack(input, assumed_align=16).mark_layout_dynamic(leading_dim=1)
               .mark_compact_shape_dynamic(mode=1, divisibility=16))
     mOutput = (from_dlpack(output, assumed_align=16).mark_layout_dynamic(leading_dim=1)
                .mark_compact_shape_dynamic(mode=1, divisibility=16))
-    mScale = from_dlpack(scale).mark_layout_dynamic()
-    fn = _compiled(("mxfp8_swizzle_v2", M, N), mxfp8_swizzle_v2_jit, mInput, mOutput, mScale, ngc, ncb)
+    mScale = from_dlpack(scale, assumed_align=4)
+    fn = _compiled(
+        ("mxfp8_swizzle_v2", M, N, tile_n),
+        mxfp8_swizzle_v2_jit,
+        mInput,
+        mOutput,
+        mScale,
+        M,
+        N,
+        ncb,
+        tile_n,
+        cluster_n,
+    )
     fn(mInput, mOutput, mScale)
     return output, scale.view(nrb, ncb, 32, 16).view(torch.float8_e8m0fnu)
 
