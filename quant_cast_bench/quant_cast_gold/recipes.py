@@ -1044,6 +1044,74 @@ def mxfp8_swizzle_f(x, **kwargs):
     return qdata, _to_blocked_4d(scale_e8m0)
 
 
+def _f32_to_fp8_nvidia_sr(x, key):
+    """Eager emulation of Blackwell ``cvt.rs.satfinite.e4m3x4.f32``.
+
+    One Philox word supplies four 16-bit random operands in the same lane and bit order as the
+    hardware instruction. The exponent-dependent discarded-bit width handles both normal and
+    subnormal E4M3 values; the bottom bin rounds directly between zero and 2**-9.
+    """
+    flat = x.contiguous().reshape(-1)
+    assert flat.numel() % 4 == 0, "NVIDIA fp8 SR requires numel divisible by 4"
+    groups = flat.numel() // 4
+    n_words = ((groups + 3) // 4) * 4
+    bits = prng.bits(key, n_words, dtype=torch.uint32).to(torch.int64)
+
+    # v4 gives each thread 16 contiguous values and computes one Philox counter for them. Its four
+    # result words feed the four consecutive e4m3x4 groups directly, so group g consumes bits[g].
+    word = bits[:groups]
+
+    # cvt.rs.e4m3x4 reuses each half-word for two lanes; the second lane reads its bits reversed.
+    low = word & 0xFFFF
+    high = (word >> 16) & 0xFFFF
+    low_reversed = sum(((low >> i) & 1) << (15 - i) for i in range(16))
+    high_reversed = sum(((high >> i) & 1) << (15 - i) for i in range(16))
+    random16 = torch.stack(
+        [low, low_reversed, high, high_reversed], dim=1
+    ).reshape(-1).double()
+
+    # E4M3 keeps three mantissa bits and has minimum normal exponent -6. For normal values this
+    # discards 20 fp32 mantissa bits; each subnormal binade discards one additional bit.
+    clamped = flat.clamp(-448.0, 448.0)
+    exponent = (
+        (clamped.abs().view(torch.int32).to(torch.int64) >> 23) & 0xFF
+    ) - 127
+    discarded_bits = 20 + (-6 - exponent).clamp(min=0)
+    shift = discarded_bits.clamp(max=23)
+    rounded_bits = (
+        clamped.view(torch.int32).to(torch.int64)
+        + (random16.to(torch.int64) << (shift - 16))
+    ) & -(torch.ones_like(shift) << shift)
+    rounded = rounded_bits.to(torch.int32).view(torch.float32)
+
+    # Values below the smallest subnormal require a direct probabilistic choice between zero and
+    # 2**-9 because zero has no exponent field on which the add-and-truncate rule can operate.
+    subnormal_ulp = 2.0**-9
+    magnitude = flat.abs().double()
+    promote = magnitude / subnormal_ulp + random16 / (1 << 16) >= 1.0
+    sign = torch.where(torch.signbit(flat), -1.0, 1.0)
+    bottom = sign.double() * torch.where(
+        promote,
+        torch.full_like(magnitude, subnormal_ulp),
+        torch.zeros_like(magnitude),
+    )
+    rounded = torch.where(
+        magnitude < subnormal_ulp, bottom.to(torch.float32), rounded
+    )
+    return rounded.to(torch.float8_e4m3fn).reshape(x.shape)
+
+
+def mxfp8_swizzle_sr_f(x, key, **kwargs):
+    """``mxfp8_swizzle_f`` with NVIDIA SM100 stochastic rounding for qdata."""
+    *lead, last = x.shape
+    x_b = x.reshape(*lead, last // 32, 32)
+    amax = x_b.abs().amax(dim=-1, keepdim=True)
+    scale_e8m0 = _amax_to_e8m0_rceil(amax)
+    scaled = x_b.to(torch.float32) * _e8m0_scale_to_reciprocal_fp32(scale_e8m0)
+    qdata = _f32_to_fp8_nvidia_sr(scaled, key).reshape(*lead, last)
+    return qdata, _to_blocked_4d(scale_e8m0.squeeze(-1))
+
+
 def mxfp8_swizzle_dq_f(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     # not a dataclass field -- used inside _mxfp8_swizzle_correctness, and importable
     # directly by consumers that need the inverse. Un-swizzle the 4D block grid back to
@@ -1071,6 +1139,33 @@ Mxfp8SwizzleGold = QuantCastSingleKernelGold(
     correctness_fn=_mxfp8_swizzle_correctness,
     example_input_fn=lambda M, K: (torch.randn(M, K, dtype=torch.bfloat16, device="cuda"),),
     perf_description="(1,32) block, swizzle",
+)
+
+
+def _mxfp8_swizzle_sr_correctness(
+    inputs: Tuple[torch.Tensor, torch.Tensor],
+    outputs: Tuple[torch.Tensor, torch.Tensor],
+) -> None:
+    x, _key = inputs
+    qdata, scale = outputs
+    x_hat = mxfp8_swizzle_dq_f(qdata, scale)
+    sqnr = _compute_error(x.float(), x_hat.float())
+    threshold = 15.0
+    assert sqnr > threshold, (
+        f"mxfp8_swizzle_sr: sqnr={sqnr.item():.2f} dB below {threshold} dB"
+    )
+
+
+def _mxfp8_swizzle_sr_inputs(M, K):
+    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+    return x, prng.key(0, device=x.device)
+
+
+Mxfp8SwizzleSRGold = QuantCastSingleKernelGold(
+    pt_ref_fn=mxfp8_swizzle_sr_f,
+    correctness_fn=_mxfp8_swizzle_sr_correctness,
+    example_input_fn=_mxfp8_swizzle_sr_inputs,
+    perf_description="(1,32) block, fp8 qdata (NVIDIA cvt.rs SR numerics), swizzle",
 )
 
 
@@ -2230,6 +2325,7 @@ ALL_RECIPES = [
     # 8-bit 1D, dim-k reduction
     ("mxfp8", Mxfp8Gold),
     ("mxfp8_swizzle", Mxfp8SwizzleGold),
+    ("mxfp8_swizzle_sr", Mxfp8SwizzleSRGold),
     ("fp8_deepseek_1x128", Deepseek1x128Gold),
     # 8-bit 1D, dim-m reduction
     ("mxfp8_dim_m", Mxfp8DimMGold),

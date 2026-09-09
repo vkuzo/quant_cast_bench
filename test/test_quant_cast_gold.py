@@ -22,6 +22,8 @@ from quant_cast_bench.quant_cast_gold.recipes import (
     _compute_error,
     hadamard_rht_matrix,
     hadamard_rht_f,
+    mxfp8_swizzle_f,
+    mxfp8_swizzle_sr_f,
     nvfp4_gs_scale,
     nvfp4_gs_swizzle_dim_k_dim_m_rht_f,
     nvfp4_gs_swizzle_dim_k_dim_m_rht_sr_f,
@@ -49,6 +51,20 @@ def test_ref_correctness(name, gold):
 
     outputs = gold.pt_ref_fn(*inputs, global_row=0, global_col=0, num_col=inputs[0].shape[1])
     gold.correctness_fn(inputs, outputs)  # raises AssertionError on failure
+
+
+def test_mxfp8_swizzle_sr_reproducible_and_preserves_scale():
+    x = torch.randn(129, 160, dtype=torch.bfloat16, device="cuda")
+    key = prng.key(7, device=x.device)
+
+    q0, scale0 = mxfp8_swizzle_sr_f(x, key)
+    q1, scale1 = mxfp8_swizzle_sr_f(x, key)
+    q_rtne, scale_rtne = mxfp8_swizzle_f(x)
+
+    assert torch.equal(q0.view(torch.uint8), q1.view(torch.uint8))
+    assert torch.equal(scale0.view(torch.uint8), scale1.view(torch.uint8))
+    assert torch.equal(scale0.view(torch.uint8), scale_rtne.view(torch.uint8))
+    assert not torch.equal(q0.view(torch.uint8), q_rtne.view(torch.uint8))
 
 
 # ===========================================================================
