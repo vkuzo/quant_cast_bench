@@ -1736,9 +1736,16 @@ MXFP8_SWIZZLE_V3 = QuantCastCuteRecipe.from_gold(
 # `rounding_mode` adds a compile-time stochastic specialization to this same kernel: RTNE retains the
 # original vector cast, while STOCHASTIC uses one Philox4x32 call and four Blackwell e4m3x4 cvt.rs
 # instructions per thread. Both modes keep the same load, reduction, scale-write, and launch paths.
+# `mode` adds compile-time dim-K, dim-M, and fused dim-KM specializations. Dim-K keeps the original
+# register/direct-store path. Modes containing dim-M additionally stage that same coalesced input
+# load through a shared-memory scratchpad; pairs of threads then consume one 32x1 block and write the
+# transposed qdata directly. The input is still loaded only once in fused dim-KM.
 # Ragged M and K%128 tails launch over complete padded 128x128 swizzle atoms. Padded lanes load zero,
 # skip qdata stores, and explicitly write zero scale bytes; the aligned specialization stays unchanged.
 _MXS4_HALF = _MXS3_VPT // 2   # 8 elems per sub-load (2 halves of the 16-elem/thread run)
+_MXS_MODE_DIM_K = 0
+_MXS_MODE_DIM_M = 1
+_MXS_MODE_DIM_KM = 2
 
 
 @dsl_user_op
@@ -1811,20 +1818,32 @@ def _mxfp8_v4_quantize(thrInput, rcp, mSeed: cute.Tensor, flat_start, stochastic
 @cute.kernel
 def mxfp8_swizzle_v4_kernel(
     gInput: cute.Tensor,   # 2-D bf16 input, zipped_divide'd into (32,128) tiles
-    gOutput: cute.Tensor,
-    mScaleLogical: cute.Tensor,
+    gOutputK: cute.Tensor,
+    mScaleKLogical: cute.Tensor,
+    gOutputM: cute.Tensor,
+    mScaleMLogical: cute.Tensor,
     mSeed: cute.Tensor,
     input_tv_layout: cute.Layout,
+    input_m_tv_layout: cute.Layout,
+    output_m_tv_layout: cute.Layout,
+    scratch_layout: cute.ComposedLayout,
+    tile_m: cutlass.Constexpr,
+    tile_n: cutlass.Constexpr,
     M: cutlass.Constexpr,
     N: cutlass.Constexpr,
     ragged: cutlass.Constexpr,
+    mode: cutlass.Constexpr,
     stochastic: cutlass.Constexpr,
 ):
     tidx, _, _ = cute.arch.thread_idx()
     bidx, bidy, _ = cute.arch.block_idx()
+    do_dim_k = mode != _MXS_MODE_DIM_M
+    do_dim_m = mode != _MXS_MODE_DIM_K
+    threads_per_row = tile_n // _MXS3_VPT
+    row_blocks = tile_m // 32
 
-    row = bidy * _MXS3_TM + tidx // _MXS3_TPR
-    col_start = bidx * _MXS3_TN + (tidx % _MXS3_TPR) * _MXS3_VPT
+    row = bidy * tile_m + tidx // threads_per_row
+    col_start = bidx * tile_n + (tidx % threads_per_row) * _MXS3_VPT
 
     # TWO separate 8-elem fragment loads (each a clean LDG.128), concat'd into one 16-elem rmem
     # fragment via adjacent register writes, then read back as a SINGLE 16-wide SSA value so the whole
@@ -1834,13 +1853,32 @@ def mxfp8_swizzle_v4_kernel(
     blkInput = gInput[((None, None), (bidy, bidx))]
     tidfrgInput = cute.composition(blkInput, input_tv_layout)
     thrFrg = tidfrgInput[(tidx, None)]              # this thread's 16 contiguous cols
-    blkOutput = gOutput[((None, None), (bidy, bidx))]
-    tidfrgOutput = cute.composition(blkOutput, input_tv_layout)
+    if cutlass.const_expr(do_dim_k):
+        blkOutputK = gOutputK[((None, None), (bidy, bidx))]
+        tidfrgOutputK = cute.composition(blkOutputK, input_tv_layout)
+    if cutlass.const_expr(do_dim_m):
+        smem = utils.SmemAllocator()
+        input_storage = smem.allocate_array(
+            cutlass.BFloat16, cute.cosize(scratch_layout), byte_alignment=1024
+        )
+        sScratch = cute.make_tensor(input_storage, scratch_layout)
+        tidfrgScratch = cute.composition(sScratch, input_tv_layout)
+        thrScratch = tidfrgScratch[(tidx, None)]
+        thrScratch8 = cute.tiled_divide(thrScratch, (8,))
+        tidfrgInputM = cute.composition(sScratch, input_m_tv_layout)
+        thrInputM = tidfrgInputM[(tidx, None)]
+        scratch_store_atom = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(),
+            cutlass.BFloat16,
+            num_bits_per_copy=128,
+        )
+        blkOutputM = gOutputM[((None, None), (bidx, bidy))]
+        tidfrgOutputM = cute.composition(blkOutputM, output_m_tv_layout)
 
     # The compile-time term makes every CTA take the full path for aligned shapes. For ragged shapes,
     # the remaining test is CTA-uniform and confines zero-fill/predication to boundary CTAs.
     use_full_tile = cutlass.const_expr(not ragged) or (
-        ((bidy + 1) * _MXS3_TM <= M) & ((bidx + 1) * _MXS3_TN <= N)
+        ((bidy + 1) * tile_m <= M) & ((bidx + 1) * tile_n <= N)
     )
     # Keep each complete path inside this branch: CuTe cannot carry the mutable rmem fragment across
     # dynamic control flow, and folding the bounds into per-thread load/store predicates slows every
@@ -1852,21 +1890,59 @@ def mxfp8_swizzle_v4_kernel(
         ri2[(None, 0)] = frg2[(None, 0)].load()
         ri2[(None, 1)] = frg2[(None, 1)].load()
 
-        thrInput = rIn.load().to(cutlass.Float32)
-        thrA_abs = cute.math.absf(thrInput)
-        thrA_amax16 = thrA_abs.reduce(
-            cute.ReductionOp.MAX, init_val=0.0, reduction_profile=1
-        )
-        thrA_amax32 = cute.arch.warp_reduction_max(
-            thrA_amax16, threads_in_group=_MXS3_LANES
-        )
-        rcp, biased = _e8m0(thrA_amax32)
-        tidfrgOutput[(tidx, None)] = _mxfp8_v4_quantize(
-            thrInput, rcp, mSeed, row * N + col_start, stochastic
-        )
+        if cutlass.const_expr(do_dim_m):
+            cute.copy(scratch_store_atom, ri2[(None, 0)], thrScratch8[(None, 0)])
+            cute.copy(scratch_store_atom, ri2[(None, 1)], thrScratch8[(None, 1)])
 
-        if tidx % _MXS3_LANES == 0:
-            mScaleLogical[(row, col_start // 32)] = biased.to(mScaleLogical.element_type)
+        if cutlass.const_expr(do_dim_k):
+            # Keep the original dim-K register path: no shared-memory round trip.
+            thrInput = rIn.load().to(cutlass.Float32)
+            thrA_abs = cute.math.absf(thrInput)
+            thrA_amax16 = thrA_abs.reduce(
+                cute.ReductionOp.MAX, init_val=0.0, reduction_profile=1
+            )
+            thrA_amax32 = cute.arch.warp_reduction_max(
+                thrA_amax16, threads_in_group=_MXS3_LANES
+            )
+            rcp, biased = _e8m0(thrA_amax32)
+            tidfrgOutputK[(tidx, None)] = _mxfp8_v4_quantize(
+                thrInput, rcp, mSeed, row * N + col_start, stochastic
+            )
+
+            if tidx % _MXS3_LANES == 0:
+                mScaleKLogical[(row, col_start // 32)] = biased.to(
+                    mScaleKLogical.element_type
+                )
+
+        if cutlass.const_expr(do_dim_m):
+            cute.arch.sync_threads()
+            input_m = thrInputM.load().to(cutlass.Float32)
+            amax_m16 = cute.math.absf(input_m).reduce(
+                cute.ReductionOp.MAX, init_val=0.0, reduction_profile=1
+            )
+            amax_m32 = cute.arch.warp_reduction_max(
+                amax_m16, threads_in_group=_MXS3_LANES
+            )
+            rcp_m, biased_m = _e8m0(amax_m32)
+            pair = tidx // _MXS3_LANES
+            output_row_m = bidx * tile_n + pair % tile_n
+            row_block_m = pair // tile_n
+            output_col_m = (
+                bidy * tile_m + row_block_m * 32
+                + (tidx % _MXS3_LANES) * _MXS3_VPT
+            )
+            qdata_m = _mxfp8_v4_quantize(
+                input_m,
+                rcp_m,
+                mSeed,
+                output_row_m * M + output_col_m,
+                stochastic,
+            )
+            tidfrgOutputM[(tidx, None)] = qdata_m
+            if tidx % _MXS3_LANES == 0:
+                mScaleMLogical[
+                    (output_row_m, bidy * row_blocks + row_block_m)
+                ] = biased_m.to(mScaleMLogical.element_type)
     else:
         # Every lane must participate in the reduction, but padded lanes must not dereference qdata.
         frg2 = cute.tiled_divide(thrFrg, (_MXS4_HALF,))
@@ -1878,84 +1954,188 @@ def mxfp8_swizzle_v4_kernel(
                 ri2[(None, 0)] = frg2[(None, 0)].load()
                 ri2[(None, 1)] = frg2[(None, 1)].load()
 
-        thrInput = rIn.load().to(cutlass.Float32)
-        thrA_abs = cute.math.absf(thrInput)
-        thrA_amax16 = thrA_abs.reduce(
-            cute.ReductionOp.MAX, init_val=0.0, reduction_profile=1
-        )
-        thrA_amax32 = cute.arch.warp_reduction_max(
-            thrA_amax16, threads_in_group=_MXS3_LANES
-        )
-        rcp, biased = _e8m0(thrA_amax32)
-        qdata = _mxfp8_v4_quantize(
-            thrInput, rcp, mSeed, row * N + col_start, stochastic
-        )
+        if cutlass.const_expr(do_dim_m):
+            cute.copy(scratch_store_atom, ri2[(None, 0)], thrScratch8[(None, 0)])
+            cute.copy(scratch_store_atom, ri2[(None, 1)], thrScratch8[(None, 1)])
 
-        if row < M:
-            if col_start < N:
-                tidfrgOutput[(tidx, None)] = qdata
+        if cutlass.const_expr(do_dim_k):
+            thrInput = rIn.load().to(cutlass.Float32)
+            thrA_abs = cute.math.absf(thrInput)
+            thrA_amax16 = thrA_abs.reduce(
+                cute.ReductionOp.MAX, init_val=0.0, reduction_profile=1
+            )
+            thrA_amax32 = cute.arch.warp_reduction_max(
+                thrA_amax16, threads_in_group=_MXS3_LANES
+            )
+            rcp, biased = _e8m0(thrA_amax32)
+            qdata = _mxfp8_v4_quantize(
+                thrInput, rcp, mSeed, row * N + col_start, stochastic
+            )
 
-        if tidx % _MXS3_LANES == 0:
-            col = col_start // 32
             if row < M:
                 if col_start < N:
-                    mScaleLogical[(row, col)] = biased.to(mScaleLogical.element_type)
+                    tidfrgOutputK[(tidx, None)] = qdata
+
+            if tidx % _MXS3_LANES == 0:
+                col = col_start // 32
+                if row < M:
+                    if col_start < N:
+                        mScaleKLogical[(row, col)] = biased.to(
+                            mScaleKLogical.element_type
+                        )
+                    else:
+                        mScaleKLogical[(row, col)] = cutlass.Uint8(0)
                 else:
-                    mScaleLogical[(row, col)] = cutlass.Uint8(0)
-            else:
-                mScaleLogical[(row, col)] = cutlass.Uint8(0)
+                    mScaleKLogical[(row, col)] = cutlass.Uint8(0)
+
+        if cutlass.const_expr(do_dim_m):
+            cute.arch.sync_threads()
+            input_m = thrInputM.load().to(cutlass.Float32)
+            amax_m16 = cute.math.absf(input_m).reduce(
+                cute.ReductionOp.MAX, init_val=0.0, reduction_profile=1
+            )
+            amax_m32 = cute.arch.warp_reduction_max(
+                amax_m16, threads_in_group=_MXS3_LANES
+            )
+            rcp_m, biased_m = _e8m0(amax_m32)
+            pair = tidx // _MXS3_LANES
+            output_row_m = bidx * tile_n + pair % tile_n
+            row_block_m = pair // tile_n
+            input_row_m = bidy * tile_m + row_block_m * 32
+            output_col_m = input_row_m + (tidx % _MXS3_LANES) * _MXS3_VPT
+            qdata_m = _mxfp8_v4_quantize(
+                input_m,
+                rcp_m,
+                mSeed,
+                output_row_m * M + output_col_m,
+                stochastic,
+            )
+            if output_row_m < N:
+                if input_row_m < M:
+                    tidfrgOutputM[(tidx, None)] = qdata_m
+
+            if tidx % _MXS3_LANES == 0:
+                scale_m = cutlass.Uint8(0)
+                if output_row_m < N:
+                    if input_row_m < M:
+                        scale_m = cutlass.Uint8(biased_m)
+                mScaleMLogical[
+                    (output_row_m, bidy * row_blocks + row_block_m)
+                ] = scale_m
 
 
 @cute.jit
 def mxfp8_swizzle_v4_jit(
     mInput: cute.Tensor,
-    mOutput: cute.Tensor,
-    mScale: cute.Tensor,
+    mOutputK: cute.Tensor,
+    mScaleK: cute.Tensor,
+    mOutputM: cute.Tensor,
+    mScaleM: cute.Tensor,
     mSeed: cute.Tensor,
+    tile_m: cutlass.Constexpr,
+    tile_n: cutlass.Constexpr,
     M: cutlass.Constexpr,
     N: cutlass.Constexpr,
-    ncb: cutlass.Constexpr,
+    ncb_k: cutlass.Constexpr,
+    ncb_m: cutlass.Constexpr,
+    cluster_n: cutlass.Constexpr,
+    mode: cutlass.Constexpr,
     stochastic: cutlass.Constexpr,
 ):
     padded_M = _ceil_div(M, 128) * 128
     padded_N = _ceil_div(N, 128) * 128
-    tiler_mn = (_MXS3_TM, _MXS3_TN)
+    threads_per_row = tile_n // _MXS3_VPT
+    row_blocks = tile_m // 32
+    threads_per_block = tile_m * threads_per_row
+    tiler_mn = (tile_m, tile_n)
     input_tv_layout = cute.make_layout(
-        ((_MXS3_TPR, _MXS3_TM), (_MXS3_VPT,)),
-        stride=((_MXS3_TM * _MXS3_VPT, 1), (_MXS3_TM,)),
+        ((threads_per_row, tile_m), (_MXS3_VPT,)),
+        stride=((tile_m * _MXS3_VPT, 1), (tile_m,)),
     )
     gInput = cute.zipped_divide(mInput, tiler_mn)
-    gOutput = cute.zipped_divide(mOutput, tiler_mn)
+    gOutputK = cute.zipped_divide(mOutputK, tiler_mn)
+    output_m_tiler = (tile_n, tile_m)
+    # Two adjacent threads own one transposed output row: each reads/stores 16 of its 32 values,
+    # then the same two-lane reduction used by dim-K produces their shared block scale.
+    input_m_tv_layout = cute.make_layout(
+        ((_MXS3_LANES, tile_n, row_blocks), (_MXS3_VPT,)),
+        stride=((_MXS3_VPT, tile_m, 32), (1,)),
+    )
+    output_m_tv_layout = cute.make_layout(
+        ((_MXS3_LANES, tile_n, row_blocks), (_MXS3_VPT,)),
+        stride=((_MXS3_VPT * tile_n, 1, 32 * tile_n), (tile_n,)),
+    )
+    gOutputM = cute.zipped_divide(mOutputM, output_m_tiler)
 
-    # Logical (row, 1x32-col-group) view over the physical (nrb,ncb,32,16) scale buffer. The
+    # The input is written in the original coalesced row ownership, then read down columns by pairs
+    # of threads for dim-M. Keeping this view row-major measured faster than K_SW128 for this exact
+    # 32x128 access pattern. The dim-K specialization never allocates the scratchpad.
+    scratch_layout = cute.make_composed_layout(
+        cute.make_swizzle(0, 0, 0),
+        0,
+        cute.make_layout(tiler_mn, stride=(tile_n, 1)),
+    )
+
+    # Logical (row, 1x32-col-group) views over the physical (nrb,ncb,32,16) scale buffers. The
     # hierarchical modes split row into (b, a, br) and col into (c4, bc), and their strides encode
     # the blocked/swizzled destination directly, so the kernel need not calculate a physical offset.
     # This also saves one register versus the explicit _swizzle_flat address calculation.
-    nrb = cute.size(mScale) // (ncb * 32 * 16)
-    scale_layout = cute.make_layout(
-        ((32, 4, nrb), (4, ncb)),
-        stride=((16, 4, ncb * 32 * 16), (1, 32 * 16)),
+    nrb_k = cute.size(mScaleK) // (ncb_k * 32 * 16)
+    scale_k_layout = cute.make_layout(
+        ((32, 4, nrb_k), (4, ncb_k)),
+        stride=((16, 4, ncb_k * 32 * 16), (1, 32 * 16)),
     )
-    mScaleLogical = cute.make_tensor(mScale.iterator, scale_layout)
+    mScaleKLogical = cute.make_tensor(mScaleK.iterator, scale_k_layout)
+    nrb_m = cute.size(mScaleM) // (ncb_m * 32 * 16)
+    scale_m_layout = cute.make_layout(
+        ((32, 4, nrb_m), (4, ncb_m)),
+        stride=((16, 4, ncb_m * 32 * 16), (1, 32 * 16)),
+    )
+    mScaleMLogical = cute.make_tensor(mScaleM.iterator, scale_m_layout)
 
-    mxfp8_swizzle_v4_kernel(
-        gInput, gOutput, mScaleLogical, mSeed, input_tv_layout, M, N,
+    kernel = mxfp8_swizzle_v4_kernel(
+        gInput,
+        gOutputK,
+        mScaleKLogical,
+        gOutputM,
+        mScaleMLogical,
+        mSeed,
+        input_tv_layout,
+        input_m_tv_layout,
+        output_m_tv_layout,
+        scratch_layout,
+        tile_m,
+        tile_n,
+        M,
+        N,
         M != padded_M or N != padded_N,
+        mode,
         stochastic,
-    ).launch(
-        # Walk every slot of the padded scale grid. Predicates prevent padded coordinates from
-        # touching the unpadded qdata input/output.
-        grid=(padded_N // _MXS3_TN, padded_M // _MXS3_TM, 1),
-        block=(_MXS3_THREADS, 1, 1),
     )
+    # Walk every slot of the padded scale grids. Predicates prevent padded coordinates from touching
+    # the unpadded qdata input/output. Keep dim-K's original non-clustered launch exact.
+    if cutlass.const_expr(cluster_n == 1):
+        kernel.launch(
+            grid=(padded_N // tile_n, padded_M // tile_m, 1),
+            block=(threads_per_block, 1, 1),
+        )
+    else:
+        kernel.launch(
+            grid=(padded_N // tile_n, padded_M // tile_m, 1),
+            block=(threads_per_block, 1, 1),
+            cluster=(cluster_n, 1, 1),
+        )
 
 
 def mxfp8_swizzle_v4(
     input: torch.Tensor,
+    mode: str = "dim_k",
     key: torch.Tensor | None = None,
     rounding_mode: str = "rtne",
     **kwargs,
 ):
+    """Direct-load MXFP8 cast in dim-K, dim-M, or fused dim-KM mode."""
+    assert mode in ("dim_k", "dim_m", "dim_km"), f"unsupported mode: {mode}"
     assert len(input.shape) == 2, "unsupported"
     assert input.is_contiguous(), "unsupported"
     assert input.dtype == torch.bfloat16, "v4 is bf16-only"
@@ -1970,21 +2150,95 @@ def mxfp8_swizzle_v4(
         assert key is None, "RTNE rounding does not use a Philox key"
     M, N = input.shape
     assert M > 0 and N > 0, "v4 requires non-empty dimensions"
-    assert N % 32 == 0, "v4 requires K % 32 == 0"
-    ngc = N // 32
-    nrb, ncb = _ceil_div(M, 128), _ceil_div(ngc, 4)
-    output = torch.empty(M, N, dtype=torch.float8_e4m3fn, device=input.device)
-    scale = torch.empty(nrb * ncb * 32 * 16, dtype=torch.uint8, device=input.device)
+    do_dim_k = mode != "dim_m"
+    do_dim_m = mode != "dim_k"
+    # A sweep over all 32/64/128 tile pairs found the original 32x128 tile best for both dim-M and
+    # dim-KM across square and rectangular 2K--16K shapes, so every specialization keeps it.
+    tile_m, tile_n = _MXS3_TM, _MXS3_TN
+    assert tile_m % 32 == 0 and tile_n % 32 == 0, "unsupported v4 tile"
+    assert 128 % tile_m == 0 and 128 % tile_n == 0, "v4 tile must divide scale atom"
+    assert tile_m * tile_n // _MXS3_VPT <= 1024, "v4 tile exceeds CTA size"
+    grid_n = _ceil_div(N, 128) * 128 // tile_n
+    if mode == "dim_k":
+        cluster_n = 1
+    else:
+        # A two-CTA N-oriented cluster consistently trims launch/locality overhead through 8M
+        # elements. Larger grids are fastest without clustering.
+        cluster_n = 2 if M * N <= 2048 * 4096 and grid_n % 2 == 0 else 1
+    assert cluster_n in (1, 2, 4, 8, 16), "unsupported v4 cluster"
+    assert grid_n % cluster_n == 0, "v4 N grid must be divisible by cluster size"
+    if do_dim_k:
+        assert N % 32 == 0, "v4 dim-K requires N % 32 == 0"
+    if do_dim_m:
+        assert M % 32 == 0, "v4 dim-M requires M % 32 == 0"
+        assert N % 16 == 0, "v4 dim-M requires N % 16 == 0"
+
+    if do_dim_k:
+        nrb_k, ncb_k = _ceil_div(M, 128), _ceil_div(N // 32, 4)
+        output_k = torch.empty(
+            M, N, dtype=torch.float8_e4m3fn, device=input.device
+        )
+        scale_k = torch.empty(
+            nrb_k * ncb_k * 32 * 16, dtype=torch.uint8, device=input.device
+        )
+        output_k_cute = from_dlpack(output_k, assumed_align=16)
+        scale_k_cute = from_dlpack(scale_k)
+    if do_dim_m:
+        nrb_m, ncb_m = _ceil_div(N, 128), _ceil_div(M // 32, 4)
+        output_m = torch.empty(
+            N, M, dtype=torch.float8_e4m3fn, device=input.device
+        )
+        scale_m = torch.empty(
+            nrb_m * ncb_m * 32 * 16, dtype=torch.uint8, device=input.device
+        )
+        output_m_cute = from_dlpack(output_m, assumed_align=16)
+        scale_m_cute = from_dlpack(scale_m)
+    if not do_dim_k:
+        nrb_k, ncb_k = nrb_m, ncb_m
+        output_k, scale_k = output_m, scale_m
+        output_k_cute, scale_k_cute = output_m_cute, scale_m_cute
+    if not do_dim_m:
+        nrb_m, ncb_m = nrb_k, ncb_k
+        output_m, scale_m = output_k, scale_k
+        output_m_cute, scale_m_cute = output_k_cute, scale_k_cute
+
     input_cute = from_dlpack(input, assumed_align=16)
-    output_cute = from_dlpack(output, assumed_align=16)
-    scale_cute = from_dlpack(scale)
     # RTNE's compile-time branch never reads mSeed, so reuse an existing tensor as its dummy kernel
     # argument and avoid allocating any RNG state on the default path.
-    seed_cute = from_dlpack(key.reshape(-1).view(torch.int64)) if stochastic else scale_cute
-    mxfp8_swizzle_v4_jit(
-        input_cute, output_cute, scale_cute, seed_cute, M, N, ncb, stochastic
+    seed_cute = (
+        from_dlpack(key.reshape(-1).view(torch.int64))
+        if stochastic
+        else scale_k_cute
     )
-    return output, scale.view(nrb, ncb, 32, 16).view(torch.float8_e8m0fnu)
+    mode_id = {
+        "dim_k": _MXS_MODE_DIM_K,
+        "dim_m": _MXS_MODE_DIM_M,
+        "dim_km": _MXS_MODE_DIM_KM,
+    }[mode]
+    mxfp8_swizzle_v4_jit(
+        input_cute,
+        output_k_cute,
+        scale_k_cute,
+        output_m_cute,
+        scale_m_cute,
+        seed_cute,
+        tile_m,
+        tile_n,
+        M,
+        N,
+        ncb_k,
+        ncb_m,
+        cluster_n,
+        mode_id,
+        stochastic,
+    )
+    scale_m = scale_m.view(nrb_m, ncb_m, 32, 16).view(torch.float8_e8m0fnu)
+    if mode == "dim_m":
+        return output_m, scale_m
+    scale_k = scale_k.view(nrb_k, ncb_k, 32, 16).view(torch.float8_e8m0fnu)
+    if mode == "dim_km":
+        return output_k, scale_k, output_m, scale_m
+    return output_k, scale_k
 
 
 MXFP8_SWIZZLE_V4 = QuantCastCuteRecipe.from_gold(
@@ -1992,9 +2246,47 @@ MXFP8_SWIZZLE_V4 = QuantCastCuteRecipe.from_gold(
 )
 
 
+def _mxfp8_swizzle_sr_v4(input, key, **kwargs):
+    return mxfp8_swizzle_v4(
+        input, mode="dim_k", key=key, rounding_mode="stochastic", **kwargs
+    )
+
+
 MXFP8_SWIZZLE_SR_V4 = QuantCastCuteRecipe.from_gold(
     Mxfp8SwizzleSRGold,
-    cute_fn=partial(mxfp8_swizzle_v4, rounding_mode="stochastic"),
+    cute_fn=_mxfp8_swizzle_sr_v4,
+)
+
+
+MXFP8_DIM_M_SWIZZLE_V4 = QuantCastCuteRecipe.from_gold(
+    Mxfp8DimMSwizzleGold, cute_fn=partial(mxfp8_swizzle_v4, mode="dim_m")
+)
+
+
+def _mxfp8_dim_m_swizzle_sr_v4(input, key, **kwargs):
+    return mxfp8_swizzle_v4(
+        input, mode="dim_m", key=key, rounding_mode="stochastic", **kwargs
+    )
+
+
+MXFP8_DIM_M_SWIZZLE_SR_V4 = QuantCastCuteRecipe.from_gold(
+    Mxfp8DimMSwizzleSRGold, cute_fn=_mxfp8_dim_m_swizzle_sr_v4
+)
+
+
+MXFP8_DIM_KM_SWIZZLE_V4 = QuantCastCuteRecipe.from_gold(
+    Mxfp8DimKmSwizzleGold, cute_fn=partial(mxfp8_swizzle_v4, mode="dim_km")
+)
+
+
+def _mxfp8_dim_km_swizzle_sr_v4(input, key, **kwargs):
+    return mxfp8_swizzle_v4(
+        input, mode="dim_km", key=key, rounding_mode="stochastic", **kwargs
+    )
+
+
+MXFP8_DIM_KM_SWIZZLE_SR_V4 = QuantCastCuteRecipe.from_gold(
+    Mxfp8DimKmSwizzleSRGold, cute_fn=_mxfp8_dim_km_swizzle_sr_v4
 )
 
 
@@ -2270,9 +2562,6 @@ MXFP8_SWIZZLE_V5 = QuantCastCuteRecipe.from_gold(
 # qdata conversion changes to Philox plus Blackwell cvt.rs.e4m3x4.
 _MXS_TM, _MXS_MAX_TN, _MXS_WARPS = 128, 128, 4
 _MXS_THREADS = _MXS_WARPS * 32                       # 128, one thread per tile row
-_MXS_MODE_DIM_K = 0
-_MXS_MODE_DIM_M = 1
-_MXS_MODE_DIM_KM = 2
 
 
 def _mxfp8_swizzle_v2_tile_n(M, N):
@@ -3145,6 +3434,10 @@ ALL_RECIPES = [
     ("mxfp8_swizzle_v3", MXFP8_SWIZZLE_V3),
     ("mxfp8_swizzle_v4", MXFP8_SWIZZLE_V4),
     ("mxfp8_swizzle_sr_v4", MXFP8_SWIZZLE_SR_V4),
+    ("mxfp8_dim_m_swizzle_v4", MXFP8_DIM_M_SWIZZLE_V4),
+    ("mxfp8_dim_m_swizzle_sr_v4", MXFP8_DIM_M_SWIZZLE_SR_V4),
+    ("mxfp8_dim_km_swizzle_v4", MXFP8_DIM_KM_SWIZZLE_V4),
+    ("mxfp8_dim_km_swizzle_sr_v4", MXFP8_DIM_KM_SWIZZLE_SR_V4),
     ("mxfp8_swizzle_v5", MXFP8_SWIZZLE_V5),
     ("mxfp8_dim_m_swizzle_v2", MXFP8_DIM_M_SWIZZLE_V2),
     ("mxfp8_dim_m_swizzle_sr_v2", MXFP8_DIM_M_SWIZZLE_SR_V2),

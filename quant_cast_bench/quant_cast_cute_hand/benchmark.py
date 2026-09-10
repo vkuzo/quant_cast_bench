@@ -347,7 +347,7 @@ def _bench_mxfp8_swizzle_sr_v4(M, K):
     key = prng.key(0, device=x.device)
 
     def run():
-        return mxfp8_swizzle_v4(x, key, rounding_mode="stochastic")
+        return mxfp8_swizzle_v4(x, key=key, rounding_mode="stochastic")
 
     q, s = run()
     torch.cuda.synchronize()
@@ -412,15 +412,19 @@ def _bench_mxfp8_dim_m_swizzle_v2(M, K):
     )
 
 
-def _bench_mxfp8_dim_m_swizzle_sr_v2(M, K):
+def _bench_mxfp8_dim_m_swizzle_v4(M, K):
+    return _bench_mxfp8_dim_m_swizzle_impl(
+        M, K, lambda x: mxfp8_swizzle_v4(x, mode="dim_m")
+    )
+
+
+def _bench_mxfp8_dim_m_swizzle_sr_impl(M, K, kernel_fn):
     torch.manual_seed(0)
     x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
     key = prng.key(0, device=x.device)
 
     def run():
-        return mxfp8_swizzle_v2(
-            x, mode="dim_m", key=key, rounding_mode="stochastic"
-        )
+        return kernel_fn(x, key)
 
     outputs = run()
     torch.cuda.synchronize()
@@ -433,6 +437,26 @@ def _bench_mxfp8_dim_m_swizzle_sr_v2(M, K):
         output.numel() * output.element_size() for output in outputs
     )
     return run, bytes_per_iter
+
+
+def _bench_mxfp8_dim_m_swizzle_sr_v2(M, K):
+    return _bench_mxfp8_dim_m_swizzle_sr_impl(
+        M,
+        K,
+        lambda x, key: mxfp8_swizzle_v2(
+            x, mode="dim_m", key=key, rounding_mode="stochastic"
+        ),
+    )
+
+
+def _bench_mxfp8_dim_m_swizzle_sr_v4(M, K):
+    return _bench_mxfp8_dim_m_swizzle_sr_impl(
+        M,
+        K,
+        lambda x, key: mxfp8_swizzle_v4(
+            x, mode="dim_m", key=key, rounding_mode="stochastic"
+        ),
+    )
 
 
 def _bench_mxfp8_dim_km_swizzle_impl(M, K, kernel_fn):
@@ -461,15 +485,19 @@ def _bench_mxfp8_dim_km_swizzle_v2(M, K):
     )
 
 
-def _bench_mxfp8_dim_km_swizzle_sr_v2(M, K):
+def _bench_mxfp8_dim_km_swizzle_v4(M, K):
+    return _bench_mxfp8_dim_km_swizzle_impl(
+        M, K, lambda x: mxfp8_swizzle_v4(x, mode="dim_km")
+    )
+
+
+def _bench_mxfp8_dim_km_swizzle_sr_impl(M, K, kernel_fn):
     torch.manual_seed(0)
     x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
     key = prng.key(0, device=x.device)
 
     def run():
-        return mxfp8_swizzle_v2(
-            x, mode="dim_km", key=key, rounding_mode="stochastic"
-        )
+        return kernel_fn(x, key)
 
     outputs = run()
     torch.cuda.synchronize()
@@ -482,6 +510,26 @@ def _bench_mxfp8_dim_km_swizzle_sr_v2(M, K):
         output.numel() * output.element_size() for output in outputs
     )
     return run, bytes_per_iter
+
+
+def _bench_mxfp8_dim_km_swizzle_sr_v2(M, K):
+    return _bench_mxfp8_dim_km_swizzle_sr_impl(
+        M,
+        K,
+        lambda x, key: mxfp8_swizzle_v2(
+            x, mode="dim_km", key=key, rounding_mode="stochastic"
+        ),
+    )
+
+
+def _bench_mxfp8_dim_km_swizzle_sr_v4(M, K):
+    return _bench_mxfp8_dim_km_swizzle_sr_impl(
+        M,
+        K,
+        lambda x, key: mxfp8_swizzle_v4(
+            x, mode="dim_km", key=key, rounding_mode="stochastic"
+        ),
+    )
 
 
 def _bench_transpose_v0(M, K):
@@ -540,6 +588,10 @@ _KERNELS = {
     "mxfp8_dim_m_swizzle_sr_v2": _bench_mxfp8_dim_m_swizzle_sr_v2,
     "mxfp8_dim_km_swizzle_v2": _bench_mxfp8_dim_km_swizzle_v2,
     "mxfp8_dim_km_swizzle_sr_v2": _bench_mxfp8_dim_km_swizzle_sr_v2,
+    "mxfp8_dim_m_swizzle_v4": _bench_mxfp8_dim_m_swizzle_v4,
+    "mxfp8_dim_m_swizzle_sr_v4": _bench_mxfp8_dim_m_swizzle_sr_v4,
+    "mxfp8_dim_km_swizzle_v4": _bench_mxfp8_dim_km_swizzle_v4,
+    "mxfp8_dim_km_swizzle_sr_v4": _bench_mxfp8_dim_km_swizzle_sr_v4,
     "transpose_v0": _bench_transpose_v0,
     "transpose_v1": _bench_transpose_v1,
 }
