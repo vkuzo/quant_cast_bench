@@ -339,7 +339,7 @@ def _bench_mxfp8_swizzle_sr_v2(M, K):
     return run, bytes_per_iter
 
 
-def _bench_mxfp8_swizzle_v4_stochastic(M, K):
+def _bench_mxfp8_swizzle_sr_v4(M, K):
     # Same v4 kernel and launch geometry, with its compile-time stochastic specialization. Each
     # thread generates one Philox counter and uses four cvt.rs.e4m3x4 instructions for its 16 values.
     torch.manual_seed(0)
@@ -534,7 +534,7 @@ _KERNELS = {
     "mxfp8_swizzle_sr_v2": _bench_mxfp8_swizzle_sr_v2,
     "mxfp8_swizzle_v3": _bench_mxfp8_swizzle_v3,
     "mxfp8_swizzle_v4": _bench_mxfp8_swizzle_v4,
-    "mxfp8_swizzle_v4_stochastic": _bench_mxfp8_swizzle_v4_stochastic,
+    "mxfp8_swizzle_sr_v4": _bench_mxfp8_swizzle_sr_v4,
     "mxfp8_swizzle_v5": _bench_mxfp8_swizzle_v5,
     "mxfp8_dim_m_swizzle_v2": _bench_mxfp8_dim_m_swizzle_v2,
     "mxfp8_dim_m_swizzle_sr_v2": _bench_mxfp8_dim_m_swizzle_sr_v2,

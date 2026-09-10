@@ -1992,7 +1992,7 @@ MXFP8_SWIZZLE_V4 = QuantCastCuteRecipe.from_gold(
 )
 
 
-MXFP8_SWIZZLE_V4_STOCHASTIC = QuantCastCuteRecipe.from_gold(
+MXFP8_SWIZZLE_SR_V4 = QuantCastCuteRecipe.from_gold(
     Mxfp8SwizzleSRGold,
     cute_fn=partial(mxfp8_swizzle_v4, rounding_mode="stochastic"),
 )
@@ -3144,7 +3144,7 @@ ALL_RECIPES = [
     ("mxfp8_swizzle_sr_v2", MXFP8_SWIZZLE_SR_V2),
     ("mxfp8_swizzle_v3", MXFP8_SWIZZLE_V3),
     ("mxfp8_swizzle_v4", MXFP8_SWIZZLE_V4),
-    ("mxfp8_swizzle_v4_stochastic", MXFP8_SWIZZLE_V4_STOCHASTIC),
+    ("mxfp8_swizzle_sr_v4", MXFP8_SWIZZLE_SR_V4),
     ("mxfp8_swizzle_v5", MXFP8_SWIZZLE_V5),
     ("mxfp8_dim_m_swizzle_v2", MXFP8_DIM_M_SWIZZLE_V2),
     ("mxfp8_dim_m_swizzle_sr_v2", MXFP8_DIM_M_SWIZZLE_SR_V2),

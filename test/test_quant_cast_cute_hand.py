@@ -62,7 +62,7 @@ _REQUIRES_SM100 = frozenset({
     "mxfp8_swizzle_sr_v2",
     "mxfp8_swizzle_v3",
     "mxfp8_swizzle_v4",
-    "mxfp8_swizzle_v4_stochastic",
+    "mxfp8_swizzle_sr_v4",
     "mxfp8_swizzle_v5",
     "mxfp8_dim_m_swizzle_v2",
     "mxfp8_dim_m_swizzle_sr_v2",
@@ -306,10 +306,10 @@ def test_mxfp8_swizzle_v4():
     recipe.correctness_fn(inputs, outputs)
 
 
-def test_mxfp8_swizzle_v4_stochastic_folded_key_and_padding():
+def test_mxfp8_swizzle_sr_v4_folded_key_and_padding():
     if torch.cuda.get_device_capability() != (10, 0):
         pytest.skip("v4 stochastic rounding emits Blackwell-only PTX; requires cuda capability 10.0")
-    recipe = _get_recipe("mxfp8_swizzle_v4_stochastic")
+    recipe = _get_recipe("mxfp8_swizzle_sr_v4")
     x, _ = recipe.example_input_fn(129, 160)
     x[0, :8] = torch.tensor(
         [448.0, -448.0, 0.0, -0.0, 2.0**-9, -(2.0**-9), 2.0**-10, -(2.0**-10)],
