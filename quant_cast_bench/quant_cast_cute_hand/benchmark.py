@@ -7,6 +7,10 @@ device name). We build a bf16 (M, K) input, run the selected kernel, time it wit
 
     python -m quant_cast_bench.quant_cast_cute_hand.benchmark --kernel add_v0
     python -m quant_cast_bench.quant_cast_cute_hand.benchmark --kernel add_v0 --M 8192 --K 8192
+    python -m quant_cast_bench.quant_cast_cute_hand.benchmark --kernel add_v0 \
+        --M 2048,4096,8192 --K 2048,4096,8192
+    python -m quant_cast_bench.quant_cast_cute_hand.benchmark --kernel add_v0 \
+        --M 2048,4096 --K 2048,4096 --output_metrics gpu_time_ms,tb_s,pct_peak
 """
 
 import os
@@ -534,20 +538,26 @@ _KERNELS = {
 }
 
 
-def main(
-    kernel: str = "add_v0",
-    M: int = 16384,
-    K: int = 16384,
-):
-    """Benchmark one handwritten CuTeDSL kernel and print GPU time + achieved memory bandwidth."""
-    device_name = torch.cuda.get_device_name(0)
-    peak_bw = _peak_bw_gbps(device_name)
+def _parse_sizes(value: str, name: str) -> list[int]:
+    """Parse one integer or a comma-separated list of integers."""
+    items = str(value).split(",")
+    if any(not item.strip() for item in items):
+        raise ValueError(
+            f"{name} must be an integer or comma-separated integers, got {value!r}"
+        )
+    try:
+        sizes = [int(item) for item in items]
+    except ValueError as exc:
+        raise ValueError(
+            f"{name} must be an integer or comma-separated integers, got {value!r}"
+        ) from exc
+    if any(size <= 0 for size in sizes):
+        raise ValueError(f"{name} values must be positive, got {value!r}")
+    return sizes
 
-    if kernel not in _KERNELS:
-        raise ValueError(f"unknown kernel {kernel!r}; have {sorted(_KERNELS)}")
 
+def _benchmark_one(kernel: str, M: int, K: int, peak_bw: float):
     run, bytes_per_iter = _KERNELS[kernel](M, K)
-
     # warm up so first-call costs (compile, autotune, allocator) don't leak into the timing.
     for _ in range(2):
         run()
@@ -556,14 +566,91 @@ def main(
     gpu_time_ms = do_bench_using_profiling(run)
     gbps = bytes_per_iter / (gpu_time_ms * 1e-3) / 1e9
     pct_peak = gbps / peak_bw * 100
+    return gpu_time_ms, gbps, pct_peak
 
-    print(f"kernel: {kernel}  shape: ({M}, {K})  dtype: bfloat16")
+
+_OUTPUT_METRICS = ("gpu_time_ms", "tb_s", "pct_peak")
+
+
+def _parse_output_metrics(value: str) -> list[str]:
+    metrics = [item.strip() for item in str(value).split(",")]
+    if any(not metric for metric in metrics):
+        raise ValueError(
+            "output_metrics must be a comma-separated combination of "
+            f"{_OUTPUT_METRICS}, got {value!r}"
+        )
+    invalid = [metric for metric in metrics if metric not in _OUTPUT_METRICS]
+    if invalid:
+        raise ValueError(
+            f"unsupported output metrics {invalid}; choose from {_OUTPUT_METRICS}"
+        )
+    return list(dict.fromkeys(metrics))
+
+
+def _format_metric(result, metric: str) -> str:
+    gpu_time_ms, gbps, pct_peak = result
+    if metric == "gpu_time_ms":
+        return f"{gpu_time_ms:.4f}"
+    if metric == "tb_s":
+        return f"{gbps / 1000:.3f}"
+    return f"{pct_peak:.1f}%"
+
+
+@fire.decorators.SetParseFns(M=str, K=str, output_metrics=str)
+def main(
+    kernel: str = "add_v0",
+    M: str = "16384",
+    K: str = "16384",
+    output_metrics: str = "tb_s",
+):
+    """Benchmark one handwritten CuTeDSL kernel over one shape or an M-by-K shape grid."""
+    device_name = torch.cuda.get_device_name(0)
+    peak_bw = _peak_bw_gbps(device_name)
+
+    if kernel not in _KERNELS:
+        raise ValueError(f"unknown kernel {kernel!r}; have {sorted(_KERNELS)}")
+
+    m_values = _parse_sizes(M, "M")
+    k_values = _parse_sizes(K, "K")
+    metrics = _parse_output_metrics(output_metrics)
+    results = {
+        (m, k): _benchmark_one(kernel, m, k, peak_bw)
+        for m in m_values
+        for k in k_values
+    }
+
+    if len(m_values) > 1 or len(k_values) > 1:
+        print(f"kernel: {kernel}  dtype: bfloat16")
+        print(f"device: {device_name} (peak {peak_bw / 1000:.2f} TB/s)")
+        for metric_index, metric in enumerate(metrics):
+            if metric_index:
+                print()
+            print(f"metric: {metric}")
+            rows = []
+            for m in m_values:
+                rows.append(
+                    [m]
+                    + [_format_metric(results[(m, k)], metric) for k in k_values]
+                )
+            print(
+                tabulate.tabulate(
+                    rows,
+                    headers=["M \\ K", *k_values],
+                    colalign=("right",) * (len(k_values) + 1),
+                )
+            )
+        return
+
+    m, k = m_values[0], k_values[0]
+    result = results[(m, k)]
+
+    print(f"kernel: {kernel}  shape: ({m}, {k})  dtype: bfloat16")
     print(f"device: {device_name} (peak {peak_bw / 1000:.2f} TB/s)")
     print(
         tabulate.tabulate(
-            [[kernel, f"{gpu_time_ms:.4f}", f"{gbps:.1f}", f"{pct_peak:.1f}%"]],
-            headers=["kernel", "gpu_time_ms", "gbps", "pct_peak"],
-            colalign=("left", "right", "right", "right"),
+            [[kernel, *[_format_metric(result, metric) for metric in metrics]]],
+            headers=["kernel", *metrics],
+            colalign=("left",) + ("right",) * len(metrics),
         )
     )
 
