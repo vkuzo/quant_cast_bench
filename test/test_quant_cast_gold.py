@@ -22,6 +22,10 @@ from quant_cast_bench.quant_cast_gold.recipes import (
     _compute_error,
     hadamard_rht_matrix,
     hadamard_rht_f,
+    mxfp8_dim_km_swizzle_f,
+    mxfp8_dim_km_swizzle_sr_f,
+    mxfp8_dim_m_swizzle_f,
+    mxfp8_dim_m_swizzle_sr_f,
     mxfp8_swizzle_f,
     mxfp8_swizzle_sr_f,
     nvfp4_gs_scale,
@@ -65,6 +69,37 @@ def test_mxfp8_swizzle_sr_reproducible_and_preserves_scale():
     assert torch.equal(scale0.view(torch.uint8), scale1.view(torch.uint8))
     assert torch.equal(scale0.view(torch.uint8), scale_rtne.view(torch.uint8))
     assert not torch.equal(q0.view(torch.uint8), q_rtne.view(torch.uint8))
+
+
+@pytest.mark.parametrize(
+    "sr_fn,rtne_fn",
+    [
+        (mxfp8_dim_m_swizzle_sr_f, mxfp8_dim_m_swizzle_f),
+        (mxfp8_dim_km_swizzle_sr_f, mxfp8_dim_km_swizzle_f),
+    ],
+)
+def test_mxfp8_dim_m_modes_sr_reproducible_and_preserve_scales(sr_fn, rtne_fn):
+    x = torch.randn(96, 160, dtype=torch.bfloat16, device="cuda")
+    key = prng.fold_in(prng.key(7, device=x.device), 12345)
+
+    outputs0 = sr_fn(x, key)
+    outputs1 = sr_fn(x, key)
+    rtne_outputs = rtne_fn(x)
+
+    for output0, output1 in zip(outputs0, outputs1):
+        assert torch.equal(output0.view(torch.uint8), output1.view(torch.uint8))
+    for index in range(1, len(outputs0), 2):
+        assert torch.equal(
+            outputs0[index].view(torch.uint8),
+            rtne_outputs[index].view(torch.uint8),
+        )
+    assert any(
+        not torch.equal(
+            outputs0[index].view(torch.uint8),
+            rtne_outputs[index].view(torch.uint8),
+        )
+        for index in range(0, len(outputs0), 2)
+    )
 
 
 # ===========================================================================

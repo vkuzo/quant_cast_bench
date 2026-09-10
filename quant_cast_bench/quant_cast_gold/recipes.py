@@ -1180,6 +1180,23 @@ def mxfp8_dim_m_swizzle_f(x, **kwargs):
     return qdata, _to_blocked_4d(scale_e8m0)
 
 
+def mxfp8_dim_m_swizzle_sr_f(x, key, **kwargs):
+    """``mxfp8_dim_m_swizzle_f`` with NVIDIA SM100 stochastic rounding for qdata.
+
+    Random words follow the flattened transposed ``(N, M)`` output. This is the contiguous order
+    used by the dim-M kernel: one output row contains consecutive 32-element reduction blocks.
+    """
+    M, N = x.shape
+    x_b = x.reshape(M // 32, 32, N)
+    amax = x_b.abs().amax(dim=1, keepdim=True)
+    scale_e8m0 = _amax_to_e8m0_rceil(amax)
+    scaled = (
+        x_b.to(torch.float32) * _e8m0_scale_to_reciprocal_fp32(scale_e8m0)
+    ).reshape(M, N).t().contiguous()
+    qdata = _f32_to_fp8_nvidia_sr(scaled, key)
+    return qdata, _to_blocked_4d(scale_e8m0.squeeze(1).t().contiguous())
+
+
 def mxfp8_dim_m_swizzle_dq_f(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     # not a dataclass field -- inverse for the correctness check / consumers. `q` is (N, M) in
     # the transposed dim-M frame, so its 32-blocks run along the last (M) axis; reuse
@@ -1210,6 +1227,22 @@ Mxfp8DimMSwizzleGold = QuantCastSingleKernelGold(
 )
 
 
+def _mxfp8_dim_m_swizzle_sr_correctness(
+    inputs: Tuple[torch.Tensor, torch.Tensor],
+    outputs: Tuple[torch.Tensor, torch.Tensor],
+) -> None:
+    x, _key = inputs
+    _mxfp8_dim_m_swizzle_correctness((x,), outputs)
+
+
+Mxfp8DimMSwizzleSRGold = QuantCastSingleKernelGold(
+    pt_ref_fn=mxfp8_dim_m_swizzle_sr_f,
+    correctness_fn=_mxfp8_dim_m_swizzle_sr_correctness,
+    example_input_fn=_mxfp8_swizzle_sr_inputs,
+    perf_description="(32,1) block, t-contig, NVIDIA cvt.rs SR numerics, swizzle",
+)
+
+
 # ---------------------------------------------------------------------------
 # Golden recipe: mxfp8 in BOTH directions (one pass), with BOTH e8m0 scales in the swizzled
 # (NVIDIA 32x4x4 blocked) layout. Combines mxfp8_dim_km_f (dim-K -> qk (M,N) + sk (M,N//32);
@@ -1223,6 +1256,20 @@ def mxfp8_dim_km_swizzle_f(x, **kwargs):
     `(nrb, ncb, 32, 16)` of sk (M,N//32) / sm (N,M//32)."""
     qk, sk, qm, sm = mxfp8_dim_km_f(x)
     return qk, _to_blocked_4d(sk), qm, _to_blocked_4d(sm)
+
+
+def mxfp8_dim_km_swizzle_sr_f(x, key, **kwargs):
+    """Both orientations of ``mxfp8_dim_km_swizzle_f`` with NVIDIA SM100 qdata SR.
+
+    The two orientations share the caller's Philox key, and each indexes that stream by its own
+    flattened output position: ``(M, N)`` for dim-K and transposed ``(N, M)`` for dim-M.
+
+    TODO(future): do not reuse flat indices between dim-k and dim-m, instead start dim-m flat index
+    at M*N.
+    """
+    qk, sk = mxfp8_swizzle_sr_f(x, key)
+    qm, sm = mxfp8_dim_m_swizzle_sr_f(x, key)
+    return qk, sk, qm, sm
 
 
 def _mxfp8_dim_km_swizzle_correctness(
@@ -1249,6 +1296,25 @@ Mxfp8DimKmSwizzleGold = QuantCastSingleKernelGold(
     correctness_fn=_mxfp8_dim_km_swizzle_correctness,
     example_input_fn=lambda M, K: (torch.randn(M, K, dtype=torch.bfloat16, device="cuda"),),
     perf_description="(1,32) dim-k + (32,1) dim-m, one pass, t-contig, swizzle",
+)
+
+
+def _mxfp8_dim_km_swizzle_sr_correctness(
+    inputs: Tuple[torch.Tensor, torch.Tensor],
+    outputs: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+) -> None:
+    x, _key = inputs
+    _mxfp8_dim_km_swizzle_correctness((x,), outputs)
+
+
+Mxfp8DimKmSwizzleSRGold = QuantCastSingleKernelGold(
+    pt_ref_fn=mxfp8_dim_km_swizzle_sr_f,
+    correctness_fn=_mxfp8_dim_km_swizzle_sr_correctness,
+    example_input_fn=_mxfp8_swizzle_sr_inputs,
+    perf_description=(
+        "(1,32) dim-k + (32,1) dim-m, one pass, NVIDIA cvt.rs SR numerics, "
+        "t-contig, swizzle"
+    ),
 )
 
 
@@ -2330,10 +2396,12 @@ ALL_RECIPES = [
     # 8-bit 1D, dim-m reduction
     ("mxfp8_dim_m", Mxfp8DimMGold),
     ("mxfp8_dim_m_swizzle", Mxfp8DimMSwizzleGold),
+    ("mxfp8_dim_m_swizzle_sr", Mxfp8DimMSwizzleSRGold),
     ("fp8_deepseek_1x128_dim_m", Deepseek1x128DimMGold),
     # 8-bit 1D, dim-km reduction 
     ("mxfp8_dim_km", Mxfp8DimKmGold),
     ("mxfp8_dim_km_swizzle", Mxfp8DimKmSwizzleGold),
+    ("mxfp8_dim_km_swizzle_sr", Mxfp8DimKmSwizzleSRGold),
     ("fp8_deepseek_1x128_dim_km", Deepseek1x128DimKmGold),
     # 8-bit 2D
     ("mxfp8_32x32", Mxfp832x32ExpandGold),

@@ -65,7 +65,9 @@ _REQUIRES_SM100 = frozenset({
     "mxfp8_swizzle_v4_stochastic",
     "mxfp8_swizzle_v5",
     "mxfp8_dim_m_swizzle_tma",
+    "mxfp8_dim_m_swizzle_tma_stochastic",
     "mxfp8_dim_km_swizzle_tma",
+    "mxfp8_dim_km_swizzle_tma_stochastic",
 })
 
 def _get_recipe(recipe_name):
@@ -170,12 +172,27 @@ def test_mxfp8_swizzle_v2_stochastic_folded_key_and_padding():
     assert qdata_and_scale_equal(outputs[1], ref_outputs[1])
 
 
-@pytest.mark.parametrize("mode", ["dim_m", "dim_km"])
-def test_mxfp8_swizzle_v2_stochastic_rejects_non_dim_k(mode):
-    x = torch.randn(128, 128, dtype=torch.bfloat16, device="cuda")
-    key = prng.key(0, device=x.device)
-    with pytest.raises(AssertionError, match="only mode='dim_k'"):
-        mxfp8_swizzle_v2(x, mode=mode, key=key, rounding_mode="stochastic")
+@pytest.mark.parametrize(
+    "mode,recipe_name,M,N",
+    [
+        ("dim_m", "mxfp8_dim_m_swizzle_tma_stochastic", 96, 144),
+        ("dim_km", "mxfp8_dim_km_swizzle_tma_stochastic", 96, 160),
+    ],
+)
+def test_mxfp8_swizzle_v2_stochastic_dim_m_modes(mode, recipe_name, M, N):
+    if torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip("v2 stochastic rounding emits Blackwell-only PTX; requires cuda capability 10.0")
+    recipe = _get_recipe(recipe_name)
+    x, _ = recipe.example_input_fn(M, N)
+    key = prng.fold_in(prng.key(7, device=x.device), 12345)
+
+    outputs = mxfp8_swizzle_v2(
+        x, mode=mode, key=key, rounding_mode="stochastic"
+    )
+    ref_outputs = recipe.pt_ref_fn(x, key)
+    assert len(outputs) == len(ref_outputs)
+    for output, ref_output in zip(outputs, ref_outputs):
+        assert qdata_and_scale_equal(output, ref_output)
 
 
 @pytest.mark.parametrize(
