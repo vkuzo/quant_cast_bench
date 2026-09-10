@@ -59,15 +59,15 @@ torch.manual_seed(0)
 _REQUIRES_SM100 = frozenset({
     "mxfp8_swizzle",
     "mxfp8_swizzle_v2",
-    "mxfp8_swizzle_v2_stochastic",
+    "mxfp8_swizzle_sr_v2",
     "mxfp8_swizzle_v3",
     "mxfp8_swizzle_v4",
     "mxfp8_swizzle_v4_stochastic",
     "mxfp8_swizzle_v5",
-    "mxfp8_dim_m_swizzle_tma",
-    "mxfp8_dim_m_swizzle_tma_stochastic",
-    "mxfp8_dim_km_swizzle_tma",
-    "mxfp8_dim_km_swizzle_tma_stochastic",
+    "mxfp8_dim_m_swizzle_v2",
+    "mxfp8_dim_m_swizzle_sr_v2",
+    "mxfp8_dim_km_swizzle_v2",
+    "mxfp8_dim_km_swizzle_sr_v2",
 })
 
 def _get_recipe(recipe_name):
@@ -154,10 +154,10 @@ def test_mxfp8_swizzle_v2(M, K):
     recipe.correctness_fn(inputs, outputs)
 
 
-def test_mxfp8_swizzle_v2_stochastic_folded_key_and_padding():
+def test_mxfp8_swizzle_sr_v2_folded_key_and_padding():
     if torch.cuda.get_device_capability() != (10, 0):
         pytest.skip("v2 stochastic rounding emits Blackwell-only PTX; requires cuda capability 10.0")
-    recipe = _get_recipe("mxfp8_swizzle_v2_stochastic")
+    recipe = _get_recipe("mxfp8_swizzle_sr_v2")
     x, _ = recipe.example_input_fn(129, 160)
     x[0, :8] = torch.tensor(
         [448.0, -448.0, 0.0, -0.0, 2.0**-9, -(2.0**-9), 2.0**-10, -(2.0**-10)],
@@ -175,11 +175,11 @@ def test_mxfp8_swizzle_v2_stochastic_folded_key_and_padding():
 @pytest.mark.parametrize(
     "mode,recipe_name,M,N",
     [
-        ("dim_m", "mxfp8_dim_m_swizzle_tma_stochastic", 96, 144),
-        ("dim_km", "mxfp8_dim_km_swizzle_tma_stochastic", 96, 160),
+        ("dim_m", "mxfp8_dim_m_swizzle_sr_v2", 96, 144),
+        ("dim_km", "mxfp8_dim_km_swizzle_sr_v2", 96, 160),
     ],
 )
-def test_mxfp8_swizzle_v2_stochastic_dim_m_modes(mode, recipe_name, M, N):
+def test_mxfp8_swizzle_sr_v2_dim_m_modes(mode, recipe_name, M, N):
     if torch.cuda.get_device_capability() != (10, 0):
         pytest.skip("v2 stochastic rounding emits Blackwell-only PTX; requires cuda capability 10.0")
     recipe = _get_recipe(recipe_name)
@@ -198,8 +198,8 @@ def test_mxfp8_swizzle_v2_stochastic_dim_m_modes(mode, recipe_name, M, N):
 @pytest.mark.parametrize(
     "mode,reference",
     [
-        ("dim_m", "mxfp8_dim_m_swizzle_tma"),
-        ("dim_km", "mxfp8_dim_km_swizzle_tma"),
+        ("dim_m", "mxfp8_dim_m_swizzle_v2"),
+        ("dim_km", "mxfp8_dim_km_swizzle_v2"),
     ],
 )
 def test_mxfp8_swizzle_v2_mode(mode, reference):
@@ -332,7 +332,7 @@ def test_mxfp8_swizzle_v4_rounding_mode_validation():
         mxfp8_swizzle_v4(x, rounding_mode="toward_zero")
 
 
-@pytest.mark.parametrize("kernel", ["mxfp8_dim_m_swizzle_tma"])
+@pytest.mark.parametrize("kernel", ["mxfp8_dim_m_swizzle_v2"])
 def test_mxfp8_dim_m_swizzle(kernel):
     if kernel in _REQUIRES_SM100 and torch.cuda.get_device_capability() != (10, 0):
         pytest.skip(f"{kernel} emits Blackwell-only PTX; requires cuda capability 10.0")
@@ -344,7 +344,7 @@ def test_mxfp8_dim_m_swizzle(kernel):
     assert qdata_and_scale_equal(outputs[1], ref_outputs[1])
 
 
-@pytest.mark.parametrize("kernel", ["mxfp8_dim_m_swizzle_tma"])
+@pytest.mark.parametrize("kernel", ["mxfp8_dim_m_swizzle_v2"])
 def test_mxfp8_dim_m_swizzle_padding(kernel):
     if kernel in _REQUIRES_SM100 and torch.cuda.get_device_capability() != (10, 0):
         pytest.skip(f"{kernel} emits Blackwell-only PTX; requires cuda capability 10.0")
@@ -364,7 +364,7 @@ def test_mxfp8_dim_m_swizzle_padding(kernel):
     assert torch.count_nonzero(padded[:N, M // 32:]) == 0
 
 
-@pytest.mark.parametrize("kernel", ["mxfp8_dim_km_swizzle_tma"])
+@pytest.mark.parametrize("kernel", ["mxfp8_dim_km_swizzle_v2"])
 @pytest.mark.parametrize("M,N", [(128, 512), (96, 160)])
 def test_mxfp8_dim_km_swizzle(kernel, M, N):
     if kernel in _REQUIRES_SM100 and torch.cuda.get_device_capability() != (10, 0):
@@ -392,7 +392,7 @@ def test_mxfp8_dim_km_swizzle(kernel, M, N):
     assert torch.count_nonzero(sm_unblocked[:N, M // 32:]) == 0
 
 
-@pytest.mark.parametrize("kernel", ["mxfp8_dim_km_swizzle_tma"])
+@pytest.mark.parametrize("kernel", ["mxfp8_dim_km_swizzle_v2"])
 def test_mxfp8_dim_km_swizzle_rejects_partial_group(kernel):
     if kernel in _REQUIRES_SM100 and torch.cuda.get_device_capability() != (10, 0):
         pytest.skip(f"{kernel} emits Blackwell-only PTX; requires cuda capability 10.0")

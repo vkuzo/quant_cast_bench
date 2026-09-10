@@ -2932,14 +2932,14 @@ MXFP8_SWIZZLE_V2 = QuantCastCuteRecipe.from_gold(
 )
 
 
-def _mxfp8_swizzle_v2_stochastic(input, key, **kwargs):
+def _mxfp8_swizzle_sr_v2(input, key, **kwargs):
     return mxfp8_swizzle_v2(
         input, mode="dim_k", key=key, rounding_mode="stochastic", **kwargs
     )
 
 
-MXFP8_SWIZZLE_V2_STOCHASTIC = QuantCastCuteRecipe.from_gold(
-    Mxfp8SwizzleSRGold, cute_fn=_mxfp8_swizzle_v2_stochastic
+MXFP8_SWIZZLE_SR_V2 = QuantCastCuteRecipe.from_gold(
+    Mxfp8SwizzleSRGold, cute_fn=_mxfp8_swizzle_sr_v2
 )
 
 
@@ -3103,35 +3103,35 @@ def _mxfp8_swizzle_v2_m_jit(
     )
 
 
-MXFP8_DIM_M_SWIZZLE_TMA = QuantCastCuteRecipe.from_gold(
+MXFP8_DIM_M_SWIZZLE_V2 = QuantCastCuteRecipe.from_gold(
     Mxfp8DimMSwizzleGold, cute_fn=partial(mxfp8_swizzle_v2, mode="dim_m")
 )
 
 
-def _mxfp8_dim_m_swizzle_tma_stochastic(input, key, **kwargs):
+def _mxfp8_dim_m_swizzle_sr_v2(input, key, **kwargs):
     return mxfp8_swizzle_v2(
         input, mode="dim_m", key=key, rounding_mode="stochastic", **kwargs
     )
 
 
-MXFP8_DIM_M_SWIZZLE_TMA_STOCHASTIC = QuantCastCuteRecipe.from_gold(
-    Mxfp8DimMSwizzleSRGold, cute_fn=_mxfp8_dim_m_swizzle_tma_stochastic
+MXFP8_DIM_M_SWIZZLE_SR_V2 = QuantCastCuteRecipe.from_gold(
+    Mxfp8DimMSwizzleSRGold, cute_fn=_mxfp8_dim_m_swizzle_sr_v2
 )
 
 
-MXFP8_DIM_KM_SWIZZLE_TMA = QuantCastCuteRecipe.from_gold(
+MXFP8_DIM_KM_SWIZZLE_V2 = QuantCastCuteRecipe.from_gold(
     Mxfp8DimKmSwizzleGold, cute_fn=partial(mxfp8_swizzle_v2, mode="dim_km")
 )
 
 
-def _mxfp8_dim_km_swizzle_tma_stochastic(input, key, **kwargs):
+def _mxfp8_dim_km_swizzle_sr_v2(input, key, **kwargs):
     return mxfp8_swizzle_v2(
         input, mode="dim_km", key=key, rounding_mode="stochastic", **kwargs
     )
 
 
-MXFP8_DIM_KM_SWIZZLE_TMA_STOCHASTIC = QuantCastCuteRecipe.from_gold(
-    Mxfp8DimKmSwizzleSRGold, cute_fn=_mxfp8_dim_km_swizzle_tma_stochastic
+MXFP8_DIM_KM_SWIZZLE_SR_V2 = QuantCastCuteRecipe.from_gold(
+    Mxfp8DimKmSwizzleSRGold, cute_fn=_mxfp8_dim_km_swizzle_sr_v2
 )
 
 
@@ -3141,13 +3141,13 @@ ALL_RECIPES = [
     ("deepseek_1x128_dim_m_v2", FP8_DEEPSEEK_1X128_DIM_M_V2),
     ("mxfp8_swizzle", MXFP8_SWIZZLE),
     ("mxfp8_swizzle_v2", MXFP8_SWIZZLE_V2),
-    ("mxfp8_swizzle_v2_stochastic", MXFP8_SWIZZLE_V2_STOCHASTIC),
+    ("mxfp8_swizzle_sr_v2", MXFP8_SWIZZLE_SR_V2),
     ("mxfp8_swizzle_v3", MXFP8_SWIZZLE_V3),
     ("mxfp8_swizzle_v4", MXFP8_SWIZZLE_V4),
     ("mxfp8_swizzle_v4_stochastic", MXFP8_SWIZZLE_V4_STOCHASTIC),
     ("mxfp8_swizzle_v5", MXFP8_SWIZZLE_V5),
-    ("mxfp8_dim_m_swizzle_tma", MXFP8_DIM_M_SWIZZLE_TMA),
-    ("mxfp8_dim_m_swizzle_tma_stochastic", MXFP8_DIM_M_SWIZZLE_TMA_STOCHASTIC),
-    ("mxfp8_dim_km_swizzle_tma", MXFP8_DIM_KM_SWIZZLE_TMA),
-    ("mxfp8_dim_km_swizzle_tma_stochastic", MXFP8_DIM_KM_SWIZZLE_TMA_STOCHASTIC),
+    ("mxfp8_dim_m_swizzle_v2", MXFP8_DIM_M_SWIZZLE_V2),
+    ("mxfp8_dim_m_swizzle_sr_v2", MXFP8_DIM_M_SWIZZLE_SR_V2),
+    ("mxfp8_dim_km_swizzle_v2", MXFP8_DIM_KM_SWIZZLE_V2),
+    ("mxfp8_dim_km_swizzle_sr_v2", MXFP8_DIM_KM_SWIZZLE_SR_V2),
 ]
