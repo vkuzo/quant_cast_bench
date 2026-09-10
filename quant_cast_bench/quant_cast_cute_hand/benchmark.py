@@ -26,7 +26,8 @@ from quant_cast_bench.quant_cast_cute_hand.recipes import (
     transpose_v0, transpose_v1,
 )
 from quant_cast_bench.quant_cast_gold.recipes import (
-    mxfp8_dim_km_swizzle_f, mxfp8_dim_m_swizzle_f, mxfp8_swizzle_f,
+    mxfp8_dim_km_swizzle_f, mxfp8_dim_km_swizzle_sr_f,
+    mxfp8_dim_m_swizzle_f, mxfp8_dim_m_swizzle_sr_f, mxfp8_swizzle_f,
     mxfp8_swizzle_sr_f,
 )
 
@@ -400,6 +401,29 @@ def _bench_mxfp8_dim_m_swizzle_tma(M, K):
     )
 
 
+def _bench_mxfp8_dim_m_swizzle_tma_stochastic(M, K):
+    torch.manual_seed(0)
+    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+    key = prng.key(0, device=x.device)
+
+    def run():
+        return mxfp8_swizzle_v2(
+            x, mode="dim_m", key=key, rounding_mode="stochastic"
+        )
+
+    outputs = run()
+    torch.cuda.synchronize()
+    ref_outputs = mxfp8_dim_m_swizzle_sr_f(x, key)
+    for output, ref_output in zip(outputs, ref_outputs):
+        assert torch.equal(
+            output.view(torch.uint8), ref_output.view(torch.uint8)
+        ), "output mismatch vs reference"
+    bytes_per_iter = x.numel() * x.element_size() + sum(
+        output.numel() * output.element_size() for output in outputs
+    )
+    return run, bytes_per_iter
+
+
 def _bench_mxfp8_dim_km_swizzle_impl(M, K, kernel_fn):
     torch.manual_seed(0)
     x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
@@ -424,6 +448,29 @@ def _bench_mxfp8_dim_km_swizzle_tma(M, K):
     return _bench_mxfp8_dim_km_swizzle_impl(
         M, K, lambda x: mxfp8_swizzle_v2(x, mode="dim_km")
     )
+
+
+def _bench_mxfp8_dim_km_swizzle_tma_stochastic(M, K):
+    torch.manual_seed(0)
+    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+    key = prng.key(0, device=x.device)
+
+    def run():
+        return mxfp8_swizzle_v2(
+            x, mode="dim_km", key=key, rounding_mode="stochastic"
+        )
+
+    outputs = run()
+    torch.cuda.synchronize()
+    ref_outputs = mxfp8_dim_km_swizzle_sr_f(x, key)
+    for output, ref_output in zip(outputs, ref_outputs):
+        assert torch.equal(
+            output.view(torch.uint8), ref_output.view(torch.uint8)
+        ), "output mismatch vs reference"
+    bytes_per_iter = x.numel() * x.element_size() + sum(
+        output.numel() * output.element_size() for output in outputs
+    )
+    return run, bytes_per_iter
 
 
 def _bench_transpose_v0(M, K):
@@ -479,7 +526,9 @@ _KERNELS = {
     "mxfp8_swizzle_v4_stochastic": _bench_mxfp8_swizzle_v4_stochastic,
     "mxfp8_swizzle_v5": _bench_mxfp8_swizzle_v5,
     "mxfp8_dim_m_swizzle_tma": _bench_mxfp8_dim_m_swizzle_tma,
+    "mxfp8_dim_m_swizzle_tma_stochastic": _bench_mxfp8_dim_m_swizzle_tma_stochastic,
     "mxfp8_dim_km_swizzle_tma": _bench_mxfp8_dim_km_swizzle_tma,
+    "mxfp8_dim_km_swizzle_tma_stochastic": _bench_mxfp8_dim_km_swizzle_tma_stochastic,
     "transpose_v0": _bench_transpose_v0,
     "transpose_v1": _bench_transpose_v1,
 }

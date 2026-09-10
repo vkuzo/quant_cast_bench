@@ -26,7 +26,8 @@ _DEBUG = os.environ.get("CUTE_DEBUG", "0") == "1"
 from quant_cast_bench.quant_cast_cute.recipes import QuantCastCuteRecipe, _philox_4x32
 from quant_cast_bench.quant_cast_gold.recipes import (
     Deepseek1x128Gold, Deepseek1x128DimMGold, Mxfp8DimKmSwizzleGold,
-    Mxfp8DimMSwizzleGold, Mxfp8SwizzleGold, Mxfp8SwizzleSRGold,
+    Mxfp8DimKmSwizzleSRGold, Mxfp8DimMSwizzleGold, Mxfp8DimMSwizzleSRGold,
+    Mxfp8SwizzleGold, Mxfp8SwizzleSRGold,
 )
 
 def _ceil_div(num, den):
@@ -2264,9 +2265,9 @@ MXFP8_SWIZZLE_V5 = QuantCastCuteRecipe.from_gold(
 # clusters improves row-major DRAM locality. Row-owned work makes each thread's scale bytes
 # contiguous in a packed store and cuts shared-load conflicts without increasing registers.
 # Together with skipping the redundant scale memset: 0.1375 -> 0.1213 ms at 16384^2 on B200.
-# Dim-K additionally has a compile-time stochastic specialization. It keeps the same TMA load,
-# reduction, scale store, shared-memory output staging, and TMA store; only the qdata conversion
-# changes to Philox plus Blackwell cvt.rs.e4m3x4. Dim-M and dim-KM remain RTNE-only.
+# All modes additionally have a compile-time stochastic specialization. They keep the same TMA
+# load, reductions, scale stores, shared-memory output staging, and TMA stores; only each enabled
+# qdata conversion changes to Philox plus Blackwell cvt.rs.e4m3x4.
 _MXS_TM, _MXS_MAX_TN, _MXS_WARPS = 128, 128, 4
 _MXS_THREADS = _MXS_WARPS * 32                       # 128, one thread per tile row
 _MXS_MODE_DIM_K = 0
@@ -2290,6 +2291,40 @@ def _mxfp8_swizzle_v2_tile_n(M, N):
     if N <= 64:
         return min(tile_n, 64)
     return tile_n
+
+
+@cute.jit
+def _mxfp8_v2_quantize_stochastic_x32(
+    values, rcp, flat_start, k0, k1, counter_base
+):
+    """Quantize one contiguous 32-value output run with two Philox counters."""
+    scaled = values * rcp
+    qwords = cute.make_rmem_tensor(cute.make_layout(8), cutlass.Uint32)
+    for half in cutlass.range_constexpr(2):
+        ctr = counter_base + cutlass.Uint64(flat_start // 16 + half)
+        c0 = cutlass.Uint32(ctr & cutlass.Uint64(0xFFFFFFFF))
+        c1 = cutlass.Uint32(ctr >> 32)
+        zero = cutlass.Uint32(0)
+        r0, r1, r2, r3 = _philox_4x32(c0, c1, zero, zero, k0, k1)
+        value = half * 16
+        word = half * 4
+        qwords[word + 0] = _cvt_rs_satfinite_e4m3x4_f32(
+            scaled[value + 0], scaled[value + 1],
+            scaled[value + 2], scaled[value + 3], r0,
+        )
+        qwords[word + 1] = _cvt_rs_satfinite_e4m3x4_f32(
+            scaled[value + 4], scaled[value + 5],
+            scaled[value + 6], scaled[value + 7], r1,
+        )
+        qwords[word + 2] = _cvt_rs_satfinite_e4m3x4_f32(
+            scaled[value + 8], scaled[value + 9],
+            scaled[value + 10], scaled[value + 11], r2,
+        )
+        qwords[word + 3] = _cvt_rs_satfinite_e4m3x4_f32(
+            scaled[value + 12], scaled[value + 13],
+            scaled[value + 14], scaled[value + 15], r3,
+        )
+    return cute.recast_tensor(qwords, dtype=cutlass.Float8E4M3FN).load()
 
 
 @cute.kernel
@@ -2416,6 +2451,19 @@ def mxfp8_swizzle_v2_kernel(
     smem_store_atom = cute.make_copy_atom(
         cute.nvgpu.CopyUniversalOp(), cutlass.Float8E4M3FN, num_bits_per_copy=128
     )
+    if cutlass.const_expr(stochastic):
+        # Both passes share the CTA-invariant key. Each thread derives counters from the flattened
+        # position of the contiguous 32-value run in the output orientation it is producing.
+        frgKey = cute.make_rmem_tensor(cute.make_layout(2), mSeed.element_type)
+        cute.copy(
+            cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), mSeed.element_type),
+            mSeed,
+            frgKey,
+        )
+        key64 = cute.recast_tensor(frgKey, dtype=cutlass.Uint64)
+        k0 = cutlass.Uint32(key64[0] & cutlass.Uint64(0xFFFFFFFF))
+        k1 = cutlass.Uint32(key64[0] >> 32)
+        counter_base = key64[1]
 
     # Each dim-M thread owns one input column and processes every 32-row group. Its transposed
     # qdata uses separate shared memory, so the optional dim-K pass can still read sInput.
@@ -2434,7 +2482,17 @@ def mxfp8_swizzle_v2_kernel(
             )
             rcp_m, biased_m = _e8m0(amax_m)
             rQM = cute.make_rmem_tensor(32, cutlass.Float8E4M3FN)
-            rQM.store((vm * rcp_m).to(cutlass.Float8E4M3FN))
+            if cutlass.const_expr(stochastic):
+                sr_output_row_m = n_tile * tile_n + tidx
+                sr_output_col_m = m_tile * tile_m + row_block * 32
+                flat_start_m = sr_output_row_m * M + sr_output_col_m
+                rQM.store(
+                    _mxfp8_v2_quantize_stochastic_x32(
+                        vm, rcp_m, flat_start_m, k0, k1, counter_base
+                    )
+                )
+            else:
+                rQM.store((vm * rcp_m).to(cutlass.Float8E4M3FN))
             rQM16 = cute.tiled_divide(rQM, (16,))
             sQM16 = cute.tiled_divide(sOutputM[(tidx, None)], (16,))
             for vec in cutlass.range_constexpr(2):
@@ -2491,20 +2549,6 @@ def mxfp8_swizzle_v2_kernel(
             cute.make_layout((32, iters), stride=(1, 32)),
             cutlass.Float8E4M3FN,
         )
-        if cutlass.const_expr(stochastic):
-            # The key is CTA-invariant but cheap to broadcast from cache. Keep it outside the
-            # per-1x32 loop so each thread loads it only once.
-            frgKey = cute.make_rmem_tensor(cute.make_layout(2), mSeed.element_type)
-            cute.copy(
-                cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), mSeed.element_type),
-                mSeed,
-                frgKey,
-            )
-            key64 = cute.recast_tensor(frgKey, dtype=cutlass.Uint64)
-            k0 = cutlass.Uint32(key64[0] & cutlass.Uint64(0xFFFFFFFF))
-            k1 = cutlass.Uint32(key64[0] >> 32)
-            counter_base = key64[1]
-            rQKWords = cute.recast_tensor(rQK, dtype=cutlass.Uint32)
 
         for it in cutlass.range_constexpr(iters):
             sGroupK = thrInputGroupsK[((None, it),)]
@@ -2523,7 +2567,6 @@ def mxfp8_swizzle_v2_kernel(
             )
             rcp_k, biased_k = _e8m0(amax_k)
             if cutlass.const_expr(stochastic):
-                scaled_k = vk * rcp_k
                 if cutlass.const_expr(row_owned_k):
                     sr_input_row_k = m_tile * tile_m + tidx
                     sr_group_col_k = n_tile * bpr + it
@@ -2531,33 +2574,11 @@ def mxfp8_swizzle_v2_kernel(
                     sr_input_row_k = m_tile * tile_m + tidx // bpr + it * 32
                     sr_group_col_k = n_tile * bpr + tidx % bpr
                 flat_start_k = sr_input_row_k * N + sr_group_col_k * 32
-
-                # A 1x32 group contains eight e4m3x4 conversions. Two Philox counters provide
-                # exactly their eight random words, with no discarded RNG output.
-                for half in cutlass.range_constexpr(2):
-                    ctr = counter_base + cutlass.Uint64(flat_start_k // 16 + half)
-                    c0 = cutlass.Uint32(ctr & cutlass.Uint64(0xFFFFFFFF))
-                    c1 = cutlass.Uint32(ctr >> 32)
-                    zero = cutlass.Uint32(0)
-                    r0, r1, r2, r3 = _philox_4x32(c0, c1, zero, zero, k0, k1)
-                    value = half * 16
-                    word = half * 4
-                    rQKWords[(word + 0, it)] = _cvt_rs_satfinite_e4m3x4_f32(
-                        scaled_k[value + 0], scaled_k[value + 1],
-                        scaled_k[value + 2], scaled_k[value + 3], r0,
+                rQK[(None, it)].store(
+                    _mxfp8_v2_quantize_stochastic_x32(
+                        vk, rcp_k, flat_start_k, k0, k1, counter_base
                     )
-                    rQKWords[(word + 1, it)] = _cvt_rs_satfinite_e4m3x4_f32(
-                        scaled_k[value + 4], scaled_k[value + 5],
-                        scaled_k[value + 6], scaled_k[value + 7], r1,
-                    )
-                    rQKWords[(word + 2, it)] = _cvt_rs_satfinite_e4m3x4_f32(
-                        scaled_k[value + 8], scaled_k[value + 9],
-                        scaled_k[value + 10], scaled_k[value + 11], r2,
-                    )
-                    rQKWords[(word + 3, it)] = _cvt_rs_satfinite_e4m3x4_f32(
-                        scaled_k[value + 12], scaled_k[value + 13],
-                        scaled_k[value + 14], scaled_k[value + 15], r3,
-                    )
+                )
             else:
                 # Keep the original dim-K RTNE conversion unchanged in its specialization.
                 rQK[(None, it)].store(
@@ -2761,7 +2782,6 @@ def mxfp8_swizzle_v2(
     assert rounding_mode in ("rtne", "stochastic"), f"unsupported rounding_mode: {rounding_mode}"
     stochastic = rounding_mode == "stochastic"
     if stochastic:
-        assert mode == "dim_k", "v2 stochastic rounding currently supports only mode='dim_k'"
         assert key is not None, "stochastic rounding requires a Philox key"
         assert key.device == input.device, "input and Philox key must be on the same device"
         assert key.dtype == torch.uint64 and key.numel() == 2, "Philox key must be uint64[2]"
@@ -2830,18 +2850,24 @@ def mxfp8_swizzle_v2(
             output_k, scale_k = output_m, scale_m
             mOutputK = mOutputM
             mScaleK = mScaleM
+        # The RTNE specialization never reads mSeed, so reuse mScaleM as a dummy argument.
+        mSeed = from_dlpack(key.reshape(-1).view(torch.int64)) if stochastic else mScaleM
 
         mode_id = (
             _MXS_MODE_DIM_KM if mode == "dim_km" else _MXS_MODE_DIM_M
         )
         fn = _compiled(
-            ("mxfp8_swizzle_v2", mode, M, N, tile_m, tile_n, cluster_n),
+            (
+                "mxfp8_swizzle_v2", mode, M, N, tile_m, tile_n, cluster_n,
+                rounding_mode,
+            ),
             _mxfp8_swizzle_v2_m_jit,
             mInput,
             mOutputM,
             mScaleM,
             mOutputK,
             mScaleK,
+            mSeed,
             M,
             N,
             ncb_m,
@@ -2850,8 +2876,9 @@ def mxfp8_swizzle_v2(
             tile_n,
             cluster_n,
             mode_id,
+            stochastic,
         )
-        fn(mInput, mOutputM, mScaleM, mOutputK, mScaleK)
+        fn(mInput, mOutputM, mScaleM, mOutputK, mScaleK, mSeed)
         scale_m = scale_m.view(nrb_m, ncb_m, 32, 16).view(
             torch.float8_e8m0fnu
         )
@@ -2933,6 +2960,7 @@ def _mxfp8_swizzle_v2_m_jit(
     mScaleM: cute.Tensor,
     mOutputK: cute.Tensor,
     mScaleK: cute.Tensor,
+    mSeed: cute.Tensor,
     M: cutlass.Constexpr,
     N: cutlass.Constexpr,
     ncb_m: cutlass.Constexpr,
@@ -2941,6 +2969,7 @@ def _mxfp8_swizzle_v2_m_jit(
     tile_n: cutlass.Constexpr,
     cluster_n: cutlass.Constexpr,
     mode: cutlass.Constexpr,
+    stochastic: cutlass.Constexpr,
 ):
     padded_M = _ceil_div(M, 128) * 128
     padded_N = _ceil_div(N, tile_n) * tile_n
@@ -3050,7 +3079,7 @@ def _mxfp8_swizzle_v2_m_jit(
         output_m_tma_tensor,
         mScaleKLogical,
         mScaleMLogical,
-        mScaleM,
+        mSeed,
         input_smem_layout,
         output_k_smem_layout,
         output_m_smem_layout,
@@ -3065,7 +3094,7 @@ def _mxfp8_swizzle_v2_m_jit(
         N,
         M != padded_M or N != padded_N,
         mode,
-        False,
+        stochastic,
     ).launch(
         # N-major scheduling keeps adjacent row-major input columns together.
         grid=(padded_N // tile_n, padded_M // tile_m, 1),
@@ -3079,8 +3108,30 @@ MXFP8_DIM_M_SWIZZLE_TMA = QuantCastCuteRecipe.from_gold(
 )
 
 
+def _mxfp8_dim_m_swizzle_tma_stochastic(input, key, **kwargs):
+    return mxfp8_swizzle_v2(
+        input, mode="dim_m", key=key, rounding_mode="stochastic", **kwargs
+    )
+
+
+MXFP8_DIM_M_SWIZZLE_TMA_STOCHASTIC = QuantCastCuteRecipe.from_gold(
+    Mxfp8DimMSwizzleSRGold, cute_fn=_mxfp8_dim_m_swizzle_tma_stochastic
+)
+
+
 MXFP8_DIM_KM_SWIZZLE_TMA = QuantCastCuteRecipe.from_gold(
     Mxfp8DimKmSwizzleGold, cute_fn=partial(mxfp8_swizzle_v2, mode="dim_km")
+)
+
+
+def _mxfp8_dim_km_swizzle_tma_stochastic(input, key, **kwargs):
+    return mxfp8_swizzle_v2(
+        input, mode="dim_km", key=key, rounding_mode="stochastic", **kwargs
+    )
+
+
+MXFP8_DIM_KM_SWIZZLE_TMA_STOCHASTIC = QuantCastCuteRecipe.from_gold(
+    Mxfp8DimKmSwizzleSRGold, cute_fn=_mxfp8_dim_km_swizzle_tma_stochastic
 )
 
 
@@ -3096,5 +3147,7 @@ ALL_RECIPES = [
     ("mxfp8_swizzle_v4_stochastic", MXFP8_SWIZZLE_V4_STOCHASTIC),
     ("mxfp8_swizzle_v5", MXFP8_SWIZZLE_V5),
     ("mxfp8_dim_m_swizzle_tma", MXFP8_DIM_M_SWIZZLE_TMA),
+    ("mxfp8_dim_m_swizzle_tma_stochastic", MXFP8_DIM_M_SWIZZLE_TMA_STOCHASTIC),
     ("mxfp8_dim_km_swizzle_tma", MXFP8_DIM_KM_SWIZZLE_TMA),
+    ("mxfp8_dim_km_swizzle_tma_stochastic", MXFP8_DIM_KM_SWIZZLE_TMA_STOCHASTIC),
 ]
