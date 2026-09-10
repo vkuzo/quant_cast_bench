@@ -15,6 +15,7 @@ import sys
 import fire
 import tabulate
 import torch
+import torch.func._random as prng
 from torch._inductor.utils import do_bench_using_profiling
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -26,6 +27,7 @@ from quant_cast_bench.quant_cast_cute_hand.recipes import (
 )
 from quant_cast_bench.quant_cast_gold.recipes import (
     mxfp8_dim_km_swizzle_f, mxfp8_dim_m_swizzle_f, mxfp8_swizzle_f,
+    mxfp8_swizzle_sr_f,
 )
 
 # Peak HBM bandwidth per GPU family (GB/s), used for the "% of peak" column. Matched by substring
@@ -302,6 +304,52 @@ def _bench_mxfp8_swizzle_v4(M, K):
     return run, bytes_per_iter
 
 
+def _bench_mxfp8_swizzle_v2_stochastic(M, K):
+    # v2's existing TMA dim-K kernel with only its qdata conversion specialized to Philox-backed
+    # Blackwell cvt.rs.e4m3x4 stochastic rounding.
+    torch.manual_seed(0)
+    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+    key = prng.key(0, device=x.device)
+
+    def run():
+        return mxfp8_swizzle_v2(x, key=key, rounding_mode="stochastic")
+
+    q, s = run()
+    torch.cuda.synchronize()
+    q_ref, s_ref = mxfp8_swizzle_sr_f(x, key)
+    assert torch.equal(s.view(torch.uint8), s_ref.view(torch.uint8)), "scale mismatch vs reference"
+    assert torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8)), "qdata mismatch vs reference"
+    bytes_per_iter = (
+        x.numel() * x.element_size()
+        + q.numel() * q.element_size()
+        + s.numel() * s.element_size()
+    )
+    return run, bytes_per_iter
+
+
+def _bench_mxfp8_swizzle_v4_stochastic(M, K):
+    # Same v4 kernel and launch geometry, with its compile-time stochastic specialization. Each
+    # thread generates one Philox counter and uses four cvt.rs.e4m3x4 instructions for its 16 values.
+    torch.manual_seed(0)
+    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+    key = prng.key(0, device=x.device)
+
+    def run():
+        return mxfp8_swizzle_v4(x, key, rounding_mode="stochastic")
+
+    q, s = run()
+    torch.cuda.synchronize()
+    q_ref, s_ref = mxfp8_swizzle_sr_f(x, key)
+    assert torch.equal(s.view(torch.uint8), s_ref.view(torch.uint8)), "scale mismatch vs reference"
+    assert torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8)), "qdata mismatch vs reference"
+    bytes_per_iter = (
+        x.numel() * x.element_size()
+        + q.numel() * q.element_size()
+        + s.numel() * s.element_size()
+    )
+    return run, bytes_per_iter
+
+
 def _bench_mxfp8_swizzle_v5(M, K):
     # Best of v1 and v4: v1's flat 1-D grid + v4's 16-elem/thread load (two LDG.128 concat'd in
     # registers) and single STG.128 store. Same outputs (bit-exact vs v1 and the gold), so it shares
@@ -425,8 +473,10 @@ _KERNELS = {
     "fp8_deepseek_1x128_dim_m_v2": _bench_fp8_deepseek_1x128_dim_m_v2,
     "mxfp8_swizzle": _bench_mxfp8_swizzle,
     "mxfp8_swizzle_v2": _bench_mxfp8_swizzle_v2,
+    "mxfp8_swizzle_v2_stochastic": _bench_mxfp8_swizzle_v2_stochastic,
     "mxfp8_swizzle_v3": _bench_mxfp8_swizzle_v3,
     "mxfp8_swizzle_v4": _bench_mxfp8_swizzle_v4,
+    "mxfp8_swizzle_v4_stochastic": _bench_mxfp8_swizzle_v4_stochastic,
     "mxfp8_swizzle_v5": _bench_mxfp8_swizzle_v5,
     "mxfp8_dim_m_swizzle_tma": _bench_mxfp8_dim_m_swizzle_tma,
     "mxfp8_dim_km_swizzle_tma": _bench_mxfp8_dim_km_swizzle_tma,

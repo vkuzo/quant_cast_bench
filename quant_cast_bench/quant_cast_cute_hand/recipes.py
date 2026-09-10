@@ -23,10 +23,10 @@ import torch
 # `CUTE_DEBUG=1 python -m ...` to enable.
 _DEBUG = os.environ.get("CUTE_DEBUG", "0") == "1"
 
-from quant_cast_bench.quant_cast_cute.recipes import QuantCastCuteRecipe
+from quant_cast_bench.quant_cast_cute.recipes import QuantCastCuteRecipe, _philox_4x32
 from quant_cast_bench.quant_cast_gold.recipes import (
     Deepseek1x128Gold, Deepseek1x128DimMGold, Mxfp8DimKmSwizzleGold,
-    Mxfp8DimMSwizzleGold, Mxfp8SwizzleGold,
+    Mxfp8DimMSwizzleGold, Mxfp8SwizzleGold, Mxfp8SwizzleSRGold,
 )
 
 def _ceil_div(num, den):
@@ -1732,9 +1732,79 @@ MXFP8_SWIZZLE_V3 = QuantCastCuteRecipe.from_gold(
 # simpler. ncu: load 8.39M sectors and store 2.36M sectors, both IDENTICAL to v3 (two LDG.128 + one
 # STG.128), 29 vs 28 regs. So the whole word-load apparatus (mWords / divisibility=4 /
 # _bf16x2_to_f32x2 / _load_bf16x16_as_f32) is dead weight; v4 deletes it. Bit-exact vs v3 and gold.
+# `rounding_mode` adds a compile-time stochastic specialization to this same kernel: RTNE retains the
+# original vector cast, while STOCHASTIC uses one Philox4x32 call and four Blackwell e4m3x4 cvt.rs
+# instructions per thread. Both modes keep the same load, reduction, scale-write, and launch paths.
 # Ragged M and K%128 tails launch over complete padded 128x128 swizzle atoms. Padded lanes load zero,
 # skip qdata stores, and explicitly write zero scale bytes; the aligned specialization stays unchanged.
 _MXS4_HALF = _MXS3_VPT // 2   # 8 elems per sub-load (2 halves of the 16-elem/thread run)
+
+
+@dsl_user_op
+def _cvt_rs_satfinite_e4m3x4_f32(v0, v1, v2, v3, rbits, *, loc=None, ip=None):
+    """Stochastically round four f32 values to four packed E4M3 bytes (Blackwell SM100).
+
+    PTX writes its first source into the high byte of the b32 result. Reverse the source operands so
+    the little-endian byte view is [e4m3(v0), e4m3(v1), e4m3(v2), e4m3(v3)].
+    """
+    args = [
+        cutlass.Float32(v3).ir_value(loc=loc, ip=ip),
+        cutlass.Float32(v2).ir_value(loc=loc, ip=ip),
+        cutlass.Float32(v1).ir_value(loc=loc, ip=ip),
+        cutlass.Float32(v0).ir_value(loc=loc, ip=ip),
+        cutlass.Uint32(rbits).ir_value(loc=loc, ip=ip),
+    ]
+    return cutlass.Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            args,
+            "cvt.rs.satfinite.e4m3x4.f32 $0, {$1, $2, $3, $4}, $5;",
+            "=r,f,f,f,f,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@cute.jit
+def _mxfp8_v4_quantize(thrInput, rcp, mSeed: cute.Tensor, flat_start, stochastic: cutlass.Constexpr):
+    scaled = thrInput * rcp
+    if cutlass.const_expr(stochastic):
+        # One Philox call supplies the four random words needed by this thread's four e4m3x4
+        # conversions. Keying by the global 16-element run makes the result independent of tiling.
+        frgKey = cute.make_rmem_tensor(cute.make_layout(2), mSeed.element_type)
+        cute.copy(
+            cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), mSeed.element_type),
+            mSeed,
+            frgKey,
+        )
+        key64 = cute.recast_tensor(frgKey, dtype=cutlass.Uint64)
+        k0 = cutlass.Uint32(key64[0] & cutlass.Uint64(0xFFFFFFFF))
+        k1 = cutlass.Uint32(key64[0] >> 32)
+        ctr = key64[1] + cutlass.Uint64(flat_start // _MXS3_VPT)
+        c0 = cutlass.Uint32(ctr & cutlass.Uint64(0xFFFFFFFF))
+        c1 = cutlass.Uint32(ctr >> 32)
+        zero = cutlass.Uint32(0)
+        r0, r1, r2, r3 = _philox_4x32(c0, c1, zero, zero, k0, k1)
+
+        qwords = cute.make_rmem_tensor(cute.make_layout(_MXS3_VPT // 4), cutlass.Uint32)
+        qwords[0] = _cvt_rs_satfinite_e4m3x4_f32(
+            scaled[0], scaled[1], scaled[2], scaled[3], r0
+        )
+        qwords[1] = _cvt_rs_satfinite_e4m3x4_f32(
+            scaled[4], scaled[5], scaled[6], scaled[7], r1
+        )
+        qwords[2] = _cvt_rs_satfinite_e4m3x4_f32(
+            scaled[8], scaled[9], scaled[10], scaled[11], r2
+        )
+        qwords[3] = _cvt_rs_satfinite_e4m3x4_f32(
+            scaled[12], scaled[13], scaled[14], scaled[15], r3
+        )
+        return cute.recast_tensor(qwords, dtype=cutlass.Float8E4M3FN).load()
+    else:
+        # Preserve v4's original RTNE expression exactly in the default specialization.
+        return scaled.to(cutlass.Float8E4M3FN)
 
 
 @cute.kernel
@@ -1742,10 +1812,12 @@ def mxfp8_swizzle_v4_kernel(
     gInput: cute.Tensor,   # 2-D bf16 input, zipped_divide'd into (32,128) tiles
     gOutput: cute.Tensor,
     mScaleLogical: cute.Tensor,
+    mSeed: cute.Tensor,
     input_tv_layout: cute.Layout,
     M: cutlass.Constexpr,
     N: cutlass.Constexpr,
     ragged: cutlass.Constexpr,
+    stochastic: cutlass.Constexpr,
 ):
     tidx, _, _ = cute.arch.thread_idx()
     bidx, bidy, _ = cute.arch.block_idx()
@@ -1788,7 +1860,9 @@ def mxfp8_swizzle_v4_kernel(
             thrA_amax16, threads_in_group=_MXS3_LANES
         )
         rcp, biased = _e8m0(thrA_amax32)
-        tidfrgOutput[(tidx, None)] = (thrInput * rcp).to(cutlass.Float8E4M3FN)
+        tidfrgOutput[(tidx, None)] = _mxfp8_v4_quantize(
+            thrInput, rcp, mSeed, row * N + col_start, stochastic
+        )
 
         if tidx % _MXS3_LANES == 0:
             mScaleLogical[(row, col_start // 32)] = biased.to(mScaleLogical.element_type)
@@ -1812,7 +1886,9 @@ def mxfp8_swizzle_v4_kernel(
             thrA_amax16, threads_in_group=_MXS3_LANES
         )
         rcp, biased = _e8m0(thrA_amax32)
-        qdata = (thrInput * rcp).to(cutlass.Float8E4M3FN)
+        qdata = _mxfp8_v4_quantize(
+            thrInput, rcp, mSeed, row * N + col_start, stochastic
+        )
 
         if row < M:
             if col_start < N:
@@ -1834,9 +1910,11 @@ def mxfp8_swizzle_v4_jit(
     mInput: cute.Tensor,
     mOutput: cute.Tensor,
     mScale: cute.Tensor,
+    mSeed: cute.Tensor,
     M: cutlass.Constexpr,
     N: cutlass.Constexpr,
     ncb: cutlass.Constexpr,
+    stochastic: cutlass.Constexpr,
 ):
     padded_M = _ceil_div(M, 128) * 128
     padded_N = _ceil_div(N, 128) * 128
@@ -1860,8 +1938,9 @@ def mxfp8_swizzle_v4_jit(
     mScaleLogical = cute.make_tensor(mScale.iterator, scale_layout)
 
     mxfp8_swizzle_v4_kernel(
-        gInput, gOutput, mScaleLogical, input_tv_layout, M, N,
+        gInput, gOutput, mScaleLogical, mSeed, input_tv_layout, M, N,
         M != padded_M or N != padded_N,
+        stochastic,
     ).launch(
         # Walk every slot of the padded scale grid. Predicates prevent padded coordinates from
         # touching the unpadded qdata input/output.
@@ -1870,10 +1949,24 @@ def mxfp8_swizzle_v4_jit(
     )
 
 
-def mxfp8_swizzle_v4(input: torch.Tensor, **kwargs):
+def mxfp8_swizzle_v4(
+    input: torch.Tensor,
+    key: torch.Tensor | None = None,
+    rounding_mode: str = "rtne",
+    **kwargs,
+):
     assert len(input.shape) == 2, "unsupported"
     assert input.is_contiguous(), "unsupported"
     assert input.dtype == torch.bfloat16, "v4 is bf16-only"
+    rounding_mode = str(getattr(rounding_mode, "value", rounding_mode)).lower()
+    assert rounding_mode in ("rtne", "stochastic"), f"unsupported rounding_mode: {rounding_mode}"
+    stochastic = rounding_mode == "stochastic"
+    if stochastic:
+        assert key is not None, "stochastic rounding requires a Philox key"
+        assert key.device == input.device, "input and Philox key must be on the same device"
+        assert key.dtype == torch.uint64 and key.numel() == 2, "Philox key must be uint64[2]"
+    else:
+        assert key is None, "RTNE rounding does not use a Philox key"
     M, N = input.shape
     assert M > 0 and N > 0, "v4 requires non-empty dimensions"
     assert N % 32 == 0, "v4 requires K % 32 == 0"
@@ -1884,12 +1977,23 @@ def mxfp8_swizzle_v4(input: torch.Tensor, **kwargs):
     input_cute = from_dlpack(input, assumed_align=16)
     output_cute = from_dlpack(output, assumed_align=16)
     scale_cute = from_dlpack(scale)
-    mxfp8_swizzle_v4_jit(input_cute, output_cute, scale_cute, M, N, ncb)
+    # RTNE's compile-time branch never reads mSeed, so reuse an existing tensor as its dummy kernel
+    # argument and avoid allocating any RNG state on the default path.
+    seed_cute = from_dlpack(key.reshape(-1).view(torch.int64)) if stochastic else scale_cute
+    mxfp8_swizzle_v4_jit(
+        input_cute, output_cute, scale_cute, seed_cute, M, N, ncb, stochastic
+    )
     return output, scale.view(nrb, ncb, 32, 16).view(torch.float8_e8m0fnu)
 
 
 MXFP8_SWIZZLE_V4 = QuantCastCuteRecipe.from_gold(
     Mxfp8SwizzleGold, cute_fn=mxfp8_swizzle_v4
+)
+
+
+MXFP8_SWIZZLE_V4_STOCHASTIC = QuantCastCuteRecipe.from_gold(
+    Mxfp8SwizzleSRGold,
+    cute_fn=partial(mxfp8_swizzle_v4, rounding_mode="stochastic"),
 )
 
 
@@ -2160,6 +2264,9 @@ MXFP8_SWIZZLE_V5 = QuantCastCuteRecipe.from_gold(
 # clusters improves row-major DRAM locality. Row-owned work makes each thread's scale bytes
 # contiguous in a packed store and cuts shared-load conflicts without increasing registers.
 # Together with skipping the redundant scale memset: 0.1375 -> 0.1213 ms at 16384^2 on B200.
+# Dim-K additionally has a compile-time stochastic specialization. It keeps the same TMA load,
+# reduction, scale store, shared-memory output staging, and TMA store; only the qdata conversion
+# changes to Philox plus Blackwell cvt.rs.e4m3x4. Dim-M and dim-KM remain RTNE-only.
 _MXS_TM, _MXS_MAX_TN, _MXS_WARPS = 128, 128, 4
 _MXS_THREADS = _MXS_WARPS * 32                       # 128, one thread per tile row
 _MXS_MODE_DIM_K = 0
@@ -2195,6 +2302,7 @@ def mxfp8_swizzle_v2_kernel(
     output_m_tma_tensor: cute.Tensor,
     mScaleKLogical: cute.Tensor,
     mScaleMLogical: cute.Tensor,
+    mSeed: cute.Tensor,
     input_smem_layout: cute.ComposedLayout,
     output_k_smem_layout: cute.ComposedLayout,
     output_m_smem_layout: cute.ComposedLayout,
@@ -2209,6 +2317,7 @@ def mxfp8_swizzle_v2_kernel(
     N: cutlass.Constexpr,
     ragged: cutlass.Constexpr,
     mode: cutlass.Constexpr,
+    stochastic: cutlass.Constexpr,
 ):
     tidx, _, _ = cute.arch.thread_idx()
     n_tile, m_tile, _ = cute.arch.block_idx()
@@ -2382,6 +2491,20 @@ def mxfp8_swizzle_v2_kernel(
             cute.make_layout((32, iters), stride=(1, 32)),
             cutlass.Float8E4M3FN,
         )
+        if cutlass.const_expr(stochastic):
+            # The key is CTA-invariant but cheap to broadcast from cache. Keep it outside the
+            # per-1x32 loop so each thread loads it only once.
+            frgKey = cute.make_rmem_tensor(cute.make_layout(2), mSeed.element_type)
+            cute.copy(
+                cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), mSeed.element_type),
+                mSeed,
+                frgKey,
+            )
+            key64 = cute.recast_tensor(frgKey, dtype=cutlass.Uint64)
+            k0 = cutlass.Uint32(key64[0] & cutlass.Uint64(0xFFFFFFFF))
+            k1 = cutlass.Uint32(key64[0] >> 32)
+            counter_base = key64[1]
+            rQKWords = cute.recast_tensor(rQK, dtype=cutlass.Uint32)
 
         for it in cutlass.range_constexpr(iters):
             sGroupK = thrInputGroupsK[((None, it),)]
@@ -2399,9 +2522,47 @@ def mxfp8_swizzle_v2_kernel(
                 cute.ReductionOp.MAX, cutlass.Float32(0.0), 0
             )
             rcp_k, biased_k = _e8m0(amax_k)
-            rQK[(None, it)].store(
-                (vk * rcp_k).to(cutlass.Float8E4M3FN)
-            )
+            if cutlass.const_expr(stochastic):
+                scaled_k = vk * rcp_k
+                if cutlass.const_expr(row_owned_k):
+                    sr_input_row_k = m_tile * tile_m + tidx
+                    sr_group_col_k = n_tile * bpr + it
+                else:
+                    sr_input_row_k = m_tile * tile_m + tidx // bpr + it * 32
+                    sr_group_col_k = n_tile * bpr + tidx % bpr
+                flat_start_k = sr_input_row_k * N + sr_group_col_k * 32
+
+                # A 1x32 group contains eight e4m3x4 conversions. Two Philox counters provide
+                # exactly their eight random words, with no discarded RNG output.
+                for half in cutlass.range_constexpr(2):
+                    ctr = counter_base + cutlass.Uint64(flat_start_k // 16 + half)
+                    c0 = cutlass.Uint32(ctr & cutlass.Uint64(0xFFFFFFFF))
+                    c1 = cutlass.Uint32(ctr >> 32)
+                    zero = cutlass.Uint32(0)
+                    r0, r1, r2, r3 = _philox_4x32(c0, c1, zero, zero, k0, k1)
+                    value = half * 16
+                    word = half * 4
+                    rQKWords[(word + 0, it)] = _cvt_rs_satfinite_e4m3x4_f32(
+                        scaled_k[value + 0], scaled_k[value + 1],
+                        scaled_k[value + 2], scaled_k[value + 3], r0,
+                    )
+                    rQKWords[(word + 1, it)] = _cvt_rs_satfinite_e4m3x4_f32(
+                        scaled_k[value + 4], scaled_k[value + 5],
+                        scaled_k[value + 6], scaled_k[value + 7], r1,
+                    )
+                    rQKWords[(word + 2, it)] = _cvt_rs_satfinite_e4m3x4_f32(
+                        scaled_k[value + 8], scaled_k[value + 9],
+                        scaled_k[value + 10], scaled_k[value + 11], r2,
+                    )
+                    rQKWords[(word + 3, it)] = _cvt_rs_satfinite_e4m3x4_f32(
+                        scaled_k[value + 12], scaled_k[value + 13],
+                        scaled_k[value + 14], scaled_k[value + 15], r3,
+                    )
+            else:
+                # Keep the original dim-K RTNE conversion unchanged in its specialization.
+                rQK[(None, it)].store(
+                    (vk * rcp_k).to(cutlass.Float8E4M3FN)
+                )
             rScaleK[it] = biased_k.to(rScaleK.element_type)
 
         use_full_tile_k = cutlass.const_expr(not ragged) or (
@@ -2489,11 +2650,13 @@ def mxfp8_swizzle_v2_jit(
     mInput,
     mOutput,
     mScale,
+    mSeed,
     M: cutlass.Constexpr,
     N: cutlass.Constexpr,
     ncb: cutlass.Constexpr,
     tile_n: cutlass.Constexpr,
     cluster_n: cutlass.Constexpr,
+    stochastic: cutlass.Constexpr,
 ):
     padded_M = _ceil_div(M, _MXS_TM) * _MXS_TM
     padded_N = _ceil_div(N, tile_n) * tile_n
@@ -2558,6 +2721,7 @@ def mxfp8_swizzle_v2_jit(
         output_tma_tensor,
         mScaleLogical,
         mScaleLogical,
+        mSeed,
         input_smem_layout,
         output_smem_layout,
         output_smem_layout,
@@ -2572,6 +2736,7 @@ def mxfp8_swizzle_v2_jit(
         N,
         M != padded_M or N != padded_N,
         _MXS_MODE_DIM_K,
+        stochastic,
     ).launch(
         # Make the fast-changing grid dimension follow contiguous columns. Clustering those CTAs
         # further preserves that locality in hardware scheduling.
@@ -2581,11 +2746,27 @@ def mxfp8_swizzle_v2_jit(
     )
 
 
-def mxfp8_swizzle_v2(input: torch.Tensor, mode: str = "dim_k", **kwargs):
+def mxfp8_swizzle_v2(
+    input: torch.Tensor,
+    mode: str = "dim_k",
+    key: torch.Tensor | None = None,
+    rounding_mode: str = "rtne",
+    **kwargs,
+):
     assert mode in ("dim_k", "dim_m", "dim_km"), f"unsupported mode: {mode}"
     assert input.dim() == 2, "unsupported"
     assert input.is_contiguous(), "unsupported"
     assert input.dtype == torch.bfloat16, "v2 is bf16-only"
+    rounding_mode = str(getattr(rounding_mode, "value", rounding_mode)).lower()
+    assert rounding_mode in ("rtne", "stochastic"), f"unsupported rounding_mode: {rounding_mode}"
+    stochastic = rounding_mode == "stochastic"
+    if stochastic:
+        assert mode == "dim_k", "v2 stochastic rounding currently supports only mode='dim_k'"
+        assert key is not None, "stochastic rounding requires a Philox key"
+        assert key.device == input.device, "input and Philox key must be on the same device"
+        assert key.dtype == torch.uint64 and key.numel() == 2, "Philox key must be uint64[2]"
+    else:
+        assert key is None, "RTNE rounding does not use a Philox key"
     M, N = input.shape
     assert M > 0 and N > 0, "v2 requires non-empty dimensions"
 
@@ -2699,24 +2880,39 @@ def mxfp8_swizzle_v2(input: torch.Tensor, mode: str = "dim_k", **kwargs):
     mOutput = (from_dlpack(output, assumed_align=16).mark_layout_dynamic(leading_dim=1)
                .mark_compact_shape_dynamic(mode=1, divisibility=16))
     mScale = from_dlpack(scale, assumed_align=4)
+    # The RTNE specialization never reads mSeed, so reuse mScale as a dummy argument on that path.
+    mSeed = from_dlpack(key.reshape(-1).view(torch.int64)) if stochastic else mScale
     fn = _compiled(
-        ("mxfp8_swizzle_v2", M, N, tile_n),
+        ("mxfp8_swizzle_v2", M, N, tile_n, rounding_mode),
         mxfp8_swizzle_v2_jit,
         mInput,
         mOutput,
         mScale,
+        mSeed,
         M,
         N,
         ncb,
         tile_n,
         cluster_n,
+        stochastic,
     )
-    fn(mInput, mOutput, mScale)
+    fn(mInput, mOutput, mScale, mSeed)
     return output, scale.view(nrb, ncb, 32, 16).view(torch.float8_e8m0fnu)
 
 
 MXFP8_SWIZZLE_V2 = QuantCastCuteRecipe.from_gold(
     Mxfp8SwizzleGold, cute_fn=mxfp8_swizzle_v2
+)
+
+
+def _mxfp8_swizzle_v2_stochastic(input, key, **kwargs):
+    return mxfp8_swizzle_v2(
+        input, mode="dim_k", key=key, rounding_mode="stochastic", **kwargs
+    )
+
+
+MXFP8_SWIZZLE_V2_STOCHASTIC = QuantCastCuteRecipe.from_gold(
+    Mxfp8SwizzleSRGold, cute_fn=_mxfp8_swizzle_v2_stochastic
 )
 
 
@@ -2854,6 +3050,7 @@ def _mxfp8_swizzle_v2_m_jit(
         output_m_tma_tensor,
         mScaleKLogical,
         mScaleMLogical,
+        mScaleM,
         input_smem_layout,
         output_k_smem_layout,
         output_m_smem_layout,
@@ -2868,6 +3065,7 @@ def _mxfp8_swizzle_v2_m_jit(
         N,
         M != padded_M or N != padded_N,
         mode,
+        False,
     ).launch(
         # N-major scheduling keeps adjacent row-major input columns together.
         grid=(padded_N // tile_n, padded_M // tile_m, 1),
@@ -2892,8 +3090,10 @@ ALL_RECIPES = [
     ("deepseek_1x128_dim_m_v2", FP8_DEEPSEEK_1X128_DIM_M_V2),
     ("mxfp8_swizzle", MXFP8_SWIZZLE),
     ("mxfp8_swizzle_v2", MXFP8_SWIZZLE_V2),
+    ("mxfp8_swizzle_v2_stochastic", MXFP8_SWIZZLE_V2_STOCHASTIC),
     ("mxfp8_swizzle_v3", MXFP8_SWIZZLE_V3),
     ("mxfp8_swizzle_v4", MXFP8_SWIZZLE_V4),
+    ("mxfp8_swizzle_v4_stochastic", MXFP8_SWIZZLE_V4_STOCHASTIC),
     ("mxfp8_swizzle_v5", MXFP8_SWIZZLE_V5),
     ("mxfp8_dim_m_swizzle_tma", MXFP8_DIM_M_SWIZZLE_TMA),
     ("mxfp8_dim_km_swizzle_tma", MXFP8_DIM_KM_SWIZZLE_TMA),
