@@ -2239,10 +2239,10 @@ MXFP8_SWIZZLE_V5 = QuantCastCuteRecipe.from_gold(
 # mxfp8_swizzle_v2: TMA (bulk-tensor) load/store of the main data, mxfp8 dim-K numerics.
 #
 # Structured on fp8_deepseek_1x128_dim_m_v2 (the warp-specialized TMA kernel above) -- the same
-# mbarrier arrive-and-expect-tx handshake and warp-0-gated G2S/S2G copies. The M tile stays 128 while
-# N is selected from 32/64/128: small problems gain CTAs, while large problems retain the efficient
-# 128x128 transfer. The calculation differs because mxfp8_swizzle reduces along K (a 1x32 block
-# within a row), not down M like deepseek dim-M:
+# mbarrier arrive-and-expect-tx handshake and warp-0-gated G2S/S2G copies. Large dim-K problems use
+# the original 128xN tiles, while small problems may use 32x128 to expose more CTAs and keep each
+# TMA transfer contiguous. The calculation differs because mxfp8_swizzle reduces along K (a 1x32
+# block within a row), not down M like deepseek dim-M:
 #   - a 128xN tile holds 128 x (N/32) scale groups. With 128 threads, each thread owns one row and
 #     visits its N/32 contiguous 1x32 groups.
 #   - scale is an e8m0 RCEIL byte (_e8m0), written through a logical layout that maps directly onto
@@ -2395,11 +2395,7 @@ def mxfp8_swizzle_v2_kernel(
     else:
         M = cute.assume(M, divby=32)
         N = cute.assume(N, divby=32)
-    ncb_k = _ceil_div(N, 128)
-    ncb_m = _ceil_div(M, 128)
-
     smem = utils.SmemAllocator()
-    tma_bar_ptr = smem.allocate_array(cutlass.Int64, 1)
     input_storage = smem.allocate_array(
         cutlass.BFloat16, tile_m * tile_n, byte_alignment=1024
     )
@@ -2407,6 +2403,9 @@ def mxfp8_swizzle_v2_kernel(
         output_m_storage = smem.allocate_array(
             cutlass.Float8E4M3FN, tile_m * tile_n, byte_alignment=1024
         )
+    # Put the small barrier after the 1KB-aligned tile buffers to avoid an otherwise unused 1016B
+    # alignment gap at the front of every CTA's shared-memory allocation.
+    tma_bar_ptr = smem.allocate_array(cutlass.Int64, 1)
 
     if tidx == 0:
         cute.arch.mbarrier_init(tma_bar_ptr, 1)
@@ -2481,17 +2480,8 @@ def mxfp8_swizzle_v2_kernel(
             tInputsInput,
             tma_bar_ptr=tma_bar_ptr,
         )
-    cute.arch.mbarrier_wait(tma_bar_ptr, 0)
-
-    smem_load_atom = cute.make_copy_atom(
-        cute.nvgpu.CopyUniversalOp(), cutlass.BFloat16, num_bits_per_copy=128
-    )
-    smem_store_atom = cute.make_copy_atom(
-        cute.nvgpu.CopyUniversalOp(), cutlass.Float8E4M3FN, num_bits_per_copy=128
-    )
     if cutlass.const_expr(stochastic):
-        # Both passes share the CTA-invariant key. Each thread derives counters from the flattened
-        # position of the contiguous 32-value run in the output orientation it is producing.
+        # The Philox key is independent of the tile, so load and unpack it while TMA fills sInput.
         frgKey = cute.make_rmem_tensor(cute.make_layout(2), mSeed.element_type)
         cute.copy(
             cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), mSeed.element_type),
@@ -2502,6 +2492,14 @@ def mxfp8_swizzle_v2_kernel(
         k0 = cutlass.Uint32(key64[0] & cutlass.Uint64(0xFFFFFFFF))
         k1 = cutlass.Uint32(key64[0] >> 32)
         counter_base = key64[1]
+    cute.arch.mbarrier_wait(tma_bar_ptr, 0)
+
+    smem_load_atom = cute.make_copy_atom(
+        cute.nvgpu.CopyUniversalOp(), cutlass.BFloat16, num_bits_per_copy=128
+    )
+    smem_store_atom = cute.make_copy_atom(
+        cute.nvgpu.CopyUniversalOp(), cutlass.Float8E4M3FN, num_bits_per_copy=128
+    )
 
     # Each dim-M thread owns one input column and processes every 32-row group. Its transposed
     # qdata uses separate shared memory, so the optional dim-K pass can still read sInput.
@@ -2581,9 +2579,6 @@ def mxfp8_swizzle_v2_kernel(
         bpr = tile_n // 32
         row_owned_k = tile_m == _MXS_TM
         iters = bpr if cutlass.const_expr(row_owned_k) else tile_m // 32
-        if cutlass.const_expr(row_owned_k):
-            input_row_k = m_tile * tile_m + tidx
-            scale_col_k = n_tile * bpr
         tidfrgInputK = cute.composition(sInput, data_k_tv_layout)
         tidfrgOutputK = cute.composition(sOutputK, data_k_tv_layout)
         thrInputGroupsK = tidfrgInputK[(tidx, None)]
@@ -2603,7 +2598,6 @@ def mxfp8_swizzle_v2_kernel(
                     (m_tile * tile_m + tidx // bpr) * N
                     + (n_tile * bpr + tidx % bpr) * 32
                 )
-
         for it in cutlass.range_constexpr(iters):
             if cutlass.const_expr(stochastic):
                 if cutlass.const_expr(row_owned_k):
@@ -2641,10 +2635,47 @@ def mxfp8_swizzle_v2_kernel(
                 )
             rScaleK[it] = biased_k.to(rScaleK.element_type)
 
+        # All BF16 reads must finish before the aliased qK view overwrites the input tile.
+        cute.arch.sync_threads()
+        for it in cutlass.range_constexpr(iters):
+            rQK16 = cute.tiled_divide(rQK[(None, it)], (16,))
+            sGroupK16 = cute.tiled_divide(
+                thrOutputGroupsK[((None, it),)], (16,)
+            )
+            for vec in cutlass.range_constexpr(2):
+                cute.copy(
+                    smem_store_atom,
+                    rQK16[(None, vec)],
+                    sGroupK16[(None, vec)],
+                )
+
+    cute.arch.fence_proxy("async.shared", space="cta")
+    cute.arch.sync_threads()
+    if cutlass.const_expr(do_dim_k):
+        if warp == 0:
+            cute.copy(
+                output_k_tma_atom,
+                tOutputsK,
+                tOutputgK[(None, m_tile, n_tile)],
+            )
+    if cutlass.const_expr(do_dim_m):
+        # The fused SR specialization issues its independent output transfers from separate warps.
+        output_m_warp = 1 if cutlass.const_expr(stochastic and do_dim_k) else 0
+        if warp == output_m_warp:
+            cute.copy(
+                output_m_tma_atom,
+                tOutputsM,
+                tOutputgM[(None, n_tile, m_tile)],
+            )
+
+    # Let the qdata TMA store overlap the much smaller direct scale write.
+    if cutlass.const_expr(do_dim_k):
         use_full_tile_k = cutlass.const_expr(not ragged) or (
             ((m_tile + 1) * tile_m <= M) & ((n_tile + 1) * tile_n <= N)
         )
         if cutlass.const_expr(row_owned_k):
+            input_row_k = m_tile * tile_m + tidx
+            scale_col_k = n_tile * bpr
             if use_full_tile_k:
                 _mxfp8_v2_store_scale_pack(
                     mScaleKLogical,
@@ -2669,6 +2700,7 @@ def mxfp8_swizzle_v2_kernel(
                 )
 
             if cutlass.const_expr(ragged):
+                ncb_k = _ceil_div(N, 128)
                 grid_n = _ceil_div(N, tile_n)
                 covered_groups = grid_n * bpr
                 if covered_groups < ncb_k * 4:
@@ -2695,36 +2727,6 @@ def mxfp8_swizzle_v2_kernel(
                             scale_k = rScaleK[it]
                     mScaleKLogical[(input_row_k, scale_col_k)] = scale_k
 
-        # All BF16 reads must finish before the aliased qK view overwrites the input tile.
-        cute.arch.sync_threads()
-        for it in cutlass.range_constexpr(iters):
-            rQK16 = cute.tiled_divide(rQK[(None, it)], (16,))
-            sGroupK16 = cute.tiled_divide(
-                thrOutputGroupsK[((None, it),)], (16,)
-            )
-            for vec in cutlass.range_constexpr(2):
-                cute.copy(
-                    smem_store_atom,
-                    rQK16[(None, vec)],
-                    sGroupK16[(None, vec)],
-                )
-
-    cute.arch.fence_proxy("async.shared", space="cta")
-    cute.arch.sync_threads()
-    if warp == 0:
-        if cutlass.const_expr(do_dim_k):
-            cute.copy(
-                output_k_tma_atom,
-                tOutputsK,
-                tOutputgK[(None, m_tile, n_tile)],
-            )
-        if cutlass.const_expr(do_dim_m):
-            cute.copy(
-                output_m_tma_atom,
-                tOutputsM,
-                tOutputgM[(None, n_tile, m_tile)],
-            )
-
 
 
 
@@ -2736,6 +2738,7 @@ def mxfp8_swizzle_v2_jit(
     mSeed,
     M: cutlass.Int32,
     N: cutlass.Int32,
+    tile_m: cutlass.Constexpr,
     tile_n: cutlass.Constexpr,
     cluster_n: cutlass.Constexpr,
     ragged: cutlass.Constexpr,
@@ -2745,8 +2748,7 @@ def mxfp8_swizzle_v2_jit(
     padded_N = _ceil_div(N, tile_n) * tile_n
     bpr = tile_n // 32
     iters = bpr
-    # Match the swizzle width to the selected tile. The logical 128xN shape is unchanged while the
-    # layout-aware fragments below see the conflict-reduced physical mapping.
+    # Match the swizzle width to the selected tile while keeping its logical shape unchanged.
     if cutlass.const_expr(tile_n == 32):
         input_smem_kind = tcgen05.SmemLayoutAtomKind.K_SW64
         output_smem_kind = tcgen05.SmemLayoutAtomKind.K_SW32
@@ -2758,25 +2760,34 @@ def mxfp8_swizzle_v2_jit(
         output_smem_kind = tcgen05.SmemLayoutAtomKind.K_SW128
     input_smem_atom = tcgen05.make_smem_layout_atom(input_smem_kind, cutlass.BFloat16)
     input_smem_layout = cute.coalesce(
-        cute.tile_to_shape(input_smem_atom, (_MXS_TM, tile_n), order=(0, 1)),
+        cute.tile_to_shape(input_smem_atom, (tile_m, tile_n), order=(0, 1)),
         target_profile=(1, 1),
     )
     # The output phase aliases the same allocation but uses its own dtype-appropriate swizzle. Its
     # lifetime starts only after the bf16-read barrier, so the two interpretations cannot overlap.
     output_smem_atom = tcgen05.make_smem_layout_atom(output_smem_kind, cutlass.Float8E4M3FN)
     output_smem_layout = cute.coalesce(
-        cute.tile_to_shape(output_smem_atom, (_MXS_TM, tile_n), order=(0, 1)),
+        cute.tile_to_shape(output_smem_atom, (tile_m, tile_n), order=(0, 1)),
         target_profile=(1, 1),
     )
-    # (thread, value) -> logical coordinate in the 128xN tile. Each thread owns one row.
-    data_tv_layout = cute.make_layout(
-        ((_MXS_THREADS,), (32, iters)),
-        stride=((1,), (_MXS_TM, _MXS_TM * 32)),
-    )
+    if cutlass.const_expr(tile_m == _MXS_TM):
+        # (thread, value) -> logical coordinate in the 128xN tile. Each thread owns one row.
+        data_tv_layout = cute.make_layout(
+            ((_MXS_THREADS,), (32, iters)),
+            stride=((1,), (tile_m, tile_m * 32)),
+        )
+    else:
+        # Smaller tiles map one (row, 1x32 group) to each thread, then advance through 32-row stages.
+        rows_per_stage = _MXS_THREADS // bpr
+        row_blocks = tile_m // rows_per_stage
+        data_tv_layout = cute.make_layout(
+            ((bpr, rows_per_stage), (32, row_blocks)),
+            stride=((tile_m * 32, 1), (tile_m, rows_per_stage)),
+        )
     input_tma_atom, input_tma_tensor = cpasync.make_tiled_tma_atom(
-        cpasync.CopyBulkTensorTileG2SOp(), mInput, input_smem_layout, (_MXS_TM, tile_n))
+        cpasync.CopyBulkTensorTileG2SOp(), mInput, input_smem_layout, (tile_m, tile_n))
     output_tma_atom, output_tma_tensor = cpasync.make_tiled_tma_atom(
-        cpasync.CopyBulkTensorTileS2GOp(), mOutput, output_smem_layout, (_MXS_TM, tile_n))
+        cpasync.CopyBulkTensorTileS2GOp(), mOutput, output_smem_layout, (tile_m, tile_n))
 
     nrb = _ceil_div(M, 128)
     ncb = _ceil_div(N, 128)
@@ -2801,7 +2812,7 @@ def mxfp8_swizzle_v2_jit(
         output_smem_layout,
         output_smem_layout,
         data_tv_layout,
-        _MXS_TM,
+        tile_m,
         tile_n,
         M,
         N,
@@ -2811,7 +2822,7 @@ def mxfp8_swizzle_v2_jit(
     ).launch(
         # Make the fast-changing grid dimension follow contiguous columns. Clustering those CTAs
         # further preserves that locality in hardware scheduling.
-        grid=(padded_N // tile_n, padded_M // _MXS_TM, 1),
+        grid=(padded_N // tile_n, padded_M // tile_m, 1),
         block=(_MXS_THREADS, 1, 1),
         cluster=(cluster_n, 1, 1),
     )
@@ -2951,12 +2962,21 @@ def mxfp8_swizzle_v2(
     assert N % 32 == 0, "v2 requires K % 32 == 0"
     ngc = N // 32
     nrb, ncb = _ceil_div(M, 128), _ceil_div(ngc, 4)
-    # Smaller N tiles expose more CTAs when the 128x128 grid cannot fill the B200. Once there are
-    # enough 128x128 tiles, their lower TMA/setup overhead wins.
+    # First choose the original adaptive N width. For small problems that would use N=64, rotate
+    # the same-size 128x64 tile to 32x128: it keeps 128 one-group threads but gives TMA contiguous
+    # rows and exposes more M-parallel CTAs.
     tile_n = _mxfp8_swizzle_v2_tile_n(M, N)
+    if M * N <= 2048 * 2048 and tile_n >= 64:
+        tile_m, tile_n = 32, 128
+    else:
+        tile_m = 128
     grid_n = _ceil_div(N, tile_n)
-    # Preserve the tuned cluster sizes where possible while requiring exact grid divisibility.
-    cluster_n = next(c for c in (16, 8, 4, 2, 1) if c <= ncb and grid_n % c == 0)
+    # RTNE benefits from N-oriented clustering and its locality. Philox supplies enough arithmetic
+    # latency hiding that independent CTAs are faster than forcing the same clustered schedule.
+    cluster_n = (
+        1 if stochastic
+        else next(c for c in (16, 8, 4, 2, 1) if c <= ncb and grid_n % c == 0)
+    )
     output = torch.empty(M, N, dtype=torch.float8_e4m3fn, device=input.device)
     # Every slot is written by the kernel, so zero-initialization would launch a redundant memset.
     scale = torch.empty(nrb * ncb * 32 * 16, dtype=torch.uint8, device=input.device)
@@ -2976,7 +2996,7 @@ def mxfp8_swizzle_v2(
     ragged = M != nrb * 128 or N != ncb * 128
     fn = _compiled(
         (
-            "mxfp8_swizzle_v2", "dim_k", tile_n, cluster_n, ragged,
+            "mxfp8_swizzle_v2", "dim_k", tile_m, tile_n, cluster_n, ragged,
             rounding_mode,
         ),
         mxfp8_swizzle_v2_jit,
@@ -2986,6 +3006,7 @@ def mxfp8_swizzle_v2(
         mSeed,
         M,
         N,
+        tile_m,
         tile_n,
         cluster_n,
         ragged,
@@ -3128,7 +3149,7 @@ def _mxfp8_swizzle_v2_m_jit(
             stride=((tile_m * 32, 1), (tile_m, 32)),
         )
 
-    mxfp8_swizzle_v2_kernel(
+    kernel = mxfp8_swizzle_v2_kernel(
         input_tma_atom,
         input_tma_tensor,
         output_k_tma_atom,
@@ -3149,12 +3170,22 @@ def _mxfp8_swizzle_v2_m_jit(
         ragged,
         mode,
         stochastic,
-    ).launch(
-        # N-major scheduling keeps adjacent row-major input columns together.
-        grid=(padded_N // tile_n, padded_M // tile_m, 1),
-        block=(max(_MXS_THREADS, tile_n), 1, 1),
-        cluster=(cluster_n, 1, 1),
     )
+    grid = (padded_N // tile_n, padded_M // tile_m, 1)
+    block = (max(_MXS_THREADS, tile_n), 1, 1)
+    if cutlass.const_expr(
+        mode == _MXS_MODE_DIM_KM and not stochastic and tile_m != 32
+    ):
+        # A degenerate cluster constrains residency for this larger two-output specialization;
+        # an ordinary launch lets Blackwell keep nine CTAs resident per SM instead.
+        kernel.launch(grid=grid, block=block)
+    else:
+        # N-major scheduling keeps adjacent row-major input columns together.
+        kernel.launch(
+            grid=grid,
+            block=block,
+            cluster=(cluster_n, 1, 1),
+        )
 
 
 MXFP8_DIM_M_SWIZZLE_V2 = QuantCastCuteRecipe.from_gold(
