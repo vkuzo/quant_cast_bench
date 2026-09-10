@@ -13,10 +13,15 @@ device name). We build a bf16 (M, K) input, run the selected kernel, time it wit
         --M 2048,4096 --K 2048,4096 --output_metrics gpu_time_ms,tb_s,pct_peak
     python -m quant_cast_bench.quant_cast_cute_hand.benchmark \
         --kernel mxfp8_swizzle_v2,mxfp8_swizzle_v4 --M 2048,4096 --K 2048,4096
+    python -m quant_cast_bench.quant_cast_cute_hand.benchmark --kernel add_v0 \
+        --M 2048,4096 --K 8192,16384 --mk_mode pair
 """
 
 import os
 import sys
+
+# Suppress Kineto's profiler_start/profiler_stop USDT messages before PyTorch initializes it.
+os.environ["KINETO_LOG_LEVEL"] = "6"
 
 import fire
 import tabulate
@@ -608,32 +613,66 @@ def _parse_kernels(value: str) -> list[str]:
     return list(dict.fromkeys(kernels))
 
 
-@fire.decorators.SetParseFns(kernel=str, M=str, K=str, output_metrics=str)
+@fire.decorators.SetParseFns(
+    kernel=str, M=str, K=str, mk_mode=str, output_metrics=str
+)
 def main(
     kernel: str = "add_v0",
     M: str = "16384",
     K: str = "16384",
+    mk_mode: str = "cartesian",
     output_metrics: str = "tb_s",
 ):
     """Benchmark handwritten CuTeDSL kernels over one shape or an M-by-K shape grid."""
-    device_name = torch.cuda.get_device_name(0)
-    peak_bw = _peak_bw_gbps(device_name)
-
     kernels = _parse_kernels(kernel)
     m_values = _parse_sizes(M, "M")
     k_values = _parse_sizes(K, "K")
     metrics = _parse_output_metrics(output_metrics)
+    mk_mode = mk_mode.strip().lower()
+    if mk_mode not in ("cartesian", "pair"):
+        raise ValueError(
+            f"unsupported mk_mode {mk_mode!r}; choose from ('cartesian', 'pair')"
+        )
+    if mk_mode == "pair":
+        if len(m_values) != len(k_values):
+            raise ValueError(
+                "pair mk_mode requires the same number of M and K values, got "
+                f"{len(m_values)} and {len(k_values)}"
+            )
+        shape_pairs = list(zip(m_values, k_values))
+    else:
+        shape_pairs = [(m, k) for m in m_values for k in k_values]
+
+    device_name = torch.cuda.get_device_name(0)
+    peak_bw = _peak_bw_gbps(device_name)
     for kernel_index, kernel_name in enumerate(kernels):
         # Keep kernel outermost so one kernel's complete shape grid finishes before the next starts.
         results = {
             (m, k): _benchmark_one(kernel_name, m, k, peak_bw)
-            for m in m_values
-            for k in k_values
+            for m, k in shape_pairs
         }
 
         if kernel_index:
             print()
-        if len(m_values) > 1 or len(k_values) > 1:
+        if mk_mode == "pair":
+            print(f"kernel: {kernel_name}  dtype: bfloat16")
+            print(f"device: {device_name} (peak {peak_bw / 1000:.2f} TB/s)")
+            for metric_index, metric in enumerate(metrics):
+                if metric_index:
+                    print()
+                print(f"metric: {metric}")
+                rows = [
+                    [f"({m}, {k})", _format_metric(results[(m, k)], metric)]
+                    for m, k in shape_pairs
+                ]
+                print(
+                    tabulate.tabulate(
+                        rows,
+                        headers=["(M, K)", metric],
+                        colalign=("right", "right"),
+                    )
+                )
+        elif len(m_values) > 1 or len(k_values) > 1:
             print(f"kernel: {kernel_name}  dtype: bfloat16")
             print(f"device: {device_name} (peak {peak_bw / 1000:.2f} TB/s)")
             for metric_index, metric in enumerate(metrics):
