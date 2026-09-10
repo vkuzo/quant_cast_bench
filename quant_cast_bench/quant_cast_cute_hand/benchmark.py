@@ -11,6 +11,8 @@ device name). We build a bf16 (M, K) input, run the selected kernel, time it wit
         --M 2048,4096,8192 --K 2048,4096,8192
     python -m quant_cast_bench.quant_cast_cute_hand.benchmark --kernel add_v0 \
         --M 2048,4096 --K 2048,4096 --output_metrics gpu_time_ms,tb_s,pct_peak
+    python -m quant_cast_bench.quant_cast_cute_hand.benchmark \
+        --kernel mxfp8_swizzle_v2,mxfp8_swizzle_v4 --M 2048,4096 --K 2048,4096
 """
 
 import os
@@ -596,63 +598,81 @@ def _format_metric(result, metric: str) -> str:
     return f"{pct_peak:.1f}%"
 
 
-@fire.decorators.SetParseFns(M=str, K=str, output_metrics=str)
+def _parse_kernels(value: str) -> list[str]:
+    kernels = [item.strip() for item in str(value).split(",")]
+    if any(not kernel for kernel in kernels):
+        raise ValueError(f"kernel must be a name or comma-separated names, got {value!r}")
+    invalid = [kernel for kernel in kernels if kernel not in _KERNELS]
+    if invalid:
+        raise ValueError(f"unknown kernels {invalid}; have {sorted(_KERNELS)}")
+    return list(dict.fromkeys(kernels))
+
+
+@fire.decorators.SetParseFns(kernel=str, M=str, K=str, output_metrics=str)
 def main(
     kernel: str = "add_v0",
     M: str = "16384",
     K: str = "16384",
     output_metrics: str = "tb_s",
 ):
-    """Benchmark one handwritten CuTeDSL kernel over one shape or an M-by-K shape grid."""
+    """Benchmark handwritten CuTeDSL kernels over one shape or an M-by-K shape grid."""
     device_name = torch.cuda.get_device_name(0)
     peak_bw = _peak_bw_gbps(device_name)
 
-    if kernel not in _KERNELS:
-        raise ValueError(f"unknown kernel {kernel!r}; have {sorted(_KERNELS)}")
-
+    kernels = _parse_kernels(kernel)
     m_values = _parse_sizes(M, "M")
     k_values = _parse_sizes(K, "K")
     metrics = _parse_output_metrics(output_metrics)
-    results = {
-        (m, k): _benchmark_one(kernel, m, k, peak_bw)
-        for m in m_values
-        for k in k_values
-    }
+    for kernel_index, kernel_name in enumerate(kernels):
+        # Keep kernel outermost so one kernel's complete shape grid finishes before the next starts.
+        results = {
+            (m, k): _benchmark_one(kernel_name, m, k, peak_bw)
+            for m in m_values
+            for k in k_values
+        }
 
-    if len(m_values) > 1 or len(k_values) > 1:
-        print(f"kernel: {kernel}  dtype: bfloat16")
-        print(f"device: {device_name} (peak {peak_bw / 1000:.2f} TB/s)")
-        for metric_index, metric in enumerate(metrics):
-            if metric_index:
-                print()
-            print(f"metric: {metric}")
-            rows = []
-            for m in m_values:
-                rows.append(
-                    [m]
-                    + [_format_metric(results[(m, k)], metric) for k in k_values]
+        if kernel_index:
+            print()
+        if len(m_values) > 1 or len(k_values) > 1:
+            print(f"kernel: {kernel_name}  dtype: bfloat16")
+            print(f"device: {device_name} (peak {peak_bw / 1000:.2f} TB/s)")
+            for metric_index, metric in enumerate(metrics):
+                if metric_index:
+                    print()
+                print(f"metric: {metric}")
+                rows = []
+                for m in m_values:
+                    rows.append(
+                        [m]
+                        + [
+                            _format_metric(results[(m, k)], metric)
+                            for k in k_values
+                        ]
+                    )
+                print(
+                    tabulate.tabulate(
+                        rows,
+                        headers=["M \\ K", *k_values],
+                        colalign=("right",) * (len(k_values) + 1),
+                    )
                 )
+        else:
+            m, k = m_values[0], k_values[0]
+            result = results[(m, k)]
+            print(f"kernel: {kernel_name}  shape: ({m}, {k})  dtype: bfloat16")
+            print(f"device: {device_name} (peak {peak_bw / 1000:.2f} TB/s)")
             print(
                 tabulate.tabulate(
-                    rows,
-                    headers=["M \\ K", *k_values],
-                    colalign=("right",) * (len(k_values) + 1),
+                    [
+                        [
+                            kernel_name,
+                            *[_format_metric(result, metric) for metric in metrics],
+                        ]
+                    ],
+                    headers=["kernel", *metrics],
+                    colalign=("left",) + ("right",) * len(metrics),
                 )
             )
-        return
-
-    m, k = m_values[0], k_values[0]
-    result = results[(m, k)]
-
-    print(f"kernel: {kernel}  shape: ({m}, {k})  dtype: bfloat16")
-    print(f"device: {device_name} (peak {peak_bw / 1000:.2f} TB/s)")
-    print(
-        tabulate.tabulate(
-            [[kernel, *[_format_metric(result, metric) for metric in metrics]]],
-            headers=["kernel", *metrics],
-            colalign=("left",) + ("right",) * len(metrics),
-        )
-    )
 
 
 if __name__ == "__main__":
