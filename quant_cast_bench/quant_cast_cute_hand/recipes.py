@@ -33,7 +33,8 @@ from quant_cast_bench.quant_cast_gold.recipes import (
     Deepseek1x128Gold, Deepseek1x128DimMGold, Mxfp8DimKmSwizzleGold,
     Mxfp8DimKmSwizzleSRGold, Mxfp8DimMSwizzleGold, Mxfp8DimMSwizzleSRGold,
     Mxfp8SwizzleGold, Mxfp8SwizzleSRGold, Nvfp4GsDimKMSwizzleGold,
-    Nvfp4GsDimMSwizzleGold, Nvfp4GsSwizzleGold,
+    Nvfp4GsDimMSwizzleGold, Nvfp4GsSwizzleDimMRHTGold,
+    Nvfp4GsSwizzleGold,
 )
 
 def _ceil_div(num, den):
@@ -3278,6 +3279,45 @@ def _nvfp4_quantize_x16(values, outer):
 
 
 @cute.jit
+def _nvfp4_rht_fwht_x16(
+    sInput: cute.Tensor,
+    row_start,
+    local_col,
+    sScaledSigns: cute.Tensor,
+):
+    """Structured RHT: sign flips followed by a four-stage in-register FWHT."""
+    transformed = cute.make_rmem_tensor(_NVFP4_GROUP, cutlass.Float32)
+    # Fold the exact power-of-two normalization into the signs, and consume the signed inputs
+    # directly in the first butterfly stage instead of materializing a separate intermediate.
+    for pair in cutlass.range_constexpr(8):
+        lo, hi = pair * 2, pair * 2 + 1
+        a = sInput[(row_start + lo, local_col)].to(
+            cutlass.Float32
+        ) * sScaledSigns[lo].to(cutlass.Float32)
+        b = sInput[(row_start + hi, local_col)].to(
+            cutlass.Float32
+        ) * sScaledSigns[hi].to(cutlass.Float32)
+        transformed[lo], transformed[hi] = a + b, a - b
+    for block in cutlass.range_constexpr(4):
+        base = block * 4
+        for offset in cutlass.range_constexpr(2):
+            lo, hi = base + offset, base + offset + 2
+            a, b = transformed[lo], transformed[hi]
+            transformed[lo], transformed[hi] = a + b, a - b
+    for block in cutlass.range_constexpr(2):
+        base = block * 8
+        for offset in cutlass.range_constexpr(4):
+            lo, hi = base + offset, base + offset + 4
+            a, b = transformed[lo], transformed[hi]
+            transformed[lo], transformed[hi] = a + b, a - b
+    for offset in cutlass.range_constexpr(8):
+        a, b = transformed[offset], transformed[offset + 8]
+        transformed[offset], transformed[offset + 8] = a + b, a - b
+
+    return transformed.load()
+
+
+@cute.jit
 def _nvfp4_store_scale_groups(
     mScaleLogical: cute.Tensor,
     rScale: cute.Tensor,
@@ -3307,7 +3347,9 @@ def _nvfp4_tma_dim_m_column(
     sInput: cute.Tensor,
     sOutputM: cute.Tensor,
     mScaleMLogical: cute.Tensor,
+    sSigns: cute.Tensor,
     outer,
+    smem_load_atom: cute.CopyAtom,
     smem_store_atom: cute.CopyAtom,
     local_col,
     pair_count: cutlass.Constexpr,
@@ -3315,24 +3357,42 @@ def _nvfp4_tma_dim_m_column(
     m_tile,
     tile_m: cutlass.Constexpr,
     tile_n: cutlass.Constexpr,
+    has_rht: cutlass.Constexpr,
     M,
     N,
 ):
     """Quantize one shared-memory input column into the transposed dim-M output."""
     output_row_m = n_tile * tile_n + local_col
     output_m_pairs = cute.tiled_divide(sOutputM[(local_col, None)], (16,))
+    if cutlass.const_expr(has_rht):
+        # Two LDS.128s keep the scaled signs in registers across every RHT group this thread owns.
+        rSigns = cute.make_rmem_tensor(_NVFP4_GROUP, cutlass.BFloat16)
+        rSignHalves = cute.tiled_divide(rSigns, (_NVFP4_DIRECT_HALF,))
+        sSignHalves = cute.tiled_divide(sSigns, (_NVFP4_DIRECT_HALF,))
+        for half in cutlass.range_constexpr(2):
+            cute.copy(
+                smem_load_atom,
+                sSignHalves[(None, half)],
+                rSignHalves[(None, half)],
+            )
     for pair in cutlass.range_constexpr(pair_count):
         rQM = cute.make_rmem_tensor(16, cutlass.Uint8)
         rQMGroups = cute.tiled_divide(rQM, (_NVFP4_DIRECT_QVPT,))
         rScaleM = cute.make_rmem_tensor(2, cutlass.Uint8)
         for group in cutlass.range_constexpr(2):
-            rInputM = cute.make_rmem_tensor(_NVFP4_GROUP, cutlass.BFloat16)
             row_start = pair * 32 + group * _NVFP4_GROUP
-            for value in cutlass.range_constexpr(_NVFP4_GROUP):
-                rInputM[value] = sInput[(row_start + value, local_col)]
-            qdata_m, scale_m = _nvfp4_quantize_x16(
-                rInputM.load().to(cutlass.Float32), outer
-            )
+            if cutlass.const_expr(has_rht):
+                values = _nvfp4_rht_fwht_x16(
+                    sInput, row_start, local_col, rSigns
+                )
+            else:
+                rInputM = cute.make_rmem_tensor(
+                    _NVFP4_GROUP, cutlass.BFloat16
+                )
+                for value in cutlass.range_constexpr(_NVFP4_GROUP):
+                    rInputM[value] = sInput[(row_start + value, local_col)]
+                values = rInputM.load().to(cutlass.Float32)
+            qdata_m, scale_m = _nvfp4_quantize_x16(values, outer)
             rQMGroups[(None, group)].store(qdata_m)
             rScaleM[group] = scale_m
         cute.copy(
@@ -3739,6 +3799,7 @@ def nvfp4_swizzle_tma_kernel(
     mScaleMLogical: cute.Tensor,
     mOuterK: cute.Tensor,
     mOuterM: cute.Tensor,
+    mRhtSign: cute.Tensor,
     input_smem_layout: cute.ComposedLayout,
     output_k_smem_layout: cute.ComposedLayout,
     output_m_smem_layout: cute.ComposedLayout,
@@ -3749,6 +3810,7 @@ def nvfp4_swizzle_tma_kernel(
     M: cutlass.Int32,
     N: cutlass.Int32,
     mode: cutlass.Constexpr,
+    has_rht: cutlass.Constexpr,
 ):
     tidx, _, _ = cute.arch.thread_idx()
     n_tile, m_tile, _ = cute.arch.block_idx()
@@ -3774,6 +3836,16 @@ def nvfp4_swizzle_tma_kernel(
             tile_m * tile_n // 2,
             byte_alignment=1024,
         )
+    if cutlass.const_expr(has_rht):
+        sign_storage = smem.allocate_array(
+            cutlass.BFloat16,
+            _NVFP4_GROUP,
+            byte_alignment=16,
+        )
+    else:
+        sign_storage = smem.allocate_array(
+            cutlass.BFloat16, 1, byte_alignment=16
+        )
     tma_bar_ptr = smem.allocate_array(cutlass.Int64, 1)
     if tidx == 0:
         cute.arch.mbarrier_init(tma_bar_ptr, 1)
@@ -3786,6 +3858,7 @@ def nvfp4_swizzle_tma_kernel(
         ),
         input_smem_layout.outer,
     )
+    sSigns = cute.make_tensor(sign_storage, cute.make_layout(_NVFP4_GROUP))
     gInput = cute.local_tile(
         input_tma_tensor, (tile_m, tile_n), (None, None)
     )
@@ -3853,6 +3926,14 @@ def nvfp4_swizzle_tma_kernel(
             tma_bar_ptr=tma_bar_ptr,
         )
 
+    if cutlass.const_expr(has_rht):
+        if tidx < _NVFP4_GROUP:
+            sSigns[tidx] = (
+                mRhtSign[tidx].to(cutlass.Float32)
+                * cutlass.Float32(0.25)
+            ).to(cutlass.BFloat16)
+        cute.arch.sync_threads()
+
     if cutlass.const_expr(do_dim_k):
         frgOuterK = cute.make_rmem_tensor(
             cute.make_layout(1), mOuterK.element_type
@@ -3887,7 +3968,9 @@ def nvfp4_swizzle_tma_kernel(
             sInput,
             sOutputM,
             mScaleMLogical,
+            sSigns,
             frgOuterM[0],
+            smem_load_atom,
             smem_store_atom,
             tidx,
             tile_m // 32,
@@ -3895,6 +3978,7 @@ def nvfp4_swizzle_tma_kernel(
             m_tile,
             tile_m,
             tile_n,
+            has_rht,
             M,
             N,
         )
@@ -4115,6 +4199,7 @@ def nvfp4_swizzle_tma_jit(
         mScaleLogical,
         mOuter,
         mOuter,
+        mInput,
         input_smem_layout,
         output_smem_layout,
         output_smem_layout,
@@ -4125,6 +4210,7 @@ def nvfp4_swizzle_tma_jit(
         M,
         N,
         _NVFP4_MODE_DIM_K,
+        False,
     ).launch(
         grid=(padded_N // tile_n,
               padded_M // tile_m, 1),
@@ -4142,11 +4228,14 @@ def nvfp4_swizzle_tma_m_jit(
     mOutputK: cute.Tensor,
     mScaleK: cute.Tensor,
     mOuterK: cute.Tensor,
+    mRhtSign: cute.Tensor,
     M: cutlass.Int32,
     N: cutlass.Int32,
     tile_m: cutlass.Constexpr,
     tile_n: cutlass.Constexpr,
     mode: cutlass.Constexpr,
+    has_rht: cutlass.Constexpr,
+    cluster_n: cutlass.Constexpr,
 ):
     do_dim_k = mode == _NVFP4_MODE_DIM_KM
     if cutlass.const_expr(do_dim_k):
@@ -4275,7 +4364,7 @@ def nvfp4_swizzle_tma_m_jit(
         else _ceil_div(M, 64) * 64
     )
     padded_N = _ceil_div(N, 128) * 128
-    nvfp4_swizzle_tma_kernel(
+    kernel = nvfp4_swizzle_tma_kernel(
         input_tma_atom,
         input_tma_tensor,
         output_k_tma_atom,
@@ -4286,6 +4375,7 @@ def nvfp4_swizzle_tma_m_jit(
         mScaleMLogical,
         mOuterK,
         mOuterM,
+        mRhtSign,
         input_smem_layout,
         output_k_smem_layout,
         output_m_smem_layout,
@@ -4296,10 +4386,14 @@ def nvfp4_swizzle_tma_m_jit(
         M,
         N,
         mode,
-    ).launch(
-        grid=(padded_N // tile_n, padded_M // tile_m, 1),
-        block=(_NVFP4_TMA_THREADS, 1, 1),
+        has_rht,
     )
+    grid = (padded_N // tile_n, padded_M // tile_m, 1)
+    block = (_NVFP4_TMA_THREADS, 1, 1)
+    if cutlass.const_expr(cluster_n == 1):
+        kernel.launch(grid=grid, block=block)
+    else:
+        kernel.launch(grid=grid, block=block, cluster=(cluster_n, 1, 1))
 
 
 def _validate_nvfp4_swizzle_inputs(input, outer_scale, kernel_name, k_multiple):
@@ -4388,9 +4482,18 @@ def nvfp4_swizzle_tma(
     outer_scale: torch.Tensor,
     outer_scale_m: torch.Tensor | None = None,
     mode: str = "dim_k",
+    rht_sign: torch.Tensor | None = None,
     **kwargs,
 ):
     assert mode in ("dim_k", "dim_m", "dim_km"), f"unsupported mode: {mode}"
+    has_rht = rht_sign is not None
+    if has_rht:
+        assert mode == "dim_m", "RHT currently supports dim-m only"
+        assert rht_sign.shape == (16,), "RHT sign input must have shape (16,)"
+        assert rht_sign.dtype == torch.bfloat16 and rht_sign.device == input.device, (
+            "RHT sign input must be bf16 on the input device"
+        )
+        assert rht_sign.is_contiguous(), "RHT sign input must be contiguous"
     # Packed TMA output rows must have a 16-byte stride: dim-K therefore requires K%32, while
     # dim-M requires M%32. The input descriptor additionally needs its BF16 row stride aligned.
     input_k_multiple = 32 if mode in ("dim_k", "dim_km") else 16
@@ -4434,6 +4537,11 @@ def nvfp4_swizzle_tma(
             .mark_compact_shape_dynamic(mode=0, divisibility=512)
         )
         mOuterM = from_dlpack(outer_scale_m.reshape(1))
+        mRhtSign = (
+            from_dlpack(rht_sign, assumed_align=16)
+            if rht_sign is not None
+            else mInput
+        )
 
         if mode == "dim_km":
             output_k, scale_k, nrb_k, ncb_k = _allocate_nvfp4_swizzle_outputs(
@@ -4460,8 +4568,24 @@ def nvfp4_swizzle_tma(
             tile_m, tile_n = 32, 128
         else:
             tile_m, tile_n = 64, 128
+        # The RHT path benefits from pairing adjacent small-problem CTAs. Larger problems have
+        # enough independent work that clustering only constrains scheduling.
+        cluster_n = (
+            2
+            if has_rht
+            and M * N <= 2048 * 2048
+            and (_ceil_div(N, tile_n) % 2 == 0)
+            else 1
+        )
         fn = _compiled(
-            ("nvfp4_swizzle_tma", mode, tile_m, tile_n),
+            (
+                "nvfp4_swizzle_tma",
+                mode,
+                has_rht,
+                tile_m,
+                tile_n,
+                cluster_n,
+            ),
             nvfp4_swizzle_tma_m_jit,
             mInput,
             mOutputM,
@@ -4470,11 +4594,14 @@ def nvfp4_swizzle_tma(
             mOutputK,
             mScaleK,
             mOuterK,
+            mRhtSign,
             M,
             N,
             tile_m,
             tile_n,
             mode_id,
+            has_rht,
+            cluster_n,
         )
         fn(
             mInput,
@@ -4484,6 +4611,7 @@ def nvfp4_swizzle_tma(
             mOutputK,
             mScaleK,
             mOuterK,
+            mRhtSign,
             M,
             N,
         )
@@ -4576,6 +4704,21 @@ NVFP4_DIM_KM_SWIZZLE_TMA = QuantCastCuteRecipe.from_gold(
 )
 
 
+def nvfp4_dim_m_rht_swizzle_tma(input, outer_scale, rht_sign, **kwargs):
+    return nvfp4_swizzle_tma(
+        input,
+        outer_scale,
+        mode="dim_m",
+        rht_sign=rht_sign,
+        **kwargs,
+    )
+
+
+NVFP4_DIM_M_RHT_SWIZZLE_TMA = QuantCastCuteRecipe.from_gold(
+    Nvfp4GsSwizzleDimMRHTGold, cute_fn=nvfp4_dim_m_rht_swizzle_tma
+)
+
+
 ALL_RECIPES = [
     ("deepseek_1x128", FP8_DEEPSEEK_1X128),
     ("deepseek_1x128_dim_m", FP8_DEEPSEEK_1X128_DIM_M),
@@ -4595,4 +4738,5 @@ ALL_RECIPES = [
     ("nvfp4_swizzle_tma", NVFP4_SWIZZLE_TMA),
     ("nvfp4_dim_m_swizzle_tma", NVFP4_DIM_M_SWIZZLE_TMA),
     ("nvfp4_dim_km_swizzle_tma", NVFP4_DIM_KM_SWIZZLE_TMA),
+    ("nvfp4_dim_m_rht_swizzle_tma", NVFP4_DIM_M_RHT_SWIZZLE_TMA),
 ]

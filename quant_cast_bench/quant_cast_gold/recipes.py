@@ -1558,19 +1558,20 @@ Nvfp4GsDimKMSwizzleGold = QuantCastSingleKernelGold(
 
 # ---------------------------------------------------------------------------
 # Golden recipe: nvfp4 (swizzled) dim-m twin of Nvfp4GsDimMSwizzleGold, but WITH the 16x16 RHT
-# applied before scaling+quantization -- i.e. exactly the dim-m half of
-# nvfp4_gs_swizzle_dim_k_dim_m_rht_f (no dim-k output). Apply the RHT to x.t() (16-blocks along the
-# original M), then nvfp4 that (N, M) tensor along its last dim, emitting in the transposed
-# (N, M//2) frame. The per-tensor outer scale is over |RHT(x.t())| (a DIFFERENT tensor than |x|, so
-# a distinct scalar -- torchao's col_global_amax). Reference only (no kernel yet).
+# applied before scaling+quantization. Apply the RHT to x.t() in FP32 (16-blocks along the original
+# M), then nvfp4 that (N, M) tensor along its last dim, emitting in the transposed (N, M//2) frame.
+# The per-tensor outer scale is over |RHT(x.t())| (a DIFFERENT tensor than |x|, so a distinct scalar
+# -- torchao's col_global_amax).
+# TODO(future): migrate the remaining RHT gold recipes to an FP32 RHT as well. They intentionally
+# retain the existing BF16 transform until their implementations and numerical contracts move
+# together.
 # ---------------------------------------------------------------------------
 def nvfp4_gs_swizzle_dim_m_rht_f(x, outer_scale, rht, **kwargs):
     """dim-m (colwise) nvfp4-swizzle WITH RHT: RHT along the original M (x.t() is (N, M), RHT hits
-    its last dim), then nvfp4 along M, output in the transposed (N, M//2) frame. Same as
-    nvfp4_gs_swizzle_dim_m_f but RHT-transformed first (the dim-m path of
-    nvfp4_gs_swizzle_dim_k_dim_m_rht_f). `outer_scale` is the per-tensor scalar over |RHT(x.t())|
-    (aux input, REPLICATE); `rht` is the 16x16 RHT matrix (aux input)."""
-    (x_t_rht,) = hadamard_rht_f(x.t().contiguous(), rht)
+    its last dim), then nvfp4 along M, output in the transposed (N, M//2) frame. `outer_scale` is
+    the per-tensor scalar over |RHT(x.t())| (aux input, REPLICATE); `rht` is the 16x16 RHT matrix
+    (aux input). The RHT is evaluated in FP32 and remains FP32 through quantization."""
+    (x_t_rht,) = hadamard_rht_fp32_f(x.t().contiguous(), rht)
     return nvfp4_gs_swizzle_f(x_t_rht, outer_scale)
 
 
@@ -1595,9 +1596,9 @@ def _nvfp4_gs_swizzle_dim_m_rht_inputs(M, K):
     # fixed +/-1 sign vector (deterministic), same as the dim_k_dim_m_rht inputs helper.
     sign = torch.tensor([1, -1] * 8, device=x.device, dtype=x.dtype)
     rht = hadamard_rht_matrix(sign, x.device, x.dtype)
-    # outer scale is over the SAME bf16 RHT output pt_ref_fn re-derives from `rht` (col_global_amax).
-    (x_t_rht,) = hadamard_rht_f(x.t().contiguous(), rht)
-    outer_scale = x_t_rht.abs().to(torch.float32).amax() / (F8E4M3_MAX * F4_E2M1_MAX)
+    # Outer scale is over the same FP32 RHT output re-derived by pt_ref_fn (col_global_amax).
+    (x_t_rht,) = hadamard_rht_fp32_f(x.t().contiguous(), rht)
+    outer_scale = x_t_rht.abs().amax() / (F8E4M3_MAX * F4_E2M1_MAX)
     return (x, outer_scale.reciprocal(), rht)  # recipes take 1/S
 
 
@@ -1605,7 +1606,7 @@ Nvfp4GsSwizzleDimMRHTGold = QuantCastSingleKernelGold(
     pt_ref_fn=nvfp4_gs_swizzle_dim_m_rht_f,
     correctness_fn=_nvfp4_gs_swizzle_dim_m_rht_correctness,
     example_input_fn=_nvfp4_gs_swizzle_dim_m_rht_inputs,
-    perf_description="(1,16) block, fp4 qdata, swizzle; dim-m (RHT), one outer scale",
+    perf_description="(1,16) block, fp4 qdata, swizzle; dim-m (FP32 RHT), one outer scale",
 )
 
 
@@ -1910,17 +1911,18 @@ Nvfp4GsSwizzle_DimKPortableSR_DimMRHTPortableSR_Gold = QuantCastSingleKernelGold
 # ---------------------------------------------------------------------------
 # Golden recipe: the dim-m-only half of
 # Nvfp4GsSwizzle_DimKPortableSR_DimMRHTPortableSR_Gold -- i.e. the SR twin of
-# Nvfp4GsSwizzleDimMRHTGold. Apply the 16x16 RHT to x.t() (16-blocks along the original M) then
+# Nvfp4GsSwizzleDimMRHTGold. This legacy SR recipe still applies its RHT in BF16; see the FP32-RHT
+# migration TODO above. Apply the 16x16 RHT to x.t() (16-blocks along the original M) then
 # STOCHASTIC-ROUND nvfp4 along M, emitting in the transposed (N, M//2) frame. This is exactly the
 # grad_output wgrad-operand cast of nvfp4 training (RHT + SR), without the dim-k output. The
 # per-tensor outer scale is over |RHT(x.t())| (torchao's col_global_amax). Reference only (no kernel).
 # ---------------------------------------------------------------------------
 def nvfp4_gs_swizzle_dim_m_rht_sr_f(x, outer_scale, rht, key, **kwargs):
     """dim-m (colwise) SR nvfp4-swizzle WITH RHT: RHT along the original M then stochastic-round
-    nvfp4 along M, output in the transposed (N, M//2) frame. Same as nvfp4_gs_swizzle_dim_m_rht_f but
-    the fp4 cast uses SR (`nvfp4_gs_swizzle_sr_f`, keyed on `key`). `outer_scale` is the per-tensor
-    scalar over |RHT(x.t())| (aux input, REPLICATE); `rht` is the 16x16 RHT matrix; `key` is a
-    torch.func._random Philox key (all aux inputs)."""
+    nvfp4 along M, output in the transposed (N, M//2) frame. Unlike the FP32 RNE recipe, this
+    future-migration path still rounds the RHT to BF16 before the FP4 cast. `outer_scale` is the
+    per-tensor scalar over |RHT(x.t())| (aux input, REPLICATE); `rht` is the 16x16 RHT matrix;
+    `key` is a torch.func._random Philox key (all aux inputs)."""
     (x_t_rht,) = hadamard_rht_f(x.t().contiguous(), rht)
     return nvfp4_gs_swizzle_sr_f(x_t_rht, outer_scale, key)
 
@@ -2306,6 +2308,15 @@ def hadamard_rht_f(x, rht, **kwargs):
     `hadamard_rht_matrix`), an explicit input. Returns a 1-tuple `(out,)` -- no scale."""
     *lead, last = x.shape
     out = (x.reshape(*lead, last // 16, 16) @ rht).reshape(*lead, last)
+    return (out,)
+
+
+def hadamard_rht_fp32_f(x, rht, **kwargs):
+    """Apply the 16x16 RHT in FP32 and return an FP32 result."""
+    *lead, last = x.shape
+    out = (
+        x.reshape(*lead, last // 16, 16).float() @ rht.float()
+    ).reshape(*lead, last)
     return (out,)
 
 

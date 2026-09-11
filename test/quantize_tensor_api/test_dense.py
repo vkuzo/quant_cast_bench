@@ -22,6 +22,7 @@ from quant_cast_bench.quant_cast_gold.recipes import (
     F8E4M3_MAX,
     _compute_error,
     hadamard_rht_f,
+    hadamard_rht_fp32_f,
     hadamard_rht_matrix,
     mxfp8_32x32_expand_f,
     mxfp8_32x32_qdata_dim_k_scale_dim_km_swizzle_f,
@@ -326,8 +327,9 @@ def test_nvfp4_dim_m_rht_matches_gold_bitwise(M, N, dtype):
     # -> byte-identical by construction; runs eager on any CUDA device (bit-math fp4 path).
     sign = torch.tensor([1, -1] * 8, device=x.device, dtype=x.dtype)  # fixed +/-1 RHT sign vector
     rht = hadamard_rht_matrix(sign, x.device, x.dtype)
-    # two-level outer scale is over |RHT(x.t())| (the RHT-domain amax), not |x|. API and gold consume 1/S.
-    (x_t_rht,) = hadamard_rht_f(x.t().contiguous(), rht)
+    # Two-level outer scale is over the FP32 |RHT(x.t())| (the RHT-domain amax), not |x|. API and
+    # gold consume 1/S.
+    (x_t_rht,) = hadamard_rht_fp32_f(x.t().contiguous(), rht)
     outer_quant_scale = (x_t_rht.abs().to(torch.float32).amax() / (F8E4M3_MAX * F4_E2M1_MAX)).reciprocal()
     q, s = quantize_tensor(
         x.t(),  # dim-m: pass a transposed view; the API un-transposes and uses the dim-m kernel
