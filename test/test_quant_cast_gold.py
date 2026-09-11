@@ -22,6 +22,7 @@ from quant_cast_bench.quant_cast_gold.recipes import (
     _compute_error,
     hadamard_rht_matrix,
     hadamard_rht_f,
+    hadamard_rht_fp32_f,
     mxfp8_dim_km_swizzle_f,
     mxfp8_dim_km_swizzle_sr_f,
     mxfp8_dim_m_swizzle_f,
@@ -110,10 +111,15 @@ def test_nvfp4_rht_nvidia_sr_variants_compose_the_nvidia_sr_gold():
     x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
     sign = torch.tensor([1, -1] * 8, device=x.device, dtype=x.dtype)
     rht = hadamard_rht_matrix(sign, x.device, x.dtype)
-    (x_t_rht,) = hadamard_rht_f(x.t().contiguous(), rht)
+    (x_t_rht_bf16,) = hadamard_rht_f(x.t().contiguous(), rht)
+    (x_t_rht_fp32,) = hadamard_rht_fp32_f(x.t().contiguous(), rht)
     outer_scale_k = nvfp4_gs_scale(x).reciprocal()
-    outer_scale_m = (
-        x_t_rht.abs().to(torch.float32).amax()
+    outer_scale_m_bf16 = (
+        x_t_rht_bf16.abs().to(torch.float32).amax()
+        / (F8E4M3_MAX * F4_E2M1_MAX)
+    ).reciprocal()
+    outer_scale_m_fp32 = (
+        x_t_rht_fp32.abs().amax()
         / (F8E4M3_MAX * F4_E2M1_MAX)
     ).reciprocal()
     key_k = prng.key(7, device=x.device)
@@ -121,18 +127,21 @@ def test_nvfp4_rht_nvidia_sr_variants_compose_the_nvidia_sr_gold():
 
     expected_k = nvfp4_gs_swizzle_nvidia_sr_f(x, outer_scale_k, key_k)
     expected_m = nvfp4_gs_swizzle_nvidia_sr_f(
-        x_t_rht, outer_scale_m, key_m
+        x_t_rht_fp32, outer_scale_m_fp32, key_m
+    )
+    expected_m_fused = nvfp4_gs_swizzle_nvidia_sr_f(
+        x_t_rht_bf16, outer_scale_m_bf16, key_m
     )
     actual_m = nvfp4_gs_swizzle_dim_m_rht_nvidia_sr_f(
-        x, outer_scale_m, rht, key_m
+        x, outer_scale_m_fp32, rht, key_m
     )
     actual_km = nvfp4_gs_swizzle_dim_k_dim_m_rht_nvidia_sr_f(
-        x, outer_scale_k, outer_scale_m, rht, key_k, key_m
+        x, outer_scale_k, outer_scale_m_bf16, rht, key_k, key_m
     )
 
     for actual, expected in zip(actual_m, expected_m):
         assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
-    for actual, expected in zip(actual_km, (*expected_k, *expected_m)):
+    for actual, expected in zip(actual_km, (*expected_k, *expected_m_fused)):
         assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
 
 

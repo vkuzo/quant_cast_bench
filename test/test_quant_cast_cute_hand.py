@@ -78,6 +78,7 @@ _REQUIRES_SM100 = frozenset({
     "nvfp4_swizzle_tma",
     "nvfp4_dim_m_swizzle_tma",
     "nvfp4_dim_m_rht_swizzle_tma",
+    "nvfp4_dim_m_swizzle_rht_sr_tma",
     "nvfp4_dim_km_swizzle_tma",
 })
 
@@ -86,12 +87,15 @@ def _get_recipe(recipe_name):
     return recipe
 
 
-def _nvfp4_dim_m_rht_test_inputs(M, K):
+def _nvfp4_dim_m_rht_test_inputs(M, K, *, stochastic=False):
     x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
     rht_sign = torch.tensor([1, -1] * 8, device=x.device, dtype=x.dtype)
     rht = hadamard_rht_matrix(rht_sign, x.device, x.dtype)
     (x_t_rht,) = hadamard_rht_fp32_f(x.t().contiguous(), rht)
     outer_scale = nvfp4_gs_scale(x_t_rht).reciprocal()
+    if stochastic:
+        key = prng.key(0, device=x.device)
+        return (x, outer_scale, rht_sign, key), (x, outer_scale, rht, key)
     return (x, outer_scale, rht_sign), (x, outer_scale, rht)
 
 def test_add_v0():
@@ -470,6 +474,9 @@ def test_nvfp4_swizzle_tma_rejects_unaligned_packed_stride():
         ("nvfp4_dim_m_rht_swizzle_tma", 32, 16),
         ("nvfp4_dim_m_rht_swizzle_tma", 96, 48),
         ("nvfp4_dim_m_rht_swizzle_tma", 160, 144),
+        ("nvfp4_dim_m_swizzle_rht_sr_tma", 32, 16),
+        ("nvfp4_dim_m_swizzle_rht_sr_tma", 96, 48),
+        ("nvfp4_dim_m_swizzle_rht_sr_tma", 160, 144),
         ("nvfp4_dim_km_swizzle_tma", 32, 32),
         ("nvfp4_dim_km_swizzle_tma", 96, 160),
         ("nvfp4_dim_km_swizzle_tma", 160, 96),
@@ -479,8 +486,15 @@ def test_nvfp4_dim_m_tma_padding(kernel, M, K):
     if torch.cuda.get_device_capability() != (10, 0):
         pytest.skip(f"{kernel} emits Blackwell-only PTX; requires cuda capability 10.0")
     recipe = _get_recipe(kernel)
-    if kernel == "nvfp4_dim_m_rht_swizzle_tma":
-        cute_inputs, gold_inputs = _nvfp4_dim_m_rht_test_inputs(M, K)
+    if kernel in (
+        "nvfp4_dim_m_rht_swizzle_tma",
+        "nvfp4_dim_m_swizzle_rht_sr_tma",
+    ):
+        cute_inputs, gold_inputs = _nvfp4_dim_m_rht_test_inputs(
+            M,
+            K,
+            stochastic=kernel == "nvfp4_dim_m_swizzle_rht_sr_tma",
+        )
     else:
         cute_inputs = gold_inputs = recipe.example_input_fn(M, K)
     outputs = recipe.cute_fn(*cute_inputs)
@@ -643,8 +657,15 @@ def test_cute_hand_matches_reference(name, recipe):
     if name in _REQUIRES_SM100 and torch.cuda.get_device_capability() != (10, 0):
         pytest.skip(f"{name} emits Blackwell-only PTX; requires cuda capability 10.0")
     torch.manual_seed(0)
-    if name == "nvfp4_dim_m_rht_swizzle_tma":
-        cute_inputs, gold_inputs = _nvfp4_dim_m_rht_test_inputs(512, 512)
+    if name in (
+        "nvfp4_dim_m_rht_swizzle_tma",
+        "nvfp4_dim_m_swizzle_rht_sr_tma",
+    ):
+        cute_inputs, gold_inputs = _nvfp4_dim_m_rht_test_inputs(
+            512,
+            512,
+            stochastic=name == "nvfp4_dim_m_swizzle_rht_sr_tma",
+        )
     else:
         cute_inputs = gold_inputs = recipe.example_input_fn(512, 512)
 
