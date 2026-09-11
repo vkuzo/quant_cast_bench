@@ -13,8 +13,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from qdata_utils import mismatch_fraction, qdata_and_scale_equal
 from quant_cast_bench.quant_cast_triton.recipes import (
     ALL_RECIPES,
-    NVFP4_NVIDIA_SR_SWIZZLE,
-    NVFP4_SR_SWIZZLE,
+    NVFP4_SWIZZLE_PORTABLE_SR,
+    NVFP4_SWIZZLE_SR,
     SR_F32_TO_BF16_GLOBAL,
 )
 
@@ -29,8 +29,8 @@ pytestmark = pytest.mark.skipif(
 _REQUIRES_SM100 = frozenset({
     "nvfp4",
     "nvfp4_swizzle",
-    "nvfp4_sr_swizzle",
-    "nvfp4_nvidia_sr_swizzle",  # cvt.rs.satfinite.e2m1x4.f32 is Blackwell-only PTX
+    "nvfp4_swizzle_portable_sr",
+    "nvfp4_swizzle_sr",  # cvt.rs.satfinite.e2m1x4.f32 is Blackwell-only PTX
     "mxfp8_dim_m",
     "mxfp8_dim_m_swizzle",
     "mxfp8_32x32_dim_km_swizzle",
@@ -52,12 +52,13 @@ _SHAPES = [(512, 512), (96, 160), (128, 160)]
 _SHAPE_UNSUPPORTED = {
     (96, 160): frozenset({
         "fp8_deepseek_1x128", "fp8_deepseek_1x128_dim_m", "fp8_deepseek_1x128_dim_km",
-        "fp8_deepseek_128x128", "nvfp4", "nvfp4_swizzle", "nvfp4_sr_swizzle",
-        "nvfp4_nvidia_sr_swizzle", "nvfp4_blocked_outer",
+        "fp8_deepseek_128x128", "nvfp4", "nvfp4_swizzle", "nvfp4_swizzle_portable_sr",
+        "nvfp4_swizzle_sr", "nvfp4_blocked_outer",
     }),
     (128, 160): frozenset({
         "fp8_deepseek_1x128", "fp8_deepseek_1x128_dim_km", "fp8_deepseek_128x128",
-        "nvfp4", "nvfp4_swizzle", "nvfp4_sr_swizzle", "nvfp4_nvidia_sr_swizzle", "nvfp4_blocked_outer",
+        "nvfp4", "nvfp4_swizzle", "nvfp4_swizzle_portable_sr", "nvfp4_swizzle_sr",
+        "nvfp4_blocked_outer",
     }),
 }
 
@@ -103,16 +104,18 @@ def test_triton_matches_reference(name, recipe, shape):
     # stream keyed on each element's GLOBAL flat index (gold gathers prng.bits(key, n)[gidx]; kernel
     # does tl.randint4x(seed, gidx>>2)[gidx&3]):
     #   * fp32_to_bf16_sr_global_offsets -- 16-bit dither, add-then-truncate to bf16.
-    #   * nvfp4_sr_swizzle -- 22-bit dither into the scaled fp32 data, truncate, then the hardware fp4
-    #     cvt. Because the truncation lands normals exactly on the e2m1 grid and the scale uses div.rn,
-    #     the cvt matches gold's software f32_to_f4_unpacked (incl. the subnormal ties truncation makes).
-    #   * nvfp4_nvidia_sr_swizzle -- the Blackwell cvt.rs.satfinite.e2m1x4.f32 intrinsic, fed one Philox
+    #   * nvfp4_swizzle_portable_sr -- 22-bit dither into the scaled fp32 data, truncate, then the
+    #     hardware fp4 cvt. Because the truncation lands normals exactly on the e2m1 grid and the
+    #     scale uses div.rn, the cvt matches gold's software f32_to_f4_unpacked (including the
+    #     subnormal ties truncation makes).
+    #   * nvfp4_swizzle_sr -- the Blackwell cvt.rs.satfinite.e2m1x4.f32 intrinsic, fed one Philox
     #     word per group of 4 elements in the gold's perm order; the gold reproduces the intrinsic's
     #     exact carry-round + byte-interleaved bit layout, so kernel and gold agree bit-for-bit.
-    # All fall through to the equality assertion below. Other _sr recipes (e.g. nvfp4_dim_m_rht_sr_swizzle)
+    # All fall through to the equality assertion below. Other _sr recipes (e.g.
+    # nvfp4_dim_m_swizzle_rht_portable_sr)
     # have no Triton kernel yet and are only property-checked, so they still stop here.
     if "_sr" in name and name not in (
-        "fp32_to_bf16_sr_global_offsets", "nvfp4_sr_swizzle", "nvfp4_nvidia_sr_swizzle"
+        "fp32_to_bf16_sr_global_offsets", "nvfp4_swizzle_portable_sr", "nvfp4_swizzle_sr"
     ):
         return
 
@@ -131,8 +134,8 @@ def test_triton_matches_reference(name, recipe, shape):
 # must reproduce the gold for ANY key -- not just the default one the parametrized sweep uses.
 _FULL_KEY_SR_RECIPES = [
     ("fp32_to_bf16_sr_global_offsets", SR_F32_TO_BF16_GLOBAL),
-    ("nvfp4_sr_swizzle", NVFP4_SR_SWIZZLE),
-    ("nvfp4_nvidia_sr_swizzle", NVFP4_NVIDIA_SR_SWIZZLE),
+    ("nvfp4_swizzle_portable_sr", NVFP4_SWIZZLE_PORTABLE_SR),
+    ("nvfp4_swizzle_sr", NVFP4_SWIZZLE_SR),
 ]
 
 

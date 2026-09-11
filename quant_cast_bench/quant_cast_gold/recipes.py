@@ -2422,11 +2422,14 @@ ALL_RECIPES = [
     ("nvfp4_dim_m_swizzle", Nvfp4GsDimMSwizzleGold),
     ("nvfp4_dim_km_swizzle", Nvfp4GsDimKMSwizzleGold),
     ("nvfp4_dim_m_rht_swizzle", Nvfp4GsSwizzleDimMRHTGold),
-    ("nvfp4_sr_swizzle", Nvfp4GsSRSwizzleGold),
-    ("nvfp4_nvidia_sr_swizzle", Nvfp4GsNVIDIASRSwizzleGold),
-    ("nvfp4_dim_m_rht_sr_swizzle", Nvfp4GsDimMRHTSRSwizzleGold),
+    ("nvfp4_swizzle_portable_sr", Nvfp4GsSRSwizzleGold),
+    ("nvfp4_swizzle_sr", Nvfp4GsNVIDIASRSwizzleGold),
+    ("nvfp4_dim_m_swizzle_rht_portable_sr", Nvfp4GsDimMRHTSRSwizzleGold),
     ("nvfp4_swizzle_dim_k_dim_m_rht", Nvfp4GsSwizzle_DimK_DimMRHT_Gold),
-    ("nvfp4_swizzle_dim_k_sr_dim_m_rht_sr", Nvfp4GsSwizzle_DimKSR_DimMRHTSR_Gold),
+    (
+        "nvfp4_swizzle_dim_k_portable_sr_dim_m_rht_portable_sr",
+        Nvfp4GsSwizzle_DimKSR_DimMRHTSR_Gold,
+    ),
     ("nvfp4_blocked_outer", Nvfp4BlockedOuterGold),
     # RHT
     ("bf16_rht", HadamardRht),

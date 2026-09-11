@@ -1495,12 +1495,12 @@ NVFP4_SWIZZLE = QuantCastTritonRecipe.from_gold(
 )
 # NVFP4_SWIZZLE with stochastic rounding: same kernel/grid, selected by ROUNDING (see _nvfp4_kernel).
 # The gold's aux order is (x, outer_scale, key), so `key` arrives positionally. Bit-matches the gold.
-NVFP4_SR_SWIZZLE = QuantCastTritonRecipe.from_gold(
+NVFP4_SWIZZLE_PORTABLE_SR = QuantCastTritonRecipe.from_gold(
     Nvfp4GsSRSwizzleGold,
     triton_fn=functools.partial(nvfp4_triton, swizzle=True, rounding="sr"),
 )
 # Same, but hardware SR via the Blackwell cvt.rs.satfinite.e2m1x4.f32 intrinsic (ROUNDING="nvidia_sr").
-NVFP4_NVIDIA_SR_SWIZZLE = QuantCastTritonRecipe.from_gold(
+NVFP4_SWIZZLE_SR = QuantCastTritonRecipe.from_gold(
     Nvfp4GsNVIDIASRSwizzleGold,
     triton_fn=functools.partial(nvfp4_triton, swizzle=True, rounding="nvidia_sr"),
 )
@@ -1726,8 +1726,8 @@ ALL_RECIPES = [
     # 4 bit 1D
     ("nvfp4", NVFP4),
     ("nvfp4_swizzle", NVFP4_SWIZZLE),
-    ("nvfp4_sr_swizzle", NVFP4_SR_SWIZZLE),
-    ("nvfp4_nvidia_sr_swizzle", NVFP4_NVIDIA_SR_SWIZZLE),
+    ("nvfp4_swizzle_portable_sr", NVFP4_SWIZZLE_PORTABLE_SR),
+    ("nvfp4_swizzle_sr", NVFP4_SWIZZLE_SR),
     ("nvfp4_blocked_outer", NVFP4_BLOCKED_OUTER),
     # RHT
     ("bf16_rht", BF16_RHT),

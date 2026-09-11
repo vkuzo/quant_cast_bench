@@ -52,10 +52,10 @@ nvfp4_swizzle                                                                   
 nvfp4_dim_m_swizzle                                                             0.5123  1342.8       16.8%  (1,16) block, fp4 qdata, t-contig, swizzle; dim-m
 nvfp4_dim_km_swizzle                                                            0.8910   941.5       11.8%  (1,16) block, fp4 qdata, swizzle; dim-k + dim-m (no RHT), per-orientation outer scale
 nvfp4_dim_m_rht_swizzle                                                         1.0437   659.1        8.2%  (1,16) block, fp4 qdata, swizzle; dim-m (RHT), one outer scale
-nvfp4_sr_swizzle                                                                0.7745   888.1       11.1%  (1,16) block, fp4 qdata (stochastic rounding), swizzle
-nvfp4_dim_m_rht_sr_swizzle                                                      1.4366   478.8        6.0%  (1,16) block, fp4 qdata (stochastic rounding), swizzle; dim-m (RHT), one outer scale
+nvfp4_swizzle_portable_sr                                                       0.7745   888.1       11.1%  (1,16) block, fp4 qdata (stochastic rounding), swizzle
+nvfp4_dim_m_swizzle_rht_portable_sr                                             1.4366   478.8        6.0%  (1,16) block, fp4 qdata (stochastic rounding), swizzle; dim-m (RHT), one outer scale
 nvfp4_swizzle_dim_k_dim_m_rht                                                   1.3914   602.9        7.5%  (1,16) block, fp4 qdata, swizzle; dim-k (no RHT) + dim-m (RHT), two outer scales
-nvfp4_swizzle_dim_k_sr_dim_m_rht_sr                                             2.2085   379.8        4.7%  (1,16) block, fp4 qdata (stochastic rounding), swizzle; dim-k (no RHT) + dim-m (RHT), two outer scales
+nvfp4_swizzle_dim_k_portable_sr_dim_m_rht_portable_sr                           2.2085   379.8        4.7%  (1,16) block, fp4 qdata (stochastic rounding), swizzle; dim-k (no RHT) + dim-m (RHT), two outer scales
 bf16_rht                                                                        0.4583  2342.9       29.3%  elementwise RHT
 fp32_to_bf16_sr_global_offsets                SKIPPED: Unsupported: Observed exception                      elementwise SR with stateless RNG
 debug_relu                                                                      0.1639  6552.3       81.9%  debug: relu, elementwise, no quant
@@ -88,7 +88,7 @@ fp8_rowwise                                          0.1294  6222.7       77.8% 
 fp8_colwise                                          0.2217  3632.2       45.4%  (-1,1) block, t-contig
 nvfp4                                                0.1738  3956.8       49.5%  (1,16) block, fp4 qdata, no swizzle
 nvfp4_swizzle                                        0.1610  4273.5       53.4%  (1,16) block, fp4 qdata, swizzle
-nvfp4_sr_swizzle                                     0.3528  1949.7       24.4%  (1,16) block, fp4 qdata (stochastic rounding), swizzle
+nvfp4_swizzle_portable_sr                            0.3528  1949.7       24.4%  (1,16) block, fp4 qdata (stochastic rounding), swizzle
 bf16_rht                                             0.1991  5392.2       67.4%  elementwise RHT
 fp32_to_bf16_sr_global_offsets                       0.2565    6280       78.5%  elementwise SR with stateless RNG
 ```

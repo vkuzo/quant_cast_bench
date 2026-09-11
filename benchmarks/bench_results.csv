@@ -22,10 +22,10 @@ nvfp4_swizzle,compile,0.3814,1803.4,22.54
 nvfp4_dim_m_swizzle,compile,0.5100,1348.7,16.86
 nvfp4_dim_km_swizzle,compile,0.8877,945.0,11.81
 nvfp4_dim_m_rht_swizzle,compile,1.0441,658.8,8.23
-nvfp4_sr_swizzle,compile,0.7421,926.9,11.59
-nvfp4_dim_m_rht_sr_swizzle,compile,1.4095,488.0,6.10
+nvfp4_swizzle_portable_sr,compile,0.7421,926.9,11.59
+nvfp4_dim_m_swizzle_rht_portable_sr,compile,1.4095,488.0,6.10
 nvfp4_swizzle_dim_k_dim_m_rht,compile,1.4289,587.1,7.34
-nvfp4_swizzle_dim_k_sr_dim_m_rht_sr,compile,2.1492,390.3,4.88
+nvfp4_swizzle_dim_k_portable_sr_dim_m_rht_portable_sr,compile,2.1492,390.3,4.88
 bf16_rht,compile,0.4583,2342.9,29.29
 debug_relu,compile,0.1639,6552.3,81.90
 relu (baseline),triton,0.1773,6057.6,75.72
@@ -88,4 +88,4 @@ fp8_deepseek_1x128_dim_m,flex_tile_map_triton,0.1461,5568.5,69.61
 mxfp8_dim_m,flex_tile_map_triton,0.1968,4133.6,51.67
 mxfp8_32x32,flex_tile_map_triton,0.1266,6360.6,79.51
 nvfp4,flex_tile_map_triton,0.1383,4973.8,62.17
-nvfp4_sr_swizzle,triton,0.3529,1949.5,24.37
+nvfp4_swizzle_portable_sr,triton,0.3529,1949.5,24.37
