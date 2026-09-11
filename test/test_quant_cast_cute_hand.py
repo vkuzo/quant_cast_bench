@@ -13,7 +13,13 @@ import torch.func._random as prng
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from qdata_utils import mismatch_fraction, qdata_and_scale_equal
-from quant_cast_bench.quant_cast_gold.recipes import _from_blocked_4d
+from quant_cast_bench.quant_cast_gold.recipes import (
+    Nvfp4GsSwizzleDimMRHTGold,
+    _from_blocked_4d,
+    hadamard_rht_fp32_f,
+    hadamard_rht_matrix,
+    nvfp4_gs_scale,
+)
 
 # The CuTeDSL kernels import `_maybe_recast_from_f4_f6` (the fp4/fp6 register-packing helper) from
 # cutlass.cute.testing. That is the nvidia-cutlass-dsl >= 4.5.2 name; gate the whole module on the
@@ -71,12 +77,22 @@ _REQUIRES_SM100 = frozenset({
     "nvfp4_swizzle_direct",
     "nvfp4_swizzle_tma",
     "nvfp4_dim_m_swizzle_tma",
+    "nvfp4_dim_m_rht_swizzle_tma",
     "nvfp4_dim_km_swizzle_tma",
 })
 
 def _get_recipe(recipe_name):
     _recipe_name, recipe = [x for x in ALL_RECIPES if x[0] == recipe_name][0]
     return recipe
+
+
+def _nvfp4_dim_m_rht_test_inputs(M, K):
+    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+    rht_sign = torch.tensor([1, -1] * 8, device=x.device, dtype=x.dtype)
+    rht = hadamard_rht_matrix(rht_sign, x.device, x.dtype)
+    (x_t_rht,) = hadamard_rht_fp32_f(x.t().contiguous(), rht)
+    outer_scale = nvfp4_gs_scale(x_t_rht).reciprocal()
+    return (x, outer_scale, rht_sign), (x, outer_scale, rht)
 
 def test_add_v0():
     M, K = 2, 64
@@ -451,6 +467,9 @@ def test_nvfp4_swizzle_tma_rejects_unaligned_packed_stride():
         ("nvfp4_dim_m_swizzle_tma", 32, 16),
         ("nvfp4_dim_m_swizzle_tma", 96, 48),
         ("nvfp4_dim_m_swizzle_tma", 160, 144),
+        ("nvfp4_dim_m_rht_swizzle_tma", 32, 16),
+        ("nvfp4_dim_m_rht_swizzle_tma", 96, 48),
+        ("nvfp4_dim_m_rht_swizzle_tma", 160, 144),
         ("nvfp4_dim_km_swizzle_tma", 32, 32),
         ("nvfp4_dim_km_swizzle_tma", 96, 160),
         ("nvfp4_dim_km_swizzle_tma", 160, 96),
@@ -460,9 +479,12 @@ def test_nvfp4_dim_m_tma_padding(kernel, M, K):
     if torch.cuda.get_device_capability() != (10, 0):
         pytest.skip(f"{kernel} emits Blackwell-only PTX; requires cuda capability 10.0")
     recipe = _get_recipe(kernel)
-    inputs = recipe.example_input_fn(M, K)
-    outputs = recipe.cute_fn(*inputs)
-    references = recipe.pt_ref_fn(*inputs)
+    if kernel == "nvfp4_dim_m_rht_swizzle_tma":
+        cute_inputs, gold_inputs = _nvfp4_dim_m_rht_test_inputs(M, K)
+    else:
+        cute_inputs = gold_inputs = recipe.example_input_fn(M, K)
+    outputs = recipe.cute_fn(*cute_inputs)
+    references = recipe.pt_ref_fn(*gold_inputs)
     for output, reference in zip(outputs, references):
         assert qdata_and_scale_equal(output, reference)
 
@@ -621,11 +643,18 @@ def test_cute_hand_matches_reference(name, recipe):
     if name in _REQUIRES_SM100 and torch.cuda.get_device_capability() != (10, 0):
         pytest.skip(f"{name} emits Blackwell-only PTX; requires cuda capability 10.0")
     torch.manual_seed(0)
-    inputs = recipe.example_input_fn(512, 512)
+    if name == "nvfp4_dim_m_rht_swizzle_tma":
+        cute_inputs, gold_inputs = _nvfp4_dim_m_rht_test_inputs(512, 512)
+    else:
+        cute_inputs = gold_inputs = recipe.example_input_fn(512, 512)
 
-    tile_kwargs = {"global_row": 0, "global_col": 0, "num_col": inputs[0].shape[-1]}
-    ref_outs = recipe.pt_ref_fn(*inputs, **tile_kwargs)
-    cute_outs = recipe.cute_fn(*inputs, **tile_kwargs)
+    tile_kwargs = {
+        "global_row": 0,
+        "global_col": 0,
+        "num_col": gold_inputs[0].shape[-1],
+    }
+    ref_outs = recipe.pt_ref_fn(*gold_inputs, **tile_kwargs)
+    cute_outs = recipe.cute_fn(*cute_inputs, **tile_kwargs)
 
     assert len(cute_outs) == len(ref_outs), f"{name}: output count {len(cute_outs)} != {len(ref_outs)}"
     for i, (t, r) in enumerate(zip(cute_outs, ref_outs)):
@@ -634,7 +663,7 @@ def test_cute_hand_matches_reference(name, recipe):
         )
 
     # Every recipe's outputs must be a valid quantization (the gold correctness_fn).
-    recipe.correctness_fn(inputs, cute_outs)
+    recipe.correctness_fn(gold_inputs, cute_outs)
 
     # And must reproduce the gold bit-for-bit: identical fp32 math + RNE cast.
     for i, (t, r) in enumerate(zip(cute_outs, ref_outs)):

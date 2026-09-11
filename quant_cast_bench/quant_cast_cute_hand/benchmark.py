@@ -34,15 +34,17 @@ from quant_cast_bench.quant_cast_cute_hand.recipes import (
     add_v0, add_v1, add_v2, fp8_deepseek_1x128, fp8_deepseek_1x128_dim_m,
     fp8_deepseek_1x128_dim_m_v2, mxfp8_swizzle, mxfp8_swizzle_v2,
     mxfp8_swizzle_v3, mxfp8_swizzle_v4, mxfp8_swizzle_v5,
-    nvfp4_dim_km_swizzle_tma, nvfp4_dim_m_swizzle_tma,
-    nvfp4_swizzle_direct, nvfp4_swizzle_tma,
+    nvfp4_dim_km_swizzle_tma, nvfp4_dim_m_rht_swizzle_tma,
+    nvfp4_dim_m_swizzle_tma, nvfp4_swizzle_direct, nvfp4_swizzle_tma,
     transpose_v0, transpose_v1,
 )
 from quant_cast_bench.quant_cast_gold.recipes import (
     mxfp8_dim_km_swizzle_f, mxfp8_dim_km_swizzle_sr_f,
     mxfp8_dim_m_swizzle_f, mxfp8_dim_m_swizzle_sr_f, mxfp8_swizzle_f,
-    mxfp8_swizzle_sr_f, nvfp4_gs_scale, nvfp4_gs_swizzle_dim_km_f,
-    nvfp4_gs_swizzle_dim_m_f, nvfp4_gs_swizzle_f,
+    mxfp8_swizzle_sr_f, hadamard_rht_fp32_f, hadamard_rht_matrix,
+    nvfp4_gs_scale, nvfp4_gs_swizzle_dim_km_f, nvfp4_gs_swizzle_dim_m_f,
+    nvfp4_gs_swizzle_f,
+    Nvfp4GsSwizzleDimMRHTGold,
 )
 
 # Peak HBM bandwidth per GPU family (GB/s), used for the "% of peak" column. Matched by substring
@@ -558,6 +560,28 @@ def _bench_nvfp4_dim_km_swizzle_tma(M, K):
     return run, bytes_per_iter
 
 
+def _bench_nvfp4_dim_m_rht_swizzle_tma(M, K):
+    torch.manual_seed(0)
+    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+    rht_sign = torch.tensor([1, -1] * 8, device=x.device, dtype=x.dtype)
+    rht = hadamard_rht_matrix(rht_sign, x.device, x.dtype)
+    (x_t_rht,) = hadamard_rht_fp32_f(x.t().contiguous(), rht)
+    outer_scale = nvfp4_gs_scale(x_t_rht).reciprocal()
+
+    def run():
+        return nvfp4_dim_m_rht_swizzle_tma(x, outer_scale, rht_sign)
+
+    outputs = run()
+    torch.cuda.synchronize()
+    references = Nvfp4GsSwizzleDimMRHTGold.pt_ref_fn(x, outer_scale, rht)
+    for output, reference in zip(outputs, references):
+        assert torch.equal(output.view(torch.uint8), reference.view(torch.uint8))
+    bytes_per_iter = x.numel() * x.element_size() + sum(
+        output.numel() * output.element_size() for output in outputs
+    )
+    return run, bytes_per_iter
+
+
 def _bench_transpose_v0(M, K):
     # read input (M*K bf16) + write transposed output (K*M bf16); a memory-bound 2D transpose.
     # v0 is the naive path: coalesced vectorized read, scattered (strided) column write.
@@ -618,6 +642,7 @@ _KERNELS = {
     "nvfp4_swizzle_tma": _bench_nvfp4_swizzle_tma,
     "nvfp4_dim_m_swizzle_tma": _bench_nvfp4_dim_m_swizzle_tma,
     "nvfp4_dim_km_swizzle_tma": _bench_nvfp4_dim_km_swizzle_tma,
+    "nvfp4_dim_m_rht_swizzle_tma": _bench_nvfp4_dim_m_rht_swizzle_tma,
     "transpose_v0": _bench_transpose_v0,
     "transpose_v1": _bench_transpose_v1,
 }
