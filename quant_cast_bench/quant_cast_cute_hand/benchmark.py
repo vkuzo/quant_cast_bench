@@ -34,12 +34,15 @@ from quant_cast_bench.quant_cast_cute_hand.recipes import (
     add_v0, add_v1, add_v2, fp8_deepseek_1x128, fp8_deepseek_1x128_dim_m,
     fp8_deepseek_1x128_dim_m_v2, mxfp8_swizzle, mxfp8_swizzle_v2,
     mxfp8_swizzle_v3, mxfp8_swizzle_v4, mxfp8_swizzle_v5,
+    nvfp4_dim_km_swizzle_tma, nvfp4_dim_m_swizzle_tma,
+    nvfp4_swizzle_direct, nvfp4_swizzle_tma,
     transpose_v0, transpose_v1,
 )
 from quant_cast_bench.quant_cast_gold.recipes import (
     mxfp8_dim_km_swizzle_f, mxfp8_dim_km_swizzle_sr_f,
     mxfp8_dim_m_swizzle_f, mxfp8_dim_m_swizzle_sr_f, mxfp8_swizzle_f,
-    mxfp8_swizzle_sr_f,
+    mxfp8_swizzle_sr_f, nvfp4_gs_scale, nvfp4_gs_swizzle_dim_km_f,
+    nvfp4_gs_swizzle_dim_m_f, nvfp4_gs_swizzle_f,
 )
 
 # Peak HBM bandwidth per GPU family (GB/s), used for the "% of peak" column. Matched by substring
@@ -484,6 +487,77 @@ def _bench_mxfp8_dim_km_swizzle_sr_v2(M, K):
     return run, bytes_per_iter
 
 
+def _bench_nvfp4_swizzle_impl(M, K, kernel_fn):
+    torch.manual_seed(0)
+    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+    outer_scale = nvfp4_gs_scale(x).reciprocal()
+
+    def run():
+        return kernel_fn(x, outer_scale)
+
+    qdata, scale = run()
+    torch.cuda.synchronize()
+    qdata_ref, scale_ref = nvfp4_gs_swizzle_f(x, outer_scale)
+    assert torch.equal(
+        qdata.view(torch.uint8), qdata_ref.view(torch.uint8)
+    ), "qdata mismatch vs reference"
+    assert torch.equal(
+        scale.view(torch.uint8), scale_ref.view(torch.uint8)
+    ), "scale mismatch vs reference"
+    bytes_per_iter = (
+        x.numel() * x.element_size()
+        + qdata.numel() * qdata.element_size()
+        + scale.numel() * scale.element_size()
+    )
+    return run, bytes_per_iter
+
+
+def _bench_nvfp4_swizzle_direct(M, K):
+    return _bench_nvfp4_swizzle_impl(M, K, nvfp4_swizzle_direct)
+
+
+def _bench_nvfp4_swizzle_tma(M, K):
+    return _bench_nvfp4_swizzle_impl(M, K, nvfp4_swizzle_tma)
+
+
+def _bench_nvfp4_dim_m_swizzle_tma(M, K):
+    torch.manual_seed(0)
+    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+    outer_scale = nvfp4_gs_scale(x).reciprocal()
+
+    def run():
+        return nvfp4_dim_m_swizzle_tma(x, outer_scale)
+
+    outputs = run()
+    torch.cuda.synchronize()
+    references = nvfp4_gs_swizzle_dim_m_f(x, outer_scale)
+    for output, reference in zip(outputs, references):
+        assert torch.equal(output.view(torch.uint8), reference.view(torch.uint8))
+    bytes_per_iter = x.numel() * x.element_size() + sum(
+        output.numel() * output.element_size() for output in outputs
+    )
+    return run, bytes_per_iter
+
+
+def _bench_nvfp4_dim_km_swizzle_tma(M, K):
+    torch.manual_seed(0)
+    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+    outer_scale = nvfp4_gs_scale(x).reciprocal()
+
+    def run():
+        return nvfp4_dim_km_swizzle_tma(x, outer_scale, outer_scale)
+
+    outputs = run()
+    torch.cuda.synchronize()
+    references = nvfp4_gs_swizzle_dim_km_f(x, outer_scale, outer_scale)
+    for output, reference in zip(outputs, references):
+        assert torch.equal(output.view(torch.uint8), reference.view(torch.uint8))
+    bytes_per_iter = x.numel() * x.element_size() + sum(
+        output.numel() * output.element_size() for output in outputs
+    )
+    return run, bytes_per_iter
+
+
 def _bench_transpose_v0(M, K):
     # read input (M*K bf16) + write transposed output (K*M bf16); a memory-bound 2D transpose.
     # v0 is the naive path: coalesced vectorized read, scattered (strided) column write.
@@ -540,6 +614,10 @@ _KERNELS = {
     "mxfp8_dim_m_swizzle_sr_v2": _bench_mxfp8_dim_m_swizzle_sr_v2,
     "mxfp8_dim_km_swizzle_v2": _bench_mxfp8_dim_km_swizzle_v2,
     "mxfp8_dim_km_swizzle_sr_v2": _bench_mxfp8_dim_km_swizzle_sr_v2,
+    "nvfp4_swizzle_direct": _bench_nvfp4_swizzle_direct,
+    "nvfp4_swizzle_tma": _bench_nvfp4_swizzle_tma,
+    "nvfp4_dim_m_swizzle_tma": _bench_nvfp4_dim_m_swizzle_tma,
+    "nvfp4_dim_km_swizzle_tma": _bench_nvfp4_dim_km_swizzle_tma,
     "transpose_v0": _bench_transpose_v0,
     "transpose_v1": _bench_transpose_v1,
 }
