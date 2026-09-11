@@ -80,6 +80,8 @@ _REQUIRES_SM100 = frozenset({
     "nvfp4_dim_m_rht_swizzle_tma",
     "nvfp4_dim_m_swizzle_rht_sr_tma",
     "nvfp4_dim_km_swizzle_tma",
+    "nvfp4_swizzle_dim_k_dim_m_rht_tma",
+    "nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_tma",
 })
 
 def _get_recipe(recipe_name):
@@ -97,6 +99,28 @@ def _nvfp4_dim_m_rht_test_inputs(M, K, *, stochastic=False):
         key = prng.key(0, device=x.device)
         return (x, outer_scale, rht_sign, key), (x, outer_scale, rht, key)
     return (x, outer_scale, rht_sign), (x, outer_scale, rht)
+
+
+def _nvfp4_dim_km_rht_test_inputs(M, K, *, stochastic=False):
+    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+    rht_sign = torch.tensor([1, -1] * 8, device=x.device, dtype=x.dtype)
+    rht = hadamard_rht_matrix(rht_sign, x.device, x.dtype)
+    (x_t_rht,) = hadamard_rht_fp32_f(x.t().contiguous(), rht)
+    outer_scale_k = nvfp4_gs_scale(x).reciprocal()
+    outer_scale_m = nvfp4_gs_scale(x_t_rht).reciprocal()
+    if stochastic:
+        key_k = prng.key(0, device=x.device)
+        key_m = prng.key(1, device=x.device)
+        return (
+            x, outer_scale_k, outer_scale_m, rht_sign, key_k, key_m
+        ), (
+            x, outer_scale_k, outer_scale_m, rht, key_k, key_m
+        )
+    return (
+        x, outer_scale_k, outer_scale_m, rht_sign
+    ), (
+        x, outer_scale_k, outer_scale_m, rht
+    )
 
 def test_add_v0():
     M, K = 2, 64
@@ -480,6 +504,12 @@ def test_nvfp4_swizzle_tma_rejects_unaligned_packed_stride():
         ("nvfp4_dim_km_swizzle_tma", 32, 32),
         ("nvfp4_dim_km_swizzle_tma", 96, 160),
         ("nvfp4_dim_km_swizzle_tma", 160, 96),
+        ("nvfp4_swizzle_dim_k_dim_m_rht_tma", 32, 32),
+        ("nvfp4_swizzle_dim_k_dim_m_rht_tma", 96, 160),
+        ("nvfp4_swizzle_dim_k_dim_m_rht_tma", 160, 96),
+        ("nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_tma", 32, 32),
+        ("nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_tma", 96, 160),
+        ("nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_tma", 160, 96),
     ],
 )
 def test_nvfp4_dim_m_tma_padding(kernel, M, K):
@@ -487,6 +517,15 @@ def test_nvfp4_dim_m_tma_padding(kernel, M, K):
         pytest.skip(f"{kernel} emits Blackwell-only PTX; requires cuda capability 10.0")
     recipe = _get_recipe(kernel)
     if kernel in (
+        "nvfp4_swizzle_dim_k_dim_m_rht_tma",
+        "nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_tma",
+    ):
+        cute_inputs, gold_inputs = _nvfp4_dim_km_rht_test_inputs(
+            M,
+            K,
+            stochastic=kernel == "nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_tma",
+        )
+    elif kernel in (
         "nvfp4_dim_m_rht_swizzle_tma",
         "nvfp4_dim_m_swizzle_rht_sr_tma",
     ):
@@ -510,7 +549,11 @@ def test_nvfp4_dim_m_tma_padding(kernel, M, K):
     assert torch.count_nonzero(sm_padded[K:, :]) == 0
     assert torch.count_nonzero(sm_padded[:K, M // 16:]) == 0
 
-    if kernel == "nvfp4_dim_km_swizzle_tma":
+    if kernel in (
+        "nvfp4_dim_km_swizzle_tma",
+        "nvfp4_swizzle_dim_k_dim_m_rht_tma",
+        "nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_tma",
+    ):
         qk, sk = outputs[:2]
         assert qk.shape == (M, K // 2)
         nrb_k, ncb_k = (M + 127) // 128, ((K // 16) + 3) // 4
@@ -658,6 +701,15 @@ def test_cute_hand_matches_reference(name, recipe):
         pytest.skip(f"{name} emits Blackwell-only PTX; requires cuda capability 10.0")
     torch.manual_seed(0)
     if name in (
+        "nvfp4_swizzle_dim_k_dim_m_rht_tma",
+        "nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_tma",
+    ):
+        cute_inputs, gold_inputs = _nvfp4_dim_km_rht_test_inputs(
+            512,
+            512,
+            stochastic=name == "nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_tma",
+        )
+    elif name in (
         "nvfp4_dim_m_rht_swizzle_tma",
         "nvfp4_dim_m_swizzle_rht_sr_tma",
     ):

@@ -34,6 +34,8 @@ from quant_cast_bench.quant_cast_gold.recipes import (
     Mxfp8DimKmSwizzleSRGold, Mxfp8DimMSwizzleGold, Mxfp8DimMSwizzleSRGold,
     Mxfp8SwizzleGold, Mxfp8SwizzleSRGold, Nvfp4GsDimKMSwizzleGold,
     Nvfp4GsDimMSwizzleGold, Nvfp4GsDimMSwizzleRHTSRGold,
+    Nvfp4GsSwizzle_DimK_DimMRHT_Gold,
+    Nvfp4GsSwizzle_DimKSR_DimMRHTSR_Gold,
     Nvfp4GsSwizzleDimMRHTGold,
     Nvfp4GsSwizzleGold,
 )
@@ -3354,6 +3356,23 @@ def _nvfp4_quantize_stochastic_x16(values, outer, sr_counter, k0, k1):
 
 
 @cute.jit
+def _nvfp4_load_philox_key(mSeed: cute.Tensor):
+    """Load one PyTorch Philox key and return its two key words plus counter base."""
+    frgKey = cute.make_rmem_tensor(cute.make_layout(2), mSeed.element_type)
+    cute.copy(
+        cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), mSeed.element_type),
+        mSeed,
+        frgKey,
+    )
+    key64 = cute.recast_tensor(frgKey, dtype=cutlass.Uint64)
+    return (
+        cutlass.Uint32(key64[0] & cutlass.Uint64(0xFFFFFFFF)),
+        cutlass.Uint32(key64[0] >> 32),
+        key64[1],
+    )
+
+
+@cute.jit
 def _nvfp4_rht_fwht_x16(
     sInput: cute.Tensor,
     row_start,
@@ -3891,7 +3910,8 @@ def nvfp4_swizzle_tma_kernel(
     mOuterK: cute.Tensor,
     mOuterM: cute.Tensor,
     mRhtSign: cute.Tensor,
-    mSeed: cute.Tensor,
+    mSeedK: cute.Tensor,
+    mSeedM: cute.Tensor,
     input_smem_layout: cute.ComposedLayout,
     output_k_smem_layout: cute.ComposedLayout,
     output_m_smem_layout: cute.ComposedLayout,
@@ -4019,22 +4039,18 @@ def nvfp4_swizzle_tma_kernel(
             tma_bar_ptr=tma_bar_ptr,
         )
 
-    k0 = cutlass.Uint32(0)
-    k1 = cutlass.Uint32(0)
-    counter_base = cutlass.Uint64(0)
+    k0_k = cutlass.Uint32(0)
+    k1_k = cutlass.Uint32(0)
+    counter_base_k = cutlass.Uint64(0)
+    k0_m = cutlass.Uint32(0)
+    k1_m = cutlass.Uint32(0)
+    counter_base_m = cutlass.Uint64(0)
     if cutlass.const_expr(stochastic):
-        # Load the key while the input TMA is in flight. The logical dim-M flat index below makes
-        # the random stream independent of the selected tile shape.
-        frgKey = cute.make_rmem_tensor(cute.make_layout(2), mSeed.element_type)
-        cute.copy(
-            cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), mSeed.element_type),
-            mSeed,
-            frgKey,
-        )
-        key64 = cute.recast_tensor(frgKey, dtype=cutlass.Uint64)
-        k0 = cutlass.Uint32(key64[0] & cutlass.Uint64(0xFFFFFFFF))
-        k1 = cutlass.Uint32(key64[0] >> 32)
-        counter_base = key64[1]
+        # Load both independent orientation keys while the input TMA is in flight. Logical flat
+        # indices below make both random streams independent of the selected tile shape.
+        k0_m, k1_m, counter_base_m = _nvfp4_load_philox_key(mSeedM)
+        if cutlass.const_expr(do_dim_k):
+            k0_k, k1_k, counter_base_k = _nvfp4_load_philox_key(mSeedK)
 
     if cutlass.const_expr(has_rht):
         if tidx < _NVFP4_GROUP:
@@ -4090,9 +4106,9 @@ def nvfp4_swizzle_tma_kernel(
             tile_n,
             has_rht,
             stochastic,
-            counter_base,
-            k0,
-            k1,
+            counter_base_m,
+            k0_m,
+            k1_m,
             M,
             N,
         )
@@ -4119,6 +4135,16 @@ def nvfp4_swizzle_tma_kernel(
         ) // threads_per_row_k
         rScaleK = cute.make_rmem_tensor(groups_per_thread_k, cutlass.Uint8)
         thrOutputPairsK = cute.tiled_divide(thrOutputGroupsK, (16,))
+        row_k = m_tile * tile_m + tidx // threads_per_row_k
+        scale_col_k = (
+            n_tile * (tile_n // _NVFP4_GROUP)
+            + (tidx % threads_per_row_k) * groups_per_thread_k
+        )
+        sr_counter_start_k = cutlass.Uint64(0)
+        if cutlass.const_expr(stochastic):
+            sr_counter_start_k = counter_base_k + cutlass.Uint64(
+                row_k * (N // _NVFP4_GROUP) + scale_col_k
+            )
         if cutlass.const_expr(do_dim_m):
             # Separate fused output storage allows each pair to be staged immediately instead of
             # keeping the whole row segment live while the aliased input remains in use.
@@ -4145,9 +4171,19 @@ def nvfp4_swizzle_tma_kernel(
                             sGroupK8[(None, half)],
                             rInputK8[(None, half)],
                         )
-                    qdata_k, scale_k = _nvfp4_quantize_x16(
-                        rInputK.load().to(cutlass.Float32), frgOuterK[0]
-                    )
+                    values_k = rInputK.load().to(cutlass.Float32)
+                    if cutlass.const_expr(stochastic):
+                        qdata_k, scale_k = _nvfp4_quantize_stochastic_x16(
+                            values_k,
+                            frgOuterK[0],
+                            sr_counter_start_k + cutlass.Uint64(group),
+                            k0_k,
+                            k1_k,
+                        )
+                    else:
+                        qdata_k, scale_k = _nvfp4_quantize_x16(
+                            values_k, frgOuterK[0]
+                        )
                     rQPairGroupsK[(None, pair_group)].store(qdata_k)
                     rScaleK[group] = scale_k
                 cute.copy(
@@ -4171,9 +4207,19 @@ def nvfp4_swizzle_tma_kernel(
                         sGroupK8[(None, half)],
                         rInputK8[(None, half)],
                     )
-                qdata_k, scale_k = _nvfp4_quantize_x16(
-                    rInputK.load().to(cutlass.Float32), frgOuterK[0]
-                )
+                values_k = rInputK.load().to(cutlass.Float32)
+                if cutlass.const_expr(stochastic):
+                    qdata_k, scale_k = _nvfp4_quantize_stochastic_x16(
+                        values_k,
+                        frgOuterK[0],
+                        sr_counter_start_k + cutlass.Uint64(group),
+                        k0_k,
+                        k1_k,
+                    )
+                else:
+                    qdata_k, scale_k = _nvfp4_quantize_x16(
+                        values_k, frgOuterK[0]
+                    )
                 rQGroupsK[(None, group)].store(qdata_k)
                 rScaleK[group] = scale_k
 
@@ -4194,11 +4240,6 @@ def nvfp4_swizzle_tma_kernel(
                 tOutputgK[(None, m_tile, n_tile)],
             )
 
-        row_k = m_tile * tile_m + tidx // threads_per_row_k
-        scale_col_k = (
-            n_tile * (tile_n // _NVFP4_GROUP)
-            + (tidx % threads_per_row_k) * groups_per_thread_k
-        )
         if scale_col_k < _ceil_div(N, 64) * 4:
             if (row_k < M) & (
                 scale_col_k + groups_per_thread_k <= N // _NVFP4_GROUP
@@ -4315,6 +4356,7 @@ def nvfp4_swizzle_tma_jit(
         mOuter,
         mInput,
         mScale,
+        mScale,
         input_smem_layout,
         output_smem_layout,
         output_smem_layout,
@@ -4345,7 +4387,8 @@ def nvfp4_swizzle_tma_m_jit(
     mScaleK: cute.Tensor,
     mOuterK: cute.Tensor,
     mRhtSign: cute.Tensor,
-    mSeed: cute.Tensor,
+    mSeedK: cute.Tensor,
+    mSeedM: cute.Tensor,
     M: cutlass.Int32,
     N: cutlass.Int32,
     tile_m: cutlass.Constexpr,
@@ -4494,7 +4537,8 @@ def nvfp4_swizzle_tma_m_jit(
         mOuterK,
         mOuterM,
         mRhtSign,
-        mSeed,
+        mSeedK,
+        mSeedM,
         input_smem_layout,
         output_k_smem_layout,
         output_m_smem_layout,
@@ -4604,6 +4648,7 @@ def nvfp4_swizzle_tma(
     mode: str = "dim_k",
     rht_sign: torch.Tensor | None = None,
     key: torch.Tensor | None = None,
+    key_m: torch.Tensor | None = None,
     rounding_mode: str = "rtne",
     **kwargs,
 ):
@@ -4615,8 +4660,8 @@ def nvfp4_swizzle_tma(
     )
     stochastic = rounding_mode == "stochastic"
     if stochastic:
-        assert mode == "dim_m" and has_rht, (
-            "stochastic rounding currently supports dim-m RHT only"
+        assert has_rht and mode in ("dim_m", "dim_km"), (
+            "stochastic rounding currently requires an RHT dim-m output"
         )
         assert key is not None, "stochastic rounding requires a Philox key"
         assert key.device == input.device, (
@@ -4625,10 +4670,24 @@ def nvfp4_swizzle_tma(
         assert key.dtype == torch.uint64 and key.numel() == 2, (
             "Philox key must be uint64[2]"
         )
+        if mode == "dim_km":
+            assert key_m is not None, "stochastic dim-km requires a dim-M Philox key"
+            assert key_m.device == input.device, (
+                "input and dim-M Philox key must be on the same device"
+            )
+            assert key_m.dtype == torch.uint64 and key_m.numel() == 2, (
+                "dim-M Philox key must be uint64[2]"
+            )
+        else:
+            assert key_m is None, "stochastic dim-m takes one Philox key"
     else:
-        assert key is None, "RTNE rounding does not use a Philox key"
+        assert key is None and key_m is None, (
+            "RTNE rounding does not use Philox keys"
+        )
     if has_rht:
-        assert mode == "dim_m", "RHT currently supports dim-m only"
+        assert mode in ("dim_m", "dim_km"), (
+            "RHT requires a dim-m output"
+        )
         assert rht_sign.shape == (16,), "RHT sign input must have shape (16,)"
         assert rht_sign.dtype == torch.bfloat16 and rht_sign.device == input.device, (
             "RHT sign input must be bf16 on the input device"
@@ -4682,12 +4741,18 @@ def nvfp4_swizzle_tma(
             if rht_sign is not None
             else mInput
         )
-        # The RTNE specialization never reads mSeed, so reuse an existing tensor as its dummy.
-        mSeed = (
-            from_dlpack(key.reshape(-1).view(torch.int64))
-            if stochastic
-            else mScaleM
-        )
+        # Compile-time RTNE branches never read these dummy tensors. Dim-M-only SR treats `key` as
+        # its primary stream; fused SR uses independent primary dim-K and secondary dim-M streams.
+        if stochastic:
+            if mode == "dim_km":
+                mSeedK = from_dlpack(key.reshape(-1).view(torch.int64))
+                mSeedM = from_dlpack(key_m.reshape(-1).view(torch.int64))
+            else:
+                mSeedK = mScaleM
+                mSeedM = from_dlpack(key.reshape(-1).view(torch.int64))
+        else:
+            mSeedK = mScaleM
+            mSeedM = mScaleM
 
         if mode == "dim_km":
             output_k, scale_k, nrb_k, ncb_k = _allocate_nvfp4_swizzle_outputs(
@@ -4710,15 +4775,27 @@ def nvfp4_swizzle_tma(
             mOutputK, mScaleK, mOuterK = mOutputM, mScaleM, mOuterM
             mode_id = _NVFP4_MODE_DIM_M
 
-        if M * N <= 2048 * 2048:
+        fused_rht = mode == "dim_km" and has_rht
+        if fused_rht:
+            tile_m = 32 if M * N <= 2048 * 2048 else 64
+            tile_n = 128
+        elif M * N <= 2048 * 2048:
             tile_m, tile_n = 32, 128
         elif stochastic and M * N >= 8192 * 8192:
             tile_m, tile_n = 128, 128
         else:
             tile_m, tile_n = 64, 128
-        # RTNE benefits from pairing only the smallest RHT CTAs. The heavier SR specialization
-        # regains locality from pairs of the 128-row CTAs selected for large problems.
-        if stochastic and M * N >= 8192 * 8192:
+        # Fused SR benefits from pairing adjacent CTAs at both tile sizes; fused RTNE does so only
+        # through 4K. Standalone RTNE clusters only its smallest tile, while standalone SR also
+        # pairs large tiles.
+        if fused_rht:
+            cluster_n = (
+                2
+                if (stochastic or M * N <= 4096 * 4096)
+                and _ceil_div(N, tile_n) % 2 == 0
+                else 1
+            )
+        elif stochastic and M * N >= 8192 * 8192:
             cluster_n = 2 if _ceil_div(N, tile_n) % 2 == 0 else 1
         else:
             cluster_n = (
@@ -4747,7 +4824,8 @@ def nvfp4_swizzle_tma(
             mScaleK,
             mOuterK,
             mRhtSign,
-            mSeed,
+            mSeedK,
+            mSeedM,
             M,
             N,
             tile_m,
@@ -4766,7 +4844,8 @@ def nvfp4_swizzle_tma(
             mScaleK,
             mOuterK,
             mRhtSign,
-            mSeed,
+            mSeedK,
+            mSeedM,
             M,
             N,
         )
@@ -4894,6 +4973,53 @@ NVFP4_DIM_M_SWIZZLE_RHT_SR_TMA = QuantCastCuteRecipe.from_gold(
 )
 
 
+def nvfp4_swizzle_dim_k_dim_m_rht_tma(
+    input, outer_scale_k, outer_scale_m, rht_sign, **kwargs
+):
+    return nvfp4_swizzle_tma(
+        input,
+        outer_scale_k,
+        outer_scale_m=outer_scale_m,
+        mode="dim_km",
+        rht_sign=rht_sign,
+        **kwargs,
+    )
+
+
+NVFP4_SWIZZLE_DIM_K_DIM_M_RHT_TMA = QuantCastCuteRecipe.from_gold(
+    Nvfp4GsSwizzle_DimK_DimMRHT_Gold,
+    cute_fn=nvfp4_swizzle_dim_k_dim_m_rht_tma,
+)
+
+
+def nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_tma(
+    input,
+    outer_scale_k,
+    outer_scale_m,
+    rht_sign,
+    key_k,
+    key_m,
+    **kwargs,
+):
+    return nvfp4_swizzle_tma(
+        input,
+        outer_scale_k,
+        outer_scale_m=outer_scale_m,
+        mode="dim_km",
+        rht_sign=rht_sign,
+        key=key_k,
+        key_m=key_m,
+        rounding_mode="stochastic",
+        **kwargs,
+    )
+
+
+NVFP4_SWIZZLE_DIM_K_SR_DIM_M_RHT_SR_TMA = QuantCastCuteRecipe.from_gold(
+    Nvfp4GsSwizzle_DimKSR_DimMRHTSR_Gold,
+    cute_fn=nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_tma,
+)
+
+
 ALL_RECIPES = [
     ("deepseek_1x128", FP8_DEEPSEEK_1X128),
     ("deepseek_1x128_dim_m", FP8_DEEPSEEK_1X128_DIM_M),
@@ -4915,4 +5041,9 @@ ALL_RECIPES = [
     ("nvfp4_dim_km_swizzle_tma", NVFP4_DIM_KM_SWIZZLE_TMA),
     ("nvfp4_dim_m_rht_swizzle_tma", NVFP4_DIM_M_RHT_SWIZZLE_TMA),
     ("nvfp4_dim_m_swizzle_rht_sr_tma", NVFP4_DIM_M_SWIZZLE_RHT_SR_TMA),
+    ("nvfp4_swizzle_dim_k_dim_m_rht_tma", NVFP4_SWIZZLE_DIM_K_DIM_M_RHT_TMA),
+    (
+        "nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_tma",
+        NVFP4_SWIZZLE_DIM_K_SR_DIM_M_RHT_SR_TMA,
+    ),
 ]
