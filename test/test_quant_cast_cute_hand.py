@@ -68,6 +68,10 @@ _REQUIRES_SM100 = frozenset({
     "mxfp8_dim_m_swizzle_sr_v2",
     "mxfp8_dim_km_swizzle_v2",
     "mxfp8_dim_km_swizzle_sr_v2",
+    "nvfp4_swizzle_direct",
+    "nvfp4_swizzle_tma",
+    "nvfp4_dim_m_swizzle_tma",
+    "nvfp4_dim_km_swizzle_tma",
 })
 
 def _get_recipe(recipe_name):
@@ -400,6 +404,86 @@ def test_mxfp8_dim_km_swizzle_rejects_partial_group(kernel):
     inputs = recipe.example_input_fn(96, 144)
     with pytest.raises(AssertionError, match="N % 32"):
         recipe.cute_fn(*inputs)
+
+
+@pytest.mark.parametrize(
+    "kernel,M,K",
+    [
+        ("nvfp4_swizzle_direct", 1, 16),
+        ("nvfp4_swizzle_direct", 128, 64),
+        ("nvfp4_swizzle_direct", 33, 80),
+        ("nvfp4_swizzle_direct", 129, 144),
+        ("nvfp4_swizzle_tma", 1, 32),
+        ("nvfp4_swizzle_tma", 33, 96),
+        ("nvfp4_swizzle_tma", 129, 160),
+    ],
+)
+def test_nvfp4_swizzle_cute_hand(kernel, M, K):
+    if torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip(f"{kernel} emits Blackwell-only PTX; requires cuda capability 10.0")
+    recipe = _get_recipe(kernel)
+    inputs = recipe.example_input_fn(M, K)
+    outputs = recipe.cute_fn(*inputs)
+    ref_outputs = recipe.pt_ref_fn(*inputs)
+    assert qdata_and_scale_equal(outputs[0], ref_outputs[0])
+    assert qdata_and_scale_equal(outputs[1], ref_outputs[1])
+    assert outputs[0].shape == (M, K // 2)
+
+    nrb, ncb = (M + 127) // 128, ((K // 16) + 3) // 4
+    assert outputs[1].shape == (nrb, ncb, 32, 16)
+    padded = _from_blocked_4d(outputs[1], nrb * 128, ncb * 4).view(torch.uint8)
+    assert torch.count_nonzero(padded[M:, :]) == 0
+    assert torch.count_nonzero(padded[:M, K // 16:]) == 0
+
+
+def test_nvfp4_swizzle_tma_rejects_unaligned_packed_stride():
+    if torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip("nvfp4_swizzle_tma emits Blackwell-only PTX; requires cuda capability 10.0")
+    recipe = _get_recipe("nvfp4_swizzle_tma")
+    inputs = recipe.example_input_fn(32, 16)
+    with pytest.raises(AssertionError, match="K % 32"):
+        recipe.cute_fn(*inputs)
+
+
+@pytest.mark.parametrize(
+    "kernel,M,K",
+    [
+        ("nvfp4_dim_m_swizzle_tma", 32, 16),
+        ("nvfp4_dim_m_swizzle_tma", 96, 48),
+        ("nvfp4_dim_m_swizzle_tma", 160, 144),
+        ("nvfp4_dim_km_swizzle_tma", 32, 32),
+        ("nvfp4_dim_km_swizzle_tma", 96, 160),
+        ("nvfp4_dim_km_swizzle_tma", 160, 96),
+    ],
+)
+def test_nvfp4_dim_m_tma_padding(kernel, M, K):
+    if torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip(f"{kernel} emits Blackwell-only PTX; requires cuda capability 10.0")
+    recipe = _get_recipe(kernel)
+    inputs = recipe.example_input_fn(M, K)
+    outputs = recipe.cute_fn(*inputs)
+    references = recipe.pt_ref_fn(*inputs)
+    for output, reference in zip(outputs, references):
+        assert qdata_and_scale_equal(output, reference)
+
+    qm, sm = outputs[-2:]
+    assert qm.shape == (K, M // 2)
+    nrb_m, ncb_m = (K + 127) // 128, ((M // 16) + 3) // 4
+    assert sm.shape == (nrb_m, ncb_m, 32, 16)
+    sm_padded = _from_blocked_4d(sm, nrb_m * 128, ncb_m * 4).view(torch.uint8)
+    assert torch.count_nonzero(sm_padded[K:, :]) == 0
+    assert torch.count_nonzero(sm_padded[:K, M // 16:]) == 0
+
+    if kernel == "nvfp4_dim_km_swizzle_tma":
+        qk, sk = outputs[:2]
+        assert qk.shape == (M, K // 2)
+        nrb_k, ncb_k = (M + 127) // 128, ((K // 16) + 3) // 4
+        assert sk.shape == (nrb_k, ncb_k, 32, 16)
+        sk_padded = _from_blocked_4d(sk, nrb_k * 128, ncb_k * 4).view(
+            torch.uint8
+        )
+        assert torch.count_nonzero(sk_padded[M:, :]) == 0
+        assert torch.count_nonzero(sk_padded[:M, K // 16:]) == 0
 
 
 @pytest.mark.parametrize("M,K", [(1, 32), (31, 96), (33, 160), (127, 64), (129, 160)])
