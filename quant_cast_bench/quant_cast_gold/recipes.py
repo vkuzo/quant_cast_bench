@@ -1964,15 +1964,29 @@ Nvfp4GsDimMSwizzleRHTPortableSRGold = QuantCastSingleKernelGold(
 def nvfp4_gs_swizzle_dim_m_rht_nvidia_sr_f(
     x, outer_scale, rht, key, **kwargs
 ):
-    """Dim-M RHT NVFP4 using NVIDIA ``cvt.rs.e2m1x4`` stochastic rounding."""
-    (x_t_rht,) = hadamard_rht_f(x.t().contiguous(), rht)
+    """FP32 dim-M RHT NVFP4 using NVIDIA ``cvt.rs.e2m1x4`` stochastic rounding."""
+    (x_t_rht,) = hadamard_rht_fp32_f(x.t().contiguous(), rht)
     return nvfp4_gs_swizzle_nvidia_sr_f(x_t_rht, outer_scale, key)
+
+
+def _nvfp4_gs_swizzle_dim_m_rht_nvidia_sr_inputs(M, K):
+    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+    sign = torch.tensor([1, -1] * 8, device=x.device, dtype=x.dtype)
+    rht = hadamard_rht_matrix(sign, x.device, x.dtype)
+    (x_t_rht,) = hadamard_rht_fp32_f(x.t().contiguous(), rht)
+    outer_scale = x_t_rht.abs().amax() / (F8E4M3_MAX * F4_E2M1_MAX)
+    return (
+        x,
+        outer_scale.reciprocal(),
+        rht,
+        prng.key(0, device=x.device),
+    )
 
 
 Nvfp4GsDimMSwizzleRHTSRGold = QuantCastSingleKernelGold(
     pt_ref_fn=nvfp4_gs_swizzle_dim_m_rht_nvidia_sr_f,
     correctness_fn=_nvfp4_gs_swizzle_dim_m_rht_sr_correctness,
-    example_input_fn=_nvfp4_gs_swizzle_dim_m_rht_sr_inputs,
+    example_input_fn=_nvfp4_gs_swizzle_dim_m_rht_nvidia_sr_inputs,
     perf_description=(
         "(1,16) block, fp4 qdata (NVIDIA cvt.rs SR numerics), swizzle; "
         "dim-m (RHT), one outer scale"
@@ -1985,9 +1999,9 @@ def nvfp4_gs_swizzle_dim_k_dim_m_rht_nvidia_sr_f(
 ):
     """Dim-K and dim-M RHT NVFP4 using independent NVIDIA ``cvt.rs`` SR streams."""
     qk, sk = nvfp4_gs_swizzle_nvidia_sr_f(x, outer_scale_k, key_k)
-    qm, sm = nvfp4_gs_swizzle_dim_m_rht_nvidia_sr_f(
-        x, outer_scale_m, rht, key_m
-    )
+    # Keep this existing fused gold on its BF16-RHT contract until its implementation migrates.
+    (x_t_rht,) = hadamard_rht_f(x.t().contiguous(), rht)
+    qm, sm = nvfp4_gs_swizzle_nvidia_sr_f(x_t_rht, outer_scale_m, key_m)
     return qk, sk, qm, sm
 
 
