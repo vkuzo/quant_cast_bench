@@ -1746,7 +1746,7 @@ def _nvfp4_gs_swizzle_sr_inputs(M, K):
     return (x, nvfp4_gs_scale(x).reciprocal(), prng.key(0, device=x.device))  # 1/S; fixed Philox key -> reproducible SR
 
 
-Nvfp4GsSRSwizzleGold = QuantCastSingleKernelGold(
+Nvfp4GsSwizzlePortableSRGold = QuantCastSingleKernelGold(
     pt_ref_fn=nvfp4_gs_swizzle_sr_f,
     correctness_fn=_nvfp4_gs_swizzle_sr_correctness,
     example_input_fn=_nvfp4_gs_swizzle_sr_inputs,
@@ -1754,7 +1754,8 @@ Nvfp4GsSRSwizzleGold = QuantCastSingleKernelGold(
 )
 
 # ---------------------------------------------------------------------------
-# Golden recipe: same swizzled nvfp4 activation cast as Nvfp4GsSRSwizzleGold, but the fp4 SR follows
+# Golden recipe: same swizzled nvfp4 activation cast as Nvfp4GsSwizzlePortableSRGold, but the fp4 SR
+# follows
 # the NVIDIA `cvt.rs.satfinite.e2m1x4.f32` HARDWARE intrinsic numerics instead of the portable
 # software add-dither-truncate. This is the bit-exact eager EMULATION of that intrinsic (no PTX yet;
 # a real cvt.rs kernel matching this gold comes later) -- the same emulation added to
@@ -1843,7 +1844,7 @@ def nvfp4_gs_swizzle_nvidia_sr_f(x, outer_scale, key, **kwargs):
     return qdata, inner_swizzled
 
 
-Nvfp4GsNVIDIASRSwizzleGold = QuantCastSingleKernelGold(
+Nvfp4GsSwizzleSRGold = QuantCastSingleKernelGold(
     pt_ref_fn=nvfp4_gs_swizzle_nvidia_sr_f,
     correctness_fn=_nvfp4_gs_swizzle_sr_correctness,  # same round-trip SQNR check as the software-SR gold
     example_input_fn=_nvfp4_gs_swizzle_sr_inputs,     # same (x, 1/S, fixed Philox key) inputs
@@ -1896,7 +1897,7 @@ def _nvfp4_gs_swizzle_dim_k_dim_m_rht_sr_inputs(M, K):
     return (x, outer_scale_k.reciprocal(), outer_scale_m.reciprocal(), rht, key_k, key_m)  # recipes take 1/S
 
 
-Nvfp4GsSwizzle_DimKSR_DimMRHTSR_Gold = QuantCastSingleKernelGold(
+Nvfp4GsSwizzle_DimKPortableSR_DimMRHTPortableSR_Gold = QuantCastSingleKernelGold(
     pt_ref_fn=nvfp4_gs_swizzle_dim_k_dim_m_rht_sr_f,
     correctness_fn=_nvfp4_gs_swizzle_dim_k_dim_m_rht_sr_correctness,
     example_input_fn=_nvfp4_gs_swizzle_dim_k_dim_m_rht_sr_inputs,
@@ -1908,7 +1909,8 @@ Nvfp4GsSwizzle_DimKSR_DimMRHTSR_Gold = QuantCastSingleKernelGold(
 
 
 # ---------------------------------------------------------------------------
-# Golden recipe: the dim-m-only half of Nvfp4GsSwizzle_DimKSR_DimMRHTSR_Gold -- i.e. the SR twin of
+# Golden recipe: the dim-m-only half of
+# Nvfp4GsSwizzle_DimKPortableSR_DimMRHTPortableSR_Gold -- i.e. the SR twin of
 # Nvfp4GsSwizzleDimMRHTGold. Apply the 16x16 RHT to x.t() (16-blocks along the original M) then
 # STOCHASTIC-ROUND nvfp4 along M, emitting in the transposed (N, M//2) frame. This is exactly the
 # grad_output wgrad-operand cast of nvfp4 training (RHT + SR), without the dim-k output. The
@@ -1950,7 +1952,7 @@ def _nvfp4_gs_swizzle_dim_m_rht_sr_inputs(M, K):
     return (x, outer_scale.reciprocal(), rht, prng.key(0, device=x.device))  # 1/S; fixed Philox key -> reproducible SR
 
 
-Nvfp4GsDimMRHTSRSwizzleGold = QuantCastSingleKernelGold(
+Nvfp4GsDimMSwizzleRHTPortableSRGold = QuantCastSingleKernelGold(
     pt_ref_fn=nvfp4_gs_swizzle_dim_m_rht_sr_f,
     correctness_fn=_nvfp4_gs_swizzle_dim_m_rht_sr_correctness,
     example_input_fn=_nvfp4_gs_swizzle_dim_m_rht_sr_inputs,
@@ -2422,13 +2424,16 @@ ALL_RECIPES = [
     ("nvfp4_dim_m_swizzle", Nvfp4GsDimMSwizzleGold),
     ("nvfp4_dim_km_swizzle", Nvfp4GsDimKMSwizzleGold),
     ("nvfp4_dim_m_rht_swizzle", Nvfp4GsSwizzleDimMRHTGold),
-    ("nvfp4_swizzle_portable_sr", Nvfp4GsSRSwizzleGold),
-    ("nvfp4_swizzle_sr", Nvfp4GsNVIDIASRSwizzleGold),
-    ("nvfp4_dim_m_swizzle_rht_portable_sr", Nvfp4GsDimMRHTSRSwizzleGold),
+    ("nvfp4_swizzle_portable_sr", Nvfp4GsSwizzlePortableSRGold),
+    ("nvfp4_swizzle_sr", Nvfp4GsSwizzleSRGold),
+    (
+        "nvfp4_dim_m_swizzle_rht_portable_sr",
+        Nvfp4GsDimMSwizzleRHTPortableSRGold,
+    ),
     ("nvfp4_swizzle_dim_k_dim_m_rht", Nvfp4GsSwizzle_DimK_DimMRHT_Gold),
     (
         "nvfp4_swizzle_dim_k_portable_sr_dim_m_rht_portable_sr",
-        Nvfp4GsSwizzle_DimKSR_DimMRHTSR_Gold,
+        Nvfp4GsSwizzle_DimKPortableSR_DimMRHTPortableSR_Gold,
     ),
     ("nvfp4_blocked_outer", Nvfp4BlockedOuterGold),
     # RHT

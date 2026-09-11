@@ -210,7 +210,8 @@ def quantize_tensor(
                 if (inner_scaling_type, swizzle_type) == (ScalingType.BlockWise1x16, SwizzleType.SWIZZLE_32_4_4):
                     assert rht_tensor is None, "rht_tensor is only supported by the dim-m nvfp4 cast"
                     if qdata_rounding_mode == RoundingMode.STOCHASTIC:
-                        # SR nvfp4 (Nvfp4GsSRSwizzleGold's nvfp4_gs_swizzle_sr_f): gold reference, no
+                        # SR nvfp4 (Nvfp4GsSwizzlePortableSRGold's nvfp4_gs_swizzle_sr_f): gold
+                        # reference, no
                         # Triton kernel; random_key is its Philox key.
                         return nvfp4_gs_swizzle_sr_f(x, outer_quant_scale, random_key)
                     return nvfp4_triton(x, outer_quant_scale, swizzle=True)
@@ -223,7 +224,8 @@ def quantize_tensor(
             # blocks along M, transposed (N, M//2) frame, swizzled e4m3 scale); RTNE with an RHT is
             # Nvfp4GsSwizzleDimMRHTGold's nvfp4_gs_swizzle_dim_m_rht_f (same, but RHT x.t() first -- the
             # wgrad-operand cast of nvfp4 training); STOCHASTIC is the SR twin of the latter
-            # (Nvfp4GsDimMRHTSRSwizzleGold's nvfp4_gs_swizzle_dim_m_rht_sr_f) -- the only dim-m SR gold
+            # (Nvfp4GsDimMSwizzleRHTPortableSRGold's nvfp4_gs_swizzle_dim_m_rht_sr_f) -- the only
+            # dim-m SR gold
             # is the RHT one, so SR requires an rht_tensor. The outer_quant_scale must match: |x.t()| for the
             # no-RHT path, |RHT(x.t())| for the RHT paths (caller-set).
             if (inner_scaling_type, swizzle_type) == (ScalingType.BlockWise1x16, SwizzleType.SWIZZLE_32_4_4):

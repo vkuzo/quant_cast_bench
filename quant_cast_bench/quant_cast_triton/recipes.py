@@ -37,8 +37,8 @@ from quant_cast_bench.quant_cast_gold.recipes import (
     Mxfp8SwizzleGold,
     Nvfp4BlockedOuterGold,
     Nvfp4GsGold,
-    Nvfp4GsNVIDIASRSwizzleGold,
-    Nvfp4GsSRSwizzleGold,
+    Nvfp4GsSwizzlePortableSRGold,
+    Nvfp4GsSwizzleSRGold,
     Nvfp4GsSwizzleGold,
     QuantCastSingleKernelGold,
     RowwiseFp8Gold,
@@ -1496,12 +1496,12 @@ NVFP4_SWIZZLE = QuantCastTritonRecipe.from_gold(
 # NVFP4_SWIZZLE with stochastic rounding: same kernel/grid, selected by ROUNDING (see _nvfp4_kernel).
 # The gold's aux order is (x, outer_scale, key), so `key` arrives positionally. Bit-matches the gold.
 NVFP4_SWIZZLE_PORTABLE_SR = QuantCastTritonRecipe.from_gold(
-    Nvfp4GsSRSwizzleGold,
+    Nvfp4GsSwizzlePortableSRGold,
     triton_fn=functools.partial(nvfp4_triton, swizzle=True, rounding="sr"),
 )
 # Same, but hardware SR via the Blackwell cvt.rs.satfinite.e2m1x4.f32 intrinsic (ROUNDING="nvidia_sr").
 NVFP4_SWIZZLE_SR = QuantCastTritonRecipe.from_gold(
-    Nvfp4GsNVIDIASRSwizzleGold,
+    Nvfp4GsSwizzleSRGold,
     triton_fn=functools.partial(nvfp4_triton, swizzle=True, rounding="nvidia_sr"),
 )
 
