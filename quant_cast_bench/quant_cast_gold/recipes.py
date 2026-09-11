@@ -1755,8 +1755,7 @@ Nvfp4GsSwizzlePortableSRGold = QuantCastSingleKernelGold(
 
 # ---------------------------------------------------------------------------
 # Golden recipe: same swizzled nvfp4 activation cast as Nvfp4GsSwizzlePortableSRGold, but the fp4 SR
-# follows
-# the NVIDIA `cvt.rs.satfinite.e2m1x4.f32` HARDWARE intrinsic numerics instead of the portable
+# follows the NVIDIA `cvt.rs.satfinite.e2m1x4.f32` HARDWARE intrinsic numerics instead of the portable
 # software add-dither-truncate. This is the bit-exact eager EMULATION of that intrinsic (no PTX yet;
 # a real cvt.rs kernel matching this gold comes later) -- the same emulation added to
 # experiments/stochastic_rounding_api/api.py (Rounding.STOCHASTIC_NVIDIA_SM100's `_reference_impl`),
@@ -1957,6 +1956,47 @@ Nvfp4GsDimMSwizzleRHTPortableSRGold = QuantCastSingleKernelGold(
     correctness_fn=_nvfp4_gs_swizzle_dim_m_rht_sr_correctness,
     example_input_fn=_nvfp4_gs_swizzle_dim_m_rht_sr_inputs,
     perf_description="(1,16) block, fp4 qdata (stochastic rounding), swizzle; dim-m (RHT), one outer scale",
+)
+
+
+def nvfp4_gs_swizzle_dim_m_rht_nvidia_sr_f(
+    x, outer_scale, rht, key, **kwargs
+):
+    """Dim-M RHT NVFP4 using NVIDIA ``cvt.rs.e2m1x4`` stochastic rounding."""
+    (x_t_rht,) = hadamard_rht_f(x.t().contiguous(), rht)
+    return nvfp4_gs_swizzle_nvidia_sr_f(x_t_rht, outer_scale, key)
+
+
+Nvfp4GsDimMSwizzleRHTSRGold = QuantCastSingleKernelGold(
+    pt_ref_fn=nvfp4_gs_swizzle_dim_m_rht_nvidia_sr_f,
+    correctness_fn=_nvfp4_gs_swizzle_dim_m_rht_sr_correctness,
+    example_input_fn=_nvfp4_gs_swizzle_dim_m_rht_sr_inputs,
+    perf_description=(
+        "(1,16) block, fp4 qdata (NVIDIA cvt.rs SR numerics), swizzle; "
+        "dim-m (RHT), one outer scale"
+    ),
+)
+
+
+def nvfp4_gs_swizzle_dim_k_dim_m_rht_nvidia_sr_f(
+    x, outer_scale_k, outer_scale_m, rht, key_k, key_m, **kwargs
+):
+    """Dim-K and dim-M RHT NVFP4 using independent NVIDIA ``cvt.rs`` SR streams."""
+    qk, sk = nvfp4_gs_swizzle_nvidia_sr_f(x, outer_scale_k, key_k)
+    qm, sm = nvfp4_gs_swizzle_dim_m_rht_nvidia_sr_f(
+        x, outer_scale_m, rht, key_m
+    )
+    return qk, sk, qm, sm
+
+
+Nvfp4GsSwizzle_DimKSR_DimMRHTSR_Gold = QuantCastSingleKernelGold(
+    pt_ref_fn=nvfp4_gs_swizzle_dim_k_dim_m_rht_nvidia_sr_f,
+    correctness_fn=_nvfp4_gs_swizzle_dim_k_dim_m_rht_sr_correctness,
+    example_input_fn=_nvfp4_gs_swizzle_dim_k_dim_m_rht_sr_inputs,
+    perf_description=(
+        "(1,16) block, fp4 qdata (NVIDIA cvt.rs SR numerics), swizzle; "
+        "dim-k (no RHT) + dim-m (RHT), two outer scales"
+    ),
 )
 
 
@@ -2430,10 +2470,15 @@ ALL_RECIPES = [
         "nvfp4_dim_m_swizzle_rht_portable_sr",
         Nvfp4GsDimMSwizzleRHTPortableSRGold,
     ),
+    ("nvfp4_dim_m_swizzle_rht_sr", Nvfp4GsDimMSwizzleRHTSRGold),
     ("nvfp4_swizzle_dim_k_dim_m_rht", Nvfp4GsSwizzle_DimK_DimMRHT_Gold),
     (
         "nvfp4_swizzle_dim_k_portable_sr_dim_m_rht_portable_sr",
         Nvfp4GsSwizzle_DimKPortableSR_DimMRHTPortableSR_Gold,
+    ),
+    (
+        "nvfp4_swizzle_dim_k_sr_dim_m_rht_sr",
+        Nvfp4GsSwizzle_DimKSR_DimMRHTSR_Gold,
     ),
     ("nvfp4_blocked_outer", Nvfp4BlockedOuterGold),
     # RHT

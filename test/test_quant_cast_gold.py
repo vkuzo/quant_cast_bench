@@ -30,8 +30,11 @@ from quant_cast_bench.quant_cast_gold.recipes import (
     mxfp8_swizzle_sr_f,
     nvfp4_gs_scale,
     nvfp4_gs_swizzle_dim_k_dim_m_rht_f,
+    nvfp4_gs_swizzle_dim_k_dim_m_rht_nvidia_sr_f,
     nvfp4_gs_swizzle_dim_k_dim_m_rht_sr_f,
+    nvfp4_gs_swizzle_dim_m_rht_nvidia_sr_f,
     nvfp4_gs_swizzle_f,
+    nvfp4_gs_swizzle_nvidia_sr_f,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -100,6 +103,37 @@ def test_mxfp8_dim_m_modes_sr_reproducible_and_preserve_scales(sr_fn, rtne_fn):
         )
         for index in range(0, len(outputs0), 2)
     )
+
+
+def test_nvfp4_rht_nvidia_sr_variants_compose_the_nvidia_sr_gold():
+    M, K = 128, 160
+    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+    sign = torch.tensor([1, -1] * 8, device=x.device, dtype=x.dtype)
+    rht = hadamard_rht_matrix(sign, x.device, x.dtype)
+    (x_t_rht,) = hadamard_rht_f(x.t().contiguous(), rht)
+    outer_scale_k = nvfp4_gs_scale(x).reciprocal()
+    outer_scale_m = (
+        x_t_rht.abs().to(torch.float32).amax()
+        / (F8E4M3_MAX * F4_E2M1_MAX)
+    ).reciprocal()
+    key_k = prng.key(7, device=x.device)
+    key_m = prng.key(11, device=x.device)
+
+    expected_k = nvfp4_gs_swizzle_nvidia_sr_f(x, outer_scale_k, key_k)
+    expected_m = nvfp4_gs_swizzle_nvidia_sr_f(
+        x_t_rht, outer_scale_m, key_m
+    )
+    actual_m = nvfp4_gs_swizzle_dim_m_rht_nvidia_sr_f(
+        x, outer_scale_m, rht, key_m
+    )
+    actual_km = nvfp4_gs_swizzle_dim_k_dim_m_rht_nvidia_sr_f(
+        x, outer_scale_k, outer_scale_m, rht, key_k, key_m
+    )
+
+    for actual, expected in zip(actual_m, expected_m):
+        assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+    for actual, expected in zip(actual_km, (*expected_k, *expected_m)):
+        assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
 
 
 # ===========================================================================
