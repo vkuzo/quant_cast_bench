@@ -37,6 +37,8 @@ from quant_cast_bench.quant_cast_cute_hand.recipes import (
     nvfp4_dim_km_swizzle_tma, nvfp4_dim_m_rht_swizzle_tma,
     nvfp4_dim_m_swizzle_rht_sr_tma,
     nvfp4_dim_m_swizzle_tma, nvfp4_swizzle_direct, nvfp4_swizzle_tma,
+    nvfp4_swizzle_dim_k_dim_m_rht_tma,
+    nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_tma,
     transpose_v0, transpose_v1,
 )
 from quant_cast_bench.quant_cast_gold.recipes import (
@@ -46,6 +48,8 @@ from quant_cast_bench.quant_cast_gold.recipes import (
     nvfp4_gs_scale, nvfp4_gs_swizzle_dim_km_f, nvfp4_gs_swizzle_dim_m_f,
     nvfp4_gs_swizzle_f,
     Nvfp4GsDimMSwizzleRHTSRGold, Nvfp4GsSwizzleDimMRHTGold,
+    Nvfp4GsSwizzle_DimK_DimMRHT_Gold,
+    Nvfp4GsSwizzle_DimKSR_DimMRHTSR_Gold,
 )
 
 # Peak HBM bandwidth per GPU family (GB/s), used for the "% of peak" column. Matched by substring
@@ -610,6 +614,54 @@ def _bench_nvfp4_dim_m_swizzle_rht_sr_tma(M, K):
     return run, bytes_per_iter
 
 
+def _bench_nvfp4_dim_km_rht_tma(M, K, *, stochastic):
+    torch.manual_seed(0)
+    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+    rht_sign = torch.tensor([1, -1] * 8, device=x.device, dtype=x.dtype)
+    rht = hadamard_rht_matrix(rht_sign, x.device, x.dtype)
+    (x_t_rht,) = hadamard_rht_fp32_f(x.t().contiguous(), rht)
+    outer_scale_k = nvfp4_gs_scale(x).reciprocal()
+    outer_scale_m = nvfp4_gs_scale(x_t_rht).reciprocal()
+    if stochastic:
+        key_k = prng.key(0, device=x.device)
+        key_m = prng.key(1, device=x.device)
+
+        def run():
+            return nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_tma(
+                x, outer_scale_k, outer_scale_m, rht_sign, key_k, key_m
+            )
+
+        gold = Nvfp4GsSwizzle_DimKSR_DimMRHTSR_Gold
+        gold_inputs = (x, outer_scale_k, outer_scale_m, rht, key_k, key_m)
+    else:
+
+        def run():
+            return nvfp4_swizzle_dim_k_dim_m_rht_tma(
+                x, outer_scale_k, outer_scale_m, rht_sign
+            )
+
+        gold = Nvfp4GsSwizzle_DimK_DimMRHT_Gold
+        gold_inputs = (x, outer_scale_k, outer_scale_m, rht)
+
+    outputs = run()
+    torch.cuda.synchronize()
+    references = gold.pt_ref_fn(*gold_inputs)
+    for output, reference in zip(outputs, references):
+        assert torch.equal(output.view(torch.uint8), reference.view(torch.uint8))
+    bytes_per_iter = x.numel() * x.element_size() + sum(
+        output.numel() * output.element_size() for output in outputs
+    )
+    return run, bytes_per_iter
+
+
+def _bench_nvfp4_swizzle_dim_k_dim_m_rht_tma(M, K):
+    return _bench_nvfp4_dim_km_rht_tma(M, K, stochastic=False)
+
+
+def _bench_nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_tma(M, K):
+    return _bench_nvfp4_dim_km_rht_tma(M, K, stochastic=True)
+
+
 def _bench_transpose_v0(M, K):
     # read input (M*K bf16) + write transposed output (K*M bf16); a memory-bound 2D transpose.
     # v0 is the naive path: coalesced vectorized read, scattered (strided) column write.
@@ -672,6 +724,8 @@ _KERNELS = {
     "nvfp4_dim_km_swizzle_tma": _bench_nvfp4_dim_km_swizzle_tma,
     "nvfp4_dim_m_rht_swizzle_tma": _bench_nvfp4_dim_m_rht_swizzle_tma,
     "nvfp4_dim_m_swizzle_rht_sr_tma": _bench_nvfp4_dim_m_swizzle_rht_sr_tma,
+    "nvfp4_swizzle_dim_k_dim_m_rht_tma": _bench_nvfp4_swizzle_dim_k_dim_m_rht_tma,
+    "nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_tma": _bench_nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_tma,
     "transpose_v0": _bench_transpose_v0,
     "transpose_v1": _bench_transpose_v1,
 }

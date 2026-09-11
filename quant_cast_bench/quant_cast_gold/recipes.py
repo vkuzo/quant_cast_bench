@@ -1562,9 +1562,9 @@ Nvfp4GsDimKMSwizzleGold = QuantCastSingleKernelGold(
 # M), then nvfp4 that (N, M) tensor along its last dim, emitting in the transposed (N, M//2) frame.
 # The per-tensor outer scale is over |RHT(x.t())| (a DIFFERENT tensor than |x|, so a distinct scalar
 # -- torchao's col_global_amax).
-# TODO(future): migrate the remaining RHT gold recipes to an FP32 RHT as well. They intentionally
-# retain the existing BF16 transform until their implementations and numerical contracts move
-# together.
+# TODO(future): migrate the remaining portable-SR RHT gold recipes to an FP32 RHT as well. They
+# intentionally retain the existing BF16 transform until their implementations and numerical
+# contracts move together.
 # ---------------------------------------------------------------------------
 def nvfp4_gs_swizzle_dim_m_rht_f(x, outer_scale, rht, **kwargs):
     """dim-m (colwise) nvfp4-swizzle WITH RHT: RHT along the original M (x.t() is (N, M), RHT hits
@@ -1618,19 +1618,19 @@ Nvfp4GsSwizzleDimMRHTGold = QuantCastSingleKernelGold(
 #   * dim-m (colwise, WITH RHT): apply the 16x16 RHT to x.t() (16-blocks along the original M), then
 #     nvfp4 that (N,M) tensor along its last dim. Outputs in the transposed (N, M//2) frame.
 # There are **two** outer scales (both aux inputs, like Nvfp4GsSwizzleGold's): the dim-k one over |x|,
-# and the dim-m one over |RHT(x.t())| -- a DIFFERENT tensor, so a distinct scalar. Reference only (no
-# kernel). Mirrors torchao test `_rht_quantize_reference` / `_rht_quantize_rowwise_reference`; the two
+# and the dim-m one over |RHT(x.t())| -- a DIFFERENT tensor, so a distinct scalar. Mirrors torchao
+# test `_rht_quantize_reference` / `_rht_quantize_rowwise_reference`; the two
 # amaxes are the kernel's `row_global_amax` / `col_global_amax` inputs. RHT = diag(sign) @ H (via the
 # HadamardRht helpers below), orthogonal, so correctness inverts the dim-m path with rht.t().
 # ---------------------------------------------------------------------------
 def nvfp4_gs_swizzle_dim_k_dim_m_rht_f(x, outer_scale_k, outer_scale_m, rht, **kwargs):
     """Tile-invariant `f`: nvfp4-swizzle x both ways in one read. dim-k is plain nvfp4 (no RHT);
-    dim-m applies the RHT to x.t() then nvfp4s along M. Returns (qk (M,N//2), sk swizzled,
+    dim-m applies the FP32 RHT to x.t() then nvfp4s along M. Returns (qk (M,N//2), sk swizzled,
     qm (N,M//2), sm swizzled). `outer_scale_k`/`outer_scale_m` are per-tensor scalars (aux inputs);
     `rht` is the 16x16 RHT matrix (aux input)."""
     qk, sk = nvfp4_gs_swizzle_f(x, outer_scale_k)  # dim-k: 1x16 along K, no RHT
     # dim-m: RHT along the original M (x.t() is (N, M), RHT hits its last dim), then nvfp4 along M.
-    (x_t_rht,) = hadamard_rht_f(x.t().contiguous(), rht)
+    (x_t_rht,) = hadamard_rht_fp32_f(x.t().contiguous(), rht)
     qm, sm = nvfp4_gs_swizzle_f(x_t_rht, outer_scale_m)  # transposed (N, M//2) frame
     return qk, sk, qm, sm
 
@@ -1661,10 +1661,9 @@ def _nvfp4_gs_swizzle_dim_k_dim_m_rht_inputs(M, K):
     sign = torch.tensor([1, -1] * 8, device=x.device, dtype=x.dtype)
     rht = hadamard_rht_matrix(sign, x.device, x.dtype)
     outer_scale_k = nvfp4_gs_scale(x)  # global amax over |x|
-    # dim-m outer scale is over the SAME bf16 RHT output pt_ref_fn re-derives from `rht` (matches
-    # torchao computing col_global_amax on the bf16 _rht_reference), so the two stay consistent.
-    (x_t_rht,) = hadamard_rht_f(x.t().contiguous(), rht)
-    outer_scale_m = x_t_rht.abs().to(torch.float32).amax() / (F8E4M3_MAX * F4_E2M1_MAX)
+    # Dim-M uses the same FP32 RHT output that pt_ref_fn quantizes.
+    (x_t_rht,) = hadamard_rht_fp32_f(x.t().contiguous(), rht)
+    outer_scale_m = x_t_rht.abs().amax() / (F8E4M3_MAX * F4_E2M1_MAX)
     return (x, outer_scale_k.reciprocal(), outer_scale_m.reciprocal(), rht)  # recipes take 1/S
 
 
@@ -1672,7 +1671,7 @@ Nvfp4GsSwizzle_DimK_DimMRHT_Gold = QuantCastSingleKernelGold(
     pt_ref_fn=nvfp4_gs_swizzle_dim_k_dim_m_rht_f,
     correctness_fn=_nvfp4_gs_swizzle_dim_k_dim_m_rht_correctness,
     example_input_fn=_nvfp4_gs_swizzle_dim_k_dim_m_rht_inputs,
-    perf_description="(1,16) block, fp4 qdata, swizzle; dim-k (no RHT) + dim-m (RHT), two outer scales",
+    perf_description="(1,16) block, fp4 qdata, swizzle; dim-k (no RHT) + dim-m (FP32 RHT), two outer scales",
 )
 
 # ---------------------------------------------------------------------------
@@ -1997,21 +1996,37 @@ Nvfp4GsDimMSwizzleRHTSRGold = QuantCastSingleKernelGold(
 def nvfp4_gs_swizzle_dim_k_dim_m_rht_nvidia_sr_f(
     x, outer_scale_k, outer_scale_m, rht, key_k, key_m, **kwargs
 ):
-    """Dim-K and dim-M RHT NVFP4 using independent NVIDIA ``cvt.rs`` SR streams."""
+    """Dim-K and FP32 dim-M RHT NVFP4 using independent NVIDIA ``cvt.rs`` SR streams."""
     qk, sk = nvfp4_gs_swizzle_nvidia_sr_f(x, outer_scale_k, key_k)
-    # Keep this existing fused gold on its BF16-RHT contract until its implementation migrates.
-    (x_t_rht,) = hadamard_rht_f(x.t().contiguous(), rht)
+    (x_t_rht,) = hadamard_rht_fp32_f(x.t().contiguous(), rht)
     qm, sm = nvfp4_gs_swizzle_nvidia_sr_f(x_t_rht, outer_scale_m, key_m)
     return qk, sk, qm, sm
+
+
+def _nvfp4_gs_swizzle_dim_k_dim_m_rht_nvidia_sr_inputs(M, K):
+    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+    sign = torch.tensor([1, -1] * 8, device=x.device, dtype=x.dtype)
+    rht = hadamard_rht_matrix(sign, x.device, x.dtype)
+    outer_scale_k = nvfp4_gs_scale(x)
+    (x_t_rht,) = hadamard_rht_fp32_f(x.t().contiguous(), rht)
+    outer_scale_m = x_t_rht.abs().amax() / (F8E4M3_MAX * F4_E2M1_MAX)
+    return (
+        x,
+        outer_scale_k.reciprocal(),
+        outer_scale_m.reciprocal(),
+        rht,
+        prng.key(0, device=x.device),
+        prng.key(1, device=x.device),
+    )
 
 
 Nvfp4GsSwizzle_DimKSR_DimMRHTSR_Gold = QuantCastSingleKernelGold(
     pt_ref_fn=nvfp4_gs_swizzle_dim_k_dim_m_rht_nvidia_sr_f,
     correctness_fn=_nvfp4_gs_swizzle_dim_k_dim_m_rht_sr_correctness,
-    example_input_fn=_nvfp4_gs_swizzle_dim_k_dim_m_rht_sr_inputs,
+    example_input_fn=_nvfp4_gs_swizzle_dim_k_dim_m_rht_nvidia_sr_inputs,
     perf_description=(
         "(1,16) block, fp4 qdata (NVIDIA cvt.rs SR numerics), swizzle; "
-        "dim-k (no RHT) + dim-m (RHT), two outer scales"
+        "dim-k (no RHT) + dim-m (FP32 RHT), two outer scales"
     ),
 )
 
