@@ -82,6 +82,8 @@ _REQUIRES_SM100 = frozenset({
     "nvfp4_dim_km_swizzle_tma",
     "nvfp4_swizzle_dim_k_dim_m_rht_tma",
     "nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_tma",
+    "nvfp4_swizzle_dim_k_dim_m_rht_pipelined",
+    "nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_pipelined",
 })
 
 def _get_recipe(recipe_name):
@@ -519,11 +521,13 @@ def test_nvfp4_dim_m_tma_padding(kernel, M, K):
     if kernel in (
         "nvfp4_swizzle_dim_k_dim_m_rht_tma",
         "nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_tma",
+        "nvfp4_swizzle_dim_k_dim_m_rht_pipelined",
+        "nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_pipelined",
     ):
         cute_inputs, gold_inputs = _nvfp4_dim_km_rht_test_inputs(
             M,
             K,
-            stochastic=kernel == "nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_tma",
+            stochastic="_sr_dim_m_" in kernel,
         )
     elif kernel in (
         "nvfp4_dim_m_rht_swizzle_tma",
@@ -553,6 +557,8 @@ def test_nvfp4_dim_m_tma_padding(kernel, M, K):
         "nvfp4_dim_km_swizzle_tma",
         "nvfp4_swizzle_dim_k_dim_m_rht_tma",
         "nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_tma",
+        "nvfp4_swizzle_dim_k_dim_m_rht_pipelined",
+        "nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_pipelined",
     ):
         qk, sk = outputs[:2]
         assert qk.shape == (M, K // 2)
@@ -563,6 +569,28 @@ def test_nvfp4_dim_m_tma_padding(kernel, M, K):
         )
         assert torch.count_nonzero(sk_padded[M:, :]) == 0
         assert torch.count_nonzero(sk_padded[:M, K // 16:]) == 0
+
+
+@pytest.mark.parametrize(
+    "kernel,M,K",
+    [
+        ("nvfp4_swizzle_dim_k_dim_m_rht_pipelined", 96, 128),
+        ("nvfp4_swizzle_dim_k_dim_m_rht_pipelined", 128, 160),
+        ("nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_pipelined", 96, 128),
+        ("nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_pipelined", 128, 160),
+    ],
+)
+def test_nvfp4_rht_pipelined_requires_full_tiles(kernel, M, K):
+    if torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip(f"{kernel} emits Blackwell-only PTX; requires cuda capability 10.0")
+    recipe = _get_recipe(kernel)
+    cute_inputs, _ = _nvfp4_dim_km_rht_test_inputs(
+        M,
+        K,
+        stochastic="_sr_dim_m_" in kernel,
+    )
+    with pytest.raises(AssertionError, match="M % 128.*K % 128"):
+        recipe.cute_fn(*cute_inputs)
 
 
 @pytest.mark.parametrize("M,K", [(1, 32), (31, 96), (33, 160), (127, 64), (129, 160)])
@@ -703,11 +731,13 @@ def test_cute_hand_matches_reference(name, recipe):
     if name in (
         "nvfp4_swizzle_dim_k_dim_m_rht_tma",
         "nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_tma",
+        "nvfp4_swizzle_dim_k_dim_m_rht_pipelined",
+        "nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_pipelined",
     ):
         cute_inputs, gold_inputs = _nvfp4_dim_km_rht_test_inputs(
             512,
             512,
-            stochastic=name == "nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_tma",
+            stochastic="_sr_dim_m_" in name,
         )
     elif name in (
         "nvfp4_dim_m_rht_swizzle_tma",
@@ -738,9 +768,11 @@ def test_cute_hand_matches_reference(name, recipe):
     # Every recipe's outputs must be a valid quantization (the gold correctness_fn).
     recipe.correctness_fn(gold_inputs, cute_outs)
 
-    # And must reproduce the gold bit-for-bit: identical fp32 math + RNE cast.
-    for i, (t, r) in enumerate(zip(cute_outs, ref_outs)):
-        assert qdata_and_scale_equal(t, r), (
-            f"{name} output {i}: {mismatch_fraction(t, r):.3%} of elements differ from the gold "
-            f"reference -- expected bit-for-bit equality"
-        )
+    # The TE-style pipelined variants deliberately use BF16 UMMA and approximate reciprocal math;
+    # validate their quantization quality above, but do not impose the other kernels' bitwise rule.
+    if not name.endswith("_pipelined"):
+        for i, (t, r) in enumerate(zip(cute_outs, ref_outs)):
+            assert qdata_and_scale_equal(t, r), (
+                f"{name} output {i}: {mismatch_fraction(t, r):.3%} of elements differ from the gold "
+                f"reference -- expected bit-for-bit equality"
+            )
