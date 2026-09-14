@@ -43,9 +43,16 @@ from quant_cast_bench.quant_cast_cute_hand.recipes import (
     nvfp4_swizzle_direct,
     nvfp4_swizzle_tma,
 )
+from quant_cast_bench.quant_cast_cute_hand.shape_utils import (
+    gpt_oss_120b_m8192_tp8_ep8,
+)
 
 
 SHAPES = (2048, 4096, 8192, 16384)
+
+_MODEL_SHAPES = {
+    "gpt-oss-120b": gpt_oss_120b_m8192_tp8_ep8,
+}
 
 
 def _ceil_div(x: int, y: int) -> int:
@@ -267,13 +274,21 @@ def _parse_kernels(value: str) -> list[str]:
     return list(dict.fromkeys(kernels))
 
 
-@fire.decorators.SetParseFns(kernel=str, M=str, K=str, mk_mode=str, csv_output=str)
+@fire.decorators.SetParseFns(
+    kernel=str,
+    M=str,
+    K=str,
+    mk_mode=str,
+    csv_output=str,
+    shapes_for_model=str,
+)
 def main(
     kernel: str = ",".join(case[0] for case in ALL_CASES),
-    M: str = ",".join(str(size) for size in SHAPES),
-    K: str = ",".join(str(size) for size in SHAPES),
-    mk_mode: str = "pair",
+    M: str | None = None,
+    K: str | None = None,
+    mk_mode: str | None = None,
     csv_output: str = "",
+    shapes_for_model: str = "",
 ) -> None:
     """Compare CuTe-hand and TransformerEngine kernels over an M-by-K shape grid.
 
@@ -283,22 +298,43 @@ def main(
     kernels = _parse_kernels(kernel)
     cases_by_name = {case[0]: case for case in ALL_CASES}
     cases = [cases_by_name[name] for name in kernels]
-    m_values = _parse_sizes(M, "M")
-    k_values = _parse_sizes(K, "K")
-    mk_mode = mk_mode.strip().lower()
-    if mk_mode not in ("cartesian", "pair"):
-        raise ValueError(
-            f"unsupported mk_mode {mk_mode!r}; choose from ('cartesian', 'pair')"
-        )
-    if mk_mode == "pair":
-        if len(m_values) != len(k_values):
+
+    shapes_for_model = shapes_for_model.strip().lower()
+    if shapes_for_model:
+        specified_shape_args = [
+            name
+            for name, value in (("M", M), ("K", K), ("mk_mode", mk_mode))
+            if value is not None
+        ]
+        if specified_shape_args:
             raise ValueError(
-                "pair mk_mode requires the same number of M and K values, got "
-                f"{len(m_values)} and {len(k_values)}"
+                "shapes_for_model cannot be combined with "
+                + ", ".join(specified_shape_args)
             )
-        shapes = list(zip(m_values, k_values))
+        if shapes_for_model not in _MODEL_SHAPES:
+            raise ValueError(
+                f"unsupported shapes_for_model {shapes_for_model!r}; "
+                f"choose from {tuple(_MODEL_SHAPES)}"
+            )
+        shapes = _MODEL_SHAPES[shapes_for_model]()
     else:
-        shapes = [(m, k) for m in m_values for k in k_values]
+        default_sizes = ",".join(str(size) for size in SHAPES)
+        m_values = _parse_sizes(default_sizes if M is None else M, "M")
+        k_values = _parse_sizes(default_sizes if K is None else K, "K")
+        mk_mode = "pair" if mk_mode is None else mk_mode.strip().lower()
+        if mk_mode not in ("cartesian", "pair"):
+            raise ValueError(
+                f"unsupported mk_mode {mk_mode!r}; choose from ('cartesian', 'pair')"
+            )
+        if mk_mode == "pair":
+            if len(m_values) != len(k_values):
+                raise ValueError(
+                    "pair mk_mode requires the same number of M and K values, got "
+                    f"{len(m_values)} and {len(k_values)}"
+                )
+            shapes = list(zip(m_values, k_values))
+        else:
+            shapes = [(m, k) for m in m_values for k in k_values]
 
     # Prime Kineto before collecting the first real data point.
     profiler_scratch = torch.empty(1, dtype=torch.int32, device="cuda")

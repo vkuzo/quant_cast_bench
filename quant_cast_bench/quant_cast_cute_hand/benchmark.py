@@ -15,6 +15,8 @@ device name). We build a bf16 (M, K) input, run the selected kernel, time it wit
         --kernel mxfp8_swizzle_v2,mxfp8_swizzle_v4 --M 2048,4096 --K 2048,4096
     python -m quant_cast_bench.quant_cast_cute_hand.benchmark --kernel add_v0 \
         --M 2048,4096 --K 8192,16384 --mk_mode pair
+    python -m quant_cast_bench.quant_cast_cute_hand.benchmark \
+        --kernel mxfp8_swizzle_v2 --shapes_for_model gpt-oss-120b
 """
 
 import os
@@ -53,6 +55,9 @@ from quant_cast_bench.quant_cast_gold.recipes import (
     Nvfp4GsDimMSwizzleRHTSRGold, Nvfp4GsSwizzleDimMRHTGold,
     Nvfp4GsSwizzle_DimK_DimMRHT_Gold,
     Nvfp4GsSwizzle_DimKSR_DimMRHTSR_Gold,
+)
+from quant_cast_bench.quant_cast_cute_hand.shape_utils import (
+    gpt_oss_120b_m8192_tp8_ep8,
 )
 
 # Peak HBM bandwidth per GPU family (GB/s), used for the "% of peak" column. Matched by substring
@@ -816,6 +821,10 @@ def _benchmark_one(kernel: str, M: int, K: int, peak_bw: float):
 
 _OUTPUT_METRICS = ("gpu_time_ms", "tb_s", "pct_peak")
 
+_MODEL_SHAPES = {
+    "gpt-oss-120b": gpt_oss_120b_m8192_tp8_ep8,
+}
+
 
 def _parse_output_metrics(value: str) -> list[str]:
     metrics = [item.strip() for item in str(value).split(",")]
@@ -852,34 +861,63 @@ def _parse_kernels(value: str) -> list[str]:
 
 
 @fire.decorators.SetParseFns(
-    kernel=str, M=str, K=str, mk_mode=str, output_metrics=str
+    kernel=str,
+    M=str,
+    K=str,
+    mk_mode=str,
+    output_metrics=str,
+    shapes_for_model=str,
 )
 def main(
     kernel: str = "add_v0",
-    M: str = "16384",
-    K: str = "16384",
-    mk_mode: str = "pair",
+    M: str | None = None,
+    K: str | None = None,
+    mk_mode: str | None = None,
     output_metrics: str = "tb_s",
+    shapes_for_model: str = "",
 ):
     """Benchmark handwritten CuTeDSL kernels over one shape or an M-by-K shape grid."""
     kernels = _parse_kernels(kernel)
-    m_values = _parse_sizes(M, "M")
-    k_values = _parse_sizes(K, "K")
     metrics = _parse_output_metrics(output_metrics)
-    mk_mode = mk_mode.strip().lower()
-    if mk_mode not in ("cartesian", "pair"):
-        raise ValueError(
-            f"unsupported mk_mode {mk_mode!r}; choose from ('cartesian', 'pair')"
-        )
-    if mk_mode == "pair":
-        if len(m_values) != len(k_values):
+
+    shapes_for_model = shapes_for_model.strip().lower()
+    if shapes_for_model:
+        specified_shape_args = [
+            name
+            for name, value in (("M", M), ("K", K), ("mk_mode", mk_mode))
+            if value is not None
+        ]
+        if specified_shape_args:
             raise ValueError(
-                "pair mk_mode requires the same number of M and K values, got "
-                f"{len(m_values)} and {len(k_values)}"
+                "shapes_for_model cannot be combined with "
+                + ", ".join(specified_shape_args)
             )
-        shape_pairs = list(zip(m_values, k_values))
+        if shapes_for_model not in _MODEL_SHAPES:
+            raise ValueError(
+                f"unsupported shapes_for_model {shapes_for_model!r}; "
+                f"choose from {tuple(_MODEL_SHAPES)}"
+            )
+        shape_pairs = _MODEL_SHAPES[shapes_for_model]()
+        m_values = [m for m, _ in shape_pairs]
+        k_values = [k for _, k in shape_pairs]
+        mk_mode = "pair"
     else:
-        shape_pairs = [(m, k) for m in m_values for k in k_values]
+        m_values = _parse_sizes("16384" if M is None else M, "M")
+        k_values = _parse_sizes("16384" if K is None else K, "K")
+        mk_mode = "pair" if mk_mode is None else mk_mode.strip().lower()
+        if mk_mode not in ("cartesian", "pair"):
+            raise ValueError(
+                f"unsupported mk_mode {mk_mode!r}; choose from ('cartesian', 'pair')"
+            )
+        if mk_mode == "pair":
+            if len(m_values) != len(k_values):
+                raise ValueError(
+                    "pair mk_mode requires the same number of M and K values, got "
+                    f"{len(m_values)} and {len(k_values)}"
+                )
+            shape_pairs = list(zip(m_values, k_values))
+        else:
+            shape_pairs = [(m, k) for m in m_values for k in k_values]
 
     device_name = torch.cuda.get_device_name(0)
     peak_bw = _peak_bw_gbps(device_name)
