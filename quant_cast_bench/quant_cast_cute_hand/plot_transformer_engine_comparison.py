@@ -21,7 +21,10 @@ def _is_true(value: str) -> bool:
 
 def _implementation(kernel: str, family: str) -> str:
     if family == "mxfp8":
-        return kernel.rsplit("_", 1)[-1]
+        implementation = kernel.rsplit("_", 1)[-1]
+        if "32x32" in kernel:
+            return f"32x32_{implementation}"
+        return implementation
     return "pipelined" if kernel.endswith("_pipelined") else "tma"
 
 
