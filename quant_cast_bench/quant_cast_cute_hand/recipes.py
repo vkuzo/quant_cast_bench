@@ -34,7 +34,8 @@ from quant_cast_bench.quant_cast_cute.recipes import (
 from quant_cast_bench.quant_cast_gold.recipes import (
     Deepseek1x128Gold, Deepseek1x128DimMGold, Mxfp8DimKmSwizzleGold,
     Mxfp8DimKmSwizzleSRGold, Mxfp8DimMSwizzleGold, Mxfp8DimMSwizzleSRGold,
-    Mxfp8SwizzleGold, Mxfp8SwizzleSRGold, Nvfp4GsDimKMSwizzleGold,
+    Mxfp832x32SwizzleGold, Mxfp8SwizzleGold, Mxfp8SwizzleSRGold,
+    Nvfp4GsDimKMSwizzleGold,
     Nvfp4GsDimMSwizzleGold, Nvfp4GsDimMSwizzleRHTSRGold,
     Nvfp4GsSwizzle_DimK_DimMRHT_Gold,
     Nvfp4GsSwizzle_DimKSR_DimMRHTSR_Gold,
@@ -2280,6 +2281,8 @@ MXFP8_SWIZZLE_V5 = QuantCastCuteRecipe.from_gold(
 # All modes additionally have a compile-time stochastic specialization. They keep the same TMA
 # load, reductions, scale stores, shared-memory output staging, and TMA stores; only each enabled
 # qdata conversion changes to Philox plus Blackwell cvt.rs.e4m3x4.
+# The 32x32 specialization keeps this dim-K data path and adds a warp max across each 32-row group;
+# the resulting scale is naturally expanded because every lane writes its warp-uniform scale byte.
 _MXS_TM, _MXS_MAX_TN, _MXS_WARPS = 128, 128, 4
 _MXS_THREADS = _MXS_WARPS * 32                       # 128, one thread per tile row
 _MXS_MODE_DIM_K = 0
@@ -2390,6 +2393,7 @@ def mxfp8_swizzle_v2_kernel(
     ragged: cutlass.Constexpr,
     mode: cutlass.Constexpr,
     stochastic: cutlass.Constexpr,
+    square_scaling: cutlass.Constexpr,
 ):
     tidx, _, _ = cute.arch.thread_idx()
     n_tile, m_tile, _ = cute.arch.block_idx()
@@ -2633,6 +2637,10 @@ def mxfp8_swizzle_v2_kernel(
             amax_k = cute.math.absf(vk).reduce(
                 cute.ReductionOp.MAX, cutlass.Float32(0.0), 0
             )
+            if cutlass.const_expr(square_scaling):
+                # One warp owns the 32 rows of each 32-column group. Broadcast their combined
+                # maximum so every row quantizes with the same 32x32-block scale.
+                amax_k = cute.arch.warp_reduction_max(amax_k)
             rcp_k, biased_k = _e8m0(amax_k)
             if cutlass.const_expr(stochastic):
                 rQK[(None, it)].store(
@@ -2723,10 +2731,15 @@ def mxfp8_swizzle_v2_kernel(
                             if col < ncb_k * 4:
                                 mScaleKLogical[(input_row_k, col)] = cutlass.Uint8(0)
         else:
-            # Short fused tiles distribute (row, 1x32 group) pairs across all threads. Their scale
-            # slots are strided across rows, so store them individually instead of packing bytes.
-            local_group_k = tidx % bpr
-            local_row_k = tidx // bpr
+            # Short tiles distribute (row, 1x32 group) pairs across all threads. The fused 1D path
+            # is group-major; square scaling is warp/block-major. Both need individual scale stores
+            # because their slots are strided across rows.
+            if cutlass.const_expr(square_scaling):
+                local_group_k = tidx // 32
+                local_row_k = tidx % 32
+            else:
+                local_group_k = tidx % bpr
+                local_row_k = tidx // bpr
             for it in cutlass.range_constexpr(iters):
                 input_row_k = m_tile * tile_m + local_row_k + it * 32
                 scale_col_k = n_tile * bpr + local_group_k
@@ -2755,6 +2768,7 @@ def mxfp8_swizzle_v2_jit(
     cluster_n: cutlass.Constexpr,
     ragged: cutlass.Constexpr,
     stochastic: cutlass.Constexpr,
+    square_scaling: cutlass.Constexpr,
 ):
     padded_M = _ceil_div(M, _MXS_TM) * _MXS_TM
     padded_N = _ceil_div(N, tile_n) * tile_n
@@ -2787,6 +2801,13 @@ def mxfp8_swizzle_v2_jit(
         data_tv_layout = cute.make_layout(
             ((_MXS_THREADS,), (32, iters)),
             stride=((1,), (tile_m, tile_m * 32)),
+        )
+    elif cutlass.const_expr(square_scaling):
+        # The 32x128 square-scale tile assigns one warp to each 32x32 block. Within a warp,
+        # lanes own rows and values walk columns, so warp_reduction_max spans the whole block.
+        data_tv_layout = cute.make_layout(
+            ((32, bpr), (32, 1)),
+            stride=((1, tile_m * 32), (tile_m, tile_m * tile_n)),
         )
     else:
         # Smaller tiles map one (row, 1x32 group) to each thread, then advance through 32-row stages.
@@ -2831,6 +2852,7 @@ def mxfp8_swizzle_v2_jit(
         ragged,
         _MXS_MODE_DIM_K,
         stochastic,
+        square_scaling,
     ).launch(
         # Make the fast-changing grid dimension follow contiguous columns. Clustering those CTAs
         # further preserves that locality in hardware scheduling.
@@ -2840,11 +2862,12 @@ def mxfp8_swizzle_v2_jit(
     )
 
 
-def mxfp8_swizzle_v2(
+def _mxfp8_swizzle_v2_impl(
     input: torch.Tensor,
-    mode: str = "dim_k",
-    key: torch.Tensor | None = None,
-    rounding_mode: str = "rtne",
+    mode: str,
+    key: torch.Tensor | None,
+    rounding_mode: str,
+    square_scaling: bool,
     **kwargs,
 ):
     assert mode in ("dim_k", "dim_m", "dim_km"), f"unsupported mode: {mode}"
@@ -2854,6 +2877,9 @@ def mxfp8_swizzle_v2(
     rounding_mode = str(getattr(rounding_mode, "value", rounding_mode)).lower()
     assert rounding_mode in ("rtne", "stochastic"), f"unsupported rounding_mode: {rounding_mode}"
     stochastic = rounding_mode == "stochastic"
+    if square_scaling:
+        assert mode == "dim_k", "32x32 v2 currently supports only dim-k output"
+        assert not stochastic, "32x32 v2 currently supports only RTNE"
     if stochastic:
         assert key is not None, "stochastic rounding requires a Philox key"
         assert key.device == input.device, "input and Philox key must be on the same device"
@@ -2862,6 +2888,8 @@ def mxfp8_swizzle_v2(
         assert key is None, "RTNE rounding does not use a Philox key"
     M, N = input.shape
     assert M > 0 and N > 0, "v2 requires non-empty dimensions"
+    if square_scaling:
+        assert M % 32 == 0, "32x32 v2 requires M % 32 == 0"
 
     if mode != "dim_k":
         assert M % 32 == 0, "v2 dim-M requires M % 32 == 0"
@@ -2986,7 +3014,9 @@ def mxfp8_swizzle_v2(
     # RTNE benefits from N-oriented clustering and its locality. Philox supplies enough arithmetic
     # latency hiding that independent CTAs are faster than forcing the same clustered schedule.
     cluster_n = (
-        1 if stochastic
+        # Square scaling has enough independent CTAs at small/medium sizes that clustering only
+        # constrains scheduling; large shapes retain v2's N-locality-oriented clusters.
+        1 if stochastic or (square_scaling and M * N <= 4096 * 4096)
         else next(c for c in (16, 8, 4, 2, 1) if c <= ncb and grid_n % c == 0)
     )
     output = torch.empty(M, N, dtype=torch.float8_e4m3fn, device=input.device)
@@ -3009,7 +3039,7 @@ def mxfp8_swizzle_v2(
     fn = _compiled(
         (
             "mxfp8_swizzle_v2", "dim_k", tile_m, tile_n, cluster_n, ragged,
-            rounding_mode,
+            rounding_mode, square_scaling,
         ),
         mxfp8_swizzle_v2_jit,
         mInput,
@@ -3023,13 +3053,47 @@ def mxfp8_swizzle_v2(
         cluster_n,
         ragged,
         stochastic,
+        square_scaling,
     )
     fn(mInput, mOutput, mScale, mSeed, M, N)
     return output, scale.view(nrb, ncb, 32, 16).view(torch.float8_e8m0fnu)
 
 
+def mxfp8_swizzle_v2(
+    input: torch.Tensor,
+    mode: str = "dim_k",
+    key: torch.Tensor | None = None,
+    rounding_mode: str = "rtne",
+    **kwargs,
+):
+    return _mxfp8_swizzle_v2_impl(
+        input,
+        mode=mode,
+        key=key,
+        rounding_mode=rounding_mode,
+        square_scaling=False,
+        **kwargs,
+    )
+
+
 MXFP8_SWIZZLE_V2 = QuantCastCuteRecipe.from_gold(
     Mxfp8SwizzleGold, cute_fn=mxfp8_swizzle_v2
+)
+
+
+def mxfp8_32x32_swizzle_v2(input: torch.Tensor, **kwargs):
+    return _mxfp8_swizzle_v2_impl(
+        input,
+        mode="dim_k",
+        key=None,
+        rounding_mode="rtne",
+        square_scaling=True,
+        **kwargs,
+    )
+
+
+MXFP8_32X32_SWIZZLE_V2 = QuantCastCuteRecipe.from_gold(
+    Mxfp832x32SwizzleGold, cute_fn=mxfp8_32x32_swizzle_v2
 )
 
 
@@ -3182,6 +3246,7 @@ def _mxfp8_swizzle_v2_m_jit(
         ragged,
         mode,
         stochastic,
+        False,
     )
     grid = (padded_N // tile_n, padded_M // tile_m, 1)
     block = (max(_MXS_THREADS, tile_n), 1, 1)
@@ -5947,6 +6012,7 @@ ALL_RECIPES = [
     ("mxfp8_swizzle", MXFP8_SWIZZLE),
     ("mxfp8_swizzle_v2", MXFP8_SWIZZLE_V2),
     ("mxfp8_swizzle_sr_v2", MXFP8_SWIZZLE_SR_V2),
+    ("mxfp8_32x32_swizzle_v2", MXFP8_32X32_SWIZZLE_V2),
     ("mxfp8_swizzle_v3", MXFP8_SWIZZLE_V3),
     ("mxfp8_swizzle_v4", MXFP8_SWIZZLE_V4),
     ("mxfp8_swizzle_sr_v4", MXFP8_SWIZZLE_SR_V4),

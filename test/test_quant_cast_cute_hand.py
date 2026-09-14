@@ -66,6 +66,7 @@ _REQUIRES_SM100 = frozenset({
     "mxfp8_swizzle",
     "mxfp8_swizzle_v2",
     "mxfp8_swizzle_sr_v2",
+    "mxfp8_32x32_swizzle_v2",
     "mxfp8_swizzle_v3",
     "mxfp8_swizzle_v4",
     "mxfp8_swizzle_sr_v4",
@@ -202,6 +203,24 @@ def test_mxfp8_swizzle_v2(M, K):
     tile_kwargs = {"global_row": 0, "global_col": 0, "num_col": inputs[0].shape[-1]}
     ref_outputs = recipe.pt_ref_fn(*inputs, **tile_kwargs)
     recipe.correctness_fn(inputs, outputs)
+
+
+@pytest.mark.parametrize("M,K", [(32, 32), (96, 160), (128, 256), (1024, 1152)])
+def test_mxfp8_32x32_swizzle_v2(M, K):
+    recipe = _get_recipe("mxfp8_32x32_swizzle_v2")
+    inputs = recipe.example_input_fn(M, K)
+    outputs = recipe.cute_fn(*inputs)
+    ref_outputs = recipe.pt_ref_fn(*inputs)
+    assert qdata_and_scale_equal(outputs[0], ref_outputs[0])
+    assert qdata_and_scale_equal(outputs[1], ref_outputs[1])
+
+
+@pytest.mark.parametrize("M,K", [(0, 32), (32, 0), (31, 32), (32, 31)])
+def test_mxfp8_32x32_swizzle_v2_rejects_invalid_shapes(M, K):
+    recipe = _get_recipe("mxfp8_32x32_swizzle_v2")
+    inputs = recipe.example_input_fn(M, K)
+    with pytest.raises(AssertionError):
+        recipe.cute_fn(*inputs)
 
 
 def test_mxfp8_swizzle_sr_v2_folded_key_and_padding():

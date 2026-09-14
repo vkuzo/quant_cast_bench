@@ -6,7 +6,9 @@ The charts report logical throughput for BF16 square inputs on B200. Each panel 
 matching kernels exposed by `benchmark_transformer_engine.py`. CuTe-hand results are blue,
 TransformerEngine results are red, RTNE is solid, and stochastic rounding is dashed. RHT
 and non-RHT kernels remain in separate panels. A missing red SR line means that
-TransformerEngine has no comparable stochastic MXFP8 implementation.
+TransformerEngine has no comparable stochastic MXFP8 implementation. The MXFP8 comparisons
+include both the conventional 1x32 scale blocks and the 32x32 scale blocks used by
+`mxfp8_32x32_swizzle_v2`.
 
 ![CuTe-hand versus TransformerEngine throughput](transformer_engine_comparison.png)
 

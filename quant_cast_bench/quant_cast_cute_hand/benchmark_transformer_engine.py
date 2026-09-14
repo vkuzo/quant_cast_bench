@@ -26,6 +26,7 @@ from torch._inductor.utils import _do_bench_using_profiling
 from transformer_engine.pytorch import MXFP8Quantizer, NVFP4Quantizer
 
 from quant_cast_bench.quant_cast_cute_hand.recipes import (
+    mxfp8_32x32_swizzle_v2,
     mxfp8_swizzle,
     mxfp8_swizzle_v2,
     mxfp8_swizzle_v3,
@@ -89,6 +90,8 @@ def _make_ours(name: str, x: torch.Tensor):
         return lambda: mxfp8_swizzle(x)
     if name == "mxfp8_swizzle_v2":
         return lambda: mxfp8_swizzle_v2(x)
+    if name == "mxfp8_32x32_swizzle_v2":
+        return lambda: mxfp8_32x32_swizzle_v2(x)
     if name == "mxfp8_swizzle_v3":
         return lambda: mxfp8_swizzle_v3(x)
     if name == "mxfp8_swizzle_v4":
@@ -140,7 +143,15 @@ def _make_ours(name: str, x: torch.Tensor):
     raise KeyError(name)
 
 
-def _make_te(family: str, mode: str, rht: bool, stochastic: bool, x: torch.Tensor):
+def _make_te(
+    family: str,
+    mode: str,
+    rht: bool,
+    stochastic: bool,
+    x: torch.Tensor,
+    *,
+    square_scaling: bool = False,
+):
     rowwise = mode in ("dim_k", "dim_km")
     columnwise = mode in ("dim_m", "dim_km")
     if family == "mxfp8":
@@ -148,6 +159,7 @@ def _make_te(family: str, mode: str, rht: bool, stochastic: bool, x: torch.Tenso
             tex.DType.kFloat8E4M3,
             rowwise=rowwise,
             columnwise=columnwise,
+            with_2d_quantization=square_scaling,
         )
         quantizer.optimize_for_gemm = True
         output = quantizer.make_empty(x.shape, dtype=x.dtype, device=x.device)
@@ -174,6 +186,7 @@ def _make_te(family: str, mode: str, rht: bool, stochastic: bool, x: torch.Tenso
 # name, family, mode, RHT, stochastic rounding
 CASES = (
     ("mxfp8_swizzle_v2", "mxfp8", "dim_k", False, False),
+    ("mxfp8_32x32_swizzle_v2", "mxfp8", "dim_k", False, False),
     ("mxfp8_dim_m_swizzle_v2", "mxfp8", "dim_m", False, False),
     ("mxfp8_dim_km_swizzle_v2", "mxfp8", "dim_km", False, False),
     ("nvfp4_swizzle_tma", "nvfp4", "dim_k", False, False),
@@ -299,7 +312,9 @@ def main(
         csv_path = Path(csv_output).expanduser()
         csv_path.parent.mkdir(parents=True, exist_ok=True)
         csv_file = csv_path.open("w", newline="")
-        csv_writer = csv.DictWriter(csv_file, fieldnames=CSV_FIELDS)
+        csv_writer = csv.DictWriter(
+            csv_file, fieldnames=CSV_FIELDS, lineterminator="\n"
+        )
         csv_writer.writeheader()
 
     te_case_names = {case[0] for case in CASES}
@@ -312,9 +327,17 @@ def main(
                 te_ms = None
                 te_tb_s = None
                 if name in te_case_names:
-                    key = (family, mode, rht, stochastic, M, K)
+                    square_scaling = name == "mxfp8_32x32_swizzle_v2"
+                    key = (family, mode, rht, stochastic, square_scaling, M, K)
                     if key not in te_cache:
-                        te_run = _make_te(family, mode, rht, stochastic, x)
+                        te_run = _make_te(
+                            family,
+                            mode,
+                            rht,
+                            stochastic,
+                            x,
+                            square_scaling=square_scaling,
+                        )
                         te_cache[key] = _time(te_run)
                     te_ms = te_cache[key]
 

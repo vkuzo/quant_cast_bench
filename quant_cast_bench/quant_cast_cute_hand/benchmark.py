@@ -32,7 +32,8 @@ from torch._inductor.utils import do_bench_using_profiling
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from quant_cast_bench.quant_cast_cute_hand.recipes import (
     add_v0, add_v1, add_v2, fp8_deepseek_1x128, fp8_deepseek_1x128_dim_m,
-    fp8_deepseek_1x128_dim_m_v2, mxfp8_swizzle, mxfp8_swizzle_v2,
+    fp8_deepseek_1x128_dim_m_v2, mxfp8_32x32_swizzle_v2, mxfp8_swizzle,
+    mxfp8_swizzle_v2,
     mxfp8_swizzle_v3, mxfp8_swizzle_v4, mxfp8_swizzle_v5,
     nvfp4_dim_km_swizzle_tma, nvfp4_dim_m_rht_swizzle_tma,
     nvfp4_dim_m_swizzle_rht_sr_tma,
@@ -44,7 +45,7 @@ from quant_cast_bench.quant_cast_cute_hand.recipes import (
     transpose_v0, transpose_v1,
 )
 from quant_cast_bench.quant_cast_gold.recipes import (
-    mxfp8_dim_km_swizzle_f, mxfp8_dim_km_swizzle_sr_f,
+    mxfp8_32x32_swizzle_f, mxfp8_dim_km_swizzle_f, mxfp8_dim_km_swizzle_sr_f,
     mxfp8_dim_m_swizzle_f, mxfp8_dim_m_swizzle_sr_f, mxfp8_swizzle_f,
     mxfp8_swizzle_sr_f, hadamard_rht_fp32_f, hadamard_rht_matrix,
     nvfp4_gs_scale, nvfp4_gs_swizzle_dim_km_f, nvfp4_gs_swizzle_dim_m_f,
@@ -273,6 +274,26 @@ def _bench_mxfp8_swizzle_v2(M, K):
         x.numel() * x.element_size()   # bf16 input read
         + q.numel() * q.element_size() # fp8 qdata write
         + s.numel() * s.element_size() # e8m0 (1-byte) scale write
+    )
+    return run, bytes_per_iter
+
+
+def _bench_mxfp8_32x32_swizzle_v2(M, K):
+    torch.manual_seed(0)
+    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+
+    def run():
+        return mxfp8_32x32_swizzle_v2(x)
+
+    q, s = run()
+    torch.cuda.synchronize()
+    q_ref, s_ref = mxfp8_32x32_swizzle_f(x)
+    assert torch.equal(s.view(torch.uint8), s_ref.view(torch.uint8)), "scale mismatch vs reference"
+    assert torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8)), "qdata mismatch vs reference"
+    bytes_per_iter = (
+        x.numel() * x.element_size()
+        + q.numel() * q.element_size()
+        + s.numel() * s.element_size()
     )
     return run, bytes_per_iter
 
@@ -738,6 +759,7 @@ _KERNELS = {
     "mxfp8_swizzle": _bench_mxfp8_swizzle,
     "mxfp8_swizzle_v2": _bench_mxfp8_swizzle_v2,
     "mxfp8_swizzle_sr_v2": _bench_mxfp8_swizzle_sr_v2,
+    "mxfp8_32x32_swizzle_v2": _bench_mxfp8_32x32_swizzle_v2,
     "mxfp8_swizzle_v3": _bench_mxfp8_swizzle_v3,
     "mxfp8_swizzle_v4": _bench_mxfp8_swizzle_v4,
     "mxfp8_swizzle_sr_v4": _bench_mxfp8_swizzle_sr_v4,
