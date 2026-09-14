@@ -861,6 +861,14 @@ def main(
 
     device_name = torch.cuda.get_device_name(0)
     peak_bw = _peak_bw_gbps(device_name)
+
+    # Prime Kineto and bring the GPU out of its initial idle state before recording the first real
+    # data point. Without this, a short first kernel can report a substantially inflated duration.
+    profiler_scratch = torch.empty(1, dtype=torch.int32, device="cuda")
+    do_bench_using_profiling(
+        profiler_scratch.zero_, warmup=2, rep=2, is_vetted_benchmarking=True
+    )
+
     for kernel_index, kernel_name in enumerate(kernels):
         # Keep kernel outermost so one kernel's complete shape grid finishes before the next starts.
         results = {

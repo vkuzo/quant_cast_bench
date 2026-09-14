@@ -2,9 +2,11 @@
 
 The primary TransformerEngine NVFP4 measurements use precomputed global amaxes,
 matching the CuTe-hand API contract where outer scales are inputs. All reported
-bandwidths use the same logical input + qdata + padded-scale byte count.
+bandwidths use the same logical input + qdata + padded-scale byte count. Kernels
+without a comparable TransformerEngine implementation still benchmark our path.
 """
 
+import csv
 import os
 from pathlib import Path
 import sys
@@ -97,6 +99,18 @@ def _make_ours(name: str, x: torch.Tensor):
         return lambda: mxfp8_swizzle_v2(x, mode="dim_m")
     if name == "mxfp8_dim_km_swizzle_v2":
         return lambda: mxfp8_swizzle_v2(x, mode="dim_km")
+    if name == "mxfp8_swizzle_sr_v2":
+        return lambda: mxfp8_swizzle_v2(
+            x, key=key_k, rounding_mode="stochastic"
+        )
+    if name == "mxfp8_dim_m_swizzle_sr_v2":
+        return lambda: mxfp8_swizzle_v2(
+            x, mode="dim_m", key=key_k, rounding_mode="stochastic"
+        )
+    if name == "mxfp8_dim_km_swizzle_sr_v2":
+        return lambda: mxfp8_swizzle_v2(
+            x, mode="dim_km", key=key_k, rounding_mode="stochastic"
+        )
     if name == "nvfp4_swizzle_direct":
         return lambda: nvfp4_swizzle_direct(x, outer)
     if name == "nvfp4_swizzle_tma":
@@ -185,6 +199,32 @@ CASES = (
     ),
 )
 
+# These are useful CuTe-hand measurements, but TransformerEngine has no matching
+# stochastic MXFP8 API to put on the other side of the comparison.
+NO_TE_CASES = (
+    ("mxfp8_swizzle_sr_v2", "mxfp8", "dim_k", False, True),
+    ("mxfp8_dim_m_swizzle_sr_v2", "mxfp8", "dim_m", False, True),
+    ("mxfp8_dim_km_swizzle_sr_v2", "mxfp8", "dim_km", False, True),
+)
+
+ALL_CASES = CASES + NO_TE_CASES
+
+CSV_FIELDS = (
+    "kernel",
+    "family",
+    "mode",
+    "rht",
+    "stochastic",
+    "M",
+    "K",
+    "ours_ms",
+    "te_ms",
+    "ours_tb_s",
+    "te_tb_s",
+    "speedup_vs_te",
+)
+
+
 def _parse_sizes(value: str, name: str) -> list[int]:
     """Parse one integer or a comma-separated list of integers."""
     items = str(value).split(",")
@@ -207,23 +247,28 @@ def _parse_kernels(value: str) -> list[str]:
     kernels = [item.strip() for item in str(value).split(",")]
     if any(not kernel for kernel in kernels):
         raise ValueError(f"kernel must be a name or comma-separated names, got {value!r}")
-    available = {case[0] for case in CASES}
+    available = {case[0] for case in ALL_CASES}
     invalid = [kernel for kernel in kernels if kernel not in available]
     if invalid:
         raise ValueError(f"unknown kernels {invalid}; have {sorted(available)}")
     return list(dict.fromkeys(kernels))
 
 
-@fire.decorators.SetParseFns(kernel=str, M=str, K=str, mk_mode=str)
+@fire.decorators.SetParseFns(kernel=str, M=str, K=str, mk_mode=str, csv_output=str)
 def main(
-    kernel: str = ",".join(case[0] for case in CASES),
+    kernel: str = ",".join(case[0] for case in ALL_CASES),
     M: str = ",".join(str(size) for size in SHAPES),
     K: str = ",".join(str(size) for size in SHAPES),
     mk_mode: str = "pair",
+    csv_output: str = "",
 ) -> None:
-    """Compare CuTe-hand and TransformerEngine kernels over an M-by-K shape grid."""
+    """Compare CuTe-hand and TransformerEngine kernels over an M-by-K shape grid.
+
+    Set ``csv_output`` to additionally save machine-readable results. Empty TE
+    fields mean that TransformerEngine has no comparable implementation.
+    """
     kernels = _parse_kernels(kernel)
-    cases_by_name = {case[0]: case for case in CASES}
+    cases_by_name = {case[0]: case for case in ALL_CASES}
     cases = [cases_by_name[name] for name in kernels]
     m_values = _parse_sizes(M, "M")
     k_values = _parse_sizes(K, "K")
@@ -248,33 +293,83 @@ def main(
         profiler_scratch.zero_, warmup=2, rep=2, is_vetted_benchmarking=True
     )
 
+    csv_file = None
+    csv_writer = None
+    if csv_output:
+        csv_path = Path(csv_output).expanduser()
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+        csv_file = csv_path.open("w", newline="")
+        csv_writer = csv.DictWriter(csv_file, fieldnames=CSV_FIELDS)
+        csv_writer.writeheader()
+
+    te_case_names = {case[0] for case in CASES}
     te_cache = {}
-    for name, family, mode, rht, stochastic in cases:
-        for M, K in shapes:
-            torch.manual_seed(0)
-            x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
-            key = (family, mode, rht, stochastic, M, K)
-            if key not in te_cache:
-                te_run = _make_te(family, mode, rht, stochastic, x)
-                te_cache[key] = _time(te_run)
-            te_ms = te_cache[key]
-            ours_ms = _time(_make_ours(name, x))
-            byte_count = _logical_bytes(M, K, family, mode)
-            te_tb_s = byte_count / (te_ms * 1e-3) / 1e12
-            ours_tb_s = byte_count / (ours_ms * 1e-3) / 1e12
-            print(
-                f"{name:48s} {M:5d}x{K:<5d} "
-                f"ours={ours_ms:.4f} ms/{ours_tb_s:.3f} TB/s "
-                f"TE={te_ms:.4f} ms/{te_tb_s:.3f} TB/s "
-                f"speedup={te_ms / ours_ms:.3f}x",
-                flush=True,
-            )
-            del x
-    print(
-        "No comparable TransformerEngine implementation: "
-        "mxfp8_swizzle_sr_v2, "
-        "mxfp8_dim_m_swizzle_sr_v2, mxfp8_dim_km_swizzle_sr_v2"
-    )
+    try:
+        for name, family, mode, rht, stochastic in cases:
+            for M, K in shapes:
+                torch.manual_seed(0)
+                x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+                te_ms = None
+                te_tb_s = None
+                if name in te_case_names:
+                    key = (family, mode, rht, stochastic, M, K)
+                    if key not in te_cache:
+                        te_run = _make_te(family, mode, rht, stochastic, x)
+                        te_cache[key] = _time(te_run)
+                    te_ms = te_cache[key]
+
+                ours_ms = _time(_make_ours(name, x))
+                byte_count = _logical_bytes(M, K, family, mode)
+                ours_tb_s = byte_count / (ours_ms * 1e-3) / 1e12
+                if te_ms is not None:
+                    te_tb_s = byte_count / (te_ms * 1e-3) / 1e12
+                    speedup = te_ms / ours_ms
+                    te_summary = (
+                        f"TE={te_ms:.4f} ms/{te_tb_s:.3f} TB/s "
+                        f"speedup={speedup:.3f}x"
+                    )
+                else:
+                    speedup = None
+                    te_summary = "TE=n/a speedup=n/a"
+                print(
+                    f"{name:48s} {M:5d}x{K:<5d} "
+                    f"ours={ours_ms:.4f} ms/{ours_tb_s:.3f} TB/s "
+                    f"{te_summary}",
+                    flush=True,
+                )
+
+                if csv_writer is not None:
+                    csv_writer.writerow(
+                        {
+                            "kernel": name,
+                            "family": family,
+                            "mode": mode,
+                            "rht": rht,
+                            "stochastic": stochastic,
+                            "M": M,
+                            "K": K,
+                            "ours_ms": f"{ours_ms:.6f}",
+                            "te_ms": "" if te_ms is None else f"{te_ms:.6f}",
+                            "ours_tb_s": f"{ours_tb_s:.6f}",
+                            "te_tb_s": "" if te_tb_s is None else f"{te_tb_s:.6f}",
+                            "speedup_vs_te": "" if speedup is None else f"{speedup:.6f}",
+                        }
+                    )
+                    csv_file.flush()
+                del x
+    finally:
+        if csv_file is not None:
+            csv_file.close()
+
+    unavailable = [name for name, *_ in NO_TE_CASES if name in kernels]
+    if unavailable:
+        print(
+            "No comparable TransformerEngine implementation: "
+            + ", ".join(unavailable),
+            flush=True,
+        )
+    if csv_output:
+        print(f"Wrote {Path(csv_output).expanduser()}", flush=True)
 
 
 if __name__ == "__main__":
