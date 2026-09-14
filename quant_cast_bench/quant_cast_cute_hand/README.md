@@ -22,3 +22,22 @@ CUDA_VISIBLE_DEVICES=1 \
 The script runs the paired square-shape sweep at 2048, 4096, 8192, and 16384, writes
 [`transformer_engine_comparison.csv`](transformer_engine_comparison.csv), and renders the
 figure with Matplotlib.
+
+## Performance versus MSLK
+
+This chart compares the CuTe-hand TMA NVFP4 Dim-K kernel with MSLK's dense Triton
+NVFP4 kernel on BF16 square inputs. Both kernels receive the same precomputed global
+scale, produce bitwise-identical packed FP4 data and swizzled scale bytes, and are
+reported using the same logical byte count. CuTe hand is blue and MSLK is red.
+
+![CuTe-hand versus MSLK throughput](mslk_comparison.png)
+
+Regenerate the benchmark CSV and chart from the repository root with:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 \
+  quant_cast_bench/quant_cast_cute_hand/update_mslk_comparison.sh
+```
+
+The script runs the paired square-shape sweep at 2048, 4096, 8192, and 16384, writes
+[`mslk_comparison.csv`](mslk_comparison.csv), and renders the figure with Matplotlib.
