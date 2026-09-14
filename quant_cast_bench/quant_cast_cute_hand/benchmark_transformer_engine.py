@@ -1,0 +1,281 @@
+"""Compare CuTe-hand quantization kernels with TransformerEngine kernels.
+
+The primary TransformerEngine NVFP4 measurements use precomputed global amaxes,
+matching the CuTe-hand API contract where outer scales are inputs. All reported
+bandwidths use the same logical input + qdata + padded-scale byte count.
+"""
+
+import os
+from pathlib import Path
+import sys
+
+# Set these before importing PyTorch or TransformerEngine.
+os.environ.setdefault("KINETO_LOG_LEVEL", "6")
+os.environ.setdefault("NVTE_USE_FAST_MATH", "1")
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+import torch
+import torch.func._random as prng
+import fire
+import transformer_engine.pytorch as te  # noqa: F401 - must precede transformer_engine_torch
+import transformer_engine_torch as tex
+from torch._inductor.utils import _do_bench_using_profiling
+from transformer_engine.pytorch import MXFP8Quantizer, NVFP4Quantizer
+
+from quant_cast_bench.quant_cast_cute_hand.recipes import (
+    mxfp8_swizzle,
+    mxfp8_swizzle_v2,
+    mxfp8_swizzle_v3,
+    mxfp8_swizzle_v4,
+    mxfp8_swizzle_v5,
+    nvfp4_dim_km_swizzle_tma,
+    nvfp4_dim_m_rht_swizzle_tma,
+    nvfp4_dim_m_swizzle_rht_sr_tma,
+    nvfp4_dim_m_swizzle_tma,
+    nvfp4_swizzle_dim_k_dim_m_rht_tma,
+    nvfp4_swizzle_dim_k_dim_m_rht_pipelined,
+    nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_tma,
+    nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_pipelined,
+    nvfp4_swizzle_direct,
+    nvfp4_swizzle_tma,
+)
+
+
+SHAPES = (2048, 4096, 8192, 16384)
+
+
+def _ceil_div(x: int, y: int) -> int:
+    return (x + y - 1) // y
+
+
+def _scale_bytes(M: int, K: int, group: int, dim_m: bool) -> int:
+    rows, groups = (K, _ceil_div(M, group)) if dim_m else (M, _ceil_div(K, group))
+    return _ceil_div(rows, 128) * _ceil_div(groups, 4) * 32 * 16
+
+
+def _logical_bytes(M: int, K: int, family: str, mode: str) -> int:
+    numel = M * K
+    qbytes = numel if family == "mxfp8" else numel // 2
+    group = 32 if family == "mxfp8" else 16
+    total = 2 * numel
+    if mode in ("dim_k", "dim_km"):
+        total += qbytes + _scale_bytes(M, K, group, dim_m=False)
+    if mode in ("dim_m", "dim_km"):
+        total += qbytes + _scale_bytes(M, K, group, dim_m=True)
+    return total
+
+
+def _time(run) -> float:
+    for _ in range(2):
+        run()
+    torch.cuda.synchronize()
+    # A short profiling window avoids Kineto overhead distorting very small TE kernels. The
+    # process-wide profiler warm-up in main handles the unusually slow first profiler invocation.
+    return _do_bench_using_profiling(
+        run, warmup=2, rep=5, is_vetted_benchmarking=True
+    )
+
+
+def _make_ours(name: str, x: torch.Tensor):
+    outer = torch.ones(1, dtype=torch.float32, device=x.device)
+    sign = torch.tensor([1, -1] * 8, dtype=torch.bfloat16, device=x.device)
+    key_k = prng.key(0, device=x.device)
+    key_m = prng.key(1, device=x.device)
+
+    if name == "mxfp8_swizzle":
+        return lambda: mxfp8_swizzle(x)
+    if name == "mxfp8_swizzle_v2":
+        return lambda: mxfp8_swizzle_v2(x)
+    if name == "mxfp8_swizzle_v3":
+        return lambda: mxfp8_swizzle_v3(x)
+    if name == "mxfp8_swizzle_v4":
+        return lambda: mxfp8_swizzle_v4(x)
+    if name == "mxfp8_swizzle_v5":
+        return lambda: mxfp8_swizzle_v5(x)
+    if name == "mxfp8_dim_m_swizzle_v2":
+        return lambda: mxfp8_swizzle_v2(x, mode="dim_m")
+    if name == "mxfp8_dim_km_swizzle_v2":
+        return lambda: mxfp8_swizzle_v2(x, mode="dim_km")
+    if name == "nvfp4_swizzle_direct":
+        return lambda: nvfp4_swizzle_direct(x, outer)
+    if name == "nvfp4_swizzle_tma":
+        return lambda: nvfp4_swizzle_tma(x, outer)
+    if name == "nvfp4_dim_m_swizzle_tma":
+        return lambda: nvfp4_dim_m_swizzle_tma(x, outer)
+    if name == "nvfp4_dim_km_swizzle_tma":
+        return lambda: nvfp4_dim_km_swizzle_tma(x, outer, outer)
+    if name == "nvfp4_dim_m_rht_swizzle_tma":
+        return lambda: nvfp4_dim_m_rht_swizzle_tma(x, outer, sign)
+    if name == "nvfp4_dim_m_swizzle_rht_sr_tma":
+        return lambda: nvfp4_dim_m_swizzle_rht_sr_tma(x, outer, sign, key_k)
+    if name == "nvfp4_swizzle_dim_k_dim_m_rht_tma":
+        return lambda: nvfp4_swizzle_dim_k_dim_m_rht_tma(x, outer, outer, sign)
+    if name == "nvfp4_swizzle_dim_k_dim_m_rht_pipelined":
+        return lambda: nvfp4_swizzle_dim_k_dim_m_rht_pipelined(
+            x, outer, outer, sign
+        )
+    if name == "nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_tma":
+        return lambda: nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_tma(
+            x, outer, outer, sign, key_k, key_m
+        )
+    if name == "nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_pipelined":
+        return lambda: nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_pipelined(
+            x, outer, outer, sign, key_k, key_m
+        )
+    raise KeyError(name)
+
+
+def _make_te(family: str, mode: str, rht: bool, stochastic: bool, x: torch.Tensor):
+    rowwise = mode in ("dim_k", "dim_km")
+    columnwise = mode in ("dim_m", "dim_km")
+    if family == "mxfp8":
+        quantizer = MXFP8Quantizer(
+            tex.DType.kFloat8E4M3,
+            rowwise=rowwise,
+            columnwise=columnwise,
+        )
+        quantizer.optimize_for_gemm = True
+        output = quantizer.make_empty(x.shape, dtype=x.dtype, device=x.device)
+        return lambda: quantizer.update_quantized(x, output)
+
+    quantizer = NVFP4Quantizer(
+        fp4_dtype=tex.DType.kFloat4E2M1,
+        rowwise=rowwise,
+        columnwise=columnwise,
+        with_amax_reduction=False,
+        with_rht=rht,
+        with_post_rht_amax=rht,
+        stochastic_rounding=stochastic,
+        with_random_sign_mask=True,
+    )
+    quantizer.optimize_for_gemm = True
+    row_amax = torch.ones(1, dtype=torch.float32, device=x.device)
+    col_amax = torch.ones(1, dtype=torch.float32, device=x.device)
+    return lambda: tex.nvfp4_quantize_with_amax(
+        x, quantizer, row_amax, col_amax
+    )
+
+
+# name, family, mode, RHT, stochastic rounding
+CASES = (
+    ("mxfp8_swizzle_v2", "mxfp8", "dim_k", False, False),
+    ("mxfp8_dim_m_swizzle_v2", "mxfp8", "dim_m", False, False),
+    ("mxfp8_dim_km_swizzle_v2", "mxfp8", "dim_km", False, False),
+    ("nvfp4_swizzle_tma", "nvfp4", "dim_k", False, False),
+    ("nvfp4_dim_m_swizzle_tma", "nvfp4", "dim_m", False, False),
+    ("nvfp4_dim_km_swizzle_tma", "nvfp4", "dim_km", False, False),
+    ("nvfp4_dim_m_rht_swizzle_tma", "nvfp4", "dim_m", True, False),
+    ("nvfp4_dim_m_swizzle_rht_sr_tma", "nvfp4", "dim_m", True, True),
+    ("nvfp4_swizzle_dim_k_dim_m_rht_tma", "nvfp4", "dim_km", True, False),
+    (
+        "nvfp4_swizzle_dim_k_dim_m_rht_pipelined",
+        "nvfp4",
+        "dim_km",
+        True,
+        False,
+    ),
+    ("nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_tma", "nvfp4", "dim_km", True, True),
+    (
+        "nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_pipelined",
+        "nvfp4",
+        "dim_km",
+        True,
+        True,
+    ),
+)
+
+def _parse_sizes(value: str, name: str) -> list[int]:
+    """Parse one integer or a comma-separated list of integers."""
+    items = str(value).split(",")
+    if any(not item.strip() for item in items):
+        raise ValueError(
+            f"{name} must be an integer or comma-separated integers, got {value!r}"
+        )
+    try:
+        sizes = [int(item) for item in items]
+    except ValueError as exc:
+        raise ValueError(
+            f"{name} must be an integer or comma-separated integers, got {value!r}"
+        ) from exc
+    if any(size <= 0 for size in sizes):
+        raise ValueError(f"{name} values must be positive, got {value!r}")
+    return sizes
+
+
+def _parse_kernels(value: str) -> list[str]:
+    kernels = [item.strip() for item in str(value).split(",")]
+    if any(not kernel for kernel in kernels):
+        raise ValueError(f"kernel must be a name or comma-separated names, got {value!r}")
+    available = {case[0] for case in CASES}
+    invalid = [kernel for kernel in kernels if kernel not in available]
+    if invalid:
+        raise ValueError(f"unknown kernels {invalid}; have {sorted(available)}")
+    return list(dict.fromkeys(kernels))
+
+
+@fire.decorators.SetParseFns(kernel=str, M=str, K=str, mk_mode=str)
+def main(
+    kernel: str = ",".join(case[0] for case in CASES),
+    M: str = ",".join(str(size) for size in SHAPES),
+    K: str = ",".join(str(size) for size in SHAPES),
+    mk_mode: str = "pair",
+) -> None:
+    """Compare CuTe-hand and TransformerEngine kernels over an M-by-K shape grid."""
+    kernels = _parse_kernels(kernel)
+    cases_by_name = {case[0]: case for case in CASES}
+    cases = [cases_by_name[name] for name in kernels]
+    m_values = _parse_sizes(M, "M")
+    k_values = _parse_sizes(K, "K")
+    mk_mode = mk_mode.strip().lower()
+    if mk_mode not in ("cartesian", "pair"):
+        raise ValueError(
+            f"unsupported mk_mode {mk_mode!r}; choose from ('cartesian', 'pair')"
+        )
+    if mk_mode == "pair":
+        if len(m_values) != len(k_values):
+            raise ValueError(
+                "pair mk_mode requires the same number of M and K values, got "
+                f"{len(m_values)} and {len(k_values)}"
+            )
+        shapes = list(zip(m_values, k_values))
+    else:
+        shapes = [(m, k) for m in m_values for k in k_values]
+
+    # Prime Kineto before collecting the first real data point.
+    profiler_scratch = torch.empty(1, dtype=torch.int32, device="cuda")
+    _do_bench_using_profiling(
+        profiler_scratch.zero_, warmup=2, rep=2, is_vetted_benchmarking=True
+    )
+
+    te_cache = {}
+    for name, family, mode, rht, stochastic in cases:
+        for M, K in shapes:
+            torch.manual_seed(0)
+            x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+            key = (family, mode, rht, stochastic, M, K)
+            if key not in te_cache:
+                te_run = _make_te(family, mode, rht, stochastic, x)
+                te_cache[key] = _time(te_run)
+            te_ms = te_cache[key]
+            ours_ms = _time(_make_ours(name, x))
+            byte_count = _logical_bytes(M, K, family, mode)
+            te_tb_s = byte_count / (te_ms * 1e-3) / 1e12
+            ours_tb_s = byte_count / (ours_ms * 1e-3) / 1e12
+            print(
+                f"{name:48s} {M:5d}x{K:<5d} "
+                f"ours={ours_ms:.4f} ms/{ours_tb_s:.3f} TB/s "
+                f"TE={te_ms:.4f} ms/{te_tb_s:.3f} TB/s "
+                f"speedup={te_ms / ours_ms:.3f}x",
+                flush=True,
+            )
+            del x
+    print(
+        "No comparable TransformerEngine implementation: "
+        "mxfp8_swizzle_sr_v2, "
+        "mxfp8_dim_m_swizzle_sr_v2, mxfp8_dim_km_swizzle_sr_v2"
+    )
+
+
+if __name__ == "__main__":
+    fire.Fire(main)
