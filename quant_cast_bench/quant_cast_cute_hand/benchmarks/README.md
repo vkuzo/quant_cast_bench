@@ -17,7 +17,7 @@ Regenerate the benchmark CSV and chart from the repository root with:
 
 ```bash
 CUDA_VISIBLE_DEVICES=1 \
-  quant_cast_bench/quant_cast_cute_hand/update_transformer_engine_comparison.sh
+  quant_cast_bench/quant_cast_cute_hand/benchmarks/update_transformer_engine_comparison.sh
 ```
 
 The script runs a paired square-shape sweep over powers of two and their midpoints from
@@ -38,7 +38,7 @@ Regenerate the benchmark CSV and chart from the repository root with:
 
 ```bash
 CUDA_VISIBLE_DEVICES=1 \
-  quant_cast_bench/quant_cast_cute_hand/update_mslk_comparison.sh
+  quant_cast_bench/quant_cast_cute_hand/benchmarks/update_mslk_comparison.sh
 ```
 
 The script runs a paired square-shape sweep over powers of two and their midpoints from

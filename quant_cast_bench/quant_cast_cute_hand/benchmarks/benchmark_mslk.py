@@ -3,10 +3,10 @@
 Both implementations receive the same precomputed global scale. Reported bandwidths use the
 same logical BF16 input + packed FP4 qdata + padded Blackwell-scale byte count.
 
-    python -m quant_cast_bench.quant_cast_cute_hand.benchmark_mslk
-    python -m quant_cast_bench.quant_cast_cute_hand.benchmark_mslk \
+    python -m quant_cast_bench.quant_cast_cute_hand.benchmarks.benchmark_mslk
+    python -m quant_cast_bench.quant_cast_cute_hand.benchmarks.benchmark_mslk \
         --M 2048,4096 --K 8192,16384 --mk_mode pair
-    python -m quant_cast_bench.quant_cast_cute_hand.benchmark_mslk \
+    python -m quant_cast_bench.quant_cast_cute_hand.benchmarks.benchmark_mslk \
         --shapes_for_model gpt-oss-120b
 """
 
@@ -18,7 +18,7 @@ import sys
 # Set this before importing PyTorch so Kineto does not print USDT messages.
 os.environ.setdefault("KINETO_LOG_LEVEL", "6")
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 import fire
 from mslk.quantize.triton.fp4_quantize import triton_quantize_nvfp4
@@ -27,7 +27,7 @@ import torch
 from torch._inductor.utils import _do_bench_using_profiling
 
 from quant_cast_bench.quant_cast_cute_hand.recipes import nvfp4_swizzle_tma
-from quant_cast_bench.quant_cast_cute_hand.shape_utils import (
+from quant_cast_bench.quant_cast_cute_hand.benchmarks.shape_utils import (
     gpt_oss_120b_m8192_tp8_ep8,
 )
 

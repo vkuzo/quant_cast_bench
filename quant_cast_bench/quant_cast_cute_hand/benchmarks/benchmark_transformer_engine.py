@@ -15,7 +15,7 @@ import sys
 os.environ.setdefault("KINETO_LOG_LEVEL", "6")
 os.environ.setdefault("NVTE_USE_FAST_MATH", "1")
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 import torch
 import torch.func._random as prng
@@ -43,7 +43,7 @@ from quant_cast_bench.quant_cast_cute_hand.recipes import (
     nvfp4_swizzle_direct,
     nvfp4_swizzle_tma,
 )
-from quant_cast_bench.quant_cast_cute_hand.shape_utils import (
+from quant_cast_bench.quant_cast_cute_hand.benchmarks.shape_utils import (
     gpt_oss_120b_m8192_tp8_ep8,
 )
 

@@ -5,19 +5,19 @@ memory bandwidth vs. the GPU's HBM ceiling (B200: 8 TB/s, H100 SXM5: 3.35 TB/s -
 device name). We build a bf16 (M, K) input, run the selected kernel, time it with
 `do_bench_using_profiling`, and report GPU time + GB/s + % of peak.
 
-    python -m quant_cast_bench.quant_cast_cute_hand.benchmark --kernel add_v0
-    python -m quant_cast_bench.quant_cast_cute_hand.benchmark --kernel add_v0 --M 8192 --K 8192
-    python -m quant_cast_bench.quant_cast_cute_hand.benchmark --kernel add_v0 \
+    python -m quant_cast_bench.quant_cast_cute_hand.benchmarks.benchmark --kernel add_v0
+    python -m quant_cast_bench.quant_cast_cute_hand.benchmarks.benchmark --kernel add_v0 --M 8192 --K 8192
+    python -m quant_cast_bench.quant_cast_cute_hand.benchmarks.benchmark --kernel add_v0 \
         --M 2048,4096,8192 --K 2048,4096,8192
-    python -m quant_cast_bench.quant_cast_cute_hand.benchmark --kernel add_v0 \
+    python -m quant_cast_bench.quant_cast_cute_hand.benchmarks.benchmark --kernel add_v0 \
         --M 2048,4096 --K 2048,4096 --output_metrics gpu_time_ms,tb_s,pct_peak
-    python -m quant_cast_bench.quant_cast_cute_hand.benchmark \
+    python -m quant_cast_bench.quant_cast_cute_hand.benchmarks.benchmark \
         --kernel mxfp8_swizzle_v2,mxfp8_swizzle_v4 --M 2048,4096 --K 2048,4096
-    python -m quant_cast_bench.quant_cast_cute_hand.benchmark --kernel add_v0 \
+    python -m quant_cast_bench.quant_cast_cute_hand.benchmarks.benchmark --kernel add_v0 \
         --M 2048,4096 --K 8192,16384 --mk_mode pair
-    python -m quant_cast_bench.quant_cast_cute_hand.benchmark \
+    python -m quant_cast_bench.quant_cast_cute_hand.benchmarks.benchmark \
         --kernel mxfp8_swizzle_v2 --shapes_for_model gpt-oss-120b
-    python -m quant_cast_bench.quant_cast_cute_hand.benchmark --kernel add_v0 --csv_output results.csv
+    python -m quant_cast_bench.quant_cast_cute_hand.benchmarks.benchmark --kernel add_v0 --csv_output results.csv
 """
 
 import csv
@@ -34,7 +34,7 @@ import torch
 import torch.func._random as prng
 from torch._inductor.utils import do_bench_using_profiling
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 from quant_cast_bench.quant_cast_cute_hand.recipes import (
     add_v0, add_v1, add_v2, fp8_deepseek_1x128, fp8_deepseek_1x128_dim_m,
     fp8_deepseek_1x128_dim_m_v2, mxfp8_32x32_swizzle_v2, mxfp8_swizzle,
@@ -59,7 +59,7 @@ from quant_cast_bench.quant_cast_gold.recipes import (
     Nvfp4GsSwizzle_DimK_DimMRHT_Gold,
     Nvfp4GsSwizzle_DimKSR_DimMRHTSR_Gold,
 )
-from quant_cast_bench.quant_cast_cute_hand.shape_utils import (
+from quant_cast_bench.quant_cast_cute_hand.benchmarks.shape_utils import (
     gpt_oss_120b_m8192_tp8_ep8,
 )
 
