@@ -17,9 +17,12 @@ device name). We build a bf16 (M, K) input, run the selected kernel, time it wit
         --M 2048,4096 --K 8192,16384 --mk_mode pair
     python -m quant_cast_bench.quant_cast_cute_hand.benchmark \
         --kernel mxfp8_swizzle_v2 --shapes_for_model gpt-oss-120b
+    python -m quant_cast_bench.quant_cast_cute_hand.benchmark --kernel add_v0 --csv_output results.csv
 """
 
+import csv
 import os
+from pathlib import Path
 import sys
 
 # Suppress Kineto's profiler_start/profiler_stop USDT messages before PyTorch initializes it.
@@ -821,6 +824,8 @@ def _benchmark_one(kernel: str, M: int, K: int, peak_bw: float):
 
 _OUTPUT_METRICS = ("gpu_time_ms", "tb_s", "pct_peak")
 
+_CSV_FIELDS = ("kernel", "M", "K", "gpu_time_ms", "tb_s", "pct_peak")
+
 _MODEL_SHAPES = {
     "gpt-oss-120b": gpt_oss_120b_m8192_tp8_ep8,
 }
@@ -867,6 +872,7 @@ def _parse_kernels(value: str) -> list[str]:
     mk_mode=str,
     output_metrics=str,
     shapes_for_model=str,
+    csv_output=str,
 )
 def main(
     kernel: str = "add_v0",
@@ -875,6 +881,7 @@ def main(
     mk_mode: str | None = None,
     output_metrics: str = "tb_s",
     shapes_for_model: str = "",
+    csv_output: str = "",
 ):
     """Benchmark handwritten CuTeDSL kernels over one shape or an M-by-K shape grid."""
     kernels = _parse_kernels(kernel)
@@ -929,12 +936,39 @@ def main(
         profiler_scratch.zero_, warmup=2, rep=2, is_vetted_benchmarking=True
     )
 
+    csv_path = None
+    if csv_output:
+        csv_path = Path(csv_output).expanduser()
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+        with csv_path.open("w", newline="") as csv_file:
+            csv.DictWriter(
+                csv_file, fieldnames=_CSV_FIELDS, lineterminator="\n"
+            ).writeheader()
+
     for kernel_index, kernel_name in enumerate(kernels):
         # Keep kernel outermost so one kernel's complete shape grid finishes before the next starts.
         results = {
             (m, k): _benchmark_one(kernel_name, m, k, peak_bw)
             for m, k in shape_pairs
         }
+
+        if csv_path is not None:
+            with csv_path.open("a", newline="") as csv_file:
+                writer = csv.DictWriter(
+                    csv_file, fieldnames=_CSV_FIELDS, lineterminator="\n"
+                )
+                for m, k in shape_pairs:
+                    gpu_time_ms, gbps, pct_peak = results[(m, k)]
+                    writer.writerow(
+                        {
+                            "kernel": kernel_name,
+                            "M": m,
+                            "K": k,
+                            "gpu_time_ms": f"{gpu_time_ms:.6f}",
+                            "tb_s": f"{gbps / 1000:.6f}",
+                            "pct_peak": f"{pct_peak:.6f}",
+                        }
+                    )
 
         if kernel_index:
             print()
@@ -996,6 +1030,9 @@ def main(
                     colalign=("left",) + ("right",) * len(metrics),
                 )
             )
+
+    if csv_path is not None:
+        print(f"Wrote {csv_path}", flush=True)
 
 
 if __name__ == "__main__":
