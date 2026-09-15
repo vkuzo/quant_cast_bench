@@ -10,8 +10,7 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
-from cutlass._mlir import ir
-from cutlass._mlir.dialects import arith, llvm, nvvm, vector  # typed NVVM e8m0 cvt ops
+from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import cpasync, tcgen05  # TMA copies + Blackwell smem layouts
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
@@ -39,6 +38,11 @@ from quant_cast_bench.quant_cast_cute_hand.mxfp8_v2 import (
     MXFP8_DIM_M_SWIZZLE_V2,
     MXFP8_SWIZZLE_SR_V2,
     MXFP8_SWIZZLE_V2,
+)
+from quant_cast_bench.quant_cast_cute_hand.utils import (
+    _ceil_div,
+    _cvt_rs_satfinite_e4m3x4_f32,
+    _e8m0,
     _e8m0_scale_store_as_uint,
 )
 from quant_cast_bench.quant_cast_gold.recipes import (
@@ -50,9 +54,6 @@ from quant_cast_bench.quant_cast_gold.recipes import (
     Nvfp4GsSwizzleDimMRHTGold,
     Nvfp4GsSwizzleGold,
 )
-
-def _ceil_div(num, den):
-    return (num + den - 1) // den
 
 @cute.kernel
 def add_v0_kernel(input: cute.Tensor, num: cutlass.Float32, output: cute.Tensor):
@@ -1251,119 +1252,6 @@ FP8_DEEPSEEK_1X128_DIM_M_V2 = QuantCastCuteRecipe.from_gold(
 # ---------------------------------------------------------------------------
 
 
-# e8m0 RCEIL helper (device): amax (f32 scalar) -> (rcp_f32, biased_uint8). Direct port of
-# torchao/prototype/moe_training/kernels/mxfp8/cute_utils.py -- the canonical CuTeDSL mxfp8 kernel.
-# Unlike our earlier inline-asm version this uses the typed NVVM cvt ops:
-#   f32 -> e8m0 : nvvm.cvt_packfloat_f32(UE8M0x2, rnd=RP)   (RP == RCEIL, high input 0.0, sat NONE)
-#   e8m0 -> f32 : nvvm.cvt_packfloat(UE8M0x2 -> BF16x2, rnd=RN) then bf16 -> f32  (supported path)
-# and the reciprocal is a real e8m0->f32 cast (reciprocal_biased = 254 - biased in uint8), matching
-# torchao `_reciprocal_scale` -- no manual <<23 exponent-shift and no byte-0/255 special cases (the
-# hardware cvt handles them). `view_as`/`pack`/`unpack` are the scalar bitcast/pack helpers.
-@dsl_user_op
-def view_as(x, dtype, *, loc=None, ip=None):
-    """Bitcast one scalar to another scalar of equal width."""
-    assert type(x).width == dtype.width
-    # bitcast wants a signed IR type even for unsigned CUTLASS types.
-    dst_type = (
-        T.i(dtype.width) if ir.IntegerType.isinstance(dtype.mlir_type) else dtype.mlir_type
-    )
-    return dtype(arith.bitcast(dst_type, x.ir_value(loc=loc, ip=ip), loc=loc, ip=ip))
-
-
-@dsl_user_op
-def unpack(x, dtype, *, loc=None, ip=None):
-    """Unpack an integer carrier into a tuple of scalar values."""
-    x = cute.typing.as_numeric(x)
-    carrier_dtype = type(x)
-    assert ir.IntegerType.isinstance(carrier_dtype.mlir_type)
-    assert carrier_dtype.width % dtype.width == 0
-    num_lanes = carrier_dtype.width // dtype.width
-    # integer vector lanes: vector<N x FP8> can crash the compiler (NVIDIA/cutlass#3342).
-    lanes = llvm.bitcast(
-        T.vector(num_lanes, T.i(dtype.width)), x.ir_value(loc=loc, ip=ip), loc=loc, ip=ip
-    )
-    return tuple(
-        view_as(
-            cute.typing.as_numeric(
-                vector.extract(lanes, dynamic_position=[], static_position=[i], loc=loc, ip=ip)
-            ),
-            dtype, loc=loc, ip=ip,
-        )
-        for i in range(num_lanes)
-    )
-
-
-@dsl_user_op
-def pack(*values, carrier=None, loc=None, ip=None):
-    """Pack same-typed scalar values into an integer carrier."""
-    assert len(values) > 0
-    lane_dtype = type(values[0])
-    assert all(type(value) is lane_dtype for value in values)
-    lane_type = T.i(lane_dtype.width)
-    lanes = vector.from_elements(
-        T.vector(len(values), lane_type),
-        tuple(arith.bitcast(lane_type, value.ir_value(loc=loc, ip=ip), loc=loc, ip=ip) for value in values),
-        loc=loc, ip=ip,
-    )
-    packed_width = len(values) * lane_dtype.width
-    packed = llvm.bitcast(T.i(packed_width), lanes, loc=loc, ip=ip)
-    if carrier is None:
-        return cute.typing.as_numeric(packed)
-    assert ir.IntegerType.isinstance(carrier.mlir_type)
-    assert carrier.width == packed_width
-    return carrier(packed)
-
-
-@dsl_user_op
-def _cvt_f32_to_ue8m0(x, *, rounding_mode, loc=None, ip=None):
-    """Convert x to a single E8M0 value without saturation (high input 0.0)."""
-    # this cutlass binding infers the result type (no leading result-type arg): (a, b, c, to, ...).
-    packed = nvvm.cvt_packfloat_f32(
-        cutlass.Float32(0.0).ir_value(loc=loc, ip=ip),
-        cutlass.Float32(x).ir_value(loc=loc, ip=ip),
-        cutlass.Int32(0).ir_value(loc=loc, ip=ip),
-        nvvm.CVTPackFloatKind.UE8M0x2,
-        rnd=rounding_mode,
-        sat=nvvm.SaturationModeKind.NONE,
-        loc=loc, ip=ip,
-    )
-    return unpack(cutlass.Int32(packed), cutlass.Float8E8M0FNU, loc=loc, ip=ip)[0]
-
-
-@dsl_user_op
-def _cvt_ue8m0_to_f32(x, *, loc=None, ip=None):
-    """Convert a single E8M0 value to f32 through the supported BF16 path."""
-    x_e8m0x2 = pack(x, cutlass.Float8E8M0FNU(0), loc=loc, ip=ip)
-    x_u32 = llvm.zext(T.i32(), x_e8m0x2.ir_value(loc=loc, ip=ip), loc=loc, ip=ip)
-    bf16x2_bits = nvvm.cvt_packfloat(
-        x_u32,
-        cutlass.Int32(0).ir_value(loc=loc, ip=ip),
-        nvvm.CVTPackFloatKind.UE8M0x2,
-        nvvm.CVTPackFloatKind.BF16x2,
-        rnd=nvvm.FPRoundingMode.RN,
-        sat=nvvm.SaturationModeKind.NONE,
-        loc=loc, ip=ip,
-    )
-    low_bf16 = unpack(cutlass.Int32(bf16x2_bits), cutlass.BFloat16, loc=loc, ip=ip)[0]
-    return low_bf16.to(cutlass.Float32)
-
-
-@cute.jit
-def _reciprocal_scale(scale_e8m0):
-    scale_biased = view_as(scale_e8m0, cutlass.Uint8)
-    reciprocal_biased = cutlass.Uint8(254) - scale_biased
-    return _cvt_ue8m0_to_f32(view_as(reciprocal_biased, cutlass.Float8E8M0FNU))
-
-
-@cute.jit
-def _e8m0(amax):
-    # torchao compute_scale_rceil: descale = amax * (1/448), RP-round to e8m0, then reciprocal.
-    descale = amax * cutlass.Float32(1.0 / 448.0)
-    scale_e8m0 = _cvt_f32_to_ue8m0(descale, rounding_mode=nvvm.FPRoundingMode.RP)
-    rcp = _reciprocal_scale(scale_e8m0)
-    return rcp, view_as(scale_e8m0, cutlass.Uint8)
-
-
 # swizzle offset (device): pre-swizzle scale position (row, col) -> flat offset into the 4D
 # (nrb, ncb, 32, 16) block grid, i.e. ((row//128 * ncb + col//4) * 32 + row%128%32) * 16
 # + ((row%128)//32 * 4 + col%4). Copied from quant_cast_cute/recipes.py `_swizzle_flat`; an exact
@@ -1760,33 +1648,6 @@ MXFP8_SWIZZLE_V3 = QuantCastCuteRecipe.from_gold(
 # Ragged M and K%128 tails launch over complete padded 128x128 swizzle atoms. Padded lanes load zero,
 # skip qdata stores, and explicitly write zero scale bytes; the aligned specialization stays unchanged.
 _MXS4_HALF = _MXS3_VPT // 2   # 8 elems per sub-load (2 halves of the 16-elem/thread run)
-
-
-@dsl_user_op
-def _cvt_rs_satfinite_e4m3x4_f32(v0, v1, v2, v3, rbits, *, loc=None, ip=None):
-    """Stochastically round four f32 values to four packed E4M3 bytes (Blackwell SM100).
-
-    PTX writes its first source into the high byte of the b32 result. Reverse the source operands so
-    the little-endian byte view is [e4m3(v0), e4m3(v1), e4m3(v2), e4m3(v3)].
-    """
-    args = [
-        cutlass.Float32(v3).ir_value(loc=loc, ip=ip),
-        cutlass.Float32(v2).ir_value(loc=loc, ip=ip),
-        cutlass.Float32(v1).ir_value(loc=loc, ip=ip),
-        cutlass.Float32(v0).ir_value(loc=loc, ip=ip),
-        cutlass.Uint32(rbits).ir_value(loc=loc, ip=ip),
-    ]
-    return cutlass.Uint32(
-        llvm.inline_asm(
-            T.i32(),
-            args,
-            "cvt.rs.satfinite.e4m3x4.f32 $0, {$1, $2, $3, $4}, $5;",
-            "=r,f,f,f,f,r",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
 
 
 @cute.jit
