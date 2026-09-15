@@ -169,7 +169,7 @@ def _plot_chart(
 
 def plot(csv_path: Path, output_path: Path) -> None:
     charts = _read_results(csv_path)
-    column_count = 3
+    column_count = 2
     section_order = ("MXFP8", "NVFP4", "NVFP4 deprecated")
     sections = {
         name: [
