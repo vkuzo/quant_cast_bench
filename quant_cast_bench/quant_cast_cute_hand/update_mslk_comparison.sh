@@ -8,8 +8,8 @@ png_path="${script_dir}/mslk_comparison.png"
 
 cd "${repo_root}"
 PYTHONUNBUFFERED=1 python "${script_dir}/benchmark_mslk.py" \
-  --M 2048,4096,8192,16384 \
-  --K 2048,4096,8192,16384 \
+  --M 2048,3072,4096,6144,8192,12288,16384,24576 \
+  --K 2048,3072,4096,6144,8192,12288,16384,24576 \
   --mk_mode pair \
   --csv_output "${csv_path}"
 python "${script_dir}/plot_mslk_comparison.py" \
