@@ -13,7 +13,7 @@ import matplotlib.pyplot as plt
 
 OURS_COLOR = "#1f77b4"
 TE_COLOR = "#d62728"
-CHART_HEIGHT = 3.3 * 1.25
+CHART_HEIGHT = 3.3 * 1.25 * 1.5
 
 DIM_M_RHT_TMA_KERNELS = {
     "nvfp4_dim_m_rht_swizzle_tma",
