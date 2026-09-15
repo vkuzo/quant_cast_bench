@@ -35,13 +35,15 @@ except (ImportError, importlib.metadata.PackageNotFoundError):
 HAS_CUTEDSL = _cutedsl_version is not None and _cutedsl_version >= _MIN_CUTEDSL
 
 if HAS_CUTEDSL:
+    from quant_cast_bench.quant_cast_cute_hand.mxfp8_v2 import (
+        _mxfp8_swizzle_v2_tile_n,
+        mxfp8_swizzle_v2,
+    )
     from quant_cast_bench.quant_cast_cute_hand.recipes import (
         ALL_RECIPES,
-        _mxfp8_swizzle_v2_tile_n,
         add_v0,
         add_v1,
         add_v2,
-        mxfp8_swizzle_v2,
         mxfp8_swizzle_v4,
         transpose_v0,
         transpose_v1,

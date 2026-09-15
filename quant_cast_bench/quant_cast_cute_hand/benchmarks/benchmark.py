@@ -35,10 +35,13 @@ import torch.func._random as prng
 from torch._inductor.utils import do_bench_using_profiling
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+from quant_cast_bench.quant_cast_cute_hand.mxfp8_v2 import (
+    mxfp8_32x32_swizzle_v2,
+    mxfp8_swizzle_v2,
+)
 from quant_cast_bench.quant_cast_cute_hand.recipes import (
     add_v0, add_v1, add_v2, fp8_deepseek_1x128, fp8_deepseek_1x128_dim_m,
-    fp8_deepseek_1x128_dim_m_v2, mxfp8_32x32_swizzle_v2, mxfp8_swizzle,
-    mxfp8_swizzle_v2,
+    fp8_deepseek_1x128_dim_m_v2, mxfp8_swizzle,
     mxfp8_swizzle_v3, mxfp8_swizzle_v4, mxfp8_swizzle_v5,
     nvfp4_dim_km_swizzle_tma, nvfp4_dim_m_rht_swizzle_tma,
     nvfp4_dim_m_swizzle_rht_sr_tma,
