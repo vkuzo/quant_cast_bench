@@ -14,6 +14,12 @@ import matplotlib.pyplot as plt
 OURS_COLOR = "#1f77b4"
 TE_COLOR = "#d62728"
 CHART_HEIGHT = 3.3 * 1.25 * 1.5
+SECTION_FONT_SIZE = 20
+TITLE_FONT_SIZE = 12
+LABEL_FONT_SIZE = 13
+TICK_FONT_SIZE = 11
+LEGEND_FONT_SIZE = 10
+ANNOTATION_FONT_SIZE = 10
 
 DIM_M_RHT_TMA_KERNELS = {
     "nvfp4_dim_m_rht_swizzle_tma",
@@ -122,7 +128,7 @@ def _plot_chart(
             0.05,
             f"No comparable TE {'/'.join(missing_te_rounding)} implementation",
             color=TE_COLOR,
-            fontsize=8,
+            fontsize=ANNOTATION_FONT_SIZE,
             ha="right",
             transform=axis.transAxes,
         )
@@ -134,7 +140,7 @@ def _plot_chart(
             0.16,
             "we need a _pipelined kernel instead of _tma\nfor this to catch TE, TODO",
             color=TE_COLOR,
-            fontsize=8,
+            fontsize=ANNOTATION_FONT_SIZE,
             ha="center",
             transform=axis.transAxes,
         )
@@ -144,20 +150,21 @@ def _plot_chart(
             0.16,
             "the _pipelined kernel implements the same thing\nand catches TE",
             color=TE_COLOR,
-            fontsize=8,
+            fontsize=ANNOTATION_FONT_SIZE,
             ha="center",
             transform=axis.transAxes,
         )
 
-    axis.set_title("\n".join(titles), fontsize=9)
+    axis.set_title("\n".join(titles), fontsize=TITLE_FONT_SIZE)
     axis.set_xticks(range(len(shapes)), [str(shape) for shape in shapes])
-    axis.set_xlabel("M == K")
-    axis.set_ylabel("TB/s")
+    axis.set_xlabel("M == K", fontsize=LABEL_FONT_SIZE)
+    axis.set_ylabel("TB/s", fontsize=LABEL_FONT_SIZE)
+    axis.tick_params(axis="both", labelsize=TICK_FONT_SIZE)
     axis.set_ylim(0, 8)
     axis.grid(axis="y", alpha=0.3)
     legend = axis.legend(
         loc="upper left",
-        fontsize=7,
+        fontsize=LEGEND_FONT_SIZE,
         ncol=2,
         frameon=False,
         handlelength=3.5,
@@ -202,7 +209,7 @@ def plot(csv_path: Path, output_path: Path) -> None:
             0,
             0.2,
             section_name,
-            fontsize=15,
+            fontsize=SECTION_FONT_SIZE,
             fontweight="bold",
             transform=heading.transAxes,
         )
