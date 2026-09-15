@@ -42,41 +42,6 @@ def _compiled(key, jit_fn, *cute_args):
     return fn
 
 
-# ---------------------------------------------------------------------------
-# mxfp8_swizzle_v2: TMA (bulk-tensor) load/store of the main data, mxfp8 dim-K numerics.
-#
-# Structured on fp8_deepseek_1x128_dim_m_v2 (the warp-specialized TMA kernel above) -- the same
-# mbarrier arrive-and-expect-tx handshake and warp-0-gated G2S/S2G copies. Large dim-K problems use
-# the original 128xN tiles, while small problems may use 32x128 to expose more CTAs and keep each
-# TMA transfer contiguous. The calculation differs because mxfp8_swizzle reduces along K (a 1x32
-# block within a row), not down M like deepseek dim-M:
-#   - a 128xN tile holds 128 x (N/32) scale groups. With 128 threads, each thread owns one row and
-#     visits its N/32 contiguous 1x32 groups.
-#   - scale is an e8m0 RCEIL byte (_e8m0), written through a logical layout that maps directly onto
-#     the swizzled (nrb,ncb,32,16) grid.
-#   - the output is NOT transposed (dim-K keeps (M,N)); sOutput has the same logical (TM,TN) shape
-#     and the S2G box matches the selected tile, so no register->smem transpose is needed.
-# TMA handles ragged edge tiles directly: G2S zero-fills out-of-bounds input lanes and S2G drops
-# out-of-bounds qdata stores. The scale grid is rounded up to complete 128x4 swizzle atoms, and
-# boundary CTAs explicitly write zero to its padded slots.
-#
-# PERF REGRESSION/WORKAROUND (nvidia-cutlass-dsl 4.6.x): 4.6 stopped vectorizing the scalar
-# sInput/sOutput loops that 4.5.2 lowered to LDS.128/STS.128. That changed 16 LDS.128 + 8 STS.128
-# into 128 LDS.U16 + 128 STS.U8, raised bank conflicts from 13.3M ld + 2.6M st to 126M ld + 60M st,
-# and dropped 16384^2 throughput from ~72.6% peak (0.140ms) to ~14% (0.72ms). The explicit 128-bit
-# CopyUniversal atoms below restore the original 16/8 vector instructions and ~72-73% peak on 4.6.
-# A plain cute.autovec_copy did not work; the explicit copy width is what prevents scalarization.
-# Independent bf16/fp8 K_SW128 views cut the remaining ld/st conflicts from 13.4M/2.7M to 5.0M/0.4M
-# without changing the ~0.140ms runtime; their lifetimes are separated by the aliasing barrier.
-# Scheduling adjacent N tiles together is the larger win: an N-major grid with N-oriented CTA
-# clusters improves row-major DRAM locality. Row-owned work makes each thread's scale bytes
-# contiguous in a packed store and cuts shared-load conflicts without increasing registers.
-# Together with skipping the redundant scale memset: 0.1375 -> 0.1213 ms at 16384^2 on B200.
-# All modes additionally have a compile-time stochastic specialization. They keep the same TMA
-# load, reductions, scale stores, shared-memory output staging, and TMA stores; only each enabled
-# qdata conversion changes to Philox plus Blackwell cvt.rs.e4m3x4.
-# The 32x32 specialization keeps this dim-K data path and adds a warp max across each 32-row group;
-# the resulting scale is naturally expanded because every lane writes its warp-uniform scale byte.
 _MXS_TM, _MXS_MAX_TN, _MXS_WARPS = 128, 128, 4
 _MXS_THREADS = _MXS_WARPS * 32                       # 128, one thread per tile row
 _MXS_MODE_DIM_K = 0
