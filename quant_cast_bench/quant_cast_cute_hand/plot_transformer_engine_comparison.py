@@ -14,12 +14,12 @@ import matplotlib.pyplot as plt
 OURS_COLOR = "#1f77b4"
 TE_COLOR = "#d62728"
 CHART_HEIGHT = 3.3 * 1.25 * 1.5
-SECTION_FONT_SIZE = 20
-TITLE_FONT_SIZE = 12
-LABEL_FONT_SIZE = 13
-TICK_FONT_SIZE = 11
-LEGEND_FONT_SIZE = 10
-ANNOTATION_FONT_SIZE = 10
+SECTION_FONT_SIZE = 40
+TITLE_FONT_SIZE = 24
+LABEL_FONT_SIZE = 26
+TICK_FONT_SIZE = 22
+LEGEND_FONT_SIZE = 20
+ANNOTATION_FONT_SIZE = 20
 
 DIM_M_RHT_TMA_KERNELS = {
     "nvfp4_dim_m_rht_swizzle_tma",
@@ -104,7 +104,7 @@ def _plot_chart(
             linewidth=2,
             marker="o",
             markersize=4,
-            label=f"CuTe hand {rounding}",
+            label=f"Ours {rounding}",
         )
 
         te_rows = [row for row in rows if row["te_tb_s"]]
@@ -117,7 +117,7 @@ def _plot_chart(
                 linewidth=2,
                 marker="o",
                 markersize=4,
-                label=f"TransformerEngine {rounding}",
+                label=f"TE {rounding}",
             )
         else:
             missing_te_rounding.append(rounding)
@@ -126,7 +126,7 @@ def _plot_chart(
         axis.text(
             0.98,
             0.05,
-            f"No comparable TE {'/'.join(missing_te_rounding)} implementation",
+            f"No comparable TE {'/'.join(missing_te_rounding)}\nimplementation",
             color=TE_COLOR,
             fontsize=ANNOTATION_FONT_SIZE,
             ha="right",
@@ -138,7 +138,7 @@ def _plot_chart(
         axis.text(
             0.5,
             0.16,
-            "we need a _pipelined kernel instead of _tma\nfor this to catch TE, TODO",
+            "we need a _pipelined kernel\ninstead of _tma to catch TE\nTODO",
             color=TE_COLOR,
             fontsize=ANNOTATION_FONT_SIZE,
             ha="center",
@@ -148,15 +148,17 @@ def _plot_chart(
         axis.text(
             0.5,
             0.16,
-            "the _pipelined kernel implements the same thing\nand catches TE",
+            "the _pipelined kernel\nimplements the same thing\nand catches TE",
             color=TE_COLOR,
             fontsize=ANNOTATION_FONT_SIZE,
             ha="center",
             transform=axis.transAxes,
         )
 
-    axis.set_title("\n".join(titles), fontsize=TITLE_FONT_SIZE)
-    axis.set_xticks(range(len(shapes)), [str(shape) for shape in shapes])
+    axis.set_title("\n".join(titles), fontsize=TITLE_FONT_SIZE, pad=12)
+    axis.set_xticks(
+        range(len(shapes)), [str(shape) for shape in shapes], rotation=30, ha="right"
+    )
     axis.set_xlabel("M == K", fontsize=LABEL_FONT_SIZE)
     axis.set_ylabel("TB/s", fontsize=LABEL_FONT_SIZE)
     axis.tick_params(axis="both", labelsize=TICK_FONT_SIZE)
@@ -168,6 +170,8 @@ def _plot_chart(
         ncol=2,
         frameon=False,
         handlelength=3.5,
+        handletextpad=0.6,
+        columnspacing=1.0,
         numpoints=2,
     )
     for line in legend.get_lines():
@@ -190,16 +194,18 @@ def plot(csv_path: Path, output_path: Path) -> None:
 
     height_ratios = []
     for variants in sections.values():
-        height_ratios.append(0.35)
+        height_ratios.append(0.7)
         height_ratios.extend(
             [CHART_HEIGHT] * math.ceil(len(variants) / column_count)
         )
 
-    figure = plt.figure(
-        figsize=(18, sum(height_ratios)), constrained_layout=True
-    )
+    figure = plt.figure(figsize=(18, sum(height_ratios)))
     grid = figure.add_gridspec(
-        len(height_ratios), column_count, height_ratios=height_ratios
+        len(height_ratios),
+        column_count,
+        height_ratios=height_ratios,
+        hspace=0.8,
+        wspace=0.18,
     )
     grid_row = 0
     for section_name, section_charts in sections.items():
