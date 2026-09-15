@@ -48,7 +48,7 @@ from quant_cast_bench.quant_cast_cute_hand.shape_utils import (
 )
 
 
-SHAPES = (2048, 4096, 8192, 16384)
+SHAPES = (2048, 3072, 4096, 6144, 8192, 12288, 16384, 24576)
 
 _MODEL_SHAPES = {
     "gpt-oss-120b": gpt_oss_120b_m8192_tp8_ep8,
