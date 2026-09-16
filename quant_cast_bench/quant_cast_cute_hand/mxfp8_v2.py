@@ -57,6 +57,8 @@ _DIM_M_FLOAT32_LARGE_TILE_64_128 = (64, 128)
 _DIM_KM_LARGE_TILE_64_128 = (64, 128)
 
 _INT32_MAX = 2**31 - 1
+_CUDA_GRID_X_MAX = _INT32_MAX
+_CUDA_GRID_Y_MAX = 2**16 - 1
 
 
 @cute.jit
@@ -115,9 +117,8 @@ def mxfp8_swizzle_v2_kernel(
     input_element_type: cutlass.Constexpr,
     tile_m_size: cutlass.Constexpr,
     tile_k_size: cutlass.Constexpr,
-    M: cutlass.Int32 | cutlass.Int64,
-    K: cutlass.Int32 | cutlass.Int64,
-    index_type: cutlass.Constexpr,
+    M: cutlass.Int32,
+    K: cutlass.Int32,
     needs_boundary_masking: cutlass.Constexpr,
     quant_orientation: cutlass.Constexpr,
     is_stochastic_qdata_rounding: cutlass.Constexpr,
@@ -189,9 +190,7 @@ def mxfp8_swizzle_v2_kernel(
 
     # bookkeeping
     tidx, _, _ = cute.arch.thread_idx()
-    tile_k_idx_i32, tile_m_idx_i32, _ = cute.arch.block_idx()
-    tile_k_idx = index_type(tile_k_idx_i32)
-    tile_m_idx = index_type(tile_m_idx_i32)
+    tile_k_idx, tile_m_idx, _ = cute.arch.block_idx()
     warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     do_dim_k = quant_orientation != _QUANT_ORIENTATION_DIM_M
     do_dim_m = quant_orientation != _QUANT_ORIENTATION_DIM_K
@@ -343,14 +342,17 @@ def mxfp8_swizzle_v2_kernel(
             # indices by M * K when both dim_m and dim_k are on. Just haven't gotten
             # to it yet, will require changes to gold and tests to maintain bitwise
             # equivalence vs kernel.
-            sr_flat_base_m = (
-                (tile_k_idx * tile_k_size + tidx) * M + tile_m_idx * tile_m_size
+            # M is divisible by 16, so divide before the wide multiply and form the Philox
+            # counter directly instead of materializing the larger flat element index.
+            global_col_m = tile_k_idx * tile_k_size + tidx
+            sr_counter_base_m = (
+                counter_base
+                + cutlass.Uint64(global_col_m) * cutlass.Uint64(M // 16)
+                + cutlass.Uint64(tile_m_idx * tile_m_size // 16)
             )
         for row_block in cutlass.range_constexpr(row_blocks):
             if cutlass.const_expr(is_stochastic_qdata_rounding):
-                sr_counter_start_m = counter_base + cutlass.Uint64(
-                    (sr_flat_base_m + row_block * 32) // 16
-                )
+                sr_counter_start_m = sr_counter_base_m + cutlass.Uint64(row_block * 2)
             rInputM = cute.make_rmem_tensor(32, cutlass.Float32)
             for row in cutlass.range_constexpr(32):
                 rInputM[row] = sInput[row_block * 32 + row, tidx].to(
@@ -381,7 +383,7 @@ def mxfp8_swizzle_v2_kernel(
             rScaleM[row_block] = biased_m.to(rScaleM.element_type)
 
         use_full_tile_m = cutlass.const_expr(not needs_boundary_masking) or (
-            ((tile_m_idx + 1) * tile_m_size <= M) & ((tile_k_idx + 1) * tile_k_size <= K)
+            (tile_m_idx < M // tile_m_size) & (tile_k_idx < K // tile_k_size)
         )
         if use_full_tile_m:
             _e8m0_scale_store_as_uint(
@@ -427,23 +429,30 @@ def mxfp8_swizzle_v2_kernel(
         )
         if cutlass.const_expr(is_stochastic_qdata_rounding):
             if cutlass.const_expr(row_owned_k):
-                sr_flat_base_k = (
-                    (tile_m_idx * tile_m_size + tidx) * K + tile_k_idx * tile_k_size
+                global_row_k = tile_m_idx * tile_m_size + tidx
+                global_col_k = tile_k_idx * tile_k_size
+                sr_counter_base_k = (
+                    counter_base
+                    + cutlass.Uint64(global_row_k) * cutlass.Uint64(K // 16)
+                    + cutlass.Uint64(global_col_k // 16)
                 )
             else:
-                sr_flat_base_k = (
-                    (tile_m_idx * tile_m_size + tidx // bpr) * K
-                    + (tile_k_idx * bpr + tidx % bpr) * 32
+                global_row_k = tile_m_idx * tile_m_size + tidx // bpr
+                global_group_k = tile_k_idx * bpr + tidx % bpr
+                sr_counter_base_k = (
+                    counter_base
+                    + cutlass.Uint64(global_row_k) * cutlass.Uint64(K // 16)
+                    + cutlass.Uint64(global_group_k * 2)
                 )
         for it in cutlass.range_constexpr(iters):
             if cutlass.const_expr(is_stochastic_qdata_rounding):
                 if cutlass.const_expr(row_owned_k):
-                    flat_start_k = sr_flat_base_k + it * 32
+                    sr_counter_start_k = sr_counter_base_k + cutlass.Uint64(it * 2)
                 else:
-                    flat_start_k = sr_flat_base_k + it * 32 * K
-                sr_counter_start_k = counter_base + cutlass.Uint64(
-                    flat_start_k // 16
-                )
+                    sr_counter_start_k = (
+                        sr_counter_base_k
+                        + cutlass.Uint64(it * 2) * cutlass.Uint64(K)
+                    )
             sGroupK = thrInputGroupsK[((None, it),)]
             rInputK = cute.make_rmem_tensor(32, input_element_type)
             input_values_per_copy = 128 // input_element_type.width
@@ -516,7 +525,7 @@ def mxfp8_swizzle_v2_kernel(
     if cutlass.const_expr(do_dim_k):
         # do the dim-k scale write (overlaps with qdata TMA store)
         use_full_tile_k = cutlass.const_expr(not needs_boundary_masking) or (
-            ((tile_m_idx + 1) * tile_m_size <= M) & ((tile_k_idx + 1) * tile_k_size <= K)
+            (tile_m_idx < M // tile_m_size) & (tile_k_idx < K // tile_k_size)
         )
         if cutlass.const_expr(row_owned_k):
             input_row_k = tile_m_idx * tile_m_size + tidx
@@ -586,9 +595,8 @@ def mxfp8_swizzle_v2_jit(
     mOutputM: cute.Tensor | None,
     mScaleM: cute.Tensor | None,
     mSeed: cute.Tensor | None,
-    M: cutlass.Int32 | cutlass.Int64,
-    K: cutlass.Int32 | cutlass.Int64,
-    index_type: cutlass.Constexpr,
+    M: cutlass.Int32,
+    K: cutlass.Int32,
     tile_m_size: cutlass.Constexpr,
     tile_k_size: cutlass.Constexpr,
     cluster_k: cutlass.Constexpr,
@@ -624,8 +632,10 @@ def mxfp8_swizzle_v2_jit(
     if cutlass.const_expr(is_square_scaling):
         assert quant_orientation == _QUANT_ORIENTATION_DIM_K
 
-    padded_M = _ceil_div(M, 128) * 128
-    padded_K = _ceil_div(K, tile_k_size) * tile_k_size
+    # M is padded to a full 128-row scale-layout block. Since every tile-M divides 128,
+    # compute the CTA count without materializing a potentially overflowing padded extent.
+    grid_m = _ceil_div(M, 128) * (128 // tile_m_size)
+    grid_k = _ceil_div(K, tile_k_size)
 
     if cutlass.const_expr(quant_orientation == _QUANT_ORIENTATION_DIM_M):
         # Keep the kernel argument type uniform while retaining the original unswizzled dim-M
@@ -688,9 +698,10 @@ def mxfp8_swizzle_v2_jit(
 
         nrb_k = _ceil_div(M, 128)
         ncb_k = _ceil_div(K, 128)
+        scale_k_row_block_stride = cutlass.Int64(ncb_k) * 32 * 16
         scale_k_layout = cute.make_layout(
             ((32, 4, nrb_k), (4, ncb_k)),
-            stride=((16, 4, ncb_k * 32 * 16), (1, 32 * 16)),
+            stride=((16, 4, scale_k_row_block_stride), (1, 32 * 16)),
         )
         mScaleKLogical = cute.make_tensor(mScaleK.iterator, scale_k_layout)
 
@@ -734,9 +745,10 @@ def mxfp8_swizzle_v2_jit(
 
         nrb_m = _ceil_div(K, 128)
         ncb_m = _ceil_div(M, 128)
+        scale_m_row_block_stride = cutlass.Int64(ncb_m) * 32 * 16
         scale_m_layout = cute.make_layout(
             ((32, 4, nrb_m), (4, ncb_m)),
-            stride=((16, 4, ncb_m * 32 * 16), (1, 32 * 16)),
+            stride=((16, 4, scale_m_row_block_stride), (1, 32 * 16)),
         )
         mScaleMLogical = cute.make_tensor(mScaleM.iterator, scale_m_layout)
     else:
@@ -764,13 +776,12 @@ def mxfp8_swizzle_v2_jit(
         tile_k_size,
         M,
         K,
-        index_type,
         needs_boundary_masking,
         quant_orientation,
         is_stochastic_qdata_rounding,
         is_square_scaling,
     )
-    grid = (padded_K // tile_k_size, padded_M // tile_m_size, 1)
+    grid = (grid_k, grid_m, 1)
     block = (max(_MIN_CTA_THREADS_128, tile_k_size), 1, 1)
     if cutlass.const_expr(
         quant_orientation == _QUANT_ORIENTATION_DIM_KM and not is_stochastic_qdata_rounding and tile_m_size != 32
@@ -823,6 +834,11 @@ def _mxfp8_swizzle_v2_impl(
 
     M, K = input.shape
     assert M > 0 and K > 0, "v2 requires non-empty dimensions"
+    if M > _INT32_MAX or K > _INT32_MAX:
+        raise ValueError(
+            "mxfp8 v2 requires each logical dimension to fit in signed int32; "
+            f"got shape ({M}, {K})"
+        )
     if is_square_scaling:
         assert M % 32 == 0, "32x32 v2 requires M % 32 == 0"
     if quant_orientation != "dim_k":
@@ -943,8 +959,16 @@ def _mxfp8_swizzle_v2_impl(
             rounding_mode,
         )
 
-    index_type = cutlass.Int64 if input.numel() > _INT32_MAX else cutlass.Int32
-    compile_key = (*compile_key, input.dtype, index_type)
+    launch_grid_k = _ceil_div(K, tile_k_size)
+    launch_grid_m = _ceil_div(M, 128) * (128 // tile_m_size)
+    if launch_grid_k > _CUDA_GRID_X_MAX or launch_grid_m > _CUDA_GRID_Y_MAX:
+        raise ValueError(
+            "mxfp8 v2 launch grid exceeds CUDA limits: "
+            f"grid=({launch_grid_k}, {launch_grid_m}, 1), "
+            f"maximum=({_CUDA_GRID_X_MAX}, {_CUDA_GRID_Y_MAX}, 65535)"
+        )
+
+    compile_key = (*compile_key, input.dtype)
 
     output_m = scale_m = mOutputM = mScaleM = None
     if do_dim_m:
@@ -1009,9 +1033,8 @@ def _mxfp8_swizzle_v2_impl(
         mOutputM,
         mScaleM,
         mSeed,
-        index_type(M),
-        index_type(K),
-        index_type,
+        cutlass.Int32(M),
+        cutlass.Int32(K),
         tile_m_size,
         tile_k_size,
         cluster_k,
