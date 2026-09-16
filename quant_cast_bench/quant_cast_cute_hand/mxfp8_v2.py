@@ -45,7 +45,7 @@ def _compiled(key, jit_fn, *cute_args):
 _DIM_K_TILE_M_SIZE_128 = 128
 _DIM_K_MAX_TILE_K_SIZE_128 = 128
 _MIN_CTA_WARPS_4 = 4
-_MXS_THREADS = _MIN_CTA_WARPS_4 * 32                       # 128, one thread per tile row
+_MIN_CTA_THREADS_128 = _MIN_CTA_WARPS_4 * 32                       # 128, one thread per tile row
 
 _MODE_DIM_K = 0
 _MODE_DIM_M = 1
@@ -532,7 +532,7 @@ def mxfp8_swizzle_v2_dim_k_jit(
     if cutlass.const_expr(tile_m_size == _DIM_K_TILE_M_SIZE_128):
         # (thread, value) -> logical coordinate in the 128xN tile. Each thread owns one row.
         data_tv_layout = cute.make_layout(
-            ((_MXS_THREADS,), (32, iters)),
+            ((_MIN_CTA_THREADS_128,), (32, iters)),
             stride=((1,), (tile_m_size, tile_m_size * 32)),
         )
     elif cutlass.const_expr(square_scaling):
@@ -544,7 +544,7 @@ def mxfp8_swizzle_v2_dim_k_jit(
         )
     else:
         # Smaller tiles map one (row, 1x32 group) to each thread, then advance through 32-row stages.
-        rows_per_stage = _MXS_THREADS // bpr
+        rows_per_stage = _MIN_CTA_THREADS_128 // bpr
         row_blocks = tile_m_size // rows_per_stage
         data_tv_layout = cute.make_layout(
             ((bpr, rows_per_stage), (32, row_blocks)),
@@ -590,7 +590,7 @@ def mxfp8_swizzle_v2_dim_k_jit(
         # Make the fast-changing grid dimension follow contiguous columns. Clustering those CTAs
         # further preserves that locality in hardware scheduling.
         grid=(padded_K // tile_k_size, padded_M // tile_m_size, 1),
-        block=(_MXS_THREADS, 1, 1),
+        block=(_MIN_CTA_THREADS_128, 1, 1),
         cluster=(cluster_k, 1, 1),
     )
 
@@ -982,7 +982,7 @@ def mxfp8_swizzle_v2_dim_m_or_km_jit(
         False,
     )
     grid = (padded_K // tile_k_size, padded_M // tile_m_size, 1)
-    block = (max(_MXS_THREADS, tile_k_size), 1, 1)
+    block = (max(_MIN_CTA_THREADS_128, tile_k_size), 1, 1)
     if cutlass.const_expr(
         mode == _MODE_DIM_KM and not stochastic and tile_m_size != 32
     ):
