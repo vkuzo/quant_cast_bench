@@ -129,7 +129,7 @@ def mxfp8_swizzle_v2_kernel(
     K: cutlass.Int32,
     needs_boundary_masking: cutlass.Constexpr,
     mode: cutlass.Constexpr,
-    stochastic: cutlass.Constexpr,
+    is_stochastic_qdata_rounding: cutlass.Constexpr,
     square_scaling: cutlass.Constexpr,
 ):
     tidx, _, _ = cute.arch.thread_idx()
@@ -233,7 +233,7 @@ def mxfp8_swizzle_v2_kernel(
             tInputsInput,
             tma_bar_ptr=tma_bar_ptr,
         )
-    if cutlass.const_expr(stochastic):
+    if cutlass.const_expr(is_stochastic_qdata_rounding):
         # The Philox key is independent of the tile, so load and unpack it while TMA fills sInput.
         frgKey = cute.make_rmem_tensor(cute.make_layout(2), mSeed.element_type)
         cute.copy(
@@ -261,12 +261,12 @@ def mxfp8_swizzle_v2_kernel(
         output_row_m = tile_k_idx * tile_k_size + tidx
         scale_col_m = tile_m_idx * row_blocks
         rScaleM = cute.make_rmem_tensor(row_blocks, cutlass.Uint8)
-        if cutlass.const_expr(stochastic):
+        if cutlass.const_expr(is_stochastic_qdata_rounding):
             sr_flat_base_m = (
                 (tile_k_idx * tile_k_size + tidx) * M + tile_m_idx * tile_m_size
             )
         for row_block in cutlass.range_constexpr(row_blocks):
-            if cutlass.const_expr(stochastic):
+            if cutlass.const_expr(is_stochastic_qdata_rounding):
                 sr_counter_start_m = counter_base + cutlass.Uint64(
                     (sr_flat_base_m + row_block * 32) // 16
                 )
@@ -281,7 +281,7 @@ def mxfp8_swizzle_v2_kernel(
             )
             rcp_m, biased_m = _e8m0(amax_m)
             rQM = cute.make_rmem_tensor(32, cutlass.Float8E4M3FN)
-            if cutlass.const_expr(stochastic):
+            if cutlass.const_expr(is_stochastic_qdata_rounding):
                 rQM.store(
                     _mxfp8_v2_quantize_stochastic_x32(
                         vm, rcp_m, sr_counter_start_m, k0, k1
@@ -341,7 +341,7 @@ def mxfp8_swizzle_v2_kernel(
             cute.make_layout((32, iters), stride=(1, 32)),
             cutlass.Float8E4M3FN,
         )
-        if cutlass.const_expr(stochastic):
+        if cutlass.const_expr(is_stochastic_qdata_rounding):
             if cutlass.const_expr(row_owned_k):
                 sr_flat_base_k = (
                     (tile_m_idx * tile_m_size + tidx) * K + tile_k_idx * tile_k_size
@@ -352,7 +352,7 @@ def mxfp8_swizzle_v2_kernel(
                     + (tile_k_idx * bpr + tidx % bpr) * 32
                 )
         for it in cutlass.range_constexpr(iters):
-            if cutlass.const_expr(stochastic):
+            if cutlass.const_expr(is_stochastic_qdata_rounding):
                 if cutlass.const_expr(row_owned_k):
                     flat_start_k = sr_flat_base_k + it * 32
                 else:
@@ -379,7 +379,7 @@ def mxfp8_swizzle_v2_kernel(
                 # maximum so every row quantizes with the same 32x32-block scale.
                 amax_k = cute.arch.warp_reduction_max(amax_k)
             rcp_k, biased_k = _e8m0(amax_k)
-            if cutlass.const_expr(stochastic):
+            if cutlass.const_expr(is_stochastic_qdata_rounding):
                 rQK[(None, it)].store(
                     _mxfp8_v2_quantize_stochastic_x32(
                         vk, rcp_k, sr_counter_start_k, k0, k1
@@ -417,7 +417,7 @@ def mxfp8_swizzle_v2_kernel(
             )
     if cutlass.const_expr(do_dim_m):
         # The fused SR specialization issues its independent output transfers from separate warps.
-        output_m_warp = 1 if cutlass.const_expr(stochastic and do_dim_k) else 0
+        output_m_warp = 1 if cutlass.const_expr(is_stochastic_qdata_rounding and do_dim_k) else 0
         if warp == output_m_warp:
             cute.copy(
                 output_m_tma_atom,
@@ -504,7 +504,7 @@ def mxfp8_swizzle_v2_dim_k_jit(
     tile_k_size: cutlass.Constexpr,
     cluster_k: cutlass.Constexpr,
     needs_boundary_masking: cutlass.Constexpr,
-    stochastic: cutlass.Constexpr,
+    is_stochastic_qdata_rounding: cutlass.Constexpr,
     square_scaling: cutlass.Constexpr,
 ) -> None:
     padded_M = _ceil_div(M, _DIM_K_TILE_M_SIZE_128) * _DIM_K_TILE_M_SIZE_128
@@ -588,7 +588,7 @@ def mxfp8_swizzle_v2_dim_k_jit(
         K,
         needs_boundary_masking,
         _MODE_DIM_K,
-        stochastic,
+        is_stochastic_qdata_rounding,
         square_scaling,
     ).launch(
         # Make the fast-changing grid dimension follow contiguous columns. Clustering those CTAs
@@ -613,11 +613,11 @@ def _mxfp8_swizzle_v2_impl(
     assert input.dtype == torch.bfloat16, "v2 is bf16-only"
     rounding_mode = str(getattr(rounding_mode, "value", rounding_mode)).lower()
     assert rounding_mode in ("rtne", "stochastic"), f"unsupported rounding_mode: {rounding_mode}"
-    stochastic = rounding_mode == "stochastic"
+    is_stochastic_qdata_rounding = rounding_mode == "stochastic"
     if square_scaling:
         assert mode == "dim_k", "32x32 v2 currently supports only dim-k output"
-        assert not stochastic, "32x32 v2 currently supports only RTNE"
-    if stochastic:
+        assert not is_stochastic_qdata_rounding, "32x32 v2 currently supports only RTNE"
+    if is_stochastic_qdata_rounding:
         assert key is not None, "stochastic rounding requires a Philox key"
         assert key.device == input.device, "input and Philox key must be on the same device"
         assert key.dtype == torch.uint64 and key.numel() == 2, "Philox key must be uint64[2]"
@@ -698,7 +698,7 @@ def _mxfp8_swizzle_v2_impl(
             mOutputK = mOutputM
             mScaleK = mScaleM
         # The RTNE specialization never reads mSeed, so reuse mScaleM as a dummy argument.
-        mSeed = from_dlpack(key.reshape(-1).view(torch.int64)) if stochastic else mScaleM
+        mSeed = from_dlpack(key.reshape(-1).view(torch.int64)) if is_stochastic_qdata_rounding else mScaleM
 
         mode_id = (
             _MODE_DIM_KM if mode == "dim_km" else _MODE_DIM_M
@@ -723,7 +723,7 @@ def _mxfp8_swizzle_v2_impl(
             cluster_k,
             needs_boundary_masking,
             mode_id,
-            stochastic,
+            is_stochastic_qdata_rounding,
         )
         fn(mInput, mOutputM, mScaleM, mOutputK, mScaleK, mSeed, M, K)
         scale_m = scale_m.view(nrb_m, ncb_m, 32, 16).view(
@@ -753,7 +753,7 @@ def _mxfp8_swizzle_v2_impl(
     cluster_k = (
         # Square scaling has enough independent CTAs at small/medium sizes that clustering only
         # constrains scheduling; large shapes retain v2's K-locality-oriented clusters.
-        1 if stochastic or (square_scaling and M * K <= 4096 * 4096)
+        1 if is_stochastic_qdata_rounding or (square_scaling and M * K <= 4096 * 4096)
         else next(c for c in (16, 8, 4, 2, 1) if c <= ncb and grid_n % c == 0)
     )
     output = torch.empty(M, K, dtype=torch.float8_e4m3fn, device=input.device)
@@ -771,7 +771,7 @@ def _mxfp8_swizzle_v2_impl(
         .mark_compact_shape_dynamic(mode=0, divisibility=512)
     )
     # The RTNE specialization never reads mSeed, so reuse mScale as a dummy argument on that path.
-    mSeed = from_dlpack(key.reshape(-1).view(torch.int64)) if stochastic else mScale
+    mSeed = from_dlpack(key.reshape(-1).view(torch.int64)) if is_stochastic_qdata_rounding else mScale
     needs_boundary_masking = M != nrb * 128 or K != ncb * 128
     fn = _compiled(
         (
@@ -789,7 +789,7 @@ def _mxfp8_swizzle_v2_impl(
         tile_k_size,
         cluster_k,
         needs_boundary_masking,
-        stochastic,
+        is_stochastic_qdata_rounding,
         square_scaling,
     )
     fn(mInput, mOutput, mScale, mSeed, M, K)
@@ -870,7 +870,7 @@ def mxfp8_swizzle_v2_dim_m_or_km_jit(
     cluster_k: cutlass.Constexpr,
     needs_boundary_masking: cutlass.Constexpr,
     mode: cutlass.Constexpr,
-    stochastic: cutlass.Constexpr,
+    is_stochastic_qdata_rounding: cutlass.Constexpr,
 ):
     padded_M = _ceil_div(M, 128) * 128
     padded_K = _ceil_div(K, tile_k_size) * tile_k_size
@@ -982,13 +982,13 @@ def mxfp8_swizzle_v2_dim_m_or_km_jit(
         K,
         needs_boundary_masking,
         mode,
-        stochastic,
+        is_stochastic_qdata_rounding,
         False,
     )
     grid = (padded_K // tile_k_size, padded_M // tile_m_size, 1)
     block = (max(_MIN_CTA_THREADS_128, tile_k_size), 1, 1)
     if cutlass.const_expr(
-        mode == _MODE_DIM_KM and not stochastic and tile_m_size != 32
+        mode == _MODE_DIM_KM and not is_stochastic_qdata_rounding and tile_m_size != 32
     ):
         # A degenerate cluster constrains residency for this larger two-output specialization;
         # an ordinary launch lets Blackwell keep nine CTAs resident per SM instead.
