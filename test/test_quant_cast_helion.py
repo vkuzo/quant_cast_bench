@@ -44,7 +44,7 @@ def test_helion_matches_reference(name, recipe):
     if name in _REQUIRES_SM100 and torch.cuda.get_device_capability() != (10, 0):
         pytest.skip(f"{name} emits Blackwell-only PTX; requires cuda capability 10.0")
     torch.manual_seed(0)
-    inputs = recipe.example_input_fn(512, 512)
+    inputs = recipe.example_input_fn(512, 512, torch.bfloat16)
 
     # flex_tile_map framework kwargs naming the tile's global origin + parent row stride. The test
     # runs the whole tensor as one tile, so origin = (0, 0) and num_col = full width. Every recipe
@@ -98,7 +98,7 @@ def test_bf16_sr_global_full_key():
     recipe = FP32_TO_BF16_SR_GLOBAL
     M, N = 512, 512
     torch.manual_seed(0)
-    x, key = recipe.example_input_fn(M, N)  # key = prng.key(0) -> [0, 0]
+    x, key = recipe.example_input_fn(M, N, torch.bfloat16)  # key = prng.key(0) -> [0, 0]
     tile_kwargs = {"global_row": 0, "global_col": 0, "num_col": N}
 
     # default key: kernel and gold draw the same Philox stream -> bit-for-bit equal.

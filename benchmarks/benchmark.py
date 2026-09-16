@@ -78,7 +78,7 @@ def _bench_relu(M, K, peak_bw):
 def _bench_one(recipe, M, K, mode, peak_bw):
     torch.manual_seed(0)
     torch._dynamo.reset()
-    inputs = recipe.example_input_fn(M, K)  # (x, *aux)
+    inputs = recipe.example_input_fn(M, K, torch.bfloat16)  # (x, *aux)
     # Some recipes (e.g. fp32_to_bf16_sr_global_offsets) consume flex_tile_map framework kwargs
     # naming the tile's global origin + parent row stride. The benchmark runs the whole tensor as a
     # single tile, so origin = (0, 0) and num_col = the full width. Every recipe fn takes **kwargs,

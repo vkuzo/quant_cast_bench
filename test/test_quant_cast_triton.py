@@ -74,7 +74,7 @@ def test_triton_matches_reference(name, recipe, shape):
         pytest.skip(f"{name} needs stricter alignment than shape {shape[0]}x{shape[1]} provides")
     M, N = shape
     torch.manual_seed(0)
-    inputs = recipe.example_input_fn(M, N)
+    inputs = recipe.example_input_fn(M, N, torch.bfloat16)
 
     # flex_tile_map framework kwargs naming the tile's global origin + parent row stride. The test
     # runs the whole tensor as one tile, so origin = (0, 0) and num_col = full width. These are needed
@@ -153,7 +153,7 @@ def test_sr_full_key(name, recipe):
         pytest.skip(f"{name} emits Blackwell-only PTX; requires cuda capability 10.0")
     M, N = 512, 512
     torch.manual_seed(0)
-    inputs = recipe.example_input_fn(M, N)  # (x, *aux, key); key = prng.key(0) -> [0, 0]
+    inputs = recipe.example_input_fn(M, N, torch.bfloat16)  # (x, *aux, key); key = prng.key(0) -> [0, 0]
     tile_kwargs = {"global_row": 0, "global_col": 0, "num_col": N}
 
     # default key: kernel and gold draw the same Philox stream -> bit-for-bit equal.

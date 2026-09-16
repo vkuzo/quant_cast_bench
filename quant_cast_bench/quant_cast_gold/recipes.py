@@ -74,9 +74,10 @@ class QuantCastSingleKernelGold:
       message if they are not. For example, if `pt_ref_fn` quantizes a tensor,
       `correctness_fn` could check SQNR between ref and quantized outputs.
 
-    `example_input_fn(M, K) -> (x, *aux)` builds one representative set of positional
-      inputs for `pt_ref_fn` at the given (rows, cols): the tensor `x` plus any extra args
-      the recipe takes (a precalculated scale, a bias, an RHT matrix, a PRNG key).
+    `example_input_fn(M, K, dtype) -> (x, *aux)` builds one representative set of
+      positional inputs for `pt_ref_fn` at the given (rows, cols) and input dtype: the
+      tensor `x` plus any extra args the recipe takes (a precalculated scale, a bias, an
+      RHT matrix, a PRNG key).
 
     `perf_description` is a free-form note about the recipe's performance characteristics
       (filled in manually per recipe); surfaced in the benchmark results.
@@ -84,7 +85,7 @@ class QuantCastSingleKernelGold:
 
     pt_ref_fn: Callable
     correctness_fn: Callable
-    example_input_fn: Callable[[int, int], Tuple[torch.Tensor, ...]]
+    example_input_fn: Callable[[int, int, torch.dtype], Tuple[torch.Tensor, ...]]
     perf_description: str
 
 
@@ -133,7 +134,7 @@ def _deepseek_1x128_correctness(
 Deepseek1x128Gold = QuantCastSingleKernelGold(
     pt_ref_fn=deepseek_1x128_f,
     correctness_fn=_deepseek_1x128_correctness,
-    example_input_fn=lambda M, K: (torch.randn(M, K, dtype=torch.bfloat16, device="cuda"),),
+    example_input_fn=lambda M, K, dtype: (torch.randn(M, K, dtype=dtype, device="cuda"),),
     perf_description="(1,128) block",
 )
 
@@ -186,7 +187,7 @@ def _deepseek_128x128_correctness(
 Deepseek128x128Gold = QuantCastSingleKernelGold(
     pt_ref_fn=deepseek_128x128_f,
     correctness_fn=_deepseek_128x128_correctness,
-    example_input_fn=lambda M, K: (torch.randn(M, K, dtype=torch.bfloat16, device="cuda"),),
+    example_input_fn=lambda M, K, dtype: (torch.randn(M, K, dtype=dtype, device="cuda"),),
     perf_description="(128,128) block",
 )
 
@@ -229,7 +230,7 @@ def _deepseek_1x128_dim_m_correctness(
 Deepseek1x128DimMGold = QuantCastSingleKernelGold(
     pt_ref_fn=deepseek_1x128_dim_m_f,
     correctness_fn=_deepseek_1x128_dim_m_correctness,
-    example_input_fn=lambda M, K: (torch.randn(M, K, dtype=torch.bfloat16, device="cuda"),),
+    example_input_fn=lambda M, K, dtype: (torch.randn(M, K, dtype=dtype, device="cuda"),),
     perf_description="(128,1) block, t-contig",
 )
 
@@ -290,7 +291,7 @@ def _deepseek_1x128_dim_km_correctness(
 Deepseek1x128DimKmGold = QuantCastSingleKernelGold(
     pt_ref_fn=deepseek_1x128_dim_km_f,
     correctness_fn=_deepseek_1x128_dim_km_correctness,
-    example_input_fn=lambda M, K: (torch.randn(M, K, dtype=torch.bfloat16, device="cuda"),),
+    example_input_fn=lambda M, K, dtype: (torch.randn(M, K, dtype=dtype, device="cuda"),),
     perf_description="(1,128) dim-k + (128,1) dim-m, one pass, t-contig",
 )
 
@@ -328,7 +329,7 @@ def _rowwise_fp8_correctness(
 RowwiseFp8Gold = QuantCastSingleKernelGold(
     pt_ref_fn=rowwise_fp8_f,
     correctness_fn=_rowwise_fp8_correctness,
-    example_input_fn=lambda M, K: (torch.randn(M, K, dtype=torch.bfloat16, device="cuda"),),
+    example_input_fn=lambda M, K, dtype: (torch.randn(M, K, dtype=dtype, device="cuda"),),
     perf_description="(1,-1) block",
 )
 
@@ -372,7 +373,7 @@ def _colwise_fp8_correctness(
 ColwiseFp8Gold = QuantCastSingleKernelGold(
     pt_ref_fn=colwise_fp8_f,
     correctness_fn=_colwise_fp8_correctness,
-    example_input_fn=lambda M, K: (torch.randn(M, K, dtype=torch.bfloat16, device="cuda"),),
+    example_input_fn=lambda M, K, dtype: (torch.randn(M, K, dtype=dtype, device="cuda"),),
     perf_description="(-1,1) block, t-contig",
 )
 
@@ -418,8 +419,8 @@ def _rowwise_precalc_correctness(
     assert sqnr > threshold, f"rowwise_precalc: sqnr={sqnr.item():.2f} dB below {threshold} dB"
 
 
-def _rowwise_precalc_inputs(M, K):
-    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+def _rowwise_precalc_inputs(M, K, dtype):
+    x = torch.randn(M, K, dtype=dtype, device="cuda")
     return (x, rowwise_precalc_scale(x))
 
 
@@ -469,8 +470,8 @@ def _colwise_precalc_correctness(
     assert sqnr > threshold, f"colwise_precalc: sqnr={sqnr.item():.2f} dB below {threshold} dB"
 
 
-def _colwise_precalc_inputs(M, K):
-    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+def _colwise_precalc_inputs(M, K, dtype):
+    x = torch.randn(M, K, dtype=dtype, device="cuda")
     return (x, colwise_precalc_scale(x))
 
 
@@ -594,7 +595,7 @@ def _mxfp8_correctness(
 Mxfp8Gold = QuantCastSingleKernelGold(
     pt_ref_fn=mxfp8_f,
     correctness_fn=_mxfp8_correctness,
-    example_input_fn=lambda M, K: (torch.randn(M, K, dtype=torch.bfloat16, device="cuda"),),
+    example_input_fn=lambda M, K, dtype: (torch.randn(M, K, dtype=dtype, device="cuda"),),
     perf_description="(1,32) block",
 )
 
@@ -644,7 +645,7 @@ def _mxfp4_correctness(
 Mxfp4Gold = QuantCastSingleKernelGold(
     pt_ref_fn=mxfp4_f,
     correctness_fn=_mxfp4_correctness,
-    example_input_fn=lambda M, K: (torch.randn(M, K, dtype=torch.bfloat16, device="cuda"),),
+    example_input_fn=lambda M, K, dtype: (torch.randn(M, K, dtype=dtype, device="cuda"),),
     perf_description="(1,32) block, fp4 qdata",
 )
 
@@ -687,7 +688,7 @@ def _mxfp8_dim_m_correctness(
 Mxfp8DimMGold = QuantCastSingleKernelGold(
     pt_ref_fn=mxfp8_dim_m_f,
     correctness_fn=_mxfp8_dim_m_correctness,
-    example_input_fn=lambda M, K: (torch.randn(M, K, dtype=torch.bfloat16, device="cuda"),),
+    example_input_fn=lambda M, K, dtype: (torch.randn(M, K, dtype=dtype, device="cuda"),),
     perf_description="(32,1) block, t-contig",
 )
 
@@ -741,7 +742,7 @@ def _mxfp8_dim_km_correctness(
 Mxfp8DimKmGold = QuantCastSingleKernelGold(
     pt_ref_fn=mxfp8_dim_km_f,
     correctness_fn=_mxfp8_dim_km_correctness,
-    example_input_fn=lambda M, K: (torch.randn(M, K, dtype=torch.bfloat16, device="cuda"),),
+    example_input_fn=lambda M, K, dtype: (torch.randn(M, K, dtype=dtype, device="cuda"),),
     perf_description="(1,32) dim-k + (32,1) dim-m, one pass, t-contig",
 )
 
@@ -783,7 +784,7 @@ Mxfp832x32ExpandGold = QuantCastSingleKernelGold(
     pt_ref_fn=mxfp8_32x32_expand_f,
     # the expanded scale is already the plain 1x32 layout, so mxfp8's (M, N//32) dequant applies.
     correctness_fn=_mxfp8_correctness,
-    example_input_fn=lambda M, K: (torch.randn(M, K, dtype=torch.bfloat16, device="cuda"),),
+    example_input_fn=lambda M, K, dtype: (torch.randn(M, K, dtype=dtype, device="cuda"),),
     perf_description="(32,32) block, expanded to (1,32)",
 )
 
@@ -829,7 +830,7 @@ def _mxfp8_32x32_swizzle_correctness(
 Mxfp832x32SwizzleGold = QuantCastSingleKernelGold(
     pt_ref_fn=mxfp8_32x32_swizzle_f,
     correctness_fn=_mxfp8_32x32_swizzle_correctness,
-    example_input_fn=lambda M, K: (torch.randn(M, K, dtype=torch.bfloat16, device="cuda"),),
+    example_input_fn=lambda M, K, dtype: (torch.randn(M, K, dtype=dtype, device="cuda"),),
     perf_description="(32,32) block, swizzle",
 )
 
@@ -873,7 +874,7 @@ def _mxfp8_32x32_dim_m_swizzle_correctness(
 Mxfp832x32DimMSwizzleGold = QuantCastSingleKernelGold(
     pt_ref_fn=mxfp8_32x32_dim_m_swizzle_f,
     correctness_fn=_mxfp8_32x32_dim_m_swizzle_correctness,
-    example_input_fn=lambda M, K: (torch.randn(M, K, dtype=torch.bfloat16, device="cuda"),),
+    example_input_fn=lambda M, K, dtype: (torch.randn(M, K, dtype=dtype, device="cuda"),),
     perf_description="(32,32) block, t-contig, swizzle",
 )
 
@@ -919,7 +920,7 @@ def _mxfp8_32x32_dim_km_swizzle_correctness(
 Mxfp832x32DimKMSwizzleGold = QuantCastSingleKernelGold(
     pt_ref_fn=mxfp8_32x32_dim_km_swizzle_f,
     correctness_fn=_mxfp8_32x32_dim_km_swizzle_correctness,
-    example_input_fn=lambda M, K: (torch.randn(M, K, dtype=torch.bfloat16, device="cuda"),),
+    example_input_fn=lambda M, K, dtype: (torch.randn(M, K, dtype=dtype, device="cuda"),),
     perf_description="(32,32) block, one pass, t-contig, swizzle",
 )
 
@@ -967,7 +968,7 @@ def _mxfp8_32x32_qdata_dim_k_scale_dim_km_swizzle_correctness(
 Mxfp832x32QdataDimKScaleDimKMSwizzleGold = QuantCastSingleKernelGold(
     pt_ref_fn=mxfp8_32x32_qdata_dim_k_scale_dim_km_swizzle_f,
     correctness_fn=_mxfp8_32x32_qdata_dim_k_scale_dim_km_swizzle_correctness,
-    example_input_fn=lambda M, K: (torch.randn(M, K, dtype=torch.bfloat16, device="cuda"),),
+    example_input_fn=lambda M, K, dtype: (torch.randn(M, K, dtype=dtype, device="cuda"),),
     perf_description="(32,32) block, one pass, dim-k qdata + km scales, swizzle",
 )
 
@@ -1137,7 +1138,7 @@ def _mxfp8_swizzle_correctness(
 Mxfp8SwizzleGold = QuantCastSingleKernelGold(
     pt_ref_fn=mxfp8_swizzle_f,
     correctness_fn=_mxfp8_swizzle_correctness,
-    example_input_fn=lambda M, K: (torch.randn(M, K, dtype=torch.bfloat16, device="cuda"),),
+    example_input_fn=lambda M, K, dtype: (torch.randn(M, K, dtype=dtype, device="cuda"),),
     perf_description="(1,32) block, swizzle",
 )
 
@@ -1156,8 +1157,8 @@ def _mxfp8_swizzle_sr_correctness(
     )
 
 
-def _mxfp8_swizzle_sr_inputs(M, K):
-    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+def _mxfp8_swizzle_sr_inputs(M, K, dtype):
+    x = torch.randn(M, K, dtype=dtype, device="cuda")
     return x, prng.key(0, device=x.device)
 
 
@@ -1222,7 +1223,7 @@ def _mxfp8_dim_m_swizzle_correctness(
 Mxfp8DimMSwizzleGold = QuantCastSingleKernelGold(
     pt_ref_fn=mxfp8_dim_m_swizzle_f,
     correctness_fn=_mxfp8_dim_m_swizzle_correctness,
-    example_input_fn=lambda M, K: (torch.randn(M, K, dtype=torch.bfloat16, device="cuda"),),
+    example_input_fn=lambda M, K, dtype: (torch.randn(M, K, dtype=dtype, device="cuda"),),
     perf_description="(32,1) block, t-contig, swizzle",
 )
 
@@ -1294,7 +1295,7 @@ def _mxfp8_dim_km_swizzle_correctness(
 Mxfp8DimKmSwizzleGold = QuantCastSingleKernelGold(
     pt_ref_fn=mxfp8_dim_km_swizzle_f,
     correctness_fn=_mxfp8_dim_km_swizzle_correctness,
-    example_input_fn=lambda M, K: (torch.randn(M, K, dtype=torch.bfloat16, device="cuda"),),
+    example_input_fn=lambda M, K, dtype: (torch.randn(M, K, dtype=dtype, device="cuda"),),
     perf_description="(1,32) dim-k + (32,1) dim-m, one pass, t-contig, swizzle",
 )
 
@@ -1362,8 +1363,8 @@ def _float8_tensorwise_correctness(
     assert sqnr > threshold, f"float8_tensorwise: sqnr={sqnr.item():.2f} dB below {threshold} dB"
 
 
-def _float8_tensorwise_inputs(M, K):
-    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+def _float8_tensorwise_inputs(M, K, dtype):
+    x = torch.randn(M, K, dtype=dtype, device="cuda")
     return (x, float8_tensorwise_scale(x))
 
 
@@ -1451,8 +1452,8 @@ def _nvfp4_gs_swizzle_correctness(
     assert sqnr > threshold, f"nvfp4_gs_swizzle: sqnr={sqnr.item():.2f} dB below {threshold} dB"
 
 
-def _nvfp4_gs_swizzle_inputs(M, K):
-    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+def _nvfp4_gs_swizzle_inputs(M, K, dtype):
+    x = torch.randn(M, K, dtype=dtype, device="cuda")
     return (x, nvfp4_gs_scale(x).reciprocal())  # recipes take 1/S (MSLK/torchao global_scale)
 
 
@@ -1493,8 +1494,8 @@ def _nvfp4_gs_swizzle_dim_m_correctness(
     assert sqnr > threshold, f"nvfp4_dim_m_swizzle: sqnr={sqnr.item():.2f} dB below {threshold} dB"
 
 
-def _nvfp4_gs_swizzle_dim_m_inputs(M, K):
-    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+def _nvfp4_gs_swizzle_dim_m_inputs(M, K, dtype):
+    x = torch.randn(M, K, dtype=dtype, device="cuda")
     return (x, nvfp4_gs_scale(x).reciprocal())  # |x.t()| == |x|; recipes take 1/S, one scale serves both
 
 
@@ -1542,8 +1543,8 @@ def _nvfp4_gs_swizzle_dim_km_correctness(
     assert sqnr_m > threshold, f"nvfp4 dim-m: sqnr={sqnr_m.item():.2f} dB below {threshold} dB"
 
 
-def _nvfp4_gs_swizzle_dim_km_inputs(M, K):
-    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+def _nvfp4_gs_swizzle_dim_km_inputs(M, K, dtype):
+    x = torch.randn(M, K, dtype=dtype, device="cuda")
     # no RHT -> |x.t()| == |x|, so both orientations get the same per-tensor outer scale (as 1/S)
     return (x, nvfp4_gs_scale(x).reciprocal(), nvfp4_gs_scale(x).reciprocal())
 
@@ -1591,8 +1592,8 @@ def _nvfp4_gs_swizzle_dim_m_rht_correctness(
     assert sqnr > threshold, f"nvfp4_dim_m_rht: sqnr={sqnr.item():.2f} dB below {threshold} dB"
 
 
-def _nvfp4_gs_swizzle_dim_m_rht_inputs(M, K):
-    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+def _nvfp4_gs_swizzle_dim_m_rht_inputs(M, K, dtype):
+    x = torch.randn(M, K, dtype=dtype, device="cuda")
     # fixed +/-1 sign vector (deterministic), same as the dim_k_dim_m_rht inputs helper.
     sign = torch.tensor([1, -1] * 8, device=x.device, dtype=x.dtype)
     rht = hadamard_rht_matrix(sign, x.device, x.dtype)
@@ -1655,8 +1656,8 @@ def _nvfp4_gs_swizzle_dim_k_dim_m_rht_correctness(
     assert sqnr_m > threshold, f"nvfp4 dim-m (RHT): sqnr={sqnr_m.item():.2f} dB below {threshold} dB"
 
 
-def _nvfp4_gs_swizzle_dim_k_dim_m_rht_inputs(M, K):
-    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+def _nvfp4_gs_swizzle_dim_k_dim_m_rht_inputs(M, K, dtype):
+    x = torch.randn(M, K, dtype=dtype, device="cuda")
     # fixed +/-1 sign vector (deterministic), same as _hadamard_rht_inputs; build the 16x16 RHT matrix.
     sign = torch.tensor([1, -1] * 8, device=x.device, dtype=x.dtype)
     rht = hadamard_rht_matrix(sign, x.device, x.dtype)
@@ -1741,8 +1742,8 @@ def _nvfp4_gs_swizzle_sr_correctness(
     assert sqnr > threshold, f"nvfp4_gs_sr_swizzle: sqnr={sqnr.item():.2f} dB below {threshold} dB"
 
 
-def _nvfp4_gs_swizzle_sr_inputs(M, K):
-    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+def _nvfp4_gs_swizzle_sr_inputs(M, K, dtype):
+    x = torch.randn(M, K, dtype=dtype, device="cuda")
     return (x, nvfp4_gs_scale(x).reciprocal(), prng.key(0, device=x.device))  # 1/S; fixed Philox key -> reproducible SR
 
 
@@ -1883,8 +1884,8 @@ def _nvfp4_gs_swizzle_dim_k_dim_m_rht_sr_correctness(
     assert sqnr_m > threshold, f"nvfp4 dim-m (RHT, SR): sqnr={sqnr_m.item():.2f} dB below {threshold} dB"
 
 
-def _nvfp4_gs_swizzle_dim_k_dim_m_rht_sr_inputs(M, K):
-    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+def _nvfp4_gs_swizzle_dim_k_dim_m_rht_sr_inputs(M, K, dtype):
+    x = torch.randn(M, K, dtype=dtype, device="cuda")
     sign = torch.tensor([1, -1] * 8, device=x.device, dtype=x.dtype)
     rht = hadamard_rht_matrix(sign, x.device, x.dtype)
     outer_scale_k = nvfp4_gs_scale(x)  # global amax over |x|
@@ -1943,8 +1944,8 @@ def _nvfp4_gs_swizzle_dim_m_rht_sr_correctness(
     assert sqnr > threshold, f"nvfp4_dim_m_rht_sr: sqnr={sqnr.item():.2f} dB below {threshold} dB"
 
 
-def _nvfp4_gs_swizzle_dim_m_rht_sr_inputs(M, K):
-    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+def _nvfp4_gs_swizzle_dim_m_rht_sr_inputs(M, K, dtype):
+    x = torch.randn(M, K, dtype=dtype, device="cuda")
     sign = torch.tensor([1, -1] * 8, device=x.device, dtype=x.dtype)
     rht = hadamard_rht_matrix(sign, x.device, x.dtype)
     (x_t_rht,) = hadamard_rht_f(x.t().contiguous(), rht)
@@ -1968,8 +1969,8 @@ def nvfp4_gs_swizzle_dim_m_rht_nvidia_sr_f(
     return nvfp4_gs_swizzle_nvidia_sr_f(x_t_rht, outer_scale, key)
 
 
-def _nvfp4_gs_swizzle_dim_m_rht_nvidia_sr_inputs(M, K):
-    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+def _nvfp4_gs_swizzle_dim_m_rht_nvidia_sr_inputs(M, K, dtype):
+    x = torch.randn(M, K, dtype=dtype, device="cuda")
     sign = torch.tensor([1, -1] * 8, device=x.device, dtype=x.dtype)
     rht = hadamard_rht_matrix(sign, x.device, x.dtype)
     (x_t_rht,) = hadamard_rht_fp32_f(x.t().contiguous(), rht)
@@ -2003,8 +2004,8 @@ def nvfp4_gs_swizzle_dim_k_dim_m_rht_nvidia_sr_f(
     return qk, sk, qm, sm
 
 
-def _nvfp4_gs_swizzle_dim_k_dim_m_rht_nvidia_sr_inputs(M, K):
-    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+def _nvfp4_gs_swizzle_dim_k_dim_m_rht_nvidia_sr_inputs(M, K, dtype):
+    x = torch.randn(M, K, dtype=dtype, device="cuda")
     sign = torch.tensor([1, -1] * 8, device=x.device, dtype=x.dtype)
     rht = hadamard_rht_matrix(sign, x.device, x.dtype)
     outer_scale_k = nvfp4_gs_scale(x)
@@ -2095,8 +2096,8 @@ def _nvfp4_gs_correctness(
     assert sqnr > threshold, f"nvfp4_gs: sqnr={sqnr.item():.2f} dB below {threshold} dB"
 
 
-def _nvfp4_gs_inputs(M, K):
-    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+def _nvfp4_gs_inputs(M, K, dtype):
+    x = torch.randn(M, K, dtype=dtype, device="cuda")
     return (x, nvfp4_gs_scale(x).reciprocal())  # recipes take 1/S (MSLK/torchao global_scale)
 
 
@@ -2123,8 +2124,8 @@ def nvfp4_gs_per_token_scale(x):
     return row_amax / (F8E4M3_MAX * F4_E2M1_MAX)
 
 
-def _nvfp4_gs_per_token_inputs(M, K):
-    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+def _nvfp4_gs_per_token_inputs(M, K, dtype):
+    x = torch.randn(M, K, dtype=dtype, device="cuda")
     return (x, nvfp4_gs_per_token_scale(x).reciprocal())  # recipes take 1/S
 
 
@@ -2217,8 +2218,8 @@ def _nvfp4_blocked_outer_correctness(
     assert sqnr > threshold, f"nvfp4_blocked_outer: sqnr={sqnr.item():.2f} dB below {threshold} dB"
 
 
-def _nvfp4_blocked_outer_inputs(M, K):
-    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+def _nvfp4_blocked_outer_inputs(M, K, dtype):
+    x = torch.randn(M, K, dtype=dtype, device="cuda")
     return (x, nvfp4_blocked_outer_scale(x).reciprocal())  # recipes take 1/S
 
 
@@ -2256,8 +2257,8 @@ def _mxfp8_bias_correctness(
     assert scale.dtype == torch.float8_e8m0fnu
 
 
-def _mxfp8_bias_inputs(M, K):
-    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+def _mxfp8_bias_inputs(M, K, dtype):
+    x = torch.randn(M, K, dtype=dtype, device="cuda")
     return (x, torch.ones_like(x))  # bias is an arbitrary same-shape input; ones is fine
 
 
@@ -2288,7 +2289,7 @@ def _debug_relu_correctness(
 DebugReluGold = QuantCastSingleKernelGold(
     pt_ref_fn=debug_relu_f,
     correctness_fn=_debug_relu_correctness,
-    example_input_fn=lambda M, K: (torch.randn(M, K, dtype=torch.bfloat16, device="cuda"),),
+    example_input_fn=lambda M, K, dtype: (torch.randn(M, K, dtype=dtype, device="cuda"),),
     perf_description="debug: relu, elementwise, no quant",
 )
 
@@ -2363,8 +2364,8 @@ def _hadamard_rht_correctness(
     assert sqnr > threshold, f"hadamard_rht: roundtrip sqnr={sqnr.item():.2f} dB below {threshold} dB"
 
 
-def _hadamard_rht_inputs(M, K):
-    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+def _hadamard_rht_inputs(M, K, dtype):
+    x = torch.randn(M, K, dtype=dtype, device="cuda")
     # fixed +/-1 sign vector (deterministic); build the 16x16 RHT matrix pt_ref_fn transforms with.
     sign = torch.tensor([1, -1] * 8, device=x.device, dtype=x.dtype)
     return (x, hadamard_rht_matrix(sign, x.device, x.dtype))
@@ -2414,7 +2415,7 @@ def _sr_bf16_unbiased_correctness(
     assert abs(out.float().mean().item() - v) < 1e-3, "sr_bf16: mean not unbiased"
 
 
-def _sr_inputs(M, K):
+def _sr_inputs(M, K, _dtype):
     # SR asserts fp32 (not bf16) and its correctness_fn checks unbiasedness on a CONSTANT value
     # strictly between two bf16 grid points (spacing 2**-7 near 1.0).
     x = torch.full((M, K), 1.0 + 0.003, dtype=torch.float32, device="cuda")

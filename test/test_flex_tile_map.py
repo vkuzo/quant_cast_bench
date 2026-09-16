@@ -81,7 +81,7 @@ def test_flex_tile_map_ref_correctness(name, recipe):
     torch.manual_seed(0)
     # example_input_fn returns the full positional inputs (x, *aux); flex_tile_map takes x as the
     # tiled input and the rest as captured aux_inputs (their tiling given by recipe.aux_kinds).
-    inputs = recipe.example_input_fn(512, 512)
+    inputs = recipe.example_input_fn(512, 512, torch.bfloat16)
     x, aux = inputs[0], inputs[1:]
 
     outputs = flex_tile_map(
@@ -112,7 +112,7 @@ def test_flex_tile_map_backends_keep_numerics(name, recipe):
         pytest.skip(f"{name}: INDUCTOR-vs-MANUAL_TILE behavior is covered by a dedicated SR test")
 
     torch.manual_seed(0)
-    inputs = recipe.example_input_fn(512, 512)
+    inputs = recipe.example_input_fn(512, 512, torch.bfloat16)
     x, aux = inputs[0], inputs[1:]
 
     kw = dict(
@@ -280,7 +280,7 @@ def test_deepseek_dim_m_non_square():
     # non-square input exercises the grid-transpose (P != Q): a 384x512 input produces a
     # (512, 384) qdata / (512, 3) scale swapped-grid output; INDUCTOR == MANUAL_TILE bit-exact.
     torch.manual_seed(0)
-    (x,) = DEEPSEEK_1X128_DIM_M.example_input_fn(384, 512)
+    (x,) = DEEPSEEK_1X128_DIM_M.example_input_fn(384, 512, torch.bfloat16)
 
     kernel = DEEPSEEK_1X128_DIM_M.pt_ref_fn
     kw = dict(output_kinds=_DIM_M_SWAP, valid_tile_size_fn=DEEPSEEK_1X128_DIM_M.valid_tile_size_fn)
@@ -306,7 +306,7 @@ def test_valid_tile_size_fn_unsatisfiable_raises_then_pad_fixes():
     # 44-wide edge fails, and spanning 300 fails too) -> the tile-size search raises. Padding the
     # columns up to a multiple of 128 makes it satisfiable.
     torch.manual_seed(0)
-    (x,) = DEEPSEEK_1X128.example_input_fn(512, 300)
+    (x,) = DEEPSEEK_1X128.example_input_fn(512, 300, torch.bfloat16)
 
     with pytest.raises(ValueError):
         flex_tile_map(
@@ -330,7 +330,7 @@ def test_valid_tile_size_fn_unsatisfiable_raises_then_pad_fixes():
 def test_pad_ref_shapes_swizzle():
     # ragged 200x300 padded to (128,128)-multiple -> (256, 384); swizzle grid nrb=2, ncb=3.
     torch.manual_seed(0)
-    (x,) = MXFP8_SWIZZLE.example_input_fn(200, 300)
+    (x,) = MXFP8_SWIZZLE.example_input_fn(200, 300, torch.bfloat16)
     qdata, scale = flex_tile_map(
         x,
         MXFP8_SWIZZLE.pt_ref_fn,
@@ -354,7 +354,7 @@ def test_pad_backends_match(recipe, pad_to):
     # padded ragged input: MANUAL_TILE must match INDUCTOR bit-exact (padding happens before
     # tiling in both paths, so the two backends see the identical padded tensor).
     torch.manual_seed(0)
-    (x,) = recipe.example_input_fn(200, 300)
+    (x,) = recipe.example_input_fn(200, 300, torch.bfloat16)
     kernel = recipe.pt_ref_fn
     kw = dict(
         pad_input_to_multiple_of=pad_to,
@@ -370,7 +370,7 @@ def test_pad_backends_match(recipe, pad_to):
 def test_pad_matches_manual_pad():
     # padding inside the API == padding the input outside it, then running the recipe.
     torch.manual_seed(0)
-    (x,) = MXFP8.example_input_fn(200, 300)
+    (x,) = MXFP8.example_input_fn(200, 300, torch.bfloat16)
     kernel = MXFP8.pt_ref_fn
     qdata, scale = flex_tile_map(
         x,
@@ -389,7 +389,7 @@ def test_sr_bf16_global_tiling_invariant():
     # the tiling-invariant SR: keyed on GLOBAL element position, so INDUCTOR == MANUAL_TILE
     # bit-for-bit (keying on tile-local order instead would make MANUAL_TILE differ from INDUCTOR).
     torch.manual_seed(0)
-    inputs = SR_BF16_GLOBAL.example_input_fn(512, 512)  # (x, key); x is the fp32 constant
+    inputs = SR_BF16_GLOBAL.example_input_fn(512, 512, torch.bfloat16)  # (x, key); x is the fp32 constant
     x, aux = inputs[0], inputs[1:]
     v = x.flatten()[0].item()
 

@@ -163,7 +163,7 @@ def test_add_v2():
 
 def test_deepseek_1x128():
     recipe = _get_recipe("deepseek_1x128")
-    inputs = recipe.example_input_fn(2, 2048)
+    inputs = recipe.example_input_fn(2, 2048, torch.bfloat16)
     print(inputs[0].shape)
     print(inputs)
 
@@ -179,7 +179,7 @@ def test_mxfp8_swizzle():
     if "mxfp8_swizzle" in _REQUIRES_SM100 and torch.cuda.get_device_capability() != (10, 0):
         pytest.skip("mxfp8_swizzle emits Blackwell-only PTX; requires cuda capability 10.0")
     recipe = _get_recipe("mxfp8_swizzle")
-    inputs = recipe.example_input_fn(128, 512)
+    inputs = recipe.example_input_fn(128, 512, torch.bfloat16)
     print(inputs[0].shape)
     # print(inputs)
 
@@ -198,7 +198,7 @@ def test_mxfp8_swizzle_v2(M, K):
     if "mxfp8_swizzle_v2" in _REQUIRES_SM100 and torch.cuda.get_device_capability() != (10, 0):
         pytest.skip("mxfp8_swizzle_v2 emits Blackwell-only PTX; requires cuda capability 10.0")
     recipe = _get_recipe("mxfp8_swizzle_v2")
-    inputs = recipe.example_input_fn(M, K)
+    inputs = recipe.example_input_fn(M, K, torch.bfloat16)
     print(inputs[0].shape)
 
     outputs = recipe.cute_fn(*inputs)
@@ -210,7 +210,7 @@ def test_mxfp8_swizzle_v2(M, K):
 @pytest.mark.parametrize("M,K", [(32, 32), (96, 160), (128, 256), (1024, 1152)])
 def test_mxfp8_32x32_swizzle_v2(M, K):
     recipe = _get_recipe("mxfp8_32x32_swizzle_v2")
-    inputs = recipe.example_input_fn(M, K)
+    inputs = recipe.example_input_fn(M, K, torch.bfloat16)
     outputs = recipe.cute_fn(*inputs)
     ref_outputs = recipe.pt_ref_fn(*inputs)
     assert qdata_and_scale_equal(outputs[0], ref_outputs[0])
@@ -220,7 +220,7 @@ def test_mxfp8_32x32_swizzle_v2(M, K):
 @pytest.mark.parametrize("M,K", [(0, 32), (32, 0), (31, 32), (32, 31)])
 def test_mxfp8_32x32_swizzle_v2_rejects_invalid_shapes(M, K):
     recipe = _get_recipe("mxfp8_32x32_swizzle_v2")
-    inputs = recipe.example_input_fn(M, K)
+    inputs = recipe.example_input_fn(M, K, torch.bfloat16)
     with pytest.raises(AssertionError):
         recipe.cute_fn(*inputs)
 
@@ -229,7 +229,7 @@ def test_mxfp8_swizzle_sr_v2_folded_key_and_padding():
     if torch.cuda.get_device_capability() != (10, 0):
         pytest.skip("v2 stochastic rounding emits Blackwell-only PTX; requires cuda capability 10.0")
     recipe = _get_recipe("mxfp8_swizzle_sr_v2")
-    x, _ = recipe.example_input_fn(129, 160)
+    x, _ = recipe.example_input_fn(129, 160, torch.bfloat16)
     x[0, :8] = torch.tensor(
         [448.0, -448.0, 0.0, -0.0, 2.0**-9, -(2.0**-9), 2.0**-10, -(2.0**-10)],
         dtype=x.dtype,
@@ -294,7 +294,7 @@ def test_mxfp8_swizzle_sr_v2_dim_m_orientations(
     if torch.cuda.get_device_capability() != (10, 0):
         pytest.skip("v2 stochastic rounding emits Blackwell-only PTX; requires cuda capability 10.0")
     recipe = _get_recipe(recipe_name)
-    x, _ = recipe.example_input_fn(M, N)
+    x, _ = recipe.example_input_fn(M, N, torch.bfloat16)
     key = prng.fold_in(prng.key(7, device=x.device), 12345)
 
     outputs = mxfp8_swizzle_v2(
@@ -321,7 +321,7 @@ def test_mxfp8_swizzle_v2_quant_orientation(quant_orientation, reference):
         pytest.skip("mxfp8_swizzle_v2 emits Blackwell-only PTX; requires cuda capability 10.0")
     recipe = _get_recipe("mxfp8_swizzle_v2")
     reference_recipe = _get_recipe(reference)
-    inputs = recipe.example_input_fn(96, 160)
+    inputs = recipe.example_input_fn(96, 160, torch.bfloat16)
 
     outputs = recipe.cute_fn(*inputs, quant_orientation=quant_orientation)
     ref_outputs = reference_recipe.pt_ref_fn(*inputs)
@@ -349,7 +349,7 @@ def test_mxfp8_swizzle_v2_padding(M, K):
     if "mxfp8_swizzle_v2" in _REQUIRES_SM100 and torch.cuda.get_device_capability() != (10, 0):
         pytest.skip("mxfp8_swizzle_v2 emits Blackwell-only PTX; requires cuda capability 10.0")
     recipe = _get_recipe("mxfp8_swizzle_v2")
-    inputs = recipe.example_input_fn(M, K)
+    inputs = recipe.example_input_fn(M, K, torch.bfloat16)
 
     outputs = recipe.cute_fn(*inputs)
     ref_outputs = recipe.pt_ref_fn(*inputs)
@@ -370,7 +370,7 @@ def test_mxfp8_swizzle_v2_rejects_invalid_shapes(M, K):
     if "mxfp8_swizzle_v2" in _REQUIRES_SM100 and torch.cuda.get_device_capability() != (10, 0):
         pytest.skip("mxfp8_swizzle_v2 emits Blackwell-only PTX; requires cuda capability 10.0")
     recipe = _get_recipe("mxfp8_swizzle_v2")
-    inputs = recipe.example_input_fn(M, K)
+    inputs = recipe.example_input_fn(M, K, torch.bfloat16)
     with pytest.raises(AssertionError):
         recipe.cute_fn(*inputs)
 
@@ -381,7 +381,7 @@ def test_mxfp8_swizzle_v3():
     if "mxfp8_swizzle_v3" in _REQUIRES_SM100 and torch.cuda.get_device_capability() != (10, 0):
         pytest.skip("mxfp8_swizzle_v3 emits Blackwell-only PTX; requires cuda capability 10.0")
     recipe = _get_recipe("mxfp8_swizzle_v3")
-    inputs = recipe.example_input_fn(128, 512)
+    inputs = recipe.example_input_fn(128, 512, torch.bfloat16)
     print(inputs[0].shape)
 
     outputs = recipe.cute_fn(*inputs)
@@ -395,7 +395,7 @@ def test_mxfp8_swizzle_v4():
     if "mxfp8_swizzle_v4" in _REQUIRES_SM100 and torch.cuda.get_device_capability() != (10, 0):
         pytest.skip("mxfp8_swizzle_v4 emits Blackwell-only PTX; requires cuda capability 10.0")
     recipe = _get_recipe("mxfp8_swizzle_v4")
-    inputs = recipe.example_input_fn(128, 512)
+    inputs = recipe.example_input_fn(128, 512, torch.bfloat16)
     print(inputs[0].shape)
 
     outputs = recipe.cute_fn(*inputs)
@@ -408,7 +408,7 @@ def test_mxfp8_swizzle_sr_v4_folded_key_and_padding():
     if torch.cuda.get_device_capability() != (10, 0):
         pytest.skip("v4 stochastic rounding emits Blackwell-only PTX; requires cuda capability 10.0")
     recipe = _get_recipe("mxfp8_swizzle_sr_v4")
-    x, _ = recipe.example_input_fn(129, 160)
+    x, _ = recipe.example_input_fn(129, 160, torch.bfloat16)
     x[0, :8] = torch.tensor(
         [448.0, -448.0, 0.0, -0.0, 2.0**-9, -(2.0**-9), 2.0**-10, -(2.0**-10)],
         dtype=x.dtype,
@@ -435,7 +435,7 @@ def test_mxfp8_dim_m_swizzle(kernel):
     if kernel in _REQUIRES_SM100 and torch.cuda.get_device_capability() != (10, 0):
         pytest.skip(f"{kernel} emits Blackwell-only PTX; requires cuda capability 10.0")
     recipe = _get_recipe(kernel)
-    inputs = recipe.example_input_fn(128, 512)
+    inputs = recipe.example_input_fn(128, 512, torch.bfloat16)
     outputs = recipe.cute_fn(*inputs)
     ref_outputs = recipe.pt_ref_fn(*inputs)
     assert qdata_and_scale_equal(outputs[0], ref_outputs[0])
@@ -448,7 +448,7 @@ def test_mxfp8_dim_m_swizzle_padding(kernel):
         pytest.skip(f"{kernel} emits Blackwell-only PTX; requires cuda capability 10.0")
     M, N = 96, 144
     recipe = _get_recipe(kernel)
-    inputs = recipe.example_input_fn(M, N)
+    inputs = recipe.example_input_fn(M, N, torch.bfloat16)
     outputs = recipe.cute_fn(*inputs)
     ref_outputs = recipe.pt_ref_fn(*inputs)
     assert qdata_and_scale_equal(outputs[0], ref_outputs[0])
@@ -468,7 +468,7 @@ def test_mxfp8_dim_km_swizzle(kernel, M, N):
     if kernel in _REQUIRES_SM100 and torch.cuda.get_device_capability() != (10, 0):
         pytest.skip(f"{kernel} emits Blackwell-only PTX; requires cuda capability 10.0")
     recipe = _get_recipe(kernel)
-    inputs = recipe.example_input_fn(M, N)
+    inputs = recipe.example_input_fn(M, N, torch.bfloat16)
     outputs = recipe.cute_fn(*inputs)
     ref_outputs = recipe.pt_ref_fn(*inputs)
     assert len(outputs) == 4
@@ -495,7 +495,7 @@ def test_mxfp8_dim_km_swizzle_rejects_partial_group(kernel):
     if kernel in _REQUIRES_SM100 and torch.cuda.get_device_capability() != (10, 0):
         pytest.skip(f"{kernel} emits Blackwell-only PTX; requires cuda capability 10.0")
     recipe = _get_recipe(kernel)
-    inputs = recipe.example_input_fn(96, 144)
+    inputs = recipe.example_input_fn(96, 144, torch.bfloat16)
     with pytest.raises(AssertionError, match="K % 32"):
         recipe.cute_fn(*inputs)
 
@@ -516,7 +516,7 @@ def test_nvfp4_swizzle_cute_hand(kernel, M, K):
     if torch.cuda.get_device_capability() != (10, 0):
         pytest.skip(f"{kernel} emits Blackwell-only PTX; requires cuda capability 10.0")
     recipe = _get_recipe(kernel)
-    inputs = recipe.example_input_fn(M, K)
+    inputs = recipe.example_input_fn(M, K, torch.bfloat16)
     outputs = recipe.cute_fn(*inputs)
     ref_outputs = recipe.pt_ref_fn(*inputs)
     assert qdata_and_scale_equal(outputs[0], ref_outputs[0])
@@ -534,7 +534,7 @@ def test_nvfp4_swizzle_tma_rejects_unaligned_packed_stride():
     if torch.cuda.get_device_capability() != (10, 0):
         pytest.skip("nvfp4_swizzle_tma emits Blackwell-only PTX; requires cuda capability 10.0")
     recipe = _get_recipe("nvfp4_swizzle_tma")
-    inputs = recipe.example_input_fn(32, 16)
+    inputs = recipe.example_input_fn(32, 16, torch.bfloat16)
     with pytest.raises(AssertionError, match="K % 32"):
         recipe.cute_fn(*inputs)
 
@@ -587,7 +587,7 @@ def test_nvfp4_dim_m_tma_padding(kernel, M, K):
             stochastic=kernel == "nvfp4_dim_m_swizzle_rht_sr_tma",
         )
     else:
-        cute_inputs = gold_inputs = recipe.example_input_fn(M, K)
+        cute_inputs = gold_inputs = recipe.example_input_fn(M, K, torch.bfloat16)
     outputs = recipe.cute_fn(*cute_inputs)
     references = recipe.pt_ref_fn(*gold_inputs)
     for output, reference in zip(outputs, references):
@@ -646,7 +646,7 @@ def test_mxfp8_swizzle_v4_padding(M, K):
     if "mxfp8_swizzle_v4" in _REQUIRES_SM100 and torch.cuda.get_device_capability() != (10, 0):
         pytest.skip("mxfp8_swizzle_v4 emits Blackwell-only PTX; requires cuda capability 10.0")
     recipe = _get_recipe("mxfp8_swizzle_v4")
-    inputs = recipe.example_input_fn(M, K)
+    inputs = recipe.example_input_fn(M, K, torch.bfloat16)
 
     outputs = recipe.cute_fn(*inputs)
     ref_outputs = recipe.pt_ref_fn(*inputs)
@@ -667,7 +667,7 @@ def test_mxfp8_swizzle_v4_rejects_invalid_shapes(M, K):
     if "mxfp8_swizzle_v4" in _REQUIRES_SM100 and torch.cuda.get_device_capability() != (10, 0):
         pytest.skip("mxfp8_swizzle_v4 emits Blackwell-only PTX; requires cuda capability 10.0")
     recipe = _get_recipe("mxfp8_swizzle_v4")
-    inputs = recipe.example_input_fn(M, K)
+    inputs = recipe.example_input_fn(M, K, torch.bfloat16)
     with pytest.raises(AssertionError):
         recipe.cute_fn(*inputs)
 
@@ -678,7 +678,7 @@ def test_mxfp8_swizzle_v5():
     if "mxfp8_swizzle_v5" in _REQUIRES_SM100 and torch.cuda.get_device_capability() != (10, 0):
         pytest.skip("mxfp8_swizzle_v5 emits Blackwell-only PTX; requires cuda capability 10.0")
     recipe = _get_recipe("mxfp8_swizzle_v5")
-    inputs = recipe.example_input_fn(128, 512)
+    inputs = recipe.example_input_fn(128, 512, torch.bfloat16)
     print(inputs[0].shape)
 
     outputs = recipe.cute_fn(*inputs)
@@ -692,7 +692,7 @@ def test_mxfp8_swizzle_v5_padding(M, K):
     if "mxfp8_swizzle_v5" in _REQUIRES_SM100 and torch.cuda.get_device_capability() != (10, 0):
         pytest.skip("mxfp8_swizzle_v5 emits Blackwell-only PTX; requires cuda capability 10.0")
     recipe = _get_recipe("mxfp8_swizzle_v5")
-    inputs = recipe.example_input_fn(M, K)
+    inputs = recipe.example_input_fn(M, K, torch.bfloat16)
 
     outputs = recipe.cute_fn(*inputs)
     ref_outputs = recipe.pt_ref_fn(*inputs)
@@ -713,7 +713,7 @@ def test_mxfp8_swizzle_v5_rejects_invalid_shapes(M, K):
     if "mxfp8_swizzle_v5" in _REQUIRES_SM100 and torch.cuda.get_device_capability() != (10, 0):
         pytest.skip("mxfp8_swizzle_v5 emits Blackwell-only PTX; requires cuda capability 10.0")
     recipe = _get_recipe("mxfp8_swizzle_v5")
-    inputs = recipe.example_input_fn(M, K)
+    inputs = recipe.example_input_fn(M, K, torch.bfloat16)
     with pytest.raises(AssertionError):
         recipe.cute_fn(*inputs)
 
@@ -742,7 +742,7 @@ def test_transpose_v1():
 
 def test_deepseek_1x128_dim_m():
     recipe = _get_recipe("deepseek_1x128_dim_m")
-    inputs = recipe.example_input_fn(256, 512)
+    inputs = recipe.example_input_fn(256, 512, torch.bfloat16)
     print(inputs[0].shape)
     print(inputs)
 
@@ -757,7 +757,7 @@ def test_deepseek_1x128_dim_m():
 
 def test_deepseek_1x128_dim_m_v2():
     recipe = _get_recipe("deepseek_1x128_dim_m_v2")
-    inputs = recipe.example_input_fn(256, 512)
+    inputs = recipe.example_input_fn(256, 512, torch.bfloat16)
     print(inputs[0].shape)
     print(inputs)
 
@@ -797,7 +797,7 @@ def test_cute_hand_matches_reference(name, recipe):
             stochastic=name == "nvfp4_dim_m_swizzle_rht_sr_tma",
         )
     else:
-        cute_inputs = gold_inputs = recipe.example_input_fn(512, 512)
+        cute_inputs = gold_inputs = recipe.example_input_fn(512, 512, torch.bfloat16)
 
     tile_kwargs = {
         "global_row": 0,

@@ -55,7 +55,7 @@ def test_ref_correctness(name, gold):
     # position kwargs a INDUCTOR-style whole-tensor call would -- recipes that ignore them accept
     # **kwargs; sr_bf16_global needs them for its per-element global-position dither.
     torch.manual_seed(0)
-    inputs = gold.example_input_fn(512, 512)
+    inputs = gold.example_input_fn(512, 512, torch.bfloat16)
 
     outputs = gold.pt_ref_fn(*inputs, global_row=0, global_col=0, num_col=inputs[0].shape[1])
     gold.correctness_fn(inputs, outputs)  # raises AssertionError on failure
