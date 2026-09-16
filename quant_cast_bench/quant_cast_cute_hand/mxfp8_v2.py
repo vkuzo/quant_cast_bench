@@ -52,7 +52,7 @@ _MODE_DIM_M = 1
 _MODE_DIM_KM = 2
 
 
-def _mxfp8_swizzle_v2_tile_n(M, K):
+def _mxfp8_swizzle_v2_tile_n(M: int, K: int) -> int:
     """Choose the measured B200 K tile from the padded 128x128 CTA count."""
     num_128_tiles = _ceil_div(M, _DIM_K_TILE_M_SIZE_128) * _ceil_div(K, _DIM_K_MAX_TILE_K_SIZE_128)
     if num_128_tiles <= 64:
@@ -72,8 +72,12 @@ def _mxfp8_swizzle_v2_tile_n(M, K):
 
 @cute.jit
 def _mxfp8_v2_quantize_stochastic_x32(
-    values, rcp, counter_start, k0, k1
-):
+    values: cute.TensorSSA,
+    rcp: cutlass.Float32,
+    counter_start: cutlass.Uint64,
+    k0: cutlass.Uint32,
+    k1: cutlass.Uint32,
+) -> cute.TensorSSA:
     """Quantize one contiguous 32-value output run with two Philox counters."""
     scaled = values * rcp
     qwords = cute.make_rmem_tensor(cute.make_layout(8), cutlass.Uint32)
@@ -490,10 +494,10 @@ def mxfp8_swizzle_v2_kernel(
 
 @cute.jit
 def mxfp8_swizzle_v2_dim_k_jit(
-    mInput,
-    mOutput,
-    mScale,
-    mSeed,
+    mInput: cute.Tensor,
+    mOutput: cute.Tensor,
+    mScale: cute.Tensor,
+    mSeed: cute.Tensor,
     M: cutlass.Int32,
     K: cutlass.Int32,
     tile_m_size: cutlass.Constexpr,
@@ -502,7 +506,7 @@ def mxfp8_swizzle_v2_dim_k_jit(
     ragged: cutlass.Constexpr,
     stochastic: cutlass.Constexpr,
     square_scaling: cutlass.Constexpr,
-):
+) -> None:
     padded_M = _ceil_div(M, _DIM_K_TILE_M_SIZE_128) * _DIM_K_TILE_M_SIZE_128
     padded_K = _ceil_div(K, tile_k_size) * tile_k_size
     bpr = tile_k_size // 32

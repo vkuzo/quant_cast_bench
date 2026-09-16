@@ -7,12 +7,21 @@ from cutlass._mlir.dialects import arith, llvm, nvvm, vector
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 
-def _ceil_div(num, den):
+def _ceil_div(
+    num: int | cutlass.Int32,
+    den: int | cutlass.Int32 | cutlass.Constexpr,
+) -> int | cutlass.Int32:
     return (num + den - 1) // den
 
 
 @dsl_user_op
-def view_as(x, dtype, *, loc=None, ip=None):
+def view_as(
+    x: cutlass.Numeric,
+    dtype: type[cutlass.Numeric],
+    *,
+    loc: ir.Location | None = None,
+    ip: ir.InsertionPoint | None = None,
+) -> cutlass.Numeric:
     """Bitcast one scalar to another scalar of equal width."""
     assert type(x).width == dtype.width
     # bitcast wants a signed IR type even for unsigned CUTLASS types.
@@ -27,7 +36,13 @@ def view_as(x, dtype, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def unpack(x, dtype, *, loc=None, ip=None):
+def unpack(
+    x: cutlass.Numeric,
+    dtype: type[cutlass.Numeric],
+    *,
+    loc: ir.Location | None = None,
+    ip: ir.InsertionPoint | None = None,
+) -> tuple[cutlass.Numeric, ...]:
     """Unpack an integer carrier into a tuple of scalar values."""
     x = cute.typing.as_numeric(x)
     carrier_dtype = type(x)
@@ -61,7 +76,12 @@ def unpack(x, dtype, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def pack(*values, carrier=None, loc=None, ip=None):
+def pack(
+    *values: cutlass.Numeric,
+    carrier: type[cutlass.Numeric] | None = None,
+    loc: ir.Location | None = None,
+    ip: ir.InsertionPoint | None = None,
+) -> cutlass.Numeric:
     """Pack same-typed scalar values into an integer carrier."""
     assert len(values) > 0
     lane_dtype = type(values[0])
@@ -91,7 +111,13 @@ def pack(*values, carrier=None, loc=None, ip=None):
 
 
 @dsl_user_op
-def _cvt_f32_to_ue8m0(x, *, rounding_mode, loc=None, ip=None):
+def _cvt_f32_to_ue8m0(
+    x: cutlass.Float32,
+    *,
+    rounding_mode: nvvm.FPRoundingMode,
+    loc: ir.Location | None = None,
+    ip: ir.InsertionPoint | None = None,
+) -> cutlass.Float8E8M0FNU:
     """Convert x to a single E8M0 value without saturation (high input 0.0)."""
     packed = nvvm.cvt_packfloat_f32(
         cutlass.Float32(0.0).ir_value(loc=loc, ip=ip),
@@ -112,7 +138,12 @@ def _cvt_f32_to_ue8m0(x, *, rounding_mode, loc=None, ip=None):
 
 
 @dsl_user_op
-def _cvt_ue8m0_to_f32(x, *, loc=None, ip=None):
+def _cvt_ue8m0_to_f32(
+    x: cutlass.Float8E8M0FNU,
+    *,
+    loc: ir.Location | None = None,
+    ip: ir.InsertionPoint | None = None,
+) -> cutlass.Float32:
     """Convert one E8M0 value to FP32 through the supported BF16 path."""
     x_e8m0x2 = pack(x, cutlass.Float8E8M0FNU(0), loc=loc, ip=ip)
     x_u32 = llvm.zext(
@@ -138,7 +169,9 @@ def _cvt_ue8m0_to_f32(x, *, loc=None, ip=None):
 
 
 @cute.jit
-def _reciprocal_scale(scale_e8m0):
+def _reciprocal_scale(
+    scale_e8m0: cutlass.Float8E8M0FNU,
+) -> cutlass.Float32:
     scale_biased = view_as(scale_e8m0, cutlass.Uint8)
     reciprocal_biased = cutlass.Uint8(254) - scale_biased
     return _cvt_ue8m0_to_f32(
@@ -147,7 +180,7 @@ def _reciprocal_scale(scale_e8m0):
 
 
 @cute.jit
-def _e8m0(amax):
+def _e8m0(amax: cutlass.Float32) -> tuple[cutlass.Float32, cutlass.Uint8]:
     """Return the reciprocal FP32 scale and RCEIL E8M0 scale byte for an amax."""
     descale = amax * cutlass.Float32(1.0 / 448.0)
     scale_e8m0 = _cvt_f32_to_ue8m0(
@@ -159,8 +192,15 @@ def _e8m0(amax):
 
 @dsl_user_op
 def _cvt_rs_satfinite_e4m3x4_f32(
-    v0, v1, v2, v3, rbits, *, loc=None, ip=None
-):
+    v0: cutlass.Float32,
+    v1: cutlass.Float32,
+    v2: cutlass.Float32,
+    v3: cutlass.Float32,
+    rbits: cutlass.Uint32,
+    *,
+    loc: ir.Location | None = None,
+    ip: ir.InsertionPoint | None = None,
+) -> cutlass.Uint32:
     """Stochastically round four FP32 values to four packed E4M3 bytes."""
     # PTX places its first source in the high byte. Reverse the sources so the little-endian byte
     # view is [e4m3(v0), e4m3(v1), e4m3(v2), e4m3(v3)].
@@ -188,10 +228,10 @@ def _cvt_rs_satfinite_e4m3x4_f32(
 def _e8m0_scale_store_as_uint(
     mScaleLogical: cute.Tensor,
     rScale: cute.Tensor,
-    row,
-    col,
+    row: cutlass.Int32,
+    col: cutlass.Int32,
     count: cutlass.Constexpr,
-):
+) -> None:
     """Store adjacent E8M0 bytes with one naturally sized integer write.
 
     Args:
