@@ -112,17 +112,17 @@ def _mxfp8_v2_quantize_stochastic_x32(
 def mxfp8_swizzle_v2_kernel(
     input_tma_atom: cute.CopyAtom,
     input_tma_tensor: cute.Tensor,
-    output_k_tma_atom: cute.CopyAtom,
-    output_k_tma_tensor: cute.Tensor,
-    output_m_tma_atom: cute.CopyAtom,
-    output_m_tma_tensor: cute.Tensor,
-    mScaleKLogical: cute.Tensor,
-    mScaleMLogical: cute.Tensor,
+    output_k_tma_atom: cute.CopyAtom | None,
+    output_k_tma_tensor: cute.Tensor | None,
+    output_m_tma_atom: cute.CopyAtom | None,
+    output_m_tma_tensor: cute.Tensor | None,
+    mScaleKLogical: cute.Tensor | None,
+    mScaleMLogical: cute.Tensor | None,
     mSeed: cute.Tensor,
     input_smem_layout: cute.ComposedLayout,
-    output_k_smem_layout: cute.ComposedLayout,
-    output_m_smem_layout: cute.ComposedLayout,
-    data_k_tv_layout: cute.Layout,
+    output_k_smem_layout: cute.ComposedLayout | None,
+    output_m_smem_layout: cute.ComposedLayout | None,
+    data_k_tv_layout: cute.Layout | None,
     tile_m_size: cutlass.Constexpr,
     tile_k_size: cutlass.Constexpr,
     M: cutlass.Int32,
@@ -131,7 +131,39 @@ def mxfp8_swizzle_v2_kernel(
     quant_orientation: cutlass.Constexpr,
     is_stochastic_qdata_rounding: cutlass.Constexpr,
     is_square_scaling: cutlass.Constexpr,
-):
+) -> None:
+    if cutlass.const_expr(quant_orientation == _QUANT_ORIENTATION_DIM_K):
+        assert output_k_tma_atom is not None
+        assert output_k_tma_tensor is not None
+        assert mScaleKLogical is not None
+        assert output_k_smem_layout is not None
+        assert data_k_tv_layout is not None
+        assert output_m_tma_atom is None
+        assert output_m_tma_tensor is None
+        assert mScaleMLogical is None
+        assert output_m_smem_layout is None
+    elif cutlass.const_expr(quant_orientation == _QUANT_ORIENTATION_DIM_M):
+        assert output_k_tma_atom is None
+        assert output_k_tma_tensor is None
+        assert mScaleKLogical is None
+        assert output_k_smem_layout is None
+        assert data_k_tv_layout is None
+        assert output_m_tma_atom is not None
+        assert output_m_tma_tensor is not None
+        assert mScaleMLogical is not None
+        assert output_m_smem_layout is not None
+    else:
+        assert quant_orientation == _QUANT_ORIENTATION_DIM_KM
+        assert output_k_tma_atom is not None
+        assert output_k_tma_tensor is not None
+        assert mScaleKLogical is not None
+        assert output_k_smem_layout is not None
+        assert data_k_tv_layout is not None
+        assert output_m_tma_atom is not None
+        assert output_m_tma_tensor is not None
+        assert mScaleMLogical is not None
+        assert output_m_smem_layout is not None
+
     tidx, _, _ = cute.arch.thread_idx()
     tile_k_idx, tile_m_idx, _ = cute.arch.block_idx()
     warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -573,14 +605,14 @@ def mxfp8_swizzle_v2_dim_k_jit(
         input_tma_tensor,
         output_tma_atom,
         output_tma_tensor,
-        output_tma_atom,
-        output_tma_tensor,
+        None,
+        None,
         mScaleLogical,
-        mScaleLogical,
+        None,
         mSeed,
         input_smem_layout,
         output_smem_layout,
-        output_smem_layout,
+        None,
         data_tv_layout,
         tile_m_size,
         tile_k_size,
@@ -693,10 +725,10 @@ def _mxfp8_swizzle_v2_impl(
                 .mark_compact_shape_dynamic(mode=0, divisibility=512)
             )
         else:
-            nrb_k, ncb_k = nrb_m, ncb_m
-            output_k, scale_k = output_m, scale_m
-            mOutputK = mOutputM
-            mScaleK = mScaleM
+            output_k = None
+            scale_k = None
+            mOutputK = None
+            mScaleK = None
         # The RTNE specialization never reads mSeed, so reuse mScaleM as a dummy argument.
         mSeed = from_dlpack(key.reshape(-1).view(torch.int64)) if is_stochastic_qdata_rounding else mScaleM
 
@@ -860,8 +892,8 @@ def mxfp8_swizzle_v2_dim_m_or_km_jit(
     mInput: cute.Tensor,
     mOutputM: cute.Tensor,
     mScaleM: cute.Tensor,
-    mOutputK: cute.Tensor,
-    mScaleK: cute.Tensor,
+    mOutputK: cute.Tensor | None,
+    mScaleK: cute.Tensor | None,
     mSeed: cute.Tensor,
     M: cutlass.Int32,
     K: cutlass.Int32,
@@ -871,7 +903,15 @@ def mxfp8_swizzle_v2_dim_m_or_km_jit(
     needs_boundary_masking: cutlass.Constexpr,
     quant_orientation: cutlass.Constexpr,
     is_stochastic_qdata_rounding: cutlass.Constexpr,
-):
+) -> None:
+    if cutlass.const_expr(quant_orientation == _QUANT_ORIENTATION_DIM_KM):
+        assert mOutputK is not None
+        assert mScaleK is not None
+    else:
+        assert quant_orientation == _QUANT_ORIENTATION_DIM_M
+        assert mOutputK is None
+        assert mScaleK is None
+
     padded_M = _ceil_div(M, 128) * 128
     padded_K = _ceil_div(K, tile_k_size) * tile_k_size
     if cutlass.const_expr(quant_orientation == _QUANT_ORIENTATION_DIM_KM):
@@ -927,10 +967,9 @@ def mxfp8_swizzle_v2_dim_m_or_km_jit(
             (tile_m_size, tile_k_size),
         )
     else:
-        # These arguments disappear with the constexpr dim-K branch.
-        output_k_smem_layout = output_m_smem_layout
-        output_k_tma_atom = output_m_tma_atom
-        output_k_tma_tensor = output_m_tma_tensor
+        output_k_smem_layout = None
+        output_k_tma_atom = None
+        output_k_tma_tensor = None
 
     nrb_m = _ceil_div(K, 128)
     ncb_m = _ceil_div(M, 128)
@@ -939,28 +978,32 @@ def mxfp8_swizzle_v2_dim_m_or_km_jit(
         stride=((16, 4, ncb_m * 32 * 16), (1, 32 * 16)),
     )
     mScaleMLogical = cute.make_tensor(mScaleM.iterator, scale_m_layout)
-    nrb_k = _ceil_div(M, 128)
-    ncb_k = _ceil_div(K, 128)
-    scale_k_layout = cute.make_layout(
-        ((32, 4, nrb_k), (4, ncb_k)),
-        stride=((16, 4, ncb_k * 32 * 16), (1, 32 * 16)),
-    )
-    mScaleKLogical = cute.make_tensor(mScaleK.iterator, scale_k_layout)
+    if cutlass.const_expr(quant_orientation == _QUANT_ORIENTATION_DIM_KM):
+        nrb_k = _ceil_div(M, 128)
+        ncb_k = _ceil_div(K, 128)
+        scale_k_layout = cute.make_layout(
+            ((32, 4, nrb_k), (4, ncb_k)),
+            stride=((16, 4, ncb_k * 32 * 16), (1, 32 * 16)),
+        )
+        mScaleKLogical = cute.make_tensor(mScaleK.iterator, scale_k_layout)
 
-    bpr = tile_k_size // 32
-    if cutlass.const_expr(tile_m_size == _DIM_K_TILE_M_SIZE_128):
-        data_k_tv_layout = cute.make_layout(
-            ((tile_m_size,), (32, bpr)),
-            stride=((1,), (tile_m_size, tile_m_size * 32)),
-        )
+        bpr = tile_k_size // 32
+        if cutlass.const_expr(tile_m_size == _DIM_K_TILE_M_SIZE_128):
+            data_k_tv_layout = cute.make_layout(
+                ((tile_m_size,), (32, bpr)),
+                stride=((1,), (tile_m_size, tile_m_size * 32)),
+            )
+        else:
+            # Flatten (1x32 group within a row, row within a 32-row stage) over the 128 threads,
+            # then advance the value iteration through successive 32-row stages.
+            row_blocks = tile_m_size // 32
+            data_k_tv_layout = cute.make_layout(
+                ((bpr, 32), (32, row_blocks)),
+                stride=((tile_m_size * 32, 1), (tile_m_size, 32)),
+            )
     else:
-        # Flatten (1x32 group within a row, row within a 32-row stage) over the 128 threads,
-        # then advance the value iteration through successive 32-row stages.
-        row_blocks = tile_m_size // 32
-        data_k_tv_layout = cute.make_layout(
-            ((bpr, 32), (32, row_blocks)),
-            stride=((tile_m_size * 32, 1), (tile_m_size, 32)),
-        )
+        mScaleKLogical = None
+        data_k_tv_layout = None
 
     kernel = mxfp8_swizzle_v2_kernel(
         input_tma_atom,
