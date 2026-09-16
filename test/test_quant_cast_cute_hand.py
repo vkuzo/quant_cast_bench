@@ -259,13 +259,13 @@ def test_mxfp8_swizzle_sr_v2_folded_key_and_padding():
     assert qdata_and_scale_equal(outputs[1], ref_outputs[1])
 
 
-def test_mxfp8_swizzle_sr_v2_int64_indexing():
+def test_mxfp8_swizzle_sr_v2_mixed_width_indexing():
     if torch.cuda.get_device_capability() != (10, 0):
         pytest.skip("v2 stochastic rounding emits Blackwell-only PTX; requires cuda capability 10.0")
 
     # This is the first square shape divisible by 32 whose flattened element count exceeds the
-    # signed-int32 range. Pick a 1x32 group starting exactly at flat index 2**31 so an int32
-    # intermediate would wrap before being converted to the Philox counter.
+    # signed-int32 range. Logical coordinates stay int32, but the flattening multiply must widen
+    # before computing the Philox counter. Pick a 1x32 group starting exactly at flat index 2**31.
     M = K = 46368
     flat_start = 2**31
     row, col = divmod(flat_start, K)
@@ -389,6 +389,14 @@ def test_mxfp8_swizzle_v2_rejects_invalid_shapes(M, K):
     inputs = recipe.example_input_fn(M, K, torch.bfloat16)
     with pytest.raises(AssertionError):
         recipe.cute_fn(*inputs)
+
+
+def test_mxfp8_swizzle_v2_rejects_grid_y_overflow():
+    # The largest legal CUDA grid.y is 65,535. Dim-M pads M to a complete 128-row
+    # scale-layout block, making this 65,538 CTAs with its selected 64-row tile.
+    x = torch.empty((4_194_368, 16), dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(ValueError, match="launch grid exceeds CUDA limits"):
+        mxfp8_swizzle_v2(x, quant_orientation="dim_m")
 
 
 def test_mxfp8_swizzle_v3():
