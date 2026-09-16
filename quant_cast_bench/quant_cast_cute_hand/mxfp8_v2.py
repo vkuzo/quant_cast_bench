@@ -495,7 +495,7 @@ def mxfp8_swizzle_v2_dim_k_jit(
     K: cutlass.Int32,
     tile_m_size: cutlass.Constexpr,
     tile_k_size: cutlass.Constexpr,
-    cluster_n: cutlass.Constexpr,
+    cluster_k: cutlass.Constexpr,
     ragged: cutlass.Constexpr,
     stochastic: cutlass.Constexpr,
     square_scaling: cutlass.Constexpr,
@@ -588,7 +588,7 @@ def mxfp8_swizzle_v2_dim_k_jit(
         # further preserves that locality in hardware scheduling.
         grid=(padded_N // tile_k_size, padded_M // tile_m_size, 1),
         block=(_MXS_THREADS, 1, 1),
-        cluster=(cluster_n, 1, 1),
+        cluster=(cluster_k, 1, 1),
     )
 
 
@@ -637,7 +637,7 @@ def _mxfp8_swizzle_v2_impl(
         padded_N = _ceil_div(K, tile_k_size) * tile_k_size
         grid_n = padded_N // tile_k_size
         grid_m = padded_M // tile_m_size
-        cluster_n = 1 if mode == "dim_km" else (
+        cluster_k = 1 if mode == "dim_km" else (
             next(c for c in (16, 8, 4, 2, 1) if c <= grid_n and grid_n % c == 0)
             if grid_m * grid_n <= 512
             else 1
@@ -699,7 +699,7 @@ def _mxfp8_swizzle_v2_impl(
         ragged = M != ncb_m * 128 or K != nrb_m * 128
         fn = _compiled(
             (
-                "mxfp8_swizzle_v2", mode, tile_m_size, tile_k_size, cluster_n, ragged,
+                "mxfp8_swizzle_v2", mode, tile_m_size, tile_k_size, cluster_k, ragged,
                 rounding_mode,
             ),
             mxfp8_swizzle_v2_dim_m_or_km_jit,
@@ -713,7 +713,7 @@ def _mxfp8_swizzle_v2_impl(
             K,
             tile_m_size,
             tile_k_size,
-            cluster_n,
+            cluster_k,
             ragged,
             mode_id,
             stochastic,
@@ -743,7 +743,7 @@ def _mxfp8_swizzle_v2_impl(
     grid_n = _ceil_div(K, tile_k_size)
     # RTNE benefits from K-oriented clustering and its locality. Philox supplies enough arithmetic
     # latency hiding that independent CTAs are faster than forcing the same clustered schedule.
-    cluster_n = (
+    cluster_k = (
         # Square scaling has enough independent CTAs at small/medium sizes that clustering only
         # constrains scheduling; large shapes retain v2's K-locality-oriented clusters.
         1 if stochastic or (square_scaling and M * K <= 4096 * 4096)
@@ -768,7 +768,7 @@ def _mxfp8_swizzle_v2_impl(
     ragged = M != nrb * 128 or K != ncb * 128
     fn = _compiled(
         (
-            "mxfp8_swizzle_v2", "dim_k", tile_m_size, tile_k_size, cluster_n, ragged,
+            "mxfp8_swizzle_v2", "dim_k", tile_m_size, tile_k_size, cluster_k, ragged,
             rounding_mode, square_scaling,
         ),
         mxfp8_swizzle_v2_dim_k_jit,
@@ -780,7 +780,7 @@ def _mxfp8_swizzle_v2_impl(
         K,
         tile_m_size,
         tile_k_size,
-        cluster_n,
+        cluster_k,
         ragged,
         stochastic,
         square_scaling,
@@ -860,7 +860,7 @@ def mxfp8_swizzle_v2_dim_m_or_km_jit(
     K: cutlass.Int32,
     tile_m_size: cutlass.Constexpr,
     tile_k_size: cutlass.Constexpr,
-    cluster_n: cutlass.Constexpr,
+    cluster_k: cutlass.Constexpr,
     ragged: cutlass.Constexpr,
     mode: cutlass.Constexpr,
     stochastic: cutlass.Constexpr,
@@ -991,7 +991,7 @@ def mxfp8_swizzle_v2_dim_m_or_km_jit(
         kernel.launch(
             grid=grid,
             block=block,
-            cluster=(cluster_n, 1, 1),
+            cluster=(cluster_k, 1, 1),
         )
 
 
