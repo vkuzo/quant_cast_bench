@@ -127,7 +127,7 @@ def mxfp8_swizzle_v2_kernel(
     tile_k_size: cutlass.Constexpr,
     M: cutlass.Int32,
     K: cutlass.Int32,
-    ragged: cutlass.Constexpr,
+    needs_boundary_masking: cutlass.Constexpr,
     mode: cutlass.Constexpr,
     stochastic: cutlass.Constexpr,
     square_scaling: cutlass.Constexpr,
@@ -137,7 +137,7 @@ def mxfp8_swizzle_v2_kernel(
     warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     do_dim_k = mode != _MODE_DIM_M
     do_dim_m = mode != _MODE_DIM_K
-    if cutlass.const_expr(not ragged):
+    if cutlass.const_expr(not needs_boundary_masking):
         M = cute.assume(M, divby=128)
         K = cute.assume(K, divby=128)
     elif cutlass.const_expr(mode == _MODE_DIM_K):
@@ -299,7 +299,7 @@ def mxfp8_swizzle_v2_kernel(
                 )
             rScaleM[row_block] = biased_m.to(rScaleM.element_type)
 
-        use_full_tile_m = cutlass.const_expr(not ragged) or (
+        use_full_tile_m = cutlass.const_expr(not needs_boundary_masking) or (
             ((tile_m_idx + 1) * tile_m_size <= M) & ((tile_k_idx + 1) * tile_k_size <= K)
         )
         if use_full_tile_m:
@@ -427,7 +427,7 @@ def mxfp8_swizzle_v2_kernel(
 
     # Let the qdata TMA store overlap the much smaller direct scale write.
     if cutlass.const_expr(do_dim_k):
-        use_full_tile_k = cutlass.const_expr(not ragged) or (
+        use_full_tile_k = cutlass.const_expr(not needs_boundary_masking) or (
             ((tile_m_idx + 1) * tile_m_size <= M) & ((tile_k_idx + 1) * tile_k_size <= K)
         )
         if cutlass.const_expr(row_owned_k):
@@ -456,7 +456,7 @@ def mxfp8_swizzle_v2_kernel(
                     iters,
                 )
 
-            if cutlass.const_expr(ragged):
+            if cutlass.const_expr(needs_boundary_masking):
                 ncb_k = _ceil_div(K, 128)
                 grid_n = _ceil_div(K, tile_k_size)
                 covered_groups = grid_n * bpr
@@ -503,7 +503,7 @@ def mxfp8_swizzle_v2_dim_k_jit(
     tile_m_size: cutlass.Constexpr,
     tile_k_size: cutlass.Constexpr,
     cluster_k: cutlass.Constexpr,
-    ragged: cutlass.Constexpr,
+    needs_boundary_masking: cutlass.Constexpr,
     stochastic: cutlass.Constexpr,
     square_scaling: cutlass.Constexpr,
 ) -> None:
@@ -586,7 +586,7 @@ def mxfp8_swizzle_v2_dim_k_jit(
         tile_k_size,
         M,
         K,
-        ragged,
+        needs_boundary_masking,
         _MODE_DIM_K,
         stochastic,
         square_scaling,
@@ -703,10 +703,10 @@ def _mxfp8_swizzle_v2_impl(
         mode_id = (
             _MODE_DIM_KM if mode == "dim_km" else _MODE_DIM_M
         )
-        ragged = M != ncb_m * 128 or K != nrb_m * 128
+        needs_boundary_masking = M != ncb_m * 128 or K != nrb_m * 128
         fn = _compiled(
             (
-                "mxfp8_swizzle_v2", mode, tile_m_size, tile_k_size, cluster_k, ragged,
+                "mxfp8_swizzle_v2", mode, tile_m_size, tile_k_size, cluster_k, needs_boundary_masking,
                 rounding_mode,
             ),
             mxfp8_swizzle_v2_dim_m_or_km_jit,
@@ -721,7 +721,7 @@ def _mxfp8_swizzle_v2_impl(
             tile_m_size,
             tile_k_size,
             cluster_k,
-            ragged,
+            needs_boundary_masking,
             mode_id,
             stochastic,
         )
@@ -772,10 +772,10 @@ def _mxfp8_swizzle_v2_impl(
     )
     # The RTNE specialization never reads mSeed, so reuse mScale as a dummy argument on that path.
     mSeed = from_dlpack(key.reshape(-1).view(torch.int64)) if stochastic else mScale
-    ragged = M != nrb * 128 or K != ncb * 128
+    needs_boundary_masking = M != nrb * 128 or K != ncb * 128
     fn = _compiled(
         (
-            "mxfp8_swizzle_v2", "dim_k", tile_m_size, tile_k_size, cluster_k, ragged,
+            "mxfp8_swizzle_v2", "dim_k", tile_m_size, tile_k_size, cluster_k, needs_boundary_masking,
             rounding_mode, square_scaling,
         ),
         mxfp8_swizzle_v2_dim_k_jit,
@@ -788,7 +788,7 @@ def _mxfp8_swizzle_v2_impl(
         tile_m_size,
         tile_k_size,
         cluster_k,
-        ragged,
+        needs_boundary_masking,
         stochastic,
         square_scaling,
     )
@@ -868,7 +868,7 @@ def mxfp8_swizzle_v2_dim_m_or_km_jit(
     tile_m_size: cutlass.Constexpr,
     tile_k_size: cutlass.Constexpr,
     cluster_k: cutlass.Constexpr,
-    ragged: cutlass.Constexpr,
+    needs_boundary_masking: cutlass.Constexpr,
     mode: cutlass.Constexpr,
     stochastic: cutlass.Constexpr,
 ):
@@ -980,7 +980,7 @@ def mxfp8_swizzle_v2_dim_m_or_km_jit(
         tile_k_size,
         M,
         K,
-        ragged,
+        needs_boundary_masking,
         mode,
         stochastic,
         False,
