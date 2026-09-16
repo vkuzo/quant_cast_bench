@@ -53,18 +53,18 @@ def _mxfp8_swizzle_v2_tile_n(M, K):
     """Choose the measured B200 K tile from the padded 128x128 CTA count."""
     num_128_tiles = _ceil_div(M, _MXS_TM) * _ceil_div(K, _MXS_MAX_TN)
     if num_128_tiles <= 64:
-        tile_n_size = 32
+        tile_k_size = 32
     elif num_128_tiles <= 512:
-        tile_n_size = 64
+        tile_k_size = 64
     else:
-        tile_n_size = 128
+        tile_k_size = 128
 
     # Do not compute padding merely to reach the selected width for very narrow matrices.
     if K <= 32:
         return 32
     if K <= 64:
-        return min(tile_n_size, 64)
-    return tile_n_size
+        return min(tile_k_size, 64)
+    return tile_k_size
 
 
 @cute.jit
@@ -117,7 +117,7 @@ def mxfp8_swizzle_v2_kernel(
     output_m_smem_layout: cute.ComposedLayout,
     data_k_tv_layout: cute.Layout,
     tile_m_size: cutlass.Constexpr,
-    tile_n_size: cutlass.Constexpr,
+    tile_k_size: cutlass.Constexpr,
     M: cutlass.Int32,
     K: cutlass.Int32,
     ragged: cutlass.Constexpr,
@@ -126,7 +126,7 @@ def mxfp8_swizzle_v2_kernel(
     square_scaling: cutlass.Constexpr,
 ):
     tidx, _, _ = cute.arch.thread_idx()
-    tile_n_idx, tile_m_idx, _ = cute.arch.block_idx()
+    tile_k_idx, tile_m_idx, _ = cute.arch.block_idx()
     warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     do_dim_k = mode != _MXS_MODE_DIM_M
     do_dim_m = mode != _MXS_MODE_DIM_K
@@ -143,11 +143,11 @@ def mxfp8_swizzle_v2_kernel(
         K = cute.assume(K, divby=32)
     smem = utils.SmemAllocator()
     input_storage = smem.allocate_array(
-        cutlass.BFloat16, tile_m_size * tile_n_size, byte_alignment=1024
+        cutlass.BFloat16, tile_m_size * tile_k_size, byte_alignment=1024
     )
     if cutlass.const_expr(do_dim_m):
         output_m_storage = smem.allocate_array(
-            cutlass.Float8E4M3FN, tile_m_size * tile_n_size, byte_alignment=1024
+            cutlass.Float8E4M3FN, tile_m_size * tile_k_size, byte_alignment=1024
         )
     # Put the small barrier after the 1KB-aligned tile buffers to avoid an otherwise unused 1016B
     # alignment gap at the front of every CTA's shared-memory allocation.
@@ -166,7 +166,7 @@ def mxfp8_swizzle_v2_kernel(
         ),
         input_smem_layout.outer,
     )
-    gInput = cute.local_tile(input_tma_tensor, (tile_m_size, tile_n_size), (None, None))
+    gInput = cute.local_tile(input_tma_tensor, (tile_m_size, tile_k_size), (None, None))
     tInputsInput, tInputgInput = cpasync.tma_partition(
         input_tma_atom,
         0,
@@ -185,7 +185,7 @@ def mxfp8_swizzle_v2_kernel(
             output_k_smem_layout.outer,
         )
         gOutputK = cute.local_tile(
-            output_k_tma_tensor, (tile_m_size, tile_n_size), (None, None)
+            output_k_tma_tensor, (tile_m_size, tile_k_size), (None, None)
         )
         tOutputsK, tOutputgK = cpasync.tma_partition(
             output_k_tma_atom,
@@ -205,7 +205,7 @@ def mxfp8_swizzle_v2_kernel(
             output_m_smem_layout.outer,
         )
         gOutputM = cute.local_tile(
-            output_m_tma_tensor, (tile_n_size, tile_m_size), (None, None)
+            output_m_tma_tensor, (tile_k_size, tile_m_size), (None, None)
         )
         tOutputsM, tOutputgM = cpasync.tma_partition(
             output_m_tma_atom,
@@ -218,11 +218,11 @@ def mxfp8_swizzle_v2_kernel(
     if warp == 0:
         with cute.arch.elect_one():
             cute.arch.mbarrier_arrive_and_expect_tx(
-                tma_bar_ptr, tile_m_size * tile_n_size * 2
+                tma_bar_ptr, tile_m_size * tile_k_size * 2
             )
         cute.copy(
             input_tma_atom,
-            tInputgInput[(None, tile_m_idx, tile_n_idx)],
+            tInputgInput[(None, tile_m_idx, tile_k_idx)],
             tInputsInput,
             tma_bar_ptr=tma_bar_ptr,
         )
@@ -251,12 +251,12 @@ def mxfp8_swizzle_v2_kernel(
     # qdata uses separate shared memory, so the optional dim-K pass can still read sInput.
     if cutlass.const_expr(do_dim_m):
         row_blocks = tile_m_size // 32
-        output_row_m = tile_n_idx * tile_n_size + tidx
+        output_row_m = tile_k_idx * tile_k_size + tidx
         scale_col_m = tile_m_idx * row_blocks
         rScaleM = cute.make_rmem_tensor(row_blocks, cutlass.Uint8)
         if cutlass.const_expr(stochastic):
             sr_flat_base_m = (
-                (tile_n_idx * tile_n_size + tidx) * M + tile_m_idx * tile_m_size
+                (tile_k_idx * tile_k_size + tidx) * M + tile_m_idx * tile_m_size
             )
         for row_block in cutlass.range_constexpr(row_blocks):
             if cutlass.const_expr(stochastic):
@@ -293,7 +293,7 @@ def mxfp8_swizzle_v2_kernel(
             rScaleM[row_block] = biased_m.to(rScaleM.element_type)
 
         use_full_tile_m = cutlass.const_expr(not ragged) or (
-            ((tile_m_idx + 1) * tile_m_size <= M) & ((tile_n_idx + 1) * tile_n_size <= K)
+            ((tile_m_idx + 1) * tile_m_size <= M) & ((tile_k_idx + 1) * tile_k_size <= K)
         )
         if use_full_tile_m:
             _e8m0_scale_store_as_uint(
@@ -322,7 +322,7 @@ def mxfp8_swizzle_v2_kernel(
     # This is the original row-owned v2 dim-K pass. Modes dim_k and dim_km execute the same code;
     # the ownership layout changes for shorter fused tiles so all 128 threads remain useful.
     if cutlass.const_expr(do_dim_k):
-        bpr = tile_n_size // 32
+        bpr = tile_k_size // 32
         row_owned_k = tile_m_size == _MXS_TM
         iters = bpr if cutlass.const_expr(row_owned_k) else tile_m_size // 32
         tidfrgInputK = cute.composition(sInput, data_k_tv_layout)
@@ -337,12 +337,12 @@ def mxfp8_swizzle_v2_kernel(
         if cutlass.const_expr(stochastic):
             if cutlass.const_expr(row_owned_k):
                 sr_flat_base_k = (
-                    (tile_m_idx * tile_m_size + tidx) * K + tile_n_idx * tile_n_size
+                    (tile_m_idx * tile_m_size + tidx) * K + tile_k_idx * tile_k_size
                 )
             else:
                 sr_flat_base_k = (
                     (tile_m_idx * tile_m_size + tidx // bpr) * K
-                    + (tile_n_idx * bpr + tidx % bpr) * 32
+                    + (tile_k_idx * bpr + tidx % bpr) * 32
                 )
         for it in cutlass.range_constexpr(iters):
             if cutlass.const_expr(stochastic):
@@ -406,7 +406,7 @@ def mxfp8_swizzle_v2_kernel(
             cute.copy(
                 output_k_tma_atom,
                 tOutputsK,
-                tOutputgK[(None, tile_m_idx, tile_n_idx)],
+                tOutputgK[(None, tile_m_idx, tile_k_idx)],
             )
     if cutlass.const_expr(do_dim_m):
         # The fused SR specialization issues its independent output transfers from separate warps.
@@ -415,17 +415,17 @@ def mxfp8_swizzle_v2_kernel(
             cute.copy(
                 output_m_tma_atom,
                 tOutputsM,
-                tOutputgM[(None, tile_n_idx, tile_m_idx)],
+                tOutputgM[(None, tile_k_idx, tile_m_idx)],
             )
 
     # Let the qdata TMA store overlap the much smaller direct scale write.
     if cutlass.const_expr(do_dim_k):
         use_full_tile_k = cutlass.const_expr(not ragged) or (
-            ((tile_m_idx + 1) * tile_m_size <= M) & ((tile_n_idx + 1) * tile_n_size <= K)
+            ((tile_m_idx + 1) * tile_m_size <= M) & ((tile_k_idx + 1) * tile_k_size <= K)
         )
         if cutlass.const_expr(row_owned_k):
             input_row_k = tile_m_idx * tile_m_size + tidx
-            scale_col_k = tile_n_idx * bpr
+            scale_col_k = tile_k_idx * bpr
             if use_full_tile_k:
                 _e8m0_scale_store_as_uint(
                     mScaleKLogical,
@@ -439,7 +439,7 @@ def mxfp8_swizzle_v2_kernel(
                 rScaleKPadded.fill(0)
                 if input_row_k < M:
                     for it in cutlass.range_constexpr(iters):
-                        if tile_n_idx * bpr + it < K // 32:
+                        if tile_k_idx * bpr + it < K // 32:
                             rScaleKPadded[it] = rScaleK[it]
                 _e8m0_scale_store_as_uint(
                     mScaleKLogical,
@@ -451,10 +451,10 @@ def mxfp8_swizzle_v2_kernel(
 
             if cutlass.const_expr(ragged):
                 ncb_k = _ceil_div(K, 128)
-                grid_n = _ceil_div(K, tile_n_size)
+                grid_n = _ceil_div(K, tile_k_size)
                 covered_groups = grid_n * bpr
                 if covered_groups < ncb_k * 4:
-                    if tile_n_idx == grid_n - 1:
+                    if tile_k_idx == grid_n - 1:
                         input_row_k = tile_m_idx * tile_m_size + tidx
                         for offset in cutlass.range_constexpr(3):
                             col = covered_groups + offset
@@ -472,7 +472,7 @@ def mxfp8_swizzle_v2_kernel(
                 local_row_k = tidx // bpr
             for it in cutlass.range_constexpr(iters):
                 input_row_k = tile_m_idx * tile_m_size + local_row_k + it * 32
-                scale_col_k = tile_n_idx * bpr + local_group_k
+                scale_col_k = tile_k_idx * bpr + local_group_k
                 if use_full_tile_k:
                     mScaleKLogical[(input_row_k, scale_col_k)] = rScaleK[it]
                 else:
@@ -494,21 +494,21 @@ def mxfp8_swizzle_v2_dim_k_jit(
     M: cutlass.Int32,
     K: cutlass.Int32,
     tile_m_size: cutlass.Constexpr,
-    tile_n_size: cutlass.Constexpr,
+    tile_k_size: cutlass.Constexpr,
     cluster_n: cutlass.Constexpr,
     ragged: cutlass.Constexpr,
     stochastic: cutlass.Constexpr,
     square_scaling: cutlass.Constexpr,
 ):
     padded_M = _ceil_div(M, _MXS_TM) * _MXS_TM
-    padded_N = _ceil_div(K, tile_n_size) * tile_n_size
-    bpr = tile_n_size // 32
+    padded_N = _ceil_div(K, tile_k_size) * tile_k_size
+    bpr = tile_k_size // 32
     iters = bpr
     # Match the swizzle width to the selected tile while keeping its logical shape unchanged.
-    if cutlass.const_expr(tile_n_size == 32):
+    if cutlass.const_expr(tile_k_size == 32):
         input_smem_kind = tcgen05.SmemLayoutAtomKind.K_SW64
         output_smem_kind = tcgen05.SmemLayoutAtomKind.K_SW32
-    elif cutlass.const_expr(tile_n_size == 64):
+    elif cutlass.const_expr(tile_k_size == 64):
         input_smem_kind = tcgen05.SmemLayoutAtomKind.K_SW128
         output_smem_kind = tcgen05.SmemLayoutAtomKind.K_SW64
     else:
@@ -516,14 +516,14 @@ def mxfp8_swizzle_v2_dim_k_jit(
         output_smem_kind = tcgen05.SmemLayoutAtomKind.K_SW128
     input_smem_atom = tcgen05.make_smem_layout_atom(input_smem_kind, cutlass.BFloat16)
     input_smem_layout = cute.coalesce(
-        cute.tile_to_shape(input_smem_atom, (tile_m_size, tile_n_size), order=(0, 1)),
+        cute.tile_to_shape(input_smem_atom, (tile_m_size, tile_k_size), order=(0, 1)),
         target_profile=(1, 1),
     )
     # The output phase aliases the same allocation but uses its own dtype-appropriate swizzle. Its
     # lifetime starts only after the bf16-read barrier, so the two interpretations cannot overlap.
     output_smem_atom = tcgen05.make_smem_layout_atom(output_smem_kind, cutlass.Float8E4M3FN)
     output_smem_layout = cute.coalesce(
-        cute.tile_to_shape(output_smem_atom, (tile_m_size, tile_n_size), order=(0, 1)),
+        cute.tile_to_shape(output_smem_atom, (tile_m_size, tile_k_size), order=(0, 1)),
         target_profile=(1, 1),
     )
     if cutlass.const_expr(tile_m_size == _MXS_TM):
@@ -537,7 +537,7 @@ def mxfp8_swizzle_v2_dim_k_jit(
         # lanes own rows and values walk columns, so warp_reduction_max spans the whole block.
         data_tv_layout = cute.make_layout(
             ((32, bpr), (32, 1)),
-            stride=((1, tile_m_size * 32), (tile_m_size, tile_m_size * tile_n_size)),
+            stride=((1, tile_m_size * 32), (tile_m_size, tile_m_size * tile_k_size)),
         )
     else:
         # Smaller tiles map one (row, 1x32 group) to each thread, then advance through 32-row stages.
@@ -548,9 +548,9 @@ def mxfp8_swizzle_v2_dim_k_jit(
             stride=((tile_m_size * 32, 1), (tile_m_size, rows_per_stage)),
         )
     input_tma_atom, input_tma_tensor = cpasync.make_tiled_tma_atom(
-        cpasync.CopyBulkTensorTileG2SOp(), mInput, input_smem_layout, (tile_m_size, tile_n_size))
+        cpasync.CopyBulkTensorTileG2SOp(), mInput, input_smem_layout, (tile_m_size, tile_k_size))
     output_tma_atom, output_tma_tensor = cpasync.make_tiled_tma_atom(
-        cpasync.CopyBulkTensorTileS2GOp(), mOutput, output_smem_layout, (tile_m_size, tile_n_size))
+        cpasync.CopyBulkTensorTileS2GOp(), mOutput, output_smem_layout, (tile_m_size, tile_k_size))
 
     nrb = _ceil_div(M, 128)
     ncb = _ceil_div(K, 128)
@@ -576,7 +576,7 @@ def mxfp8_swizzle_v2_dim_k_jit(
         output_smem_layout,
         data_tv_layout,
         tile_m_size,
-        tile_n_size,
+        tile_k_size,
         M,
         K,
         ragged,
@@ -586,7 +586,7 @@ def mxfp8_swizzle_v2_dim_k_jit(
     ).launch(
         # Make the fast-changing grid dimension follow contiguous columns. Clustering those CTAs
         # further preserves that locality in hardware scheduling.
-        grid=(padded_N // tile_n_size, padded_M // tile_m_size, 1),
+        grid=(padded_N // tile_k_size, padded_M // tile_m_size, 1),
         block=(_MXS_THREADS, 1, 1),
         cluster=(cluster_n, 1, 1),
     )
@@ -627,15 +627,15 @@ def _mxfp8_swizzle_v2_impl(
         if mode == "dim_km":
             assert K % 32 == 0, "v2 dim-K requires K % 32 == 0"
 
-        tile_m_size, tile_n_size = (
+        tile_m_size, tile_k_size = (
             _MXDMT_SMALL_TILE
             if M * K <= 2048 * 2048
             else (_MXDKMT_LARGE_TILE if mode == "dim_km" else _MXDMT_LARGE_TILE)
         )
         nrb_m, ncb_m = _ceil_div(K, 128), _ceil_div(M // 32, 4)
         padded_M = ncb_m * 128
-        padded_N = _ceil_div(K, tile_n_size) * tile_n_size
-        grid_n = padded_N // tile_n_size
+        padded_N = _ceil_div(K, tile_k_size) * tile_k_size
+        grid_n = padded_N // tile_k_size
         grid_m = padded_M // tile_m_size
         cluster_n = 1 if mode == "dim_km" else (
             next(c for c in (16, 8, 4, 2, 1) if c <= grid_n and grid_n % c == 0)
@@ -699,7 +699,7 @@ def _mxfp8_swizzle_v2_impl(
         ragged = M != ncb_m * 128 or K != nrb_m * 128
         fn = _compiled(
             (
-                "mxfp8_swizzle_v2", mode, tile_m_size, tile_n_size, cluster_n, ragged,
+                "mxfp8_swizzle_v2", mode, tile_m_size, tile_k_size, cluster_n, ragged,
                 rounding_mode,
             ),
             mxfp8_swizzle_v2_dim_m_or_km_jit,
@@ -712,7 +712,7 @@ def _mxfp8_swizzle_v2_impl(
             M,
             K,
             tile_m_size,
-            tile_n_size,
+            tile_k_size,
             cluster_n,
             ragged,
             mode_id,
@@ -735,12 +735,12 @@ def _mxfp8_swizzle_v2_impl(
     # First choose the original adaptive K width. For small problems that would use K=64, rotate
     # the same-size 128x64 tile to 32x128: it keeps 128 one-group threads but gives TMA contiguous
     # rows and exposes more M-parallel CTAs.
-    tile_n_size = _mxfp8_swizzle_v2_tile_n(M, K)
-    if M * K <= 2048 * 2048 and tile_n_size >= 64:
-        tile_m_size, tile_n_size = 32, 128
+    tile_k_size = _mxfp8_swizzle_v2_tile_n(M, K)
+    if M * K <= 2048 * 2048 and tile_k_size >= 64:
+        tile_m_size, tile_k_size = 32, 128
     else:
         tile_m_size = 128
-    grid_n = _ceil_div(K, tile_n_size)
+    grid_n = _ceil_div(K, tile_k_size)
     # RTNE benefits from K-oriented clustering and its locality. Philox supplies enough arithmetic
     # latency hiding that independent CTAs are faster than forcing the same clustered schedule.
     cluster_n = (
@@ -768,7 +768,7 @@ def _mxfp8_swizzle_v2_impl(
     ragged = M != nrb * 128 or K != ncb * 128
     fn = _compiled(
         (
-            "mxfp8_swizzle_v2", "dim_k", tile_m_size, tile_n_size, cluster_n, ragged,
+            "mxfp8_swizzle_v2", "dim_k", tile_m_size, tile_k_size, cluster_n, ragged,
             rounding_mode, square_scaling,
         ),
         mxfp8_swizzle_v2_dim_k_jit,
@@ -779,7 +779,7 @@ def _mxfp8_swizzle_v2_impl(
         M,
         K,
         tile_m_size,
-        tile_n_size,
+        tile_k_size,
         cluster_n,
         ragged,
         stochastic,
@@ -859,14 +859,14 @@ def mxfp8_swizzle_v2_dim_m_or_km_jit(
     M: cutlass.Int32,
     K: cutlass.Int32,
     tile_m_size: cutlass.Constexpr,
-    tile_n_size: cutlass.Constexpr,
+    tile_k_size: cutlass.Constexpr,
     cluster_n: cutlass.Constexpr,
     ragged: cutlass.Constexpr,
     mode: cutlass.Constexpr,
     stochastic: cutlass.Constexpr,
 ):
     padded_M = _ceil_div(M, 128) * 128
-    padded_N = _ceil_div(K, tile_n_size) * tile_n_size
+    padded_N = _ceil_div(K, tile_k_size) * tile_k_size
     if cutlass.const_expr(mode == _MXS_MODE_DIM_KM):
         # Keep each 128-bit row vector intact while XORing row bits into the shared-memory bank
         # selection. This targets the dim-K phase's 16-way row-read conflicts.
@@ -874,7 +874,7 @@ def mxfp8_swizzle_v2_dim_m_or_km_jit(
             tcgen05.SmemLayoutAtomKind.K_SW128, cutlass.BFloat16
         )
         input_smem_layout = cute.coalesce(
-            cute.tile_to_shape(input_smem_atom, (tile_m_size, tile_n_size), order=(0, 1)),
+            cute.tile_to_shape(input_smem_atom, (tile_m_size, tile_k_size), order=(0, 1)),
             target_profile=(1, 1),
         )
     else:
@@ -883,24 +883,24 @@ def mxfp8_swizzle_v2_dim_m_or_km_jit(
         input_smem_layout = cute.make_composed_layout(
             cute.make_swizzle(0, 0, 0),
             0,
-            cute.make_layout((tile_m_size, tile_n_size), stride=(tile_n_size, 1)),
+            cute.make_layout((tile_m_size, tile_k_size), stride=(tile_k_size, 1)),
         )
     output_m_smem_layout = cute.make_composed_layout(
         cute.make_swizzle(0, 0, 0),
         0,
-        cute.make_layout((tile_n_size, tile_m_size), stride=(tile_m_size, 1)),
+        cute.make_layout((tile_k_size, tile_m_size), stride=(tile_m_size, 1)),
     )
     input_tma_atom, input_tma_tensor = cpasync.make_tiled_tma_atom(
         cpasync.CopyBulkTensorTileG2SOp(),
         mInput,
         input_smem_layout,
-        (tile_m_size, tile_n_size),
+        (tile_m_size, tile_k_size),
     )
     output_m_tma_atom, output_m_tma_tensor = cpasync.make_tiled_tma_atom(
         cpasync.CopyBulkTensorTileS2GOp(),
         mOutputM,
         output_m_smem_layout,
-        (tile_n_size, tile_m_size),
+        (tile_k_size, tile_m_size),
     )
 
     if cutlass.const_expr(mode == _MXS_MODE_DIM_KM):
@@ -909,7 +909,7 @@ def mxfp8_swizzle_v2_dim_m_or_km_jit(
         )
         output_k_smem_layout = cute.coalesce(
             cute.tile_to_shape(
-                output_k_smem_atom, (tile_m_size, tile_n_size), order=(0, 1)
+                output_k_smem_atom, (tile_m_size, tile_k_size), order=(0, 1)
             ),
             target_profile=(1, 1),
         )
@@ -917,7 +917,7 @@ def mxfp8_swizzle_v2_dim_m_or_km_jit(
             cpasync.CopyBulkTensorTileS2GOp(),
             mOutputK,
             output_k_smem_layout,
-            (tile_m_size, tile_n_size),
+            (tile_m_size, tile_k_size),
         )
     else:
         # These arguments disappear with the constexpr dim-K branch.
@@ -940,7 +940,7 @@ def mxfp8_swizzle_v2_dim_m_or_km_jit(
     )
     mScaleKLogical = cute.make_tensor(mScaleK.iterator, scale_k_layout)
 
-    bpr = tile_n_size // 32
+    bpr = tile_k_size // 32
     if cutlass.const_expr(tile_m_size == _MXS_TM):
         data_k_tv_layout = cute.make_layout(
             ((tile_m_size,), (32, bpr)),
@@ -970,7 +970,7 @@ def mxfp8_swizzle_v2_dim_m_or_km_jit(
         output_m_smem_layout,
         data_k_tv_layout,
         tile_m_size,
-        tile_n_size,
+        tile_k_size,
         M,
         K,
         ragged,
@@ -978,8 +978,8 @@ def mxfp8_swizzle_v2_dim_m_or_km_jit(
         stochastic,
         False,
     )
-    grid = (padded_N // tile_n_size, padded_M // tile_m_size, 1)
-    block = (max(_MXS_THREADS, tile_n_size), 1, 1)
+    grid = (padded_N // tile_k_size, padded_M // tile_m_size, 1)
+    block = (max(_MXS_THREADS, tile_k_size), 1, 1)
     if cutlass.const_expr(
         mode == _MXS_MODE_DIM_KM and not stochastic and tile_m_size != 32
     ):
