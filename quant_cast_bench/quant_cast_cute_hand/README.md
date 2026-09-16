@@ -47,17 +47,16 @@ inside `with torch.cuda.device(input.get_device())`. Exiting the context restore
 the caller's original current device. A two-GPU regression test verifies output
 placement, numerical correctness, and current-device restoration.
 
+### Explicit host-side validation
+
+Public input, shape, orientation, rounding-mode, and Philox-key validation uses
+explicit `ValueError` checks, so invalid calls are rejected even under
+`python -O`. Assertions remain only inside the CuTe JIT/kernel, where they
+enforce compile-time specialization contracts.
+
 The following remaining issues should be addressed before upstreaming.
 
 ### Must fix
-
-#### Replace public Python assertions
-
-The public wrapper uses `assert` for device-independent user validation. These
-checks disappear under `python -O`, allowing invalid shapes, dtypes, modes, and
-keys to reach CuTe. Use explicit `ValueError`/`RuntimeError` checks, or
-`TORCH_CHECK` in a dispatcher implementation. Compile-time assertions inside
-CuTe code can remain assertions.
 
 #### Remove ignored keyword arguments
 

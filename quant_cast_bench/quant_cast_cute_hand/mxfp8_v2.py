@@ -803,51 +803,61 @@ def _mxfp8_swizzle_v2_impl_on_current_device(
     is_square_scaling: bool,
     **kwargs,
 ):
-    assert quant_orientation in (
-        "dim_k",
-        "dim_m",
-        "dim_km",
-    ), f"unsupported quant_orientation: {quant_orientation}"
-    assert input.dim() == 2, "unsupported"
-    assert input.is_contiguous(), "unsupported"
-    assert input.dtype in (
+    if quant_orientation not in ("dim_k", "dim_m", "dim_km"):
+        raise ValueError(f"unsupported quant_orientation: {quant_orientation}")
+    if input.dim() != 2:
+        raise ValueError(f"mxfp8 v2 requires a 2D input; got {input.dim()} dimensions")
+    if not input.is_contiguous():
+        raise ValueError("mxfp8 v2 requires a contiguous input")
+    if input.dtype not in (
         torch.bfloat16,
         torch.float16,
         torch.float32,
-    ), "v2 supports only bf16, fp16, and fp32 input"
+    ):
+        raise ValueError("v2 supports only bf16, fp16, and fp32 input")
 
     rounding_mode = str(getattr(rounding_mode, "value", rounding_mode)).lower()
-    assert rounding_mode in (
-        "rtne",
-        "stochastic",
-    ), f"unsupported rounding_mode: {rounding_mode}"
+    if rounding_mode not in ("rtne", "stochastic"):
+        raise ValueError(f"unsupported rounding_mode: {rounding_mode}")
     is_stochastic_qdata_rounding = rounding_mode == "stochastic"
     if is_square_scaling:
-        assert quant_orientation == "dim_k", "32x32 v2 currently supports only dim-k output"
-        assert not is_stochastic_qdata_rounding, "32x32 v2 currently supports only RTNE"
+        if quant_orientation != "dim_k":
+            raise ValueError("32x32 v2 currently supports only dim-k output")
+        if is_stochastic_qdata_rounding:
+            raise ValueError("32x32 v2 currently supports only RTNE")
     if is_stochastic_qdata_rounding:
-        assert key is not None, "stochastic rounding requires a Philox key"
-        assert key.device == input.device, "input and Philox key must be on the same device"
-        assert key.dtype == torch.uint64 and key.numel() == 2, "Philox key must be uint64[2]"
+        if key is None:
+            raise ValueError("stochastic rounding requires a Philox key")
+        if not isinstance(key, torch.Tensor):
+            raise ValueError("Philox key must be a torch.Tensor")
+        if key.device != input.device:
+            raise ValueError("input and Philox key must be on the same device")
+        if key.dtype != torch.uint64 or key.numel() != 2:
+            raise ValueError("Philox key must be uint64[2]")
     else:
-        assert key is None, "RTNE rounding does not use a Philox key"
+        if key is not None:
+            raise ValueError("RTNE rounding does not use a Philox key")
 
     M, K = input.shape
-    assert M > 0 and K > 0, "v2 requires non-empty dimensions"
+    if M <= 0 or K <= 0:
+        raise ValueError("v2 requires non-empty dimensions")
     if M > _INT32_MAX or K > _INT32_MAX:
         raise ValueError(
             "mxfp8 v2 requires each logical dimension to fit in signed int32; "
             f"got shape ({M}, {K})"
         )
     if is_square_scaling:
-        assert M % 32 == 0, "32x32 v2 requires M % 32 == 0"
+        if M % 32 != 0:
+            raise ValueError("32x32 v2 requires M % 32 == 0")
     if quant_orientation != "dim_k":
-        assert M % 32 == 0, "v2 dim-M requires M % 32 == 0"
-        assert K % 16 == 0, "v2 dim-M requires K % 16 == 0"
-        if quant_orientation == "dim_km":
-            assert K % 32 == 0, "v2 dim-K requires K % 32 == 0"
-    else:
-        assert K % 32 == 0, "v2 requires K % 32 == 0"
+        if M % 32 != 0:
+            raise ValueError("v2 dim-M requires M % 32 == 0")
+        if K % 16 != 0:
+            raise ValueError("v2 dim-M requires K % 16 == 0")
+        if quant_orientation == "dim_km" and K % 32 != 0:
+            raise ValueError("v2 dim-K requires K % 32 == 0")
+    elif K % 32 != 0:
+        raise ValueError("v2 requires K % 32 == 0")
 
     do_dim_k = quant_orientation != "dim_m"
     do_dim_m = quant_orientation != "dim_k"
@@ -1065,6 +1075,8 @@ def _mxfp8_swizzle_v2_impl(
     is_square_scaling: bool,
     **kwargs,
 ):
+    if not isinstance(input, torch.Tensor):
+        raise ValueError("mxfp8 v2 input must be a torch.Tensor")
     if input.device.type != "cuda":
         raise ValueError("mxfp8 v2 requires a CUDA input")
 

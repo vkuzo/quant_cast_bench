@@ -242,8 +242,40 @@ def test_mxfp8_swizzle_v2_guards_input_device():
 
 def test_mxfp8_v2_rejects_unsupported_input_dtype():
     x = torch.randn(128, 256, dtype=torch.float64, device="cuda")
-    with pytest.raises(AssertionError, match="supports only bf16, fp16, and fp32"):
+    with pytest.raises(ValueError, match="supports only bf16, fp16, and fp32"):
         mxfp8_swizzle_v2(x)
+
+
+@pytest.mark.parametrize(
+    "input_transform,kwargs,error",
+    [
+        (lambda x: x.unsqueeze(0), {}, "requires a 2D input"),
+        (lambda x: x.t(), {}, "requires a contiguous input"),
+        (lambda x: x, {"quant_orientation": "rows"}, "unsupported quant_orientation"),
+        (lambda x: x, {"rounding_mode": "toward_zero"}, "unsupported rounding_mode"),
+        (
+            lambda x: x,
+            {"rounding_mode": "stochastic"},
+            "stochastic rounding requires a Philox key",
+        ),
+    ],
+)
+def test_mxfp8_v2_rejects_invalid_arguments(input_transform, kwargs, error):
+    x = input_transform(torch.randn(128, 256, dtype=torch.bfloat16, device="cuda"))
+    with pytest.raises(ValueError, match=error):
+        mxfp8_swizzle_v2(x, **kwargs)
+
+
+def test_mxfp8_v2_rejects_key_for_rtne():
+    x = torch.randn(128, 256, dtype=torch.bfloat16, device="cuda")
+    key = torch.tensor([0, 0], dtype=torch.uint64, device=x.device)
+    with pytest.raises(ValueError, match="RTNE rounding does not use a Philox key"):
+        mxfp8_swizzle_v2(x, key=key)
+
+
+def test_mxfp8_v2_rejects_non_cuda_input():
+    with pytest.raises(ValueError, match="requires a CUDA input"):
+        mxfp8_swizzle_v2(torch.randn(128, 256, dtype=torch.bfloat16))
 
 
 @pytest.mark.parametrize("M,K", [(32, 32), (96, 160), (128, 256), (1024, 1152)])
@@ -260,7 +292,7 @@ def test_mxfp8_32x32_swizzle_v2(M, K):
 def test_mxfp8_32x32_swizzle_v2_rejects_invalid_shapes(M, K):
     recipe = _get_recipe("mxfp8_32x32_swizzle_v2")
     inputs = recipe.example_input_fn(M, K, torch.bfloat16)
-    with pytest.raises(AssertionError):
+    with pytest.raises(ValueError):
         recipe.cute_fn(*inputs)
 
 
@@ -410,7 +442,7 @@ def test_mxfp8_swizzle_v2_rejects_invalid_shapes(M, K):
         pytest.skip("mxfp8_swizzle_v2 emits Blackwell-only PTX; requires cuda capability 10.0")
     recipe = _get_recipe("mxfp8_swizzle_v2")
     inputs = recipe.example_input_fn(M, K, torch.bfloat16)
-    with pytest.raises(AssertionError):
+    with pytest.raises(ValueError):
         recipe.cute_fn(*inputs)
 
 
@@ -543,7 +575,7 @@ def test_mxfp8_dim_km_swizzle_rejects_partial_group(kernel):
         pytest.skip(f"{kernel} emits Blackwell-only PTX; requires cuda capability 10.0")
     recipe = _get_recipe(kernel)
     inputs = recipe.example_input_fn(96, 144, torch.bfloat16)
-    with pytest.raises(AssertionError, match="K % 32"):
+    with pytest.raises(ValueError, match="K % 32"):
         recipe.cute_fn(*inputs)
 
 
