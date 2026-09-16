@@ -53,6 +53,7 @@ _MIN_CTA_THREADS_128 = _MIN_CTA_WARPS_4 * 32
 
 _DIM_M_KM_SMALL_TILE_32_128 = (32, 128)
 _DIM_M_LARGE_TILE_64_256 = (64, 256)
+_DIM_M_FLOAT32_LARGE_TILE_64_128 = (64, 128)
 _DIM_KM_LARGE_TILE_64_128 = (64, 128)
 
 _INT32_MAX = 2**31 - 1
@@ -127,7 +128,7 @@ def mxfp8_swizzle_v2_kernel(
 
     High level flow:
       0. create smem scratchpad
-         a. both dim-k and dim-m use a tile_m_size * tile_k_size 16-bit scratchpad for input,
+         a. both dim-k and dim-m use a tile_m_size * tile_k_size input-typed scratchpad,
          b. dim-k reuses the first half of 0a for qdata (to save smem)
          c. dim-m additionally uses a tile_m_size * tile_k_size fp8 scratchpad for qdata
       1. load input data with TMA.
@@ -444,14 +445,15 @@ def mxfp8_swizzle_v2_kernel(
                     flat_start_k // 16
                 )
             sGroupK = thrInputGroupsK[((None, it),)]
-            sGroupK8 = cute.tiled_divide(sGroupK, (8,))
             rInputK = cute.make_rmem_tensor(32, input_element_type)
-            rInputK8 = cute.tiled_divide(rInputK, (8,))
-            for vec in cutlass.range_constexpr(4):
+            input_values_per_copy = 128 // input_element_type.width
+            sGroupKVec = cute.tiled_divide(sGroupK, (input_values_per_copy,))
+            rInputKVec = cute.tiled_divide(rInputK, (input_values_per_copy,))
+            for vec in cutlass.range_constexpr(32 // input_values_per_copy):
                 cute.copy(
                     smem_load_atom,
-                    sGroupK8[(None, vec)],
-                    rInputK8[(None, vec)],
+                    sGroupKVec[(None, vec)],
+                    rInputKVec[(None, vec)],
                 )
             vk = rInputK.load().to(cutlass.Float32)
             amax_k = cute.math.absf(vk).reduce(
@@ -800,7 +802,8 @@ def _mxfp8_swizzle_v2_impl(
     assert input.dtype in (
         torch.bfloat16,
         torch.float16,
-    ), "v2 supports only bf16 and fp16 input"
+        torch.float32,
+    ), "v2 supports only bf16, fp16, and fp32 input"
 
     rounding_mode = str(getattr(rounding_mode, "value", rounding_mode)).lower()
     assert rounding_mode in (
@@ -871,9 +874,11 @@ def _mxfp8_swizzle_v2_impl(
         # arithmetic latency hiding that independent CTAs are faster than the clustered schedule.
         cluster_k = (
             # Square scaling has enough independent CTAs at small/medium sizes that clustering only
-            # constrains scheduling; large shapes retain v2's K-locality-oriented clusters.
+            # constrains scheduling; large 16-bit shapes retain v2's K-locality-oriented clusters.
+            # FP32's larger shared-memory tiles reduce residency enough that clustering loses.
             1
-            if is_stochastic_qdata_rounding
+            if input.dtype == torch.float32
+            or is_stochastic_qdata_rounding
             or (is_square_scaling and M * K <= 4096 * 4096)
             else next(c for c in (16, 8, 4, 2, 1) if c <= ncb_k and grid_k % c == 0)
         )
@@ -893,7 +898,11 @@ def _mxfp8_swizzle_v2_impl(
         tile_m_size, tile_k_size = (
             _DIM_M_KM_SMALL_TILE_32_128
             if M * K <= 2048 * 2048
-            else _DIM_M_LARGE_TILE_64_256
+            else (
+                _DIM_M_FLOAT32_LARGE_TILE_64_128
+                if input.dtype == torch.float32
+                else _DIM_M_LARGE_TILE_64_256
+            )
         )
         padded_M = ncb_m * 128
         padded_K = _ceil_div(K, tile_k_size) * tile_k_size

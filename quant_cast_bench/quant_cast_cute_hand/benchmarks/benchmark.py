@@ -2,7 +2,7 @@
 
 Each kernel here is a memory-bound elementwise cast/op, so the signal we care about is achieved
 memory bandwidth vs. the GPU's HBM ceiling (B200: 8 TB/s, H100 SXM5: 3.35 TB/s -- selected from the
-device name). We build a selected 16-bit (M, K) input, run the selected kernel, time it with
+device name). We build an (M, K) input of the selected dtype, run the selected kernel, time it with
 `do_bench_using_profiling`, and report GPU time + GB/s + % of peak.
 
     python -m quant_cast_bench.quant_cast_cute_hand.benchmarks.benchmark --kernel add_v0
@@ -795,7 +795,7 @@ _KERNELS = {
     "transpose_v1": _bench_transpose_v1,
 }
 
-_FLOAT16_KERNELS = frozenset({
+_KERNELS_SUPPORTING_FLOAT16_AND_FLOAT32 = frozenset({
     "mxfp8_swizzle_v2",
     "mxfp8_swizzle_sr_v2",
     "mxfp8_32x32_swizzle_v2",
@@ -808,6 +808,7 @@ _FLOAT16_KERNELS = frozenset({
 _DTYPES = {
     "bfloat16": torch.bfloat16,
     "float16": torch.float16,
+    "float32": torch.float32,
 }
 
 
@@ -833,7 +834,7 @@ def _benchmark_one(
     kernel: str, M: int, K: int, peak_bw: float, dtype: torch.dtype
 ):
     builder = _KERNELS[kernel]
-    if kernel in _FLOAT16_KERNELS:
+    if kernel in _KERNELS_SUPPORTING_FLOAT16_AND_FLOAT32:
         run, bytes_per_iter = builder(M, K, dtype)
     else:
         run, bytes_per_iter = builder(M, K)
@@ -922,11 +923,16 @@ def main(
     kernels = _parse_kernels(kernel)
     metrics = _parse_output_metrics(output_metrics)
     dtype_name, input_dtype = _parse_dtype(dtype)
-    if input_dtype == torch.float16:
-        unsupported = [name for name in kernels if name not in _FLOAT16_KERNELS]
+    if input_dtype != torch.bfloat16:
+        unsupported = [
+            name
+            for name in kernels
+            if name not in _KERNELS_SUPPORTING_FLOAT16_AND_FLOAT32
+        ]
         if unsupported:
             raise ValueError(
-                "float16 input is unsupported by kernels: " + ", ".join(unsupported)
+                f"{dtype_name} input is unsupported by kernels: "
+                + ", ".join(unsupported)
             )
 
     shapes_for_model = shapes_for_model.strip().lower()
