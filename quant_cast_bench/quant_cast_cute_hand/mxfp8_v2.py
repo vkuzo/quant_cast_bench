@@ -486,7 +486,7 @@ def mxfp8_swizzle_v2_kernel(
 
 
 @cute.jit
-def mxfp8_swizzle_v2_jit(
+def mxfp8_swizzle_v2_dim_k_jit(
     mInput,
     mOutput,
     mScale,
@@ -702,7 +702,7 @@ def _mxfp8_swizzle_v2_impl(
                 "mxfp8_swizzle_v2", mode, tile_m, tile_n, cluster_n, ragged,
                 rounding_mode,
             ),
-            _mxfp8_swizzle_v2_m_jit,
+            mxfp8_swizzle_v2_dim_m_or_km_jit,
             mInput,
             mOutputM,
             mScaleM,
@@ -771,7 +771,7 @@ def _mxfp8_swizzle_v2_impl(
             "mxfp8_swizzle_v2", "dim_k", tile_m, tile_n, cluster_n, ragged,
             rounding_mode, square_scaling,
         ),
-        mxfp8_swizzle_v2_jit,
+        mxfp8_swizzle_v2_dim_k_jit,
         mInput,
         mOutput,
         mScale,
@@ -849,7 +849,7 @@ _MXDKMT_LARGE_TILE = (64, 128)
 
 
 @cute.jit
-def _mxfp8_swizzle_v2_m_jit(
+def mxfp8_swizzle_v2_dim_m_or_km_jit(
     mInput: cute.Tensor,
     mOutputM: cute.Tensor,
     mScaleM: cute.Tensor,
