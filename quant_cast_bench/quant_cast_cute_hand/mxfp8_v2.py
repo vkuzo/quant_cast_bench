@@ -501,7 +501,7 @@ def mxfp8_swizzle_v2_dim_k_jit(
     square_scaling: cutlass.Constexpr,
 ):
     padded_M = _ceil_div(M, _MXS_TM) * _MXS_TM
-    padded_N = _ceil_div(K, tile_k_size) * tile_k_size
+    padded_K = _ceil_div(K, tile_k_size) * tile_k_size
     bpr = tile_k_size // 32
     iters = bpr
     # Match the swizzle width to the selected tile while keeping its logical shape unchanged.
@@ -586,7 +586,7 @@ def mxfp8_swizzle_v2_dim_k_jit(
     ).launch(
         # Make the fast-changing grid dimension follow contiguous columns. Clustering those CTAs
         # further preserves that locality in hardware scheduling.
-        grid=(padded_N // tile_k_size, padded_M // tile_m_size, 1),
+        grid=(padded_K // tile_k_size, padded_M // tile_m_size, 1),
         block=(_MXS_THREADS, 1, 1),
         cluster=(cluster_k, 1, 1),
     )
@@ -634,8 +634,8 @@ def _mxfp8_swizzle_v2_impl(
         )
         nrb_m, ncb_m = _ceil_div(K, 128), _ceil_div(M // 32, 4)
         padded_M = ncb_m * 128
-        padded_N = _ceil_div(K, tile_k_size) * tile_k_size
-        grid_n = padded_N // tile_k_size
+        padded_K = _ceil_div(K, tile_k_size) * tile_k_size
+        grid_n = padded_K // tile_k_size
         grid_m = padded_M // tile_m_size
         cluster_k = 1 if mode == "dim_km" else (
             next(c for c in (16, 8, 4, 2, 1) if c <= grid_n and grid_n % c == 0)
@@ -866,7 +866,7 @@ def mxfp8_swizzle_v2_dim_m_or_km_jit(
     stochastic: cutlass.Constexpr,
 ):
     padded_M = _ceil_div(M, 128) * 128
-    padded_N = _ceil_div(K, tile_k_size) * tile_k_size
+    padded_K = _ceil_div(K, tile_k_size) * tile_k_size
     if cutlass.const_expr(mode == _MXS_MODE_DIM_KM):
         # Keep each 128-bit row vector intact while XORing row bits into the shared-memory bank
         # selection. This targets the dim-K phase's 16-way row-read conflicts.
@@ -978,7 +978,7 @@ def mxfp8_swizzle_v2_dim_m_or_km_jit(
         stochastic,
         False,
     )
-    grid = (padded_N // tile_k_size, padded_M // tile_m_size, 1)
+    grid = (padded_K // tile_k_size, padded_M // tile_m_size, 1)
     block = (max(_MXS_THREADS, tile_k_size), 1, 1)
     if cutlass.const_expr(
         mode == _MXS_MODE_DIM_KM and not stochastic and tile_m_size != 32
