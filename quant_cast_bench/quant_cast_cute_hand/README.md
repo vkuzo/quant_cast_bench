@@ -38,24 +38,18 @@ The wrapper also validates CUDA grid limits. M-grid CTA counts include the extra
 tiles required to zero the padded 128-row scale layout, without materializing a
 potentially overflowing padded extent in device code.
 
+### CUDA device guarding
+
+The wrapper follows PyTorch native top-k's device-guard pattern. When the input
+is already on the current CUDA device, it takes a direct fast path. Otherwise,
+it performs allocation, DLPack conversion, compilation/cache lookup, and launch
+inside `with torch.cuda.device(input.get_device())`. Exiting the context restores
+the caller's original current device. A two-GPU regression test verifies output
+placement, numerical correctness, and current-device restoration.
+
 The following remaining issues should be addressed before upstreaming.
 
 ### Must fix
-
-#### Add a CUDA device guard
-
-Output allocation uses `input.device`, but DLPack conversion, compilation, and
-launch are not enclosed in a CUDA device guard. A call with the current device
-set to `cuda:0` and the input on `cuda:1` was confirmed to fail with:
-
-```text
-BufferError: Can't export tensors on a different CUDA device index.
-Expected: 1. Current device: 0.
-```
-
-The complete allocation, descriptor-construction, compilation, and launch path
-should execute under the input's CUDA device guard. The compiled-function cache
-must also be validated on heterogeneous devices.
 
 #### Replace public Python assertions
 

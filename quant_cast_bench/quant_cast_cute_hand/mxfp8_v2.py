@@ -795,7 +795,7 @@ def mxfp8_swizzle_v2_jit(
     kernel.launch(grid=grid, block=block, cluster=launch_cluster)
 
 
-def _mxfp8_swizzle_v2_impl(
+def _mxfp8_swizzle_v2_impl_on_current_device(
     input: torch.Tensor,
     quant_orientation: str,
     key: torch.Tensor | None,
@@ -1055,6 +1055,34 @@ def _mxfp8_swizzle_v2_impl(
     if quant_orientation == "dim_m":
         return output_m, scale_m
     return output_k, scale_k, output_m, scale_m
+
+
+def _mxfp8_swizzle_v2_impl(
+    input: torch.Tensor,
+    quant_orientation: str,
+    key: torch.Tensor | None,
+    rounding_mode: str,
+    is_square_scaling: bool,
+    **kwargs,
+):
+    if input.device.type != "cuda":
+        raise ValueError("mxfp8 v2 requires a CUDA input")
+
+    def launch_on_current_device():
+        return _mxfp8_swizzle_v2_impl_on_current_device(
+            input,
+            quant_orientation=quant_orientation,
+            key=key,
+            rounding_mode=rounding_mode,
+            is_square_scaling=is_square_scaling,
+            **kwargs,
+        )
+
+    device = input.get_device()
+    if device == torch.cuda.current_device():
+        return launch_on_current_device()
+    with torch.cuda.device(device):
+        return launch_on_current_device()
 
 
 def mxfp8_swizzle_v2(

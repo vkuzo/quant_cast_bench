@@ -217,6 +217,29 @@ def test_mxfp8_swizzle_v2(M, K):
     recipe.correctness_fn(inputs, outputs)
 
 
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two CUDA devices")
+def test_mxfp8_swizzle_v2_guards_input_device():
+    input_device = 1
+    if torch.cuda.get_device_capability(input_device) != (10, 0):
+        pytest.skip("mxfp8_swizzle_v2 emits Blackwell-only PTX; input device must be SM100")
+
+    original_device = torch.cuda.current_device()
+    try:
+        with torch.cuda.device(input_device):
+            x = torch.randn(128, 256, dtype=torch.bfloat16, device="cuda")
+            reference = _get_recipe("mxfp8_swizzle_v2").pt_ref_fn(x)
+
+        torch.cuda.set_device(0)
+        outputs = mxfp8_swizzle_v2(x)
+
+        assert torch.cuda.current_device() == 0
+        assert all(output.device == x.device for output in outputs)
+        for output, expected in zip(outputs, reference):
+            assert qdata_and_scale_equal(output, expected)
+    finally:
+        torch.cuda.set_device(original_device)
+
+
 def test_mxfp8_v2_rejects_unsupported_input_dtype():
     x = torch.randn(128, 256, dtype=torch.float64, device="cuda")
     with pytest.raises(AssertionError, match="supports only bf16, fp16, and fp32"):
