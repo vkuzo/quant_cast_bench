@@ -118,7 +118,7 @@ def mxfp8_swizzle_v2_kernel(
     output_m_tma_tensor: cute.Tensor | None,
     mScaleKLogical: cute.Tensor | None,
     mScaleMLogical: cute.Tensor | None,
-    mSeed: cute.Tensor,
+    mSeed: cute.Tensor | None,
     input_smem_layout: cute.ComposedLayout,
     output_k_smem_layout: cute.ComposedLayout | None,
     output_m_smem_layout: cute.ComposedLayout | None,
@@ -190,6 +190,11 @@ def mxfp8_swizzle_v2_kernel(
         assert output_m_tma_tensor is not None
         assert mScaleMLogical is not None
         assert output_m_smem_layout is not None
+
+    if cutlass.const_expr(is_stochastic_qdata_rounding):
+        assert mSeed is not None
+    else:
+        assert mSeed is None
 
     # bookkeeping
     tidx, _, _ = cute.arch.thread_idx()
@@ -583,7 +588,7 @@ def mxfp8_swizzle_v2_dim_k_jit(
     mInput: cute.Tensor,
     mOutput: cute.Tensor,
     mScale: cute.Tensor,
-    mSeed: cute.Tensor,
+    mSeed: cute.Tensor | None,
     M: cutlass.Int32,
     K: cutlass.Int32,
     tile_m_size: cutlass.Constexpr,
@@ -703,7 +708,7 @@ def mxfp8_swizzle_v2_dim_m_or_km_jit(
     mScaleM: cute.Tensor,
     mOutputK: cute.Tensor | None,
     mScaleK: cute.Tensor | None,
-    mSeed: cute.Tensor,
+    mSeed: cute.Tensor | None,
     M: cutlass.Int32,
     K: cutlass.Int32,
     tile_m_size: cutlass.Constexpr,
@@ -951,8 +956,11 @@ def _mxfp8_swizzle_v2_impl(
             scale_k = None
             mOutputK = None
             mScaleK = None
-        # The RTNE specialization never reads mSeed, so reuse mScaleM as a dummy argument.
-        mSeed = from_dlpack(key.reshape(-1).view(torch.int64)) if is_stochastic_qdata_rounding else mScaleM
+        mSeed = (
+            from_dlpack(key.reshape(-1).view(torch.int64))
+            if is_stochastic_qdata_rounding
+            else None
+        )
 
         quant_orientation_id = (
             _QUANT_ORIENTATION_DIM_KM if quant_orientation == "dim_km" else _QUANT_ORIENTATION_DIM_M
@@ -1024,8 +1032,11 @@ def _mxfp8_swizzle_v2_impl(
         .mark_layout_dynamic(leading_dim=0)
         .mark_compact_shape_dynamic(mode=0, divisibility=512)
     )
-    # The RTNE specialization never reads mSeed, so reuse mScale as a dummy argument on that path.
-    mSeed = from_dlpack(key.reshape(-1).view(torch.int64)) if is_stochastic_qdata_rounding else mScale
+    mSeed = (
+        from_dlpack(key.reshape(-1).view(torch.int64))
+        if is_stochastic_qdata_rounding
+        else None
+    )
     needs_boundary_masking = M != nrb * 128 or K != ncb * 128
     fn = _compiled(
         (
