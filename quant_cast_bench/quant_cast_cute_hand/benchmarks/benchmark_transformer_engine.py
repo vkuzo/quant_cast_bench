@@ -108,20 +108,20 @@ def _make_ours(name: str, x: torch.Tensor):
     if name == "mxfp8_swizzle_v5":
         return lambda: mxfp8_swizzle_v5(x)
     if name == "mxfp8_dim_m_swizzle_v2":
-        return lambda: mxfp8_swizzle_v2(x, mode="dim_m")
+        return lambda: mxfp8_swizzle_v2(x, quant_orientation="dim_m")
     if name == "mxfp8_dim_km_swizzle_v2":
-        return lambda: mxfp8_swizzle_v2(x, mode="dim_km")
+        return lambda: mxfp8_swizzle_v2(x, quant_orientation="dim_km")
     if name == "mxfp8_swizzle_sr_v2":
         return lambda: mxfp8_swizzle_v2(
             x, key=key_k, rounding_mode="stochastic"
         )
     if name == "mxfp8_dim_m_swizzle_sr_v2":
         return lambda: mxfp8_swizzle_v2(
-            x, mode="dim_m", key=key_k, rounding_mode="stochastic"
+            x, quant_orientation="dim_m", key=key_k, rounding_mode="stochastic"
         )
     if name == "mxfp8_dim_km_swizzle_sr_v2":
         return lambda: mxfp8_swizzle_v2(
-            x, mode="dim_km", key=key_k, rounding_mode="stochastic"
+            x, quant_orientation="dim_km", key=key_k, rounding_mode="stochastic"
         )
     if name == "nvfp4_swizzle_direct":
         return lambda: nvfp4_swizzle_direct(x, outer)

@@ -244,13 +244,15 @@ def test_mxfp8_swizzle_sr_v2_folded_key_and_padding():
 
 
 @pytest.mark.parametrize(
-    "mode,recipe_name,M,N",
+    "quant_orientation,recipe_name,M,N",
     [
         ("dim_m", "mxfp8_dim_m_swizzle_sr_v2", 96, 144),
         ("dim_km", "mxfp8_dim_km_swizzle_sr_v2", 96, 160),
     ],
 )
-def test_mxfp8_swizzle_sr_v2_dim_m_modes(mode, recipe_name, M, N):
+def test_mxfp8_swizzle_sr_v2_dim_m_orientations(
+    quant_orientation, recipe_name, M, N
+):
     if torch.cuda.get_device_capability() != (10, 0):
         pytest.skip("v2 stochastic rounding emits Blackwell-only PTX; requires cuda capability 10.0")
     recipe = _get_recipe(recipe_name)
@@ -258,7 +260,10 @@ def test_mxfp8_swizzle_sr_v2_dim_m_modes(mode, recipe_name, M, N):
     key = prng.fold_in(prng.key(7, device=x.device), 12345)
 
     outputs = mxfp8_swizzle_v2(
-        x, mode=mode, key=key, rounding_mode="stochastic"
+        x,
+        quant_orientation=quant_orientation,
+        key=key,
+        rounding_mode="stochastic",
     )
     ref_outputs = recipe.pt_ref_fn(x, key)
     assert len(outputs) == len(ref_outputs)
@@ -267,20 +272,20 @@ def test_mxfp8_swizzle_sr_v2_dim_m_modes(mode, recipe_name, M, N):
 
 
 @pytest.mark.parametrize(
-    "mode,reference",
+    "quant_orientation,reference",
     [
         ("dim_m", "mxfp8_dim_m_swizzle_v2"),
         ("dim_km", "mxfp8_dim_km_swizzle_v2"),
     ],
 )
-def test_mxfp8_swizzle_v2_mode(mode, reference):
+def test_mxfp8_swizzle_v2_quant_orientation(quant_orientation, reference):
     if torch.cuda.get_device_capability() != (10, 0):
         pytest.skip("mxfp8_swizzle_v2 emits Blackwell-only PTX; requires cuda capability 10.0")
     recipe = _get_recipe("mxfp8_swizzle_v2")
     reference_recipe = _get_recipe(reference)
     inputs = recipe.example_input_fn(96, 160)
 
-    outputs = recipe.cute_fn(*inputs, mode=mode)
+    outputs = recipe.cute_fn(*inputs, quant_orientation=quant_orientation)
     ref_outputs = reference_recipe.pt_ref_fn(*inputs)
     assert len(outputs) == len(ref_outputs)
     for output, ref_output in zip(outputs, ref_outputs):

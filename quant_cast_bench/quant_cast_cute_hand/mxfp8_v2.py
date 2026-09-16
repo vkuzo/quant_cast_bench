@@ -47,9 +47,9 @@ _DIM_K_MAX_TILE_K_SIZE_128 = 128
 _MIN_CTA_WARPS_4 = 4
 _MIN_CTA_THREADS_128 = _MIN_CTA_WARPS_4 * 32                       # 128, one thread per tile row
 
-_MODE_DIM_K = 0
-_MODE_DIM_M = 1
-_MODE_DIM_KM = 2
+_QUANT_ORIENTATION_DIM_K = 0
+_QUANT_ORIENTATION_DIM_M = 1
+_QUANT_ORIENTATION_DIM_KM = 2
 
 
 def _mxfp8_swizzle_v2_tile_n(M: int, K: int) -> int:
@@ -128,21 +128,21 @@ def mxfp8_swizzle_v2_kernel(
     M: cutlass.Int32,
     K: cutlass.Int32,
     needs_boundary_masking: cutlass.Constexpr,
-    mode: cutlass.Constexpr,
+    quant_orientation: cutlass.Constexpr,
     is_stochastic_qdata_rounding: cutlass.Constexpr,
     is_square_scaling: cutlass.Constexpr,
 ):
     tidx, _, _ = cute.arch.thread_idx()
     tile_k_idx, tile_m_idx, _ = cute.arch.block_idx()
     warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
-    do_dim_k = mode != _MODE_DIM_M
-    do_dim_m = mode != _MODE_DIM_K
+    do_dim_k = quant_orientation != _QUANT_ORIENTATION_DIM_M
+    do_dim_m = quant_orientation != _QUANT_ORIENTATION_DIM_K
     if cutlass.const_expr(not needs_boundary_masking):
         M = cute.assume(M, divby=128)
         K = cute.assume(K, divby=128)
-    elif cutlass.const_expr(mode == _MODE_DIM_K):
+    elif cutlass.const_expr(quant_orientation == _QUANT_ORIENTATION_DIM_K):
         K = cute.assume(K, divby=32)
-    elif cutlass.const_expr(mode == _MODE_DIM_M):
+    elif cutlass.const_expr(quant_orientation == _QUANT_ORIENTATION_DIM_M):
         M = cute.assume(M, divby=32)
         K = cute.assume(K, divby=16)
     else:
@@ -587,7 +587,7 @@ def mxfp8_swizzle_v2_dim_k_jit(
         M,
         K,
         needs_boundary_masking,
-        _MODE_DIM_K,
+        _QUANT_ORIENTATION_DIM_K,
         is_stochastic_qdata_rounding,
         is_square_scaling,
     ).launch(
@@ -601,13 +601,13 @@ def mxfp8_swizzle_v2_dim_k_jit(
 
 def _mxfp8_swizzle_v2_impl(
     input: torch.Tensor,
-    mode: str,
+    quant_orientation: str,
     key: torch.Tensor | None,
     rounding_mode: str,
     is_square_scaling: bool,
     **kwargs,
 ):
-    assert mode in ("dim_k", "dim_m", "dim_km"), f"unsupported mode: {mode}"
+    assert quant_orientation in ("dim_k", "dim_m", "dim_km"), f"unsupported quant_orientation: {quant_orientation}"
     assert input.dim() == 2, "unsupported"
     assert input.is_contiguous(), "unsupported"
     assert input.dtype == torch.bfloat16, "v2 is bf16-only"
@@ -615,7 +615,7 @@ def _mxfp8_swizzle_v2_impl(
     assert rounding_mode in ("rtne", "stochastic"), f"unsupported rounding_mode: {rounding_mode}"
     is_stochastic_qdata_rounding = rounding_mode == "stochastic"
     if is_square_scaling:
-        assert mode == "dim_k", "32x32 v2 currently supports only dim-k output"
+        assert quant_orientation == "dim_k", "32x32 v2 currently supports only dim-k output"
         assert not is_stochastic_qdata_rounding, "32x32 v2 currently supports only RTNE"
     if is_stochastic_qdata_rounding:
         assert key is not None, "stochastic rounding requires a Philox key"
@@ -628,23 +628,23 @@ def _mxfp8_swizzle_v2_impl(
     if is_square_scaling:
         assert M % 32 == 0, "32x32 v2 requires M % 32 == 0"
 
-    if mode != "dim_k":
+    if quant_orientation != "dim_k":
         assert M % 32 == 0, "v2 dim-M requires M % 32 == 0"
         assert K % 16 == 0, "v2 dim-M requires K % 16 == 0"
-        if mode == "dim_km":
+        if quant_orientation == "dim_km":
             assert K % 32 == 0, "v2 dim-K requires K % 32 == 0"
 
         tile_m_size, tile_k_size = (
             _MXDMT_SMALL_TILE
             if M * K <= 2048 * 2048
-            else (_MXDKMT_LARGE_TILE if mode == "dim_km" else _MXDMT_LARGE_TILE)
+            else (_MXDKMT_LARGE_TILE if quant_orientation == "dim_km" else _MXDMT_LARGE_TILE)
         )
         nrb_m, ncb_m = _ceil_div(K, 128), _ceil_div(M // 32, 4)
         padded_M = ncb_m * 128
         padded_K = _ceil_div(K, tile_k_size) * tile_k_size
         grid_n = padded_K // tile_k_size
         grid_m = padded_M // tile_m_size
-        cluster_k = 1 if mode == "dim_km" else (
+        cluster_k = 1 if quant_orientation == "dim_km" else (
             next(c for c in (16, 8, 4, 2, 1) if c <= grid_n and grid_n % c == 0)
             if grid_m * grid_n <= 512
             else 1
@@ -672,7 +672,7 @@ def _mxfp8_swizzle_v2_impl(
             .mark_layout_dynamic(leading_dim=0)
             .mark_compact_shape_dynamic(mode=0, divisibility=512)
         )
-        if mode == "dim_km":
+        if quant_orientation == "dim_km":
             nrb_k, ncb_k = _ceil_div(M, 128), _ceil_div(K // 32, 4)
             output_k = torch.empty(
                 M, K, dtype=torch.float8_e4m3fn, device=input.device
@@ -700,13 +700,13 @@ def _mxfp8_swizzle_v2_impl(
         # The RTNE specialization never reads mSeed, so reuse mScaleM as a dummy argument.
         mSeed = from_dlpack(key.reshape(-1).view(torch.int64)) if is_stochastic_qdata_rounding else mScaleM
 
-        mode_id = (
-            _MODE_DIM_KM if mode == "dim_km" else _MODE_DIM_M
+        quant_orientation_id = (
+            _QUANT_ORIENTATION_DIM_KM if quant_orientation == "dim_km" else _QUANT_ORIENTATION_DIM_M
         )
         needs_boundary_masking = M != ncb_m * 128 or K != nrb_m * 128
         fn = _compiled(
             (
-                "mxfp8_swizzle_v2", mode, tile_m_size, tile_k_size, cluster_k, needs_boundary_masking,
+                "mxfp8_swizzle_v2", quant_orientation, tile_m_size, tile_k_size, cluster_k, needs_boundary_masking,
                 rounding_mode,
             ),
             mxfp8_swizzle_v2_dim_m_or_km_jit,
@@ -722,14 +722,14 @@ def _mxfp8_swizzle_v2_impl(
             tile_k_size,
             cluster_k,
             needs_boundary_masking,
-            mode_id,
+            quant_orientation_id,
             is_stochastic_qdata_rounding,
         )
         fn(mInput, mOutputM, mScaleM, mOutputK, mScaleK, mSeed, M, K)
         scale_m = scale_m.view(nrb_m, ncb_m, 32, 16).view(
             torch.float8_e8m0fnu
         )
-        if mode == "dim_km":
+        if quant_orientation == "dim_km":
             scale_k = scale_k.view(nrb_k, ncb_k, 32, 16).view(
                 torch.float8_e8m0fnu
             )
@@ -798,14 +798,14 @@ def _mxfp8_swizzle_v2_impl(
 
 def mxfp8_swizzle_v2(
     input: torch.Tensor,
-    mode: str = "dim_k",
+    quant_orientation: str = "dim_k",
     key: torch.Tensor | None = None,
     rounding_mode: str = "rtne",
     **kwargs,
 ):
     return _mxfp8_swizzle_v2_impl(
         input,
-        mode=mode,
+        quant_orientation=quant_orientation,
         key=key,
         rounding_mode=rounding_mode,
         is_square_scaling=False,
@@ -821,7 +821,7 @@ MXFP8_SWIZZLE_V2 = QuantCastCuteRecipe.from_gold(
 def mxfp8_32x32_swizzle_v2(input: torch.Tensor, **kwargs):
     return _mxfp8_swizzle_v2_impl(
         input,
-        mode="dim_k",
+        quant_orientation="dim_k",
         key=None,
         rounding_mode="rtne",
         is_square_scaling=True,
@@ -836,7 +836,7 @@ MXFP8_32X32_SWIZZLE_V2 = QuantCastCuteRecipe.from_gold(
 
 def _mxfp8_swizzle_sr_v2(input, key, **kwargs):
     return mxfp8_swizzle_v2(
-        input, mode="dim_k", key=key, rounding_mode="stochastic", **kwargs
+        input, quant_orientation="dim_k", key=key, rounding_mode="stochastic", **kwargs
     )
 
 
@@ -846,7 +846,7 @@ MXFP8_SWIZZLE_SR_V2 = QuantCastCuteRecipe.from_gold(
 
 
 # ---------------------------------------------------------------------------
-# The unified TMA kernel below supports dim-K, dim-M, and fused dim-KM specializations. Every mode
+# The unified TMA kernel below supports dim-K, dim-M, and fused dim-KM specializations. Every orientation
 # uses one input TMA load; constexpr gates select the dim-K and dim-M passes, and each enabled qdata
 # result is staged in shared memory for TMA output. Small dim-M/dim-KM inputs use a 32x128 tile to
 # expose more CTAs. Larger dim-M uses 64x256, while larger dim-KM uses 64x128.
@@ -869,12 +869,12 @@ def mxfp8_swizzle_v2_dim_m_or_km_jit(
     tile_k_size: cutlass.Constexpr,
     cluster_k: cutlass.Constexpr,
     needs_boundary_masking: cutlass.Constexpr,
-    mode: cutlass.Constexpr,
+    quant_orientation: cutlass.Constexpr,
     is_stochastic_qdata_rounding: cutlass.Constexpr,
 ):
     padded_M = _ceil_div(M, 128) * 128
     padded_K = _ceil_div(K, tile_k_size) * tile_k_size
-    if cutlass.const_expr(mode == _MODE_DIM_KM):
+    if cutlass.const_expr(quant_orientation == _QUANT_ORIENTATION_DIM_KM):
         # Keep each 128-bit row vector intact while XORing row bits into the shared-memory bank
         # selection. This targets the dim-K phase's 16-way row-read conflicts.
         input_smem_atom = tcgen05.make_smem_layout_atom(
@@ -910,7 +910,7 @@ def mxfp8_swizzle_v2_dim_m_or_km_jit(
         (tile_k_size, tile_m_size),
     )
 
-    if cutlass.const_expr(mode == _MODE_DIM_KM):
+    if cutlass.const_expr(quant_orientation == _QUANT_ORIENTATION_DIM_KM):
         output_k_smem_atom = tcgen05.make_smem_layout_atom(
             tcgen05.SmemLayoutAtomKind.K_SW128, cutlass.Float8E4M3FN
         )
@@ -981,14 +981,14 @@ def mxfp8_swizzle_v2_dim_m_or_km_jit(
         M,
         K,
         needs_boundary_masking,
-        mode,
+        quant_orientation,
         is_stochastic_qdata_rounding,
         False,
     )
     grid = (padded_K // tile_k_size, padded_M // tile_m_size, 1)
     block = (max(_MIN_CTA_THREADS_128, tile_k_size), 1, 1)
     if cutlass.const_expr(
-        mode == _MODE_DIM_KM and not is_stochastic_qdata_rounding and tile_m_size != 32
+        quant_orientation == _QUANT_ORIENTATION_DIM_KM and not is_stochastic_qdata_rounding and tile_m_size != 32
     ):
         # A degenerate cluster constrains residency for this larger two-output specialization;
         # an ordinary launch lets Blackwell keep nine CTAs resident per SM instead.
@@ -1003,13 +1003,13 @@ def mxfp8_swizzle_v2_dim_m_or_km_jit(
 
 
 MXFP8_DIM_M_SWIZZLE_V2 = QuantCastCuteRecipe.from_gold(
-    Mxfp8DimMSwizzleGold, cute_fn=partial(mxfp8_swizzle_v2, mode="dim_m")
+    Mxfp8DimMSwizzleGold, cute_fn=partial(mxfp8_swizzle_v2, quant_orientation="dim_m")
 )
 
 
 def _mxfp8_dim_m_swizzle_sr_v2(input, key, **kwargs):
     return mxfp8_swizzle_v2(
-        input, mode="dim_m", key=key, rounding_mode="stochastic", **kwargs
+        input, quant_orientation="dim_m", key=key, rounding_mode="stochastic", **kwargs
     )
 
 
@@ -1019,13 +1019,13 @@ MXFP8_DIM_M_SWIZZLE_SR_V2 = QuantCastCuteRecipe.from_gold(
 
 
 MXFP8_DIM_KM_SWIZZLE_V2 = QuantCastCuteRecipe.from_gold(
-    Mxfp8DimKmSwizzleGold, cute_fn=partial(mxfp8_swizzle_v2, mode="dim_km")
+    Mxfp8DimKmSwizzleGold, cute_fn=partial(mxfp8_swizzle_v2, quant_orientation="dim_km")
 )
 
 
 def _mxfp8_dim_km_swizzle_sr_v2(input, key, **kwargs):
     return mxfp8_swizzle_v2(
-        input, mode="dim_km", key=key, rounding_mode="stochastic", **kwargs
+        input, quant_orientation="dim_km", key=key, rounding_mode="stochastic", **kwargs
     )
 
 

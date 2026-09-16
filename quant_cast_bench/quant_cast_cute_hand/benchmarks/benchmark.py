@@ -452,7 +452,7 @@ def _bench_mxfp8_dim_m_swizzle_impl(M, K, kernel_fn):
 
 def _bench_mxfp8_dim_m_swizzle_v2(M, K):
     return _bench_mxfp8_dim_m_swizzle_impl(
-        M, K, lambda x: mxfp8_swizzle_v2(x, mode="dim_m")
+        M, K, lambda x: mxfp8_swizzle_v2(x, quant_orientation="dim_m")
     )
 
 
@@ -463,7 +463,7 @@ def _bench_mxfp8_dim_m_swizzle_sr_v2(M, K):
 
     def run():
         return mxfp8_swizzle_v2(
-            x, mode="dim_m", key=key, rounding_mode="stochastic"
+            x, quant_orientation="dim_m", key=key, rounding_mode="stochastic"
         )
 
     outputs = run()
@@ -501,7 +501,7 @@ def _bench_mxfp8_dim_km_swizzle_impl(M, K, kernel_fn):
 
 def _bench_mxfp8_dim_km_swizzle_v2(M, K):
     return _bench_mxfp8_dim_km_swizzle_impl(
-        M, K, lambda x: mxfp8_swizzle_v2(x, mode="dim_km")
+        M, K, lambda x: mxfp8_swizzle_v2(x, quant_orientation="dim_km")
     )
 
 
@@ -512,7 +512,7 @@ def _bench_mxfp8_dim_km_swizzle_sr_v2(M, K):
 
     def run():
         return mxfp8_swizzle_v2(
-            x, mode="dim_km", key=key, rounding_mode="stochastic"
+            x, quant_orientation="dim_km", key=key, rounding_mode="stochastic"
         )
 
     outputs = run()
