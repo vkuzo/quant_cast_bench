@@ -132,6 +132,33 @@ def mxfp8_swizzle_v2_kernel(
     is_stochastic_qdata_rounding: cutlass.Constexpr,
     is_square_scaling: cutlass.Constexpr,
 ) -> None:
+    """
+    Kernel for mxfp8 quantization across (dim_k, dim_m, dim_km) x (RTNE, SR)
+
+    High level flow:
+      0. create smem scratchpad
+         a. both dim-k and dim-m use a tile_m_size * tile_k_size bf16 scratchpad for input,
+         b. dim-k reuses the first half of 0a for qdata (to save smem)
+         c. dim-m additionally uses a tile_m_size * tile_k_size fp8 scratchpad for qdata
+      1. load input data with TMA.
+         a. If SR enabled, also load the random key while input data is loading
+      2. barrier to wait for (1)
+      3. if do_dim_m:
+         - read input data from smem and quantize in registers
+         - store scale to global memory
+         - store qdata to smem scratchpad from 0c
+      4. if do_dim_k:
+         - read input data from smem and quantize in registers
+         - store scale in registers
+         - syncthreads for dim-k smem input reads
+         - store qdata to smem scratchpad from 0b
+      5. syncthreads for dim-m and dim-k smem output writes
+      6. if do_dim_k, kick off dim_k TMA qdata store
+      7. if do_dim_m, kick off dim_m TMA qdata store
+      8. if do_dim_k, store scales from registers to global memory
+
+    """
+
     if cutlass.const_expr(quant_orientation == _QUANT_ORIENTATION_DIM_K):
         assert output_k_tma_atom is not None
         assert output_k_tma_tensor is not None
@@ -164,6 +191,7 @@ def mxfp8_swizzle_v2_kernel(
         assert mScaleMLogical is not None
         assert output_m_smem_layout is not None
 
+    # bookkeeping
     tidx, _, _ = cute.arch.thread_idx()
     tile_k_idx, tile_m_idx, _ = cute.arch.block_idx()
     warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -180,6 +208,8 @@ def mxfp8_swizzle_v2_kernel(
     else:
         M = cute.assume(M, divby=32)
         K = cute.assume(K, divby=32)
+
+    # create smem scratchpad
     smem = utils.SmemAllocator()
     input_storage = smem.allocate_array(
         cutlass.BFloat16, tile_m_size * tile_k_size, byte_alignment=1024
@@ -192,13 +222,17 @@ def mxfp8_swizzle_v2_kernel(
     # alignment gap at the front of every CTA's shared-memory allocation.
     tma_bar_ptr = smem.allocate_array(cutlass.Int64, 1)
 
+    # create smem barrier for input data TMA load
     if tidx == 0:
         cute.arch.mbarrier_init(tma_bar_ptr, 1)
     cute.arch.mbarrier_init_fence()
     cute.arch.sync_threads()
 
-    # All modes share one input TMA load. Dim-K aliases the input buffer only after every enabled
-    # pass has finished reading the BF16 tile.
+    # set up TMA machinery
+    # Note:
+    # * All quant orientations share one input TMA load
+    # * Dim-K aliases the input buffer for qdata output, to save smem
+    # * Dim-M does not alias the input and has a separate qdata smem buffer
     sInput = cute.make_tensor(
         cute.recast_ptr(
             input_storage, input_smem_layout.inner, dtype=cutlass.BFloat16
@@ -254,6 +288,7 @@ def mxfp8_swizzle_v2_kernel(
             cute.group_modes(gOutputM, 0, 2),
         )
 
+    # kick off input data TMA
     if warp == 0:
         with cute.arch.elect_one():
             cute.arch.mbarrier_arrive_and_expect_tx(
@@ -265,6 +300,7 @@ def mxfp8_swizzle_v2_kernel(
             tInputsInput,
             tma_bar_ptr=tma_bar_ptr,
         )
+
     if cutlass.const_expr(is_stochastic_qdata_rounding):
         # The Philox key is independent of the tile, so load and unpack it while TMA fills sInput.
         frgKey = cute.make_rmem_tensor(cute.make_layout(2), mSeed.element_type)
@@ -277,6 +313,8 @@ def mxfp8_swizzle_v2_kernel(
         k0 = cutlass.Uint32(key64[0] & cutlass.Uint64(0xFFFFFFFF))
         k1 = cutlass.Uint32(key64[0] >> 32)
         counter_base = key64[1]
+
+    # wait for input data to arrive
     cute.arch.mbarrier_wait(tma_bar_ptr, 0)
 
     smem_load_atom = cute.make_copy_atom(
@@ -286,14 +324,26 @@ def mxfp8_swizzle_v2_kernel(
         cute.nvgpu.CopyUniversalOp(), cutlass.Float8E4M3FN, num_bits_per_copy=128
     )
 
-    # Each dim-M thread owns one input column and processes every 32-row group. Its transposed
-    # qdata uses separate shared memory, so the optional dim-K pass can still read sInput.
     if cutlass.const_expr(do_dim_m):
+        # dim_m main pass (for dim_m and dim_km)
+        # * read input data from smem and quantize in registers
+        # * store scale to global memory
+        # * store qdata to smem (to be stored to global memory) with TMA later
+        #
+        # Note:
+        # Each dim-M thread owns one input column and processes every 32-row group. Its transposed
+        # qdata uses separate shared memory, so the optional dim-K pass can still read sInput.
         row_blocks = tile_m_size // 32
         output_row_m = tile_k_idx * tile_k_size + tidx
         scale_col_m = tile_m_idx * row_blocks
         rScaleM = cute.make_rmem_tensor(row_blocks, cutlass.Uint8)
         if cutlass.const_expr(is_stochastic_qdata_rounding):
+            # TODO(future): currently both the dim_m and dim_k flat element indices
+            # have range [0, M * K). This is fine for dim_m and dim_k in isolation, but
+            # reuses each index twice for dim_km. We should fix this by offsetting dim_m
+            # indices by M * K when both dim_m and dim_k are on. Just haven't gotten
+            # to it yet, will require changes to gold and tests to maintain bitwise
+            # equivalence vs kernel.
             sr_flat_base_m = (
                 (tile_k_idx * tile_k_size + tidx) * M + tile_m_idx * tile_m_size
             )
@@ -344,6 +394,7 @@ def mxfp8_swizzle_v2_kernel(
             )
         else:
             rScaleMPadded = cute.make_rmem_tensor(row_blocks, cutlass.Uint8)
+            # pad unused scale entries with zeros
             rScaleMPadded.fill(0)
             if output_row_m < K:
                 for row_block in cutlass.range_constexpr(row_blocks):
@@ -358,9 +409,11 @@ def mxfp8_swizzle_v2_kernel(
                     row_blocks,
                 )
 
-    # This is the original row-owned v2 dim-K pass. Modes dim_k and dim_km execute the same code;
-    # the ownership layout changes for shorter fused tiles so all 128 threads remain useful.
     if cutlass.const_expr(do_dim_k):
+        # dim-k main pass (for dim_k and dim_km)
+        # * read input data from smem and quantize in registers
+        # * keep scale to registers
+        # * store qdata in smem, overwriting the first half of input data (to save smem)
         bpr = tile_k_size // 32
         row_owned_k = tile_m_size == _DIM_K_TILE_M_SIZE_128
         iters = bpr if cutlass.const_expr(row_owned_k) else tile_m_size // 32
@@ -438,9 +491,12 @@ def mxfp8_swizzle_v2_kernel(
                     sGroupK16[(None, vec)],
                 )
 
+    # Publish all enabled qdata writes to the async shared-memory proxy and wait for every thread
+    # before launching the enabled qdata TMA store(s).
     cute.arch.fence_proxy("async.shared", space="cta")
     cute.arch.sync_threads()
     if cutlass.const_expr(do_dim_k):
+        # kick off dim-k TMA qdata store
         if warp == 0:
             cute.copy(
                 output_k_tma_atom,
@@ -457,8 +513,8 @@ def mxfp8_swizzle_v2_kernel(
                 tOutputgM[(None, tile_k_idx, tile_m_idx)],
             )
 
-    # Let the qdata TMA store overlap the much smaller direct scale write.
     if cutlass.const_expr(do_dim_k):
+        # do the dim-k scale write (overlaps with qdata TMA store)
         use_full_tile_k = cutlass.const_expr(not needs_boundary_masking) or (
             ((tile_m_idx + 1) * tile_m_size <= M) & ((tile_k_idx + 1) * tile_k_size <= K)
         )
@@ -520,8 +576,6 @@ def mxfp8_swizzle_v2_kernel(
                         if scale_col_k < K // 32:
                             scale_k = rScaleK[it]
                     mScaleKLogical[(input_row_k, scale_col_k)] = scale_k
-
-
 
 
 @cute.jit
