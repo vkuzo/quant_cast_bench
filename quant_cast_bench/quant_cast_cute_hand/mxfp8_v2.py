@@ -336,20 +336,24 @@ def mxfp8_swizzle_v2_kernel(
         scale_col_m = tile_m_idx * row_blocks
         rScaleM = cute.make_rmem_tensor(row_blocks, cutlass.Uint8)
         if cutlass.const_expr(is_stochastic_qdata_rounding):
-            # TODO(future): currently both the dim_m and dim_k flat element indices
-            # have range [0, M * K). This is fine for dim_m and dim_k in isolation, but
-            # reuses each index twice for dim_km. We should fix this by offsetting dim_m
-            # indices by M * K when both dim_m and dim_k are on. Just haven't gotten
-            # to it yet, will require changes to gold and tests to maintain bitwise
-            # equivalence vs kernel.
             # M is divisible by 16, so divide before the wide multiply and form the Philox
             # counter directly instead of materializing the larger flat element index.
             global_col_m = tile_k_idx * tile_k_size + tidx
-            sr_counter_base_m = (
-                counter_base
-                + cutlass.Uint64(global_col_m) * cutlass.Uint64(M // 16)
-                + cutlass.Uint64(tile_m_idx * tile_m_size // 16)
-            )
+            if cutlass.const_expr(do_dim_k):
+                # In dim-KM, place dim-M after dim-K's M*K elements in the Philox stream.
+                # Folding K into the transposed output row retains a single wide multiply.
+                sr_counter_base_m = (
+                    counter_base
+                    + (cutlass.Uint64(K) + cutlass.Uint64(global_col_m))
+                    * cutlass.Uint64(M // 16)
+                    + cutlass.Uint64(tile_m_idx * tile_m_size // 16)
+                )
+            else:
+                sr_counter_base_m = (
+                    counter_base
+                    + cutlass.Uint64(global_col_m) * cutlass.Uint64(M // 16)
+                    + cutlass.Uint64(tile_m_idx * tile_m_size // 16)
+                )
         for row_block in cutlass.range_constexpr(row_blocks):
             if cutlass.const_expr(is_stochastic_qdata_rounding):
                 sr_counter_start_m = sr_counter_base_m + cutlass.Uint64(row_block * 2)

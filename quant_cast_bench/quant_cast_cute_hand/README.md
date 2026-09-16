@@ -75,11 +75,6 @@ define:
 - distributed-execution behavior;
 - overflow/wraparound behavior for the counter.
 
-The dim-KM implementation also deliberately reuses the same flat counter range
-for dim-K and dim-M. That correlates the rounding applied to the two outputs.
-Resolve the existing TODO by assigning non-overlapping counter ranges before
-upstreaming stochastic dim-KM.
-
 #### Replace the process-global compilation cache
 
 The current dictionary cache is unbounded and unsynchronized. It has no explicit

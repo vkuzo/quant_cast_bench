@@ -1198,6 +1198,12 @@ def mxfp8_dim_m_swizzle_sr_f(x, key, **kwargs):
     return qdata, _to_blocked_4d(scale_e8m0.squeeze(1).t().contiguous())
 
 
+def _advance_philox_key_by_counters(key, counter_offset):
+    """Advance a uint64 ``(seed, offset)`` Philox key with wrapping arithmetic."""
+    key_i64 = key.reshape(-1).view(torch.int64)
+    return torch.stack((key_i64[0], key_i64[1] + counter_offset)).view(torch.uint64)
+
+
 def mxfp8_dim_m_swizzle_dq_f(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     # not a dataclass field -- inverse for the correctness check / consumers. `q` is (N, M) in
     # the transposed dim-M frame, so its 32-blocks run along the last (M) axis; reuse
@@ -1262,14 +1268,15 @@ def mxfp8_dim_km_swizzle_f(x, **kwargs):
 def mxfp8_dim_km_swizzle_sr_f(x, key, **kwargs):
     """Both orientations of ``mxfp8_dim_km_swizzle_f`` with NVIDIA SM100 qdata SR.
 
-    The two orientations share the caller's Philox key, and each indexes that stream by its own
-    flattened output position: ``(M, N)`` for dim-K and transposed ``(N, M)`` for dim-M.
-
-    TODO(future): do not reuse flat indices between dim-k and dim-m, instead start dim-m flat index
-    at M*N.
+    The two orientations use disjoint ranges of the caller's Philox stream. Dim-K indexes its
+    flattened ``(M, N)`` output starting at zero; dim-M indexes its transposed ``(N, M)`` output
+    starting at ``M * N``.
     """
+    M, N = x.shape
     qk, sk = mxfp8_swizzle_sr_f(x, key)
-    qm, sm = mxfp8_dim_m_swizzle_sr_f(x, key)
+    # One Philox counter provides the four random words consumed by 16 FP8 output values.
+    key_m = _advance_philox_key_by_counters(key, M * N // 16)
+    qm, sm = mxfp8_dim_m_swizzle_sr_f(x, key_m)
     return qk, sk, qm, sm
 
 

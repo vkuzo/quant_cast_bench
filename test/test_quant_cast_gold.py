@@ -111,6 +111,21 @@ def test_mxfp8_dim_m_modes_sr_reproducible_and_preserve_scales(sr_fn, rtne_fn):
     )
 
 
+def test_mxfp8_dim_km_swizzle_sr_uses_disjoint_counter_ranges():
+    M, K = 96, 160
+    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+    key = prng.fold_in(prng.key(7, device=x.device), 12345)
+
+    actual = mxfp8_dim_km_swizzle_sr_f(x, key)
+    expected_k = mxfp8_swizzle_sr_f(x, key)
+    key_i64 = key.view(torch.int64)
+    key_m = torch.stack((key_i64[0], key_i64[1] + M * K // 16)).view(torch.uint64)
+    expected_m = mxfp8_dim_m_swizzle_sr_f(x, key_m)
+
+    for output, expected in zip(actual, (*expected_k, *expected_m)):
+        assert torch.equal(output.view(torch.uint8), expected.view(torch.uint8))
+
+
 def test_nvfp4_rht_nvidia_sr_variants_compose_the_nvidia_sr_gold():
     M, K = 128, 160
     x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
