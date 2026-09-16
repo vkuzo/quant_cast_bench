@@ -631,6 +631,174 @@ def mxfp8_swizzle_v2_dim_k_jit(
     )
 
 
+
+# ---------------------------------------------------------------------------
+# The unified TMA kernel below supports dim-K, dim-M, and fused dim-KM specializations. Every orientation
+# uses one input TMA load; constexpr gates select the dim-K and dim-M passes, and each enabled qdata
+# result is staged in shared memory for TMA output. Small dim-M/dim-KM inputs use a 32x128 tile to
+# expose more CTAs. Larger dim-M uses 64x256, while larger dim-KM uses 64x128.
+_DIM_M_KM_SMALL_TILE_32_128 = (32, 128)
+_DIM_M_LARGE_TILE_64_256 = (64, 256)
+_DIM_KM_LARGE_TILE_64_128 = (64, 128)
+
+
+@cute.jit
+def mxfp8_swizzle_v2_dim_m_or_km_jit(
+    mInput: cute.Tensor,
+    mOutputM: cute.Tensor,
+    mScaleM: cute.Tensor,
+    mOutputK: cute.Tensor | None,
+    mScaleK: cute.Tensor | None,
+    mSeed: cute.Tensor,
+    M: cutlass.Int32,
+    K: cutlass.Int32,
+    tile_m_size: cutlass.Constexpr,
+    tile_k_size: cutlass.Constexpr,
+    cluster_k: cutlass.Constexpr,
+    needs_boundary_masking: cutlass.Constexpr,
+    quant_orientation: cutlass.Constexpr,
+    is_stochastic_qdata_rounding: cutlass.Constexpr,
+) -> None:
+    if cutlass.const_expr(quant_orientation == _QUANT_ORIENTATION_DIM_KM):
+        assert mOutputK is not None
+        assert mScaleK is not None
+    else:
+        assert quant_orientation == _QUANT_ORIENTATION_DIM_M
+        assert mOutputK is None
+        assert mScaleK is None
+
+    padded_M = _ceil_div(M, 128) * 128
+    padded_K = _ceil_div(K, tile_k_size) * tile_k_size
+    if cutlass.const_expr(quant_orientation == _QUANT_ORIENTATION_DIM_KM):
+        # Keep each 128-bit row vector intact while XORing row bits into the shared-memory bank
+        # selection. This targets the dim-K phase's 16-way row-read conflicts.
+        input_smem_atom = tcgen05.make_smem_layout_atom(
+            tcgen05.SmemLayoutAtomKind.K_SW128, cutlass.BFloat16
+        )
+        input_smem_layout = cute.coalesce(
+            cute.tile_to_shape(input_smem_atom, (tile_m_size, tile_k_size), order=(0, 1)),
+            target_profile=(1, 1),
+        )
+    else:
+        # Keep the kernel argument type uniform while retaining the original unswizzled dim-M
+        # address mapping.
+        input_smem_layout = cute.make_composed_layout(
+            cute.make_swizzle(0, 0, 0),
+            0,
+            cute.make_layout((tile_m_size, tile_k_size), stride=(tile_k_size, 1)),
+        )
+    output_m_smem_layout = cute.make_composed_layout(
+        cute.make_swizzle(0, 0, 0),
+        0,
+        cute.make_layout((tile_k_size, tile_m_size), stride=(tile_m_size, 1)),
+    )
+    input_tma_atom, input_tma_tensor = cpasync.make_tiled_tma_atom(
+        cpasync.CopyBulkTensorTileG2SOp(),
+        mInput,
+        input_smem_layout,
+        (tile_m_size, tile_k_size),
+    )
+    output_m_tma_atom, output_m_tma_tensor = cpasync.make_tiled_tma_atom(
+        cpasync.CopyBulkTensorTileS2GOp(),
+        mOutputM,
+        output_m_smem_layout,
+        (tile_k_size, tile_m_size),
+    )
+
+    if cutlass.const_expr(quant_orientation == _QUANT_ORIENTATION_DIM_KM):
+        output_k_smem_atom = tcgen05.make_smem_layout_atom(
+            tcgen05.SmemLayoutAtomKind.K_SW128, cutlass.Float8E4M3FN
+        )
+        output_k_smem_layout = cute.coalesce(
+            cute.tile_to_shape(
+                output_k_smem_atom, (tile_m_size, tile_k_size), order=(0, 1)
+            ),
+            target_profile=(1, 1),
+        )
+        output_k_tma_atom, output_k_tma_tensor = cpasync.make_tiled_tma_atom(
+            cpasync.CopyBulkTensorTileS2GOp(),
+            mOutputK,
+            output_k_smem_layout,
+            (tile_m_size, tile_k_size),
+        )
+    else:
+        output_k_smem_layout = None
+        output_k_tma_atom = None
+        output_k_tma_tensor = None
+
+    nrb_m = _ceil_div(K, 128)
+    ncb_m = _ceil_div(M, 128)
+    scale_m_layout = cute.make_layout(
+        ((32, 4, nrb_m), (4, ncb_m)),
+        stride=((16, 4, ncb_m * 32 * 16), (1, 32 * 16)),
+    )
+    mScaleMLogical = cute.make_tensor(mScaleM.iterator, scale_m_layout)
+    if cutlass.const_expr(quant_orientation == _QUANT_ORIENTATION_DIM_KM):
+        nrb_k = _ceil_div(M, 128)
+        ncb_k = _ceil_div(K, 128)
+        scale_k_layout = cute.make_layout(
+            ((32, 4, nrb_k), (4, ncb_k)),
+            stride=((16, 4, ncb_k * 32 * 16), (1, 32 * 16)),
+        )
+        mScaleKLogical = cute.make_tensor(mScaleK.iterator, scale_k_layout)
+
+        bpr = tile_k_size // 32
+        if cutlass.const_expr(tile_m_size == _DIM_K_TILE_M_SIZE_128):
+            data_k_tv_layout = cute.make_layout(
+                ((tile_m_size,), (32, bpr)),
+                stride=((1,), (tile_m_size, tile_m_size * 32)),
+            )
+        else:
+            # Flatten (1x32 group within a row, row within a 32-row stage) over the 128 threads,
+            # then advance the value iteration through successive 32-row stages.
+            row_blocks = tile_m_size // 32
+            data_k_tv_layout = cute.make_layout(
+                ((bpr, 32), (32, row_blocks)),
+                stride=((tile_m_size * 32, 1), (tile_m_size, 32)),
+            )
+    else:
+        mScaleKLogical = None
+        data_k_tv_layout = None
+
+    kernel = mxfp8_swizzle_v2_kernel(
+        input_tma_atom,
+        input_tma_tensor,
+        output_k_tma_atom,
+        output_k_tma_tensor,
+        output_m_tma_atom,
+        output_m_tma_tensor,
+        mScaleKLogical,
+        mScaleMLogical,
+        mSeed,
+        input_smem_layout,
+        output_k_smem_layout,
+        output_m_smem_layout,
+        data_k_tv_layout,
+        tile_m_size,
+        tile_k_size,
+        M,
+        K,
+        needs_boundary_masking,
+        quant_orientation,
+        is_stochastic_qdata_rounding,
+        False,
+    )
+    grid = (padded_K // tile_k_size, padded_M // tile_m_size, 1)
+    block = (max(_MIN_CTA_THREADS_128, tile_k_size), 1, 1)
+    if cutlass.const_expr(
+        quant_orientation == _QUANT_ORIENTATION_DIM_KM and not is_stochastic_qdata_rounding and tile_m_size != 32
+    ):
+        # A degenerate cluster constrains residency for this larger two-output specialization;
+        # an ordinary launch lets Blackwell keep nine CTAs resident per SM instead.
+        kernel.launch(grid=grid, block=block)
+    else:
+        # K-major scheduling keeps adjacent row-major input columns together.
+        kernel.launch(
+            grid=grid,
+            block=block,
+            cluster=(cluster_k, 1, 1),
+        )
+
 def _mxfp8_swizzle_v2_impl(
     input: torch.Tensor,
     quant_orientation: str,
@@ -875,174 +1043,6 @@ def _mxfp8_swizzle_sr_v2(input, key, **kwargs):
 MXFP8_SWIZZLE_SR_V2 = QuantCastCuteRecipe.from_gold(
     Mxfp8SwizzleSRGold, cute_fn=_mxfp8_swizzle_sr_v2
 )
-
-
-# ---------------------------------------------------------------------------
-# The unified TMA kernel below supports dim-K, dim-M, and fused dim-KM specializations. Every orientation
-# uses one input TMA load; constexpr gates select the dim-K and dim-M passes, and each enabled qdata
-# result is staged in shared memory for TMA output. Small dim-M/dim-KM inputs use a 32x128 tile to
-# expose more CTAs. Larger dim-M uses 64x256, while larger dim-KM uses 64x128.
-_DIM_M_KM_SMALL_TILE_32_128 = (32, 128)
-_DIM_M_LARGE_TILE_64_256 = (64, 256)
-_DIM_KM_LARGE_TILE_64_128 = (64, 128)
-
-
-@cute.jit
-def mxfp8_swizzle_v2_dim_m_or_km_jit(
-    mInput: cute.Tensor,
-    mOutputM: cute.Tensor,
-    mScaleM: cute.Tensor,
-    mOutputK: cute.Tensor | None,
-    mScaleK: cute.Tensor | None,
-    mSeed: cute.Tensor,
-    M: cutlass.Int32,
-    K: cutlass.Int32,
-    tile_m_size: cutlass.Constexpr,
-    tile_k_size: cutlass.Constexpr,
-    cluster_k: cutlass.Constexpr,
-    needs_boundary_masking: cutlass.Constexpr,
-    quant_orientation: cutlass.Constexpr,
-    is_stochastic_qdata_rounding: cutlass.Constexpr,
-) -> None:
-    if cutlass.const_expr(quant_orientation == _QUANT_ORIENTATION_DIM_KM):
-        assert mOutputK is not None
-        assert mScaleK is not None
-    else:
-        assert quant_orientation == _QUANT_ORIENTATION_DIM_M
-        assert mOutputK is None
-        assert mScaleK is None
-
-    padded_M = _ceil_div(M, 128) * 128
-    padded_K = _ceil_div(K, tile_k_size) * tile_k_size
-    if cutlass.const_expr(quant_orientation == _QUANT_ORIENTATION_DIM_KM):
-        # Keep each 128-bit row vector intact while XORing row bits into the shared-memory bank
-        # selection. This targets the dim-K phase's 16-way row-read conflicts.
-        input_smem_atom = tcgen05.make_smem_layout_atom(
-            tcgen05.SmemLayoutAtomKind.K_SW128, cutlass.BFloat16
-        )
-        input_smem_layout = cute.coalesce(
-            cute.tile_to_shape(input_smem_atom, (tile_m_size, tile_k_size), order=(0, 1)),
-            target_profile=(1, 1),
-        )
-    else:
-        # Keep the kernel argument type uniform while retaining the original unswizzled dim-M
-        # address mapping.
-        input_smem_layout = cute.make_composed_layout(
-            cute.make_swizzle(0, 0, 0),
-            0,
-            cute.make_layout((tile_m_size, tile_k_size), stride=(tile_k_size, 1)),
-        )
-    output_m_smem_layout = cute.make_composed_layout(
-        cute.make_swizzle(0, 0, 0),
-        0,
-        cute.make_layout((tile_k_size, tile_m_size), stride=(tile_m_size, 1)),
-    )
-    input_tma_atom, input_tma_tensor = cpasync.make_tiled_tma_atom(
-        cpasync.CopyBulkTensorTileG2SOp(),
-        mInput,
-        input_smem_layout,
-        (tile_m_size, tile_k_size),
-    )
-    output_m_tma_atom, output_m_tma_tensor = cpasync.make_tiled_tma_atom(
-        cpasync.CopyBulkTensorTileS2GOp(),
-        mOutputM,
-        output_m_smem_layout,
-        (tile_k_size, tile_m_size),
-    )
-
-    if cutlass.const_expr(quant_orientation == _QUANT_ORIENTATION_DIM_KM):
-        output_k_smem_atom = tcgen05.make_smem_layout_atom(
-            tcgen05.SmemLayoutAtomKind.K_SW128, cutlass.Float8E4M3FN
-        )
-        output_k_smem_layout = cute.coalesce(
-            cute.tile_to_shape(
-                output_k_smem_atom, (tile_m_size, tile_k_size), order=(0, 1)
-            ),
-            target_profile=(1, 1),
-        )
-        output_k_tma_atom, output_k_tma_tensor = cpasync.make_tiled_tma_atom(
-            cpasync.CopyBulkTensorTileS2GOp(),
-            mOutputK,
-            output_k_smem_layout,
-            (tile_m_size, tile_k_size),
-        )
-    else:
-        output_k_smem_layout = None
-        output_k_tma_atom = None
-        output_k_tma_tensor = None
-
-    nrb_m = _ceil_div(K, 128)
-    ncb_m = _ceil_div(M, 128)
-    scale_m_layout = cute.make_layout(
-        ((32, 4, nrb_m), (4, ncb_m)),
-        stride=((16, 4, ncb_m * 32 * 16), (1, 32 * 16)),
-    )
-    mScaleMLogical = cute.make_tensor(mScaleM.iterator, scale_m_layout)
-    if cutlass.const_expr(quant_orientation == _QUANT_ORIENTATION_DIM_KM):
-        nrb_k = _ceil_div(M, 128)
-        ncb_k = _ceil_div(K, 128)
-        scale_k_layout = cute.make_layout(
-            ((32, 4, nrb_k), (4, ncb_k)),
-            stride=((16, 4, ncb_k * 32 * 16), (1, 32 * 16)),
-        )
-        mScaleKLogical = cute.make_tensor(mScaleK.iterator, scale_k_layout)
-
-        bpr = tile_k_size // 32
-        if cutlass.const_expr(tile_m_size == _DIM_K_TILE_M_SIZE_128):
-            data_k_tv_layout = cute.make_layout(
-                ((tile_m_size,), (32, bpr)),
-                stride=((1,), (tile_m_size, tile_m_size * 32)),
-            )
-        else:
-            # Flatten (1x32 group within a row, row within a 32-row stage) over the 128 threads,
-            # then advance the value iteration through successive 32-row stages.
-            row_blocks = tile_m_size // 32
-            data_k_tv_layout = cute.make_layout(
-                ((bpr, 32), (32, row_blocks)),
-                stride=((tile_m_size * 32, 1), (tile_m_size, 32)),
-            )
-    else:
-        mScaleKLogical = None
-        data_k_tv_layout = None
-
-    kernel = mxfp8_swizzle_v2_kernel(
-        input_tma_atom,
-        input_tma_tensor,
-        output_k_tma_atom,
-        output_k_tma_tensor,
-        output_m_tma_atom,
-        output_m_tma_tensor,
-        mScaleKLogical,
-        mScaleMLogical,
-        mSeed,
-        input_smem_layout,
-        output_k_smem_layout,
-        output_m_smem_layout,
-        data_k_tv_layout,
-        tile_m_size,
-        tile_k_size,
-        M,
-        K,
-        needs_boundary_masking,
-        quant_orientation,
-        is_stochastic_qdata_rounding,
-        False,
-    )
-    grid = (padded_K // tile_k_size, padded_M // tile_m_size, 1)
-    block = (max(_MIN_CTA_THREADS_128, tile_k_size), 1, 1)
-    if cutlass.const_expr(
-        quant_orientation == _QUANT_ORIENTATION_DIM_KM and not is_stochastic_qdata_rounding and tile_m_size != 32
-    ):
-        # A degenerate cluster constrains residency for this larger two-output specialization;
-        # an ordinary launch lets Blackwell keep nine CTAs resident per SM instead.
-        kernel.launch(grid=grid, block=block)
-    else:
-        # K-major scheduling keeps adjacent row-major input columns together.
-        kernel.launch(
-            grid=grid,
-            block=block,
-            cluster=(cluster_k, 1, 1),
-        )
 
 
 MXFP8_DIM_M_SWIZZLE_V2 = QuantCastCuteRecipe.from_gold(
