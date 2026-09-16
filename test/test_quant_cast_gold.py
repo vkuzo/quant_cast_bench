@@ -48,14 +48,19 @@ pytestmark = pytest.mark.skipif(
     ALL_RECIPES,
     ids=[name for name, _ in ALL_RECIPES],
 )
-def test_ref_correctness(name, gold):
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.bfloat16, torch.float16, torch.float32],
+    ids=["bf16", "fp16", "fp32"],
+)
+def test_ref_correctness(name, gold, dtype):
     # each gold recipe is internally consistent: pt_ref_fn's own outputs clear its correctness_fn.
     # example_input_fn builds the full positional inputs (x, *aux). Calls pt_ref_fn directly on
     # the whole tensor (no flex_tile_map). The whole tensor is one tile, so we pass the origin
     # position kwargs a INDUCTOR-style whole-tensor call would -- recipes that ignore them accept
     # **kwargs; sr_bf16_global needs them for its per-element global-position dither.
     torch.manual_seed(0)
-    inputs = gold.example_input_fn(512, 512, torch.bfloat16)
+    inputs = gold.example_input_fn(512, 512, dtype)
 
     outputs = gold.pt_ref_fn(*inputs, global_row=0, global_col=0, num_col=inputs[0].shape[1])
     gold.correctness_fn(inputs, outputs)  # raises AssertionError on failure
