@@ -66,11 +66,13 @@ def _scale_bytes(M: int, K: int, group: int, dim_m: bool) -> int:
     return _ceil_div(rows, 128) * _ceil_div(groups, 4) * 32 * 16
 
 
-def _logical_bytes(M: int, K: int, family: str, mode: str) -> int:
+def _logical_bytes(
+    M: int, K: int, family: str, mode: str, input_element_size: int
+) -> int:
     numel = M * K
     qbytes = numel if family == "mxfp8" else numel // 2
     group = 32 if family == "mxfp8" else 16
-    total = 2 * numel
+    total = input_element_size * numel
     if mode in ("dim_k", "dim_km"):
         total += qbytes + _scale_bytes(M, K, group, dim_m=False)
     if mode in ("dim_m", "dim_km"):
@@ -231,7 +233,7 @@ NO_TE_CASES = (
 
 ALL_CASES = CASES + NO_TE_CASES
 
-FLOAT16_KERNELS = frozenset({
+KERNELS_SUPPORTING_FLOAT16_AND_FLOAT32 = frozenset({
     "mxfp8_swizzle_v2",
     "mxfp8_swizzle_sr_v2",
     "mxfp8_32x32_swizzle_v2",
@@ -244,6 +246,7 @@ FLOAT16_KERNELS = frozenset({
 DTYPES = {
     "bfloat16": torch.bfloat16,
     "float16": torch.float16,
+    "float32": torch.float32,
 }
 
 CSV_FIELDS = (
@@ -326,11 +329,16 @@ def main(
     cases_by_name = {case[0]: case for case in ALL_CASES}
     cases = [cases_by_name[name] for name in kernels]
     dtype_name, input_dtype = _parse_dtype(dtype)
-    if input_dtype == torch.float16:
-        unsupported = [name for name in kernels if name not in FLOAT16_KERNELS]
+    if input_dtype != torch.bfloat16:
+        unsupported = [
+            name
+            for name in kernels
+            if name not in KERNELS_SUPPORTING_FLOAT16_AND_FLOAT32
+        ]
         if unsupported:
             raise ValueError(
-                "float16 input is unsupported by kernels: " + ", ".join(unsupported)
+                f"{dtype_name} input is unsupported by kernels: "
+                + ", ".join(unsupported)
             )
 
     shapes_for_model = shapes_for_model.strip().lower()
@@ -421,7 +429,9 @@ def main(
                     te_ms = te_cache[key]
 
                 ours_ms = _time(_make_ours(name, x))
-                byte_count = _logical_bytes(M, K, family, mode)
+                byte_count = _logical_bytes(
+                    M, K, family, mode, x.element_size()
+                )
                 ours_tb_s = byte_count / (ours_ms * 1e-3) / 1e12
                 if te_ms is not None:
                     te_tb_s = byte_count / (te_ms * 1e-3) / 1e12

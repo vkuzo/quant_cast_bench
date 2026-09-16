@@ -89,7 +89,7 @@ _REQUIRES_SM100 = frozenset({
     "nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_pipelined",
 })
 
-_SUPPORTS_FLOAT16 = frozenset({
+_SUPPORTS_NON_BFLOAT16 = frozenset({
     "mxfp8_swizzle_v2",
     "mxfp8_swizzle_sr_v2",
     "mxfp8_32x32_swizzle_v2",
@@ -218,8 +218,8 @@ def test_mxfp8_swizzle_v2(M, K):
 
 
 def test_mxfp8_v2_rejects_unsupported_input_dtype():
-    x = torch.randn(128, 256, dtype=torch.float32, device="cuda")
-    with pytest.raises(AssertionError, match="supports only bf16 and fp16"):
+    x = torch.randn(128, 256, dtype=torch.float64, device="cuda")
+    with pytest.raises(AssertionError, match="supports only bf16, fp16, and fp32"):
         mxfp8_swizzle_v2(x)
 
 
@@ -787,8 +787,8 @@ def test_deepseek_1x128_dim_m_v2():
 
 @pytest.mark.parametrize(
     "dtype",
-    [torch.bfloat16, torch.float16],
-    ids=["bf16", "fp16"],
+    [torch.bfloat16, torch.float16, torch.float32],
+    ids=["bf16", "fp16", "fp32"],
 )
 @pytest.mark.parametrize("name, recipe", ALL_RECIPES, ids=[n for n, _ in ALL_RECIPES])
 def test_cute_hand_matches_reference(name, recipe, dtype):
@@ -796,8 +796,8 @@ def test_cute_hand_matches_reference(name, recipe, dtype):
     # cast). example_input_fn builds the full positional inputs (x, *aux).
     if name in _REQUIRES_SM100 and torch.cuda.get_device_capability() != (10, 0):
         pytest.skip(f"{name} emits Blackwell-only PTX; requires cuda capability 10.0")
-    if dtype == torch.float16 and name not in _SUPPORTS_FLOAT16:
-        pytest.skip(f"{name} does not support float16 input")
+    if dtype != torch.bfloat16 and name not in _SUPPORTS_NON_BFLOAT16:
+        pytest.skip(f"{name} does not support {dtype} input")
     torch.manual_seed(0)
     if name in (
         "nvfp4_swizzle_dim_k_dim_m_rht_tma",
