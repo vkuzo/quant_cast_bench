@@ -130,7 +130,7 @@ def mxfp8_swizzle_v2_kernel(
     needs_boundary_masking: cutlass.Constexpr,
     mode: cutlass.Constexpr,
     is_stochastic_qdata_rounding: cutlass.Constexpr,
-    square_scaling: cutlass.Constexpr,
+    is_square_scaling: cutlass.Constexpr,
 ):
     tidx, _, _ = cute.arch.thread_idx()
     tile_k_idx, tile_m_idx, _ = cute.arch.block_idx()
@@ -374,7 +374,7 @@ def mxfp8_swizzle_v2_kernel(
             amax_k = cute.math.absf(vk).reduce(
                 cute.ReductionOp.MAX, cutlass.Float32(0.0), 0
             )
-            if cutlass.const_expr(square_scaling):
+            if cutlass.const_expr(is_square_scaling):
                 # One warp owns the 32 rows of each 32-column group. Broadcast their combined
                 # maximum so every row quantizes with the same 32x32-block scale.
                 amax_k = cute.arch.warp_reduction_max(amax_k)
@@ -471,7 +471,7 @@ def mxfp8_swizzle_v2_kernel(
             # Short tiles distribute (row, 1x32 group) pairs across all threads. The fused 1D path
             # is group-major; square scaling is warp/block-major. Both need individual scale stores
             # because their slots are strided across rows.
-            if cutlass.const_expr(square_scaling):
+            if cutlass.const_expr(is_square_scaling):
                 local_group_k = tidx // 32
                 local_row_k = tidx % 32
             else:
@@ -505,7 +505,7 @@ def mxfp8_swizzle_v2_dim_k_jit(
     cluster_k: cutlass.Constexpr,
     needs_boundary_masking: cutlass.Constexpr,
     is_stochastic_qdata_rounding: cutlass.Constexpr,
-    square_scaling: cutlass.Constexpr,
+    is_square_scaling: cutlass.Constexpr,
 ) -> None:
     padded_M = _ceil_div(M, _DIM_K_TILE_M_SIZE_128) * _DIM_K_TILE_M_SIZE_128
     padded_K = _ceil_div(K, tile_k_size) * tile_k_size
@@ -539,7 +539,7 @@ def mxfp8_swizzle_v2_dim_k_jit(
             ((_MIN_CTA_THREADS_128,), (32, iters)),
             stride=((1,), (tile_m_size, tile_m_size * 32)),
         )
-    elif cutlass.const_expr(square_scaling):
+    elif cutlass.const_expr(is_square_scaling):
         # The 32x128 square-scale tile assigns one warp to each 32x32 block. Within a warp,
         # lanes own rows and values walk columns, so warp_reduction_max spans the whole block.
         data_tv_layout = cute.make_layout(
@@ -589,7 +589,7 @@ def mxfp8_swizzle_v2_dim_k_jit(
         needs_boundary_masking,
         _MODE_DIM_K,
         is_stochastic_qdata_rounding,
-        square_scaling,
+        is_square_scaling,
     ).launch(
         # Make the fast-changing grid dimension follow contiguous columns. Clustering those CTAs
         # further preserves that locality in hardware scheduling.
@@ -604,7 +604,7 @@ def _mxfp8_swizzle_v2_impl(
     mode: str,
     key: torch.Tensor | None,
     rounding_mode: str,
-    square_scaling: bool,
+    is_square_scaling: bool,
     **kwargs,
 ):
     assert mode in ("dim_k", "dim_m", "dim_km"), f"unsupported mode: {mode}"
@@ -614,7 +614,7 @@ def _mxfp8_swizzle_v2_impl(
     rounding_mode = str(getattr(rounding_mode, "value", rounding_mode)).lower()
     assert rounding_mode in ("rtne", "stochastic"), f"unsupported rounding_mode: {rounding_mode}"
     is_stochastic_qdata_rounding = rounding_mode == "stochastic"
-    if square_scaling:
+    if is_square_scaling:
         assert mode == "dim_k", "32x32 v2 currently supports only dim-k output"
         assert not is_stochastic_qdata_rounding, "32x32 v2 currently supports only RTNE"
     if is_stochastic_qdata_rounding:
@@ -625,7 +625,7 @@ def _mxfp8_swizzle_v2_impl(
         assert key is None, "RTNE rounding does not use a Philox key"
     M, K = input.shape
     assert M > 0 and K > 0, "v2 requires non-empty dimensions"
-    if square_scaling:
+    if is_square_scaling:
         assert M % 32 == 0, "32x32 v2 requires M % 32 == 0"
 
     if mode != "dim_k":
@@ -753,7 +753,7 @@ def _mxfp8_swizzle_v2_impl(
     cluster_k = (
         # Square scaling has enough independent CTAs at small/medium sizes that clustering only
         # constrains scheduling; large shapes retain v2's K-locality-oriented clusters.
-        1 if is_stochastic_qdata_rounding or (square_scaling and M * K <= 4096 * 4096)
+        1 if is_stochastic_qdata_rounding or (is_square_scaling and M * K <= 4096 * 4096)
         else next(c for c in (16, 8, 4, 2, 1) if c <= ncb and grid_n % c == 0)
     )
     output = torch.empty(M, K, dtype=torch.float8_e4m3fn, device=input.device)
@@ -776,7 +776,7 @@ def _mxfp8_swizzle_v2_impl(
     fn = _compiled(
         (
             "mxfp8_swizzle_v2", "dim_k", tile_m_size, tile_k_size, cluster_k, needs_boundary_masking,
-            rounding_mode, square_scaling,
+            rounding_mode, is_square_scaling,
         ),
         mxfp8_swizzle_v2_dim_k_jit,
         mInput,
@@ -790,7 +790,7 @@ def _mxfp8_swizzle_v2_impl(
         cluster_k,
         needs_boundary_masking,
         is_stochastic_qdata_rounding,
-        square_scaling,
+        is_square_scaling,
     )
     fn(mInput, mOutput, mScale, mSeed, M, K)
     return output, scale.view(nrb, ncb, 32, 16).view(torch.float8_e8m0fnu)
@@ -808,7 +808,7 @@ def mxfp8_swizzle_v2(
         mode=mode,
         key=key,
         rounding_mode=rounding_mode,
-        square_scaling=False,
+        is_square_scaling=False,
         **kwargs,
     )
 
@@ -824,7 +824,7 @@ def mxfp8_32x32_swizzle_v2(input: torch.Tensor, **kwargs):
         mode="dim_k",
         key=None,
         rounding_mode="rtne",
-        square_scaling=True,
+        is_square_scaling=True,
         **kwargs,
     )
 
