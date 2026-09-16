@@ -42,7 +42,7 @@ def _compiled(key, jit_fn, *cute_args):
     return fn
 
 
-_DIM_K_TILE_M_SIZE_128, _MXS_MAX_TK, _MXS_WARPS = 128, 128, 4
+_DIM_K_TILE_M_SIZE_128, _DIM_K_MAX_TILE_K_SIZE_128, _MXS_WARPS = 128, 128, 4
 _MXS_THREADS = _MXS_WARPS * 32                       # 128, one thread per tile row
 
 _MODE_DIM_K = 0
@@ -52,7 +52,7 @@ _MODE_DIM_KM = 2
 
 def _mxfp8_swizzle_v2_tile_n(M, K):
     """Choose the measured B200 K tile from the padded 128x128 CTA count."""
-    num_128_tiles = _ceil_div(M, _DIM_K_TILE_M_SIZE_128) * _ceil_div(K, _MXS_MAX_TK)
+    num_128_tiles = _ceil_div(M, _DIM_K_TILE_M_SIZE_128) * _ceil_div(K, _DIM_K_MAX_TILE_K_SIZE_128)
     if num_128_tiles <= 64:
         tile_k_size = 32
     elif num_128_tiles <= 512:
