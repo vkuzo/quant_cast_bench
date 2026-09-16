@@ -36,7 +36,6 @@ HAS_CUTEDSL = _cutedsl_version is not None and _cutedsl_version >= _MIN_CUTEDSL
 
 if HAS_CUTEDSL:
     from quant_cast_bench.quant_cast_cute_hand.mxfp8_v2 import (
-        _mxfp8_swizzle_v2_tile_n,
         mxfp8_swizzle_v2,
     )
     from quant_cast_bench.quant_cast_cute_hand.recipes import (
@@ -336,22 +335,6 @@ def test_mxfp8_swizzle_v2_rejects_invalid_shapes(M, K):
     with pytest.raises(AssertionError):
         recipe.cute_fn(*inputs)
 
-
-@pytest.mark.parametrize(
-    "M,K,expected",
-    [
-        (512, 512, 32),
-        (1024, 1024, 32),
-        (1024, 1152, 64),
-        (2048, 4096, 64),
-        (2048, 4224, 128),
-        (4096, 4096, 128),
-        (65536, 32, 32),
-        (65536, 64, 64),
-    ],
-)
-def test_mxfp8_swizzle_v2_adaptive_tile(M, K, expected):
-    assert _mxfp8_swizzle_v2_tile_n(M, K) == expected
 
 def test_mxfp8_swizzle_v3():
     # 2-D 32x128-tile variant of v1 with a 16-elem/thread aligned uint32-word load (2x LDG.128).

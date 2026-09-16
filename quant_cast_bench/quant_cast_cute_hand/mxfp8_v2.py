@@ -56,24 +56,6 @@ _DIM_M_LARGE_TILE_64_256 = (64, 256)
 _DIM_KM_LARGE_TILE_64_128 = (64, 128)
 
 
-def _mxfp8_swizzle_v2_tile_n(M: int, K: int) -> int:
-    """Choose the measured B200 K tile from the padded 128x128 CTA count."""
-    num_128_tiles = _ceil_div(M, _DIM_K_TILE_M_SIZE_128) * _ceil_div(K, _DIM_K_MAX_TILE_K_SIZE_128)
-    if num_128_tiles <= 64:
-        tile_k_size = 32
-    elif num_128_tiles <= 512:
-        tile_k_size = 64
-    else:
-        tile_k_size = 128
-
-    # Do not compute padding merely to reach the selected width for very narrow matrices.
-    if K <= 32:
-        return 32
-    if K <= 64:
-        return min(tile_k_size, 64)
-    return tile_k_size
-
-
 @cute.jit
 def _mxfp8_v2_quantize_stochastic_x32(
     values: cute.TensorSSA,
@@ -852,7 +834,21 @@ def _mxfp8_swizzle_v2_impl(
         # First choose the original adaptive K width. For small problems that would use K=64,
         # rotate the same-size 128x64 tile to 32x128: it keeps 128 one-group threads but gives TMA
         # contiguous rows and exposes more M-parallel CTAs.
-        tile_k_size = _mxfp8_swizzle_v2_tile_n(M, K)
+        num_128_tiles = _ceil_div(M, _DIM_K_TILE_M_SIZE_128) * _ceil_div(
+            K, _DIM_K_MAX_TILE_K_SIZE_128
+        )
+        if num_128_tiles <= 64:
+            tile_k_size = 32
+        elif num_128_tiles <= 512:
+            tile_k_size = 64
+        else:
+            tile_k_size = 128
+
+        # Do not compute padding merely to reach the selected width for very narrow matrices.
+        if K <= 32:
+            tile_k_size = 32
+        elif K <= 64:
+            tile_k_size = min(tile_k_size, 64)
         if M * K <= 2048 * 2048 and tile_k_size >= 64:
             tile_m_size, tile_k_size = 32, 128
         else:
