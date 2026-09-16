@@ -42,16 +42,17 @@ def _compiled(key, jit_fn, *cute_args):
     return fn
 
 
-_MXS_TM, _MXS_MAX_TK, _MXS_WARPS = 128, 128, 4
+_DIM_K_TILE_M_SIZE_128, _MXS_MAX_TK, _MXS_WARPS = 128, 128, 4
 _MXS_THREADS = _MXS_WARPS * 32                       # 128, one thread per tile row
-_MXS_MODE_DIM_K = 0
-_MXS_MODE_DIM_M = 1
-_MXS_MODE_DIM_KM = 2
+
+_MODE_DIM_K = 0
+_MODE_DIM_M = 1
+_MODE_DIM_KM = 2
 
 
 def _mxfp8_swizzle_v2_tile_n(M, K):
     """Choose the measured B200 K tile from the padded 128x128 CTA count."""
-    num_128_tiles = _ceil_div(M, _MXS_TM) * _ceil_div(K, _MXS_MAX_TK)
+    num_128_tiles = _ceil_div(M, _DIM_K_TILE_M_SIZE_128) * _ceil_div(K, _MXS_MAX_TK)
     if num_128_tiles <= 64:
         tile_k_size = 32
     elif num_128_tiles <= 512:
@@ -128,14 +129,14 @@ def mxfp8_swizzle_v2_kernel(
     tidx, _, _ = cute.arch.thread_idx()
     tile_k_idx, tile_m_idx, _ = cute.arch.block_idx()
     warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
-    do_dim_k = mode != _MXS_MODE_DIM_M
-    do_dim_m = mode != _MXS_MODE_DIM_K
+    do_dim_k = mode != _MODE_DIM_M
+    do_dim_m = mode != _MODE_DIM_K
     if cutlass.const_expr(not ragged):
         M = cute.assume(M, divby=128)
         K = cute.assume(K, divby=128)
-    elif cutlass.const_expr(mode == _MXS_MODE_DIM_K):
+    elif cutlass.const_expr(mode == _MODE_DIM_K):
         K = cute.assume(K, divby=32)
-    elif cutlass.const_expr(mode == _MXS_MODE_DIM_M):
+    elif cutlass.const_expr(mode == _MODE_DIM_M):
         M = cute.assume(M, divby=32)
         K = cute.assume(K, divby=16)
     else:
@@ -323,7 +324,7 @@ def mxfp8_swizzle_v2_kernel(
     # the ownership layout changes for shorter fused tiles so all 128 threads remain useful.
     if cutlass.const_expr(do_dim_k):
         bpr = tile_k_size // 32
-        row_owned_k = tile_m_size == _MXS_TM
+        row_owned_k = tile_m_size == _DIM_K_TILE_M_SIZE_128
         iters = bpr if cutlass.const_expr(row_owned_k) else tile_m_size // 32
         tidfrgInputK = cute.composition(sInput, data_k_tv_layout)
         tidfrgOutputK = cute.composition(sOutputK, data_k_tv_layout)
@@ -500,7 +501,7 @@ def mxfp8_swizzle_v2_dim_k_jit(
     stochastic: cutlass.Constexpr,
     square_scaling: cutlass.Constexpr,
 ):
-    padded_M = _ceil_div(M, _MXS_TM) * _MXS_TM
+    padded_M = _ceil_div(M, _DIM_K_TILE_M_SIZE_128) * _DIM_K_TILE_M_SIZE_128
     padded_K = _ceil_div(K, tile_k_size) * tile_k_size
     bpr = tile_k_size // 32
     iters = bpr
@@ -526,7 +527,7 @@ def mxfp8_swizzle_v2_dim_k_jit(
         cute.tile_to_shape(output_smem_atom, (tile_m_size, tile_k_size), order=(0, 1)),
         target_profile=(1, 1),
     )
-    if cutlass.const_expr(tile_m_size == _MXS_TM):
+    if cutlass.const_expr(tile_m_size == _DIM_K_TILE_M_SIZE_128):
         # (thread, value) -> logical coordinate in the 128xN tile. Each thread owns one row.
         data_tv_layout = cute.make_layout(
             ((_MXS_THREADS,), (32, iters)),
@@ -580,7 +581,7 @@ def mxfp8_swizzle_v2_dim_k_jit(
         M,
         K,
         ragged,
-        _MXS_MODE_DIM_K,
+        _MODE_DIM_K,
         stochastic,
         square_scaling,
     ).launch(
@@ -694,7 +695,7 @@ def _mxfp8_swizzle_v2_impl(
         mSeed = from_dlpack(key.reshape(-1).view(torch.int64)) if stochastic else mScaleM
 
         mode_id = (
-            _MXS_MODE_DIM_KM if mode == "dim_km" else _MXS_MODE_DIM_M
+            _MODE_DIM_KM if mode == "dim_km" else _MODE_DIM_M
         )
         ragged = M != ncb_m * 128 or K != nrb_m * 128
         fn = _compiled(
@@ -867,7 +868,7 @@ def mxfp8_swizzle_v2_dim_m_or_km_jit(
 ):
     padded_M = _ceil_div(M, 128) * 128
     padded_K = _ceil_div(K, tile_k_size) * tile_k_size
-    if cutlass.const_expr(mode == _MXS_MODE_DIM_KM):
+    if cutlass.const_expr(mode == _MODE_DIM_KM):
         # Keep each 128-bit row vector intact while XORing row bits into the shared-memory bank
         # selection. This targets the dim-K phase's 16-way row-read conflicts.
         input_smem_atom = tcgen05.make_smem_layout_atom(
@@ -903,7 +904,7 @@ def mxfp8_swizzle_v2_dim_m_or_km_jit(
         (tile_k_size, tile_m_size),
     )
 
-    if cutlass.const_expr(mode == _MXS_MODE_DIM_KM):
+    if cutlass.const_expr(mode == _MODE_DIM_KM):
         output_k_smem_atom = tcgen05.make_smem_layout_atom(
             tcgen05.SmemLayoutAtomKind.K_SW128, cutlass.Float8E4M3FN
         )
@@ -941,7 +942,7 @@ def mxfp8_swizzle_v2_dim_m_or_km_jit(
     mScaleKLogical = cute.make_tensor(mScaleK.iterator, scale_k_layout)
 
     bpr = tile_k_size // 32
-    if cutlass.const_expr(tile_m_size == _MXS_TM):
+    if cutlass.const_expr(tile_m_size == _DIM_K_TILE_M_SIZE_128):
         data_k_tv_layout = cute.make_layout(
             ((tile_m_size,), (32, bpr)),
             stride=((1,), (tile_m_size, tile_m_size * 32)),
@@ -981,7 +982,7 @@ def mxfp8_swizzle_v2_dim_m_or_km_jit(
     grid = (padded_K // tile_k_size, padded_M // tile_m_size, 1)
     block = (max(_MXS_THREADS, tile_k_size), 1, 1)
     if cutlass.const_expr(
-        mode == _MXS_MODE_DIM_KM and not stochastic and tile_m_size != 32
+        mode == _MODE_DIM_KM and not stochastic and tile_m_size != 32
     ):
         # A degenerate cluster constrains residency for this larger two-output specialization;
         # an ordinary launch lets Blackwell keep nine CTAs resident per SM instead.
