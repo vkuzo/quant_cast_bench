@@ -8,9 +8,9 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 
 
 def _ceil_div(
-    num: int | cutlass.Int32,
-    den: int | cutlass.Int32 | cutlass.Constexpr,
-) -> int | cutlass.Int32:
+    num: int | cutlass.Int32 | cutlass.Int64,
+    den: int | cutlass.Int32 | cutlass.Int64 | cutlass.Constexpr,
+) -> int | cutlass.Int32 | cutlass.Int64:
     return (num + den - 1) // den
 
 

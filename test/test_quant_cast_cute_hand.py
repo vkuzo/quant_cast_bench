@@ -18,6 +18,7 @@ from quant_cast_bench.quant_cast_gold.recipes import (
     _from_blocked_4d,
     hadamard_rht_fp32_f,
     hadamard_rht_matrix,
+    mxfp8_swizzle_sr_f,
     nvfp4_gs_scale,
 )
 
@@ -240,6 +241,44 @@ def test_mxfp8_swizzle_sr_v2_folded_key_and_padding():
     ref_outputs = recipe.pt_ref_fn(x, key)
     assert qdata_and_scale_equal(outputs[0], ref_outputs[0])
     assert qdata_and_scale_equal(outputs[1], ref_outputs[1])
+
+
+def test_mxfp8_swizzle_sr_v2_int64_indexing():
+    if torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip("v2 stochastic rounding emits Blackwell-only PTX; requires cuda capability 10.0")
+
+    # This is the first square shape divisible by 32 whose flattened element count exceeds the
+    # signed-int32 range. Pick a 1x32 group starting exactly at flat index 2**31 so an int32
+    # intermediate would wrap before being converted to the Philox counter.
+    M = K = 46368
+    flat_start = 2**31
+    row, col = divmod(flat_start, K)
+    assert col % 32 == 0
+
+    x = torch.empty((M, K), dtype=torch.bfloat16, device="cuda")
+    values = torch.linspace(-1.3, 1.7, 32, dtype=torch.float32, device=x.device).to(
+        torch.bfloat16
+    )
+    x[row, col : col + 32] = values
+    key = prng.key(7, device=x.device)
+
+    qdata, scale = mxfp8_swizzle_v2(
+        x,
+        key=key,
+        rounding_mode="stochastic",
+    )
+    shifted_key = torch.tensor(
+        [7, flat_start // 16], dtype=torch.uint64, device=x.device
+    )
+    qdata_ref, _ = mxfp8_swizzle_sr_f(values.reshape(1, 32), shifted_key)
+
+    assert torch.equal(
+        qdata[row, col : col + 32].view(torch.uint8),
+        qdata_ref[0].view(torch.uint8),
+    )
+
+    del x, qdata, scale
+    torch.cuda.empty_cache()
 
 
 @pytest.mark.parametrize(

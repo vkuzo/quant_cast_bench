@@ -55,6 +55,8 @@ _DIM_M_KM_SMALL_TILE_32_128 = (32, 128)
 _DIM_M_LARGE_TILE_64_256 = (64, 256)
 _DIM_KM_LARGE_TILE_64_128 = (64, 128)
 
+_INT32_MAX = 2**31 - 1
+
 
 @cute.jit
 def _mxfp8_v2_quantize_stochastic_x32(
@@ -111,8 +113,9 @@ def mxfp8_swizzle_v2_kernel(
     data_k_tv_layout: cute.Layout | None,
     tile_m_size: cutlass.Constexpr,
     tile_k_size: cutlass.Constexpr,
-    M: cutlass.Int32,
-    K: cutlass.Int32,
+    M: cutlass.Int32 | cutlass.Int64,
+    K: cutlass.Int32 | cutlass.Int64,
+    index_type: cutlass.Constexpr,
     needs_boundary_masking: cutlass.Constexpr,
     quant_orientation: cutlass.Constexpr,
     is_stochastic_qdata_rounding: cutlass.Constexpr,
@@ -184,7 +187,9 @@ def mxfp8_swizzle_v2_kernel(
 
     # bookkeeping
     tidx, _, _ = cute.arch.thread_idx()
-    tile_k_idx, tile_m_idx, _ = cute.arch.block_idx()
+    tile_k_idx_i32, tile_m_idx_i32, _ = cute.arch.block_idx()
+    tile_k_idx = index_type(tile_k_idx_i32)
+    tile_m_idx = index_type(tile_m_idx_i32)
     warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     do_dim_k = quant_orientation != _QUANT_ORIENTATION_DIM_M
     do_dim_m = quant_orientation != _QUANT_ORIENTATION_DIM_K
@@ -577,8 +582,9 @@ def mxfp8_swizzle_v2_jit(
     mOutputM: cute.Tensor | None,
     mScaleM: cute.Tensor | None,
     mSeed: cute.Tensor | None,
-    M: cutlass.Int32,
-    K: cutlass.Int32,
+    M: cutlass.Int32 | cutlass.Int64,
+    K: cutlass.Int32 | cutlass.Int64,
+    index_type: cutlass.Constexpr,
     tile_m_size: cutlass.Constexpr,
     tile_k_size: cutlass.Constexpr,
     cluster_k: cutlass.Constexpr,
@@ -753,6 +759,7 @@ def mxfp8_swizzle_v2_jit(
         tile_k_size,
         M,
         K,
+        index_type,
         needs_boundary_masking,
         quant_orientation,
         is_stochastic_qdata_rounding,
@@ -921,6 +928,9 @@ def _mxfp8_swizzle_v2_impl(
             rounding_mode,
         )
 
+    index_type = cutlass.Int64 if input.numel() > _INT32_MAX else cutlass.Int32
+    compile_key = (*compile_key, index_type)
+
     output_m = scale_m = mOutputM = mScaleM = None
     if do_dim_m:
         output_m = torch.empty(K, M, dtype=torch.float8_e4m3fn, device=input.device)
@@ -984,8 +994,9 @@ def _mxfp8_swizzle_v2_impl(
         mOutputM,
         mScaleM,
         mSeed,
-        M,
-        K,
+        index_type(M),
+        index_type(K),
+        index_type,
         tile_m_size,
         tile_k_size,
         cluster_k,
