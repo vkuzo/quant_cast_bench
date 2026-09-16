@@ -42,14 +42,18 @@ def _compiled(key, jit_fn, *cute_args):
     return fn
 
 
-_DIM_K_TILE_M_SIZE_128 = 128
-_DIM_K_MAX_TILE_K_SIZE_128 = 128
-_MIN_CTA_WARPS_4 = 4
-_MIN_CTA_THREADS_128 = _MIN_CTA_WARPS_4 * 32                       # 128, one thread per tile row
-
 _QUANT_ORIENTATION_DIM_K = 0
 _QUANT_ORIENTATION_DIM_M = 1
 _QUANT_ORIENTATION_DIM_KM = 2
+
+_DIM_K_TILE_M_SIZE_128 = 128
+_DIM_K_MAX_TILE_K_SIZE_128 = 128
+_MIN_CTA_WARPS_4 = 4
+_MIN_CTA_THREADS_128 = _MIN_CTA_WARPS_4 * 32
+
+_DIM_M_KM_SMALL_TILE_32_128 = (32, 128)
+_DIM_M_LARGE_TILE_64_256 = (64, 256)
+_DIM_KM_LARGE_TILE_64_128 = (64, 128)
 
 
 def _mxfp8_swizzle_v2_tile_n(M: int, K: int) -> int:
@@ -581,16 +585,6 @@ def mxfp8_swizzle_v2_kernel(
                         if scale_col_k < K // 32:
                             scale_k = rScaleK[it]
                     mScaleKLogical[(input_row_k, scale_col_k)] = scale_k
-
-
-# ---------------------------------------------------------------------------
-# The unified TMA kernel below supports dim-K, dim-M, and fused dim-KM specializations. Every orientation
-# uses one input TMA load; constexpr gates select the dim-K and dim-M passes, and each enabled qdata
-# result is staged in shared memory for TMA output. Small dim-M/dim-KM inputs use a 32x128 tile to
-# expose more CTAs. Larger dim-M uses 64x256, while larger dim-KM uses 64x128.
-_DIM_M_KM_SMALL_TILE_32_128 = (32, 128)
-_DIM_M_LARGE_TILE_64_256 = (64, 256)
-_DIM_KM_LARGE_TILE_64_128 = (64, 128)
 
 
 @cute.jit
