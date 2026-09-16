@@ -42,8 +42,10 @@ def _compiled(key, jit_fn, *cute_args):
     return fn
 
 
-_DIM_K_TILE_M_SIZE_128, _DIM_K_MAX_TILE_K_SIZE_128, _MXS_WARPS = 128, 128, 4
-_MXS_THREADS = _MXS_WARPS * 32                       # 128, one thread per tile row
+_DIM_K_TILE_M_SIZE_128 = 128
+_DIM_K_MAX_TILE_K_SIZE_128 = 128
+_MIN_CTA_WARPS_4 = 4
+_MXS_THREADS = _MIN_CTA_WARPS_4 * 32                       # 128, one thread per tile row
 
 _MODE_DIM_K = 0
 _MODE_DIM_M = 1
