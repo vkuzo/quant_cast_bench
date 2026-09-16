@@ -801,7 +801,6 @@ def _mxfp8_swizzle_v2_impl_on_current_device(
     key: torch.Tensor | None,
     rounding_mode: str,
     is_square_scaling: bool,
-    **kwargs,
 ):
     if quant_orientation not in ("dim_k", "dim_m", "dim_km"):
         raise ValueError(f"unsupported quant_orientation: {quant_orientation}")
@@ -1075,6 +1074,9 @@ def _mxfp8_swizzle_v2_impl(
     is_square_scaling: bool,
     **kwargs,
 ):
+    if kwargs:
+        unexpected = ", ".join(sorted(kwargs))
+        raise ValueError(f"unexpected keyword arguments: {unexpected}")
     if not isinstance(input, torch.Tensor):
         raise ValueError("mxfp8 v2 input must be a torch.Tensor")
     if input.device.type != "cuda":
@@ -1087,7 +1089,6 @@ def _mxfp8_swizzle_v2_impl(
             key=key,
             rounding_mode=rounding_mode,
             is_square_scaling=is_square_scaling,
-            **kwargs,
         )
 
     device = input.get_device()

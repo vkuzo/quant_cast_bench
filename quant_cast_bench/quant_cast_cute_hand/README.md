@@ -54,16 +54,14 @@ explicit `ValueError` checks, so invalid calls are rejected even under
 `python -O`. Assertions remain only inside the CuTe JIT/kernel, where they
 enforce compile-time specialization contracts.
 
+The shared wrapper also verifies that `kwargs` is empty. Public recipe wrappers
+retain `**kwargs` for compatibility with the benchmark recipe interface, but a
+misspelled or otherwise unsupported argument now raises `ValueError` instead of
+being silently ignored.
+
 The following remaining issues should be addressed before upstreaming.
 
 ### Must fix
-
-#### Remove ignored keyword arguments
-
-`_mxfp8_swizzle_v2_impl` accepts `**kwargs` but does not consume them. This was
-useful for benchmark recipe plumbing, but it silently accepts user mistakes. For
-example, `roundng_mode="stochastic"` runs RTNE instead of reporting the typo.
-The upstream operator should have an exact schema with no ignored arguments.
 
 #### Define the stochastic-rounding RNG contract
 

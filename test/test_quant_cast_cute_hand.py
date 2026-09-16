@@ -89,7 +89,7 @@ _REQUIRES_SM100 = frozenset({
     "nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_pipelined",
 })
 
-_SUPPORTS_NON_BFLOAT16 = frozenset({
+_MXFP8_V2_RECIPES = frozenset({
     "mxfp8_swizzle_v2",
     "mxfp8_swizzle_sr_v2",
     "mxfp8_32x32_swizzle_v2",
@@ -98,6 +98,7 @@ _SUPPORTS_NON_BFLOAT16 = frozenset({
     "mxfp8_dim_km_swizzle_v2",
     "mxfp8_dim_km_swizzle_sr_v2",
 })
+_SUPPORTS_NON_BFLOAT16 = _MXFP8_V2_RECIPES
 
 def _get_recipe(recipe_name):
     _recipe_name, recipe = [x for x in ALL_RECIPES if x[0] == recipe_name][0]
@@ -276,6 +277,15 @@ def test_mxfp8_v2_rejects_key_for_rtne():
 def test_mxfp8_v2_rejects_non_cuda_input():
     with pytest.raises(ValueError, match="requires a CUDA input"):
         mxfp8_swizzle_v2(torch.randn(128, 256, dtype=torch.bfloat16))
+
+
+def test_mxfp8_v2_rejects_unexpected_keyword_arguments():
+    x = torch.randn(128, 256, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(
+        ValueError,
+        match="unexpected keyword arguments: global_row, roundng_mode",
+    ):
+        mxfp8_swizzle_v2(x, global_row=0, roundng_mode="stochastic")
 
 
 @pytest.mark.parametrize("M,K", [(32, 32), (96, 160), (128, 256), (1024, 1152)])
@@ -891,7 +901,8 @@ def test_cute_hand_matches_reference(name, recipe, dtype):
         "num_col": gold_inputs[0].shape[-1],
     }
     ref_outs = recipe.pt_ref_fn(*gold_inputs, **tile_kwargs)
-    cute_outs = recipe.cute_fn(*cute_inputs, **tile_kwargs)
+    cute_kwargs = {} if name in _MXFP8_V2_RECIPES else tile_kwargs
+    cute_outs = recipe.cute_fn(*cute_inputs, **cute_kwargs)
 
     assert len(cute_outs) == len(ref_outs), f"{name}: output count {len(cute_outs)} != {len(ref_outs)}"
     for i, (t, r) in enumerate(zip(cute_outs, ref_outs)):
