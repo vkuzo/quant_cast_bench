@@ -635,9 +635,9 @@ def _mxfp8_swizzle_v2_impl(
             assert K % 32 == 0, "v2 dim-K requires K % 32 == 0"
 
         tile_m_size, tile_k_size = (
-            _MXDMT_SMALL_TILE
+            _DIM_M_KM_SMALL_TILE_32_128
             if M * K <= 2048 * 2048
-            else (_MXDKMT_LARGE_TILE if quant_orientation == "dim_km" else _MXDMT_LARGE_TILE)
+            else (_DIM_KM_LARGE_TILE_64_128 if quant_orientation == "dim_km" else _DIM_M_LARGE_TILE_64_256)
         )
         nrb_m, ncb_m = _ceil_div(K, 128), _ceil_div(M // 32, 4)
         padded_M = ncb_m * 128
@@ -850,9 +850,9 @@ MXFP8_SWIZZLE_SR_V2 = QuantCastCuteRecipe.from_gold(
 # uses one input TMA load; constexpr gates select the dim-K and dim-M passes, and each enabled qdata
 # result is staged in shared memory for TMA output. Small dim-M/dim-KM inputs use a 32x128 tile to
 # expose more CTAs. Larger dim-M uses 64x256, while larger dim-KM uses 64x128.
-_MXDMT_SMALL_TILE = (32, 128)
-_MXDMT_LARGE_TILE = (64, 256)
-_MXDKMT_LARGE_TILE = (64, 128)
+_DIM_M_KM_SMALL_TILE_32_128 = (32, 128)
+_DIM_M_LARGE_TILE_64_256 = (64, 256)
+_DIM_KM_LARGE_TILE_64_128 = (64, 128)
 
 
 @cute.jit
