@@ -89,6 +89,16 @@ _REQUIRES_SM100 = frozenset({
     "nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_pipelined",
 })
 
+_SUPPORTS_FLOAT16 = frozenset({
+    "mxfp8_swizzle_v2",
+    "mxfp8_swizzle_sr_v2",
+    "mxfp8_32x32_swizzle_v2",
+    "mxfp8_dim_m_swizzle_v2",
+    "mxfp8_dim_m_swizzle_sr_v2",
+    "mxfp8_dim_km_swizzle_v2",
+    "mxfp8_dim_km_swizzle_sr_v2",
+})
+
 def _get_recipe(recipe_name):
     _recipe_name, recipe = [x for x in ALL_RECIPES if x[0] == recipe_name][0]
     return recipe
@@ -205,6 +215,12 @@ def test_mxfp8_swizzle_v2(M, K):
     tile_kwargs = {"global_row": 0, "global_col": 0, "num_col": inputs[0].shape[-1]}
     ref_outputs = recipe.pt_ref_fn(*inputs, **tile_kwargs)
     recipe.correctness_fn(inputs, outputs)
+
+
+def test_mxfp8_v2_rejects_unsupported_input_dtype():
+    x = torch.randn(128, 256, dtype=torch.float32, device="cuda")
+    with pytest.raises(AssertionError, match="supports only bf16 and fp16"):
+        mxfp8_swizzle_v2(x)
 
 
 @pytest.mark.parametrize("M,K", [(32, 32), (96, 160), (128, 256), (1024, 1152)])
@@ -769,12 +785,19 @@ def test_deepseek_1x128_dim_m_v2():
     print(ref_outputs)
     recipe.correctness_fn(inputs, outputs)
 
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.bfloat16, torch.float16],
+    ids=["bf16", "fp16"],
+)
 @pytest.mark.parametrize("name, recipe", ALL_RECIPES, ids=[n for n, _ in ALL_RECIPES])
-def test_cute_hand_matches_reference(name, recipe):
+def test_cute_hand_matches_reference(name, recipe, dtype):
     # the CuTeDSL kernel should reproduce the gold reference bit-for-bit (identical fp32 math + RNE
     # cast). example_input_fn builds the full positional inputs (x, *aux).
     if name in _REQUIRES_SM100 and torch.cuda.get_device_capability() != (10, 0):
         pytest.skip(f"{name} emits Blackwell-only PTX; requires cuda capability 10.0")
+    if dtype == torch.float16 and name not in _SUPPORTS_FLOAT16:
+        pytest.skip(f"{name} does not support float16 input")
     torch.manual_seed(0)
     if name in (
         "nvfp4_swizzle_dim_k_dim_m_rht_tma",
@@ -797,7 +820,7 @@ def test_cute_hand_matches_reference(name, recipe):
             stochastic=name == "nvfp4_dim_m_swizzle_rht_sr_tma",
         )
     else:
-        cute_inputs = gold_inputs = recipe.example_input_fn(512, 512, torch.bfloat16)
+        cute_inputs = gold_inputs = recipe.example_input_fn(512, 512, dtype)
 
     tile_kwargs = {
         "global_row": 0,

@@ -111,6 +111,7 @@ def mxfp8_swizzle_v2_kernel(
     output_k_smem_layout: cute.ComposedLayout | None,
     output_m_smem_layout: cute.ComposedLayout | None,
     data_k_tv_layout: cute.Layout | None,
+    input_element_type: cutlass.Constexpr,
     tile_m_size: cutlass.Constexpr,
     tile_k_size: cutlass.Constexpr,
     M: cutlass.Int32 | cutlass.Int64,
@@ -126,7 +127,7 @@ def mxfp8_swizzle_v2_kernel(
 
     High level flow:
       0. create smem scratchpad
-         a. both dim-k and dim-m use a tile_m_size * tile_k_size bf16 scratchpad for input,
+         a. both dim-k and dim-m use a tile_m_size * tile_k_size 16-bit scratchpad for input,
          b. dim-k reuses the first half of 0a for qdata (to save smem)
          c. dim-m additionally uses a tile_m_size * tile_k_size fp8 scratchpad for qdata
       1. load input data with TMA.
@@ -208,7 +209,7 @@ def mxfp8_swizzle_v2_kernel(
     # create smem scratchpad
     smem = utils.SmemAllocator()
     input_storage = smem.allocate_array(
-        cutlass.BFloat16, tile_m_size * tile_k_size, byte_alignment=1024
+        input_element_type, tile_m_size * tile_k_size, byte_alignment=1024
     )
     if cutlass.const_expr(do_dim_m):
         output_m_storage = smem.allocate_array(
@@ -231,7 +232,7 @@ def mxfp8_swizzle_v2_kernel(
     # * Dim-M does not alias the input and has a separate qdata smem buffer
     sInput = cute.make_tensor(
         cute.recast_ptr(
-            input_storage, input_smem_layout.inner, dtype=cutlass.BFloat16
+            input_storage, input_smem_layout.inner, dtype=input_element_type
         ),
         input_smem_layout.outer,
     )
@@ -288,7 +289,8 @@ def mxfp8_swizzle_v2_kernel(
     if warp == 0:
         with cute.arch.elect_one():
             cute.arch.mbarrier_arrive_and_expect_tx(
-                tma_bar_ptr, tile_m_size * tile_k_size * 2
+                tma_bar_ptr,
+                tile_m_size * tile_k_size * input_element_type.width // 8,
             )
         cute.copy(
             input_tma_atom,
@@ -314,7 +316,7 @@ def mxfp8_swizzle_v2_kernel(
     cute.arch.mbarrier_wait(tma_bar_ptr, 0)
 
     smem_load_atom = cute.make_copy_atom(
-        cute.nvgpu.CopyUniversalOp(), cutlass.BFloat16, num_bits_per_copy=128
+        cute.nvgpu.CopyUniversalOp(), input_element_type, num_bits_per_copy=128
     )
     smem_store_atom = cute.make_copy_atom(
         cute.nvgpu.CopyUniversalOp(), cutlass.Float8E4M3FN, num_bits_per_copy=128
@@ -443,7 +445,7 @@ def mxfp8_swizzle_v2_kernel(
                 )
             sGroupK = thrInputGroupsK[((None, it),)]
             sGroupK8 = cute.tiled_divide(sGroupK, (8,))
-            rInputK = cute.make_rmem_tensor(32, cutlass.BFloat16)
+            rInputK = cute.make_rmem_tensor(32, input_element_type)
             rInputK8 = cute.tiled_divide(rInputK, (8,))
             for vec in cutlass.range_constexpr(4):
                 cute.copy(
@@ -473,7 +475,7 @@ def mxfp8_swizzle_v2_kernel(
                 )
             rScaleK[it] = biased_k.to(rScaleK.element_type)
 
-        # All BF16 reads must finish before the aliased qK view overwrites the input tile.
+        # All input reads must finish before the aliased qK view overwrites the input tile.
         cute.arch.sync_threads()
         for it in cutlass.range_constexpr(iters):
             rQK16 = cute.tiled_divide(rQK[(None, it)], (16,))
@@ -642,7 +644,7 @@ def mxfp8_swizzle_v2_jit(
             else tcgen05.SmemLayoutAtomKind.K_SW128
         )
         input_smem_atom = tcgen05.make_smem_layout_atom(
-            input_smem_kind, cutlass.BFloat16
+            input_smem_kind, mInput.element_type
         )
         input_smem_layout = cute.coalesce(
             cute.tile_to_shape(input_smem_atom, (tile_m_size, tile_k_size), order=(0, 1)),
@@ -755,6 +757,7 @@ def mxfp8_swizzle_v2_jit(
         output_k_smem_layout,
         output_m_smem_layout,
         data_k_tv_layout,
+        mInput.element_type,
         tile_m_size,
         tile_k_size,
         M,
@@ -794,7 +797,10 @@ def _mxfp8_swizzle_v2_impl(
     ), f"unsupported quant_orientation: {quant_orientation}"
     assert input.dim() == 2, "unsupported"
     assert input.is_contiguous(), "unsupported"
-    assert input.dtype == torch.bfloat16, "v2 is bf16-only"
+    assert input.dtype in (
+        torch.bfloat16,
+        torch.float16,
+    ), "v2 supports only bf16 and fp16 input"
 
     rounding_mode = str(getattr(rounding_mode, "value", rounding_mode)).lower()
     assert rounding_mode in (
@@ -929,7 +935,7 @@ def _mxfp8_swizzle_v2_impl(
         )
 
     index_type = cutlass.Int64 if input.numel() > _INT32_MAX else cutlass.Int32
-    compile_key = (*compile_key, index_type)
+    compile_key = (*compile_key, input.dtype, index_type)
 
     output_m = scale_m = mOutputM = mScaleM = None
     if do_dim_m:

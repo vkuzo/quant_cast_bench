@@ -231,8 +231,24 @@ NO_TE_CASES = (
 
 ALL_CASES = CASES + NO_TE_CASES
 
+FLOAT16_KERNELS = frozenset({
+    "mxfp8_swizzle_v2",
+    "mxfp8_swizzle_sr_v2",
+    "mxfp8_32x32_swizzle_v2",
+    "mxfp8_dim_m_swizzle_v2",
+    "mxfp8_dim_m_swizzle_sr_v2",
+    "mxfp8_dim_km_swizzle_v2",
+    "mxfp8_dim_km_swizzle_sr_v2",
+})
+
+DTYPES = {
+    "bfloat16": torch.bfloat16,
+    "float16": torch.float16,
+}
+
 CSV_FIELDS = (
     "kernel",
+    "dtype",
     "family",
     "mode",
     "rht",
@@ -276,6 +292,13 @@ def _parse_kernels(value: str) -> list[str]:
     return list(dict.fromkeys(kernels))
 
 
+def _parse_dtype(value: str) -> tuple[str, torch.dtype]:
+    name = str(value).strip().lower()
+    if name not in DTYPES:
+        raise ValueError(f"unsupported dtype {value!r}; choose from {tuple(DTYPES)}")
+    return name, DTYPES[name]
+
+
 @fire.decorators.SetParseFns(
     kernel=str,
     M=str,
@@ -283,6 +306,7 @@ def _parse_kernels(value: str) -> list[str]:
     mk_mode=str,
     csv_output=str,
     shapes_for_model=str,
+    dtype=str,
 )
 def main(
     kernel: str = ",".join(case[0] for case in ALL_CASES),
@@ -291,6 +315,7 @@ def main(
     mk_mode: str | None = None,
     csv_output: str = "",
     shapes_for_model: str = "",
+    dtype: str = "bfloat16",
 ) -> None:
     """Compare CuTe-hand and TransformerEngine kernels over an M-by-K shape grid.
 
@@ -300,6 +325,13 @@ def main(
     kernels = _parse_kernels(kernel)
     cases_by_name = {case[0]: case for case in ALL_CASES}
     cases = [cases_by_name[name] for name in kernels]
+    dtype_name, input_dtype = _parse_dtype(dtype)
+    if input_dtype == torch.float16:
+        unsupported = [name for name in kernels if name not in FLOAT16_KERNELS]
+        if unsupported:
+            raise ValueError(
+                "float16 input is unsupported by kernels: " + ", ".join(unsupported)
+            )
 
     shapes_for_model = shapes_for_model.strip().lower()
     if shapes_for_model:
@@ -361,12 +393,21 @@ def main(
         for name, family, mode, rht, stochastic in cases:
             for M, K in shapes:
                 torch.manual_seed(0)
-                x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+                x = torch.randn(M, K, dtype=input_dtype, device="cuda")
                 te_ms = None
                 te_tb_s = None
                 if name in te_case_names:
                     square_scaling = name == "mxfp8_32x32_swizzle_v2"
-                    key = (family, mode, rht, stochastic, square_scaling, M, K)
+                    key = (
+                        family,
+                        mode,
+                        rht,
+                        stochastic,
+                        square_scaling,
+                        dtype_name,
+                        M,
+                        K,
+                    )
                     if key not in te_cache:
                         te_run = _make_te(
                             family,
@@ -393,7 +434,7 @@ def main(
                     speedup = None
                     te_summary = "TE=n/a speedup=n/a"
                 print(
-                    f"{name:48s} {M:5d}x{K:<5d} "
+                    f"{name:48s} {M:5d}x{K:<5d} dtype={dtype_name:8s} "
                     f"ours={ours_ms:.4f} ms/{ours_tb_s:.3f} TB/s "
                     f"{te_summary}",
                     flush=True,
@@ -403,6 +444,7 @@ def main(
                     csv_writer.writerow(
                         {
                             "kernel": name,
+                            "dtype": dtype_name,
                             "family": family,
                             "mode": mode,
                             "rht": rht,

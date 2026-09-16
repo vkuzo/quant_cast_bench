@@ -2,7 +2,7 @@
 
 Each kernel here is a memory-bound elementwise cast/op, so the signal we care about is achieved
 memory bandwidth vs. the GPU's HBM ceiling (B200: 8 TB/s, H100 SXM5: 3.35 TB/s -- selected from the
-device name). We build a bf16 (M, K) input, run the selected kernel, time it with
+device name). We build a selected 16-bit (M, K) input, run the selected kernel, time it with
 `do_bench_using_profiling`, and report GPU time + GB/s + % of peak.
 
     python -m quant_cast_bench.quant_cast_cute_hand.benchmarks.benchmark --kernel add_v0
@@ -17,6 +17,8 @@ device name). We build a bf16 (M, K) input, run the selected kernel, time it wit
         --M 2048,4096 --K 8192,16384 --mk_mode pair
     python -m quant_cast_bench.quant_cast_cute_hand.benchmarks.benchmark \
         --kernel mxfp8_swizzle_v2 --shapes_for_model gpt-oss-120b
+    python -m quant_cast_bench.quant_cast_cute_hand.benchmarks.benchmark \
+        --kernel mxfp8_swizzle_v2 --dtype float16
     python -m quant_cast_bench.quant_cast_cute_hand.benchmarks.benchmark --kernel add_v0 --csv_output results.csv
 """
 
@@ -263,13 +265,13 @@ def _bench_mxfp8_swizzle(M, K):
     return run, bytes_per_iter
 
 
-def _bench_mxfp8_swizzle_v2(M, K):
+def _bench_mxfp8_swizzle_v2(M, K, dtype):
     # Same 1x32 blockwise mxfp8 quant-cast + swizzled e8m0 scale as _bench_mxfp8_swizzle, but the v2
     # kernel uses TMA (bulk-tensor) for the main-data load/store on a 128x128 tile (dim-K, no
     # transpose). Same outputs, so it shares the gold reference and bit-exact guard. Requires cuda
     # capability 10.0 (Blackwell-only scale cvt). Needs M%128==0 and K%128==0 for the TMA tile.
     torch.manual_seed(0)
-    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+    x = torch.randn(M, K, dtype=dtype, device="cuda")
 
     def run():
         return mxfp8_swizzle_v2(x)
@@ -282,16 +284,16 @@ def _bench_mxfp8_swizzle_v2(M, K):
     assert torch.equal(s.view(torch.uint8), s_ref.view(torch.uint8)), "scale mismatch vs reference"
     assert torch.equal(q.float(), q_ref.float()), "qdata mismatch vs reference"
     bytes_per_iter = (
-        x.numel() * x.element_size()   # bf16 input read
+        x.numel() * x.element_size()   # 16-bit input read
         + q.numel() * q.element_size() # fp8 qdata write
         + s.numel() * s.element_size() # e8m0 (1-byte) scale write
     )
     return run, bytes_per_iter
 
 
-def _bench_mxfp8_32x32_swizzle_v2(M, K):
+def _bench_mxfp8_32x32_swizzle_v2(M, K, dtype):
     torch.manual_seed(0)
-    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+    x = torch.randn(M, K, dtype=dtype, device="cuda")
 
     def run():
         return mxfp8_32x32_swizzle_v2(x)
@@ -360,11 +362,11 @@ def _bench_mxfp8_swizzle_v4(M, K):
     return run, bytes_per_iter
 
 
-def _bench_mxfp8_swizzle_sr_v2(M, K):
+def _bench_mxfp8_swizzle_sr_v2(M, K, dtype):
     # v2's existing TMA dim-K kernel with only its qdata conversion specialized to Philox-backed
     # Blackwell cvt.rs.e4m3x4 stochastic rounding.
     torch.manual_seed(0)
-    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+    x = torch.randn(M, K, dtype=dtype, device="cuda")
     key = prng.key(0, device=x.device)
 
     def run():
@@ -430,9 +432,9 @@ def _bench_mxfp8_swizzle_v5(M, K):
     return run, bytes_per_iter
 
 
-def _bench_mxfp8_dim_m_swizzle_impl(M, K, kernel_fn):
+def _bench_mxfp8_dim_m_swizzle_impl(M, K, dtype, kernel_fn):
     torch.manual_seed(0)
-    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+    x = torch.randn(M, K, dtype=dtype, device="cuda")
 
     def run():
         return kernel_fn(x)
@@ -450,15 +452,15 @@ def _bench_mxfp8_dim_m_swizzle_impl(M, K, kernel_fn):
     return run, bytes_per_iter
 
 
-def _bench_mxfp8_dim_m_swizzle_v2(M, K):
+def _bench_mxfp8_dim_m_swizzle_v2(M, K, dtype):
     return _bench_mxfp8_dim_m_swizzle_impl(
-        M, K, lambda x: mxfp8_swizzle_v2(x, quant_orientation="dim_m")
+        M, K, dtype, lambda x: mxfp8_swizzle_v2(x, quant_orientation="dim_m")
     )
 
 
-def _bench_mxfp8_dim_m_swizzle_sr_v2(M, K):
+def _bench_mxfp8_dim_m_swizzle_sr_v2(M, K, dtype):
     torch.manual_seed(0)
-    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+    x = torch.randn(M, K, dtype=dtype, device="cuda")
     key = prng.key(0, device=x.device)
 
     def run():
@@ -479,9 +481,9 @@ def _bench_mxfp8_dim_m_swizzle_sr_v2(M, K):
     return run, bytes_per_iter
 
 
-def _bench_mxfp8_dim_km_swizzle_impl(M, K, kernel_fn):
+def _bench_mxfp8_dim_km_swizzle_impl(M, K, dtype, kernel_fn):
     torch.manual_seed(0)
-    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+    x = torch.randn(M, K, dtype=dtype, device="cuda")
 
     def run():
         return kernel_fn(x)
@@ -499,15 +501,15 @@ def _bench_mxfp8_dim_km_swizzle_impl(M, K, kernel_fn):
     return run, bytes_per_iter
 
 
-def _bench_mxfp8_dim_km_swizzle_v2(M, K):
+def _bench_mxfp8_dim_km_swizzle_v2(M, K, dtype):
     return _bench_mxfp8_dim_km_swizzle_impl(
-        M, K, lambda x: mxfp8_swizzle_v2(x, quant_orientation="dim_km")
+        M, K, dtype, lambda x: mxfp8_swizzle_v2(x, quant_orientation="dim_km")
     )
 
 
-def _bench_mxfp8_dim_km_swizzle_sr_v2(M, K):
+def _bench_mxfp8_dim_km_swizzle_sr_v2(M, K, dtype):
     torch.manual_seed(0)
-    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+    x = torch.randn(M, K, dtype=dtype, device="cuda")
     key = prng.key(0, device=x.device)
 
     def run():
@@ -793,6 +795,21 @@ _KERNELS = {
     "transpose_v1": _bench_transpose_v1,
 }
 
+_FLOAT16_KERNELS = frozenset({
+    "mxfp8_swizzle_v2",
+    "mxfp8_swizzle_sr_v2",
+    "mxfp8_32x32_swizzle_v2",
+    "mxfp8_dim_m_swizzle_v2",
+    "mxfp8_dim_m_swizzle_sr_v2",
+    "mxfp8_dim_km_swizzle_v2",
+    "mxfp8_dim_km_swizzle_sr_v2",
+})
+
+_DTYPES = {
+    "bfloat16": torch.bfloat16,
+    "float16": torch.float16,
+}
+
 
 def _parse_sizes(value: str, name: str) -> list[int]:
     """Parse one integer or a comma-separated list of integers."""
@@ -812,8 +829,14 @@ def _parse_sizes(value: str, name: str) -> list[int]:
     return sizes
 
 
-def _benchmark_one(kernel: str, M: int, K: int, peak_bw: float):
-    run, bytes_per_iter = _KERNELS[kernel](M, K)
+def _benchmark_one(
+    kernel: str, M: int, K: int, peak_bw: float, dtype: torch.dtype
+):
+    builder = _KERNELS[kernel]
+    if kernel in _FLOAT16_KERNELS:
+        run, bytes_per_iter = builder(M, K, dtype)
+    else:
+        run, bytes_per_iter = builder(M, K)
     # warm up so first-call costs (compile, autotune, allocator) don't leak into the timing.
     for _ in range(2):
         run()
@@ -827,7 +850,7 @@ def _benchmark_one(kernel: str, M: int, K: int, peak_bw: float):
 
 _OUTPUT_METRICS = ("gpu_time_ms", "tb_s", "pct_peak")
 
-_CSV_FIELDS = ("kernel", "M", "K", "gpu_time_ms", "tb_s", "pct_peak")
+_CSV_FIELDS = ("kernel", "dtype", "M", "K", "gpu_time_ms", "tb_s", "pct_peak")
 
 _MODEL_SHAPES = {
     "gpt-oss-120b": gpt_oss_120b_m8192_tp8_ep8,
@@ -868,6 +891,13 @@ def _parse_kernels(value: str) -> list[str]:
     return list(dict.fromkeys(kernels))
 
 
+def _parse_dtype(value: str) -> tuple[str, torch.dtype]:
+    name = str(value).strip().lower()
+    if name not in _DTYPES:
+        raise ValueError(f"unsupported dtype {value!r}; choose from {tuple(_DTYPES)}")
+    return name, _DTYPES[name]
+
+
 @fire.decorators.SetParseFns(
     kernel=str,
     M=str,
@@ -876,6 +906,7 @@ def _parse_kernels(value: str) -> list[str]:
     output_metrics=str,
     shapes_for_model=str,
     csv_output=str,
+    dtype=str,
 )
 def main(
     kernel: str = "add_v0",
@@ -885,10 +916,18 @@ def main(
     output_metrics: str = "tb_s",
     shapes_for_model: str = "",
     csv_output: str = "",
+    dtype: str = "bfloat16",
 ):
     """Benchmark handwritten CuTeDSL kernels over one shape or an M-by-K shape grid."""
     kernels = _parse_kernels(kernel)
     metrics = _parse_output_metrics(output_metrics)
+    dtype_name, input_dtype = _parse_dtype(dtype)
+    if input_dtype == torch.float16:
+        unsupported = [name for name in kernels if name not in _FLOAT16_KERNELS]
+        if unsupported:
+            raise ValueError(
+                "float16 input is unsupported by kernels: " + ", ".join(unsupported)
+            )
 
     shapes_for_model = shapes_for_model.strip().lower()
     if shapes_for_model:
@@ -951,7 +990,7 @@ def main(
     for kernel_index, kernel_name in enumerate(kernels):
         # Keep kernel outermost so one kernel's complete shape grid finishes before the next starts.
         results = {
-            (m, k): _benchmark_one(kernel_name, m, k, peak_bw)
+            (m, k): _benchmark_one(kernel_name, m, k, peak_bw, input_dtype)
             for m, k in shape_pairs
         }
 
@@ -965,6 +1004,7 @@ def main(
                     writer.writerow(
                         {
                             "kernel": kernel_name,
+                            "dtype": dtype_name,
                             "M": m,
                             "K": k,
                             "gpu_time_ms": f"{gpu_time_ms:.6f}",
@@ -976,7 +1016,7 @@ def main(
         if kernel_index:
             print()
         if mk_mode == "pair":
-            print(f"kernel: {kernel_name}  dtype: bfloat16")
+            print(f"kernel: {kernel_name}  dtype: {dtype_name}")
             print(f"device: {device_name} (peak {peak_bw / 1000:.2f} TB/s)")
             for metric_index, metric in enumerate(metrics):
                 if metric_index:
@@ -994,7 +1034,7 @@ def main(
                     )
                 )
         elif len(m_values) > 1 or len(k_values) > 1:
-            print(f"kernel: {kernel_name}  dtype: bfloat16")
+            print(f"kernel: {kernel_name}  dtype: {dtype_name}")
             print(f"device: {device_name} (peak {peak_bw / 1000:.2f} TB/s)")
             for metric_index, metric in enumerate(metrics):
                 if metric_index:
@@ -1019,7 +1059,7 @@ def main(
         else:
             m, k = m_values[0], k_values[0]
             result = results[(m, k)]
-            print(f"kernel: {kernel_name}  shape: ({m}, {k})  dtype: bfloat16")
+            print(f"kernel: {kernel_name}  shape: ({m}, {k})  dtype: {dtype_name}")
             print(f"device: {device_name} (peak {peak_bw / 1000:.2f} TB/s)")
             print(
                 tabulate.tabulate(
