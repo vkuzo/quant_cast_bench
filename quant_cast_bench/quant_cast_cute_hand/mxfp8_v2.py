@@ -49,9 +49,9 @@ _MXS_MODE_DIM_M = 1
 _MXS_MODE_DIM_KM = 2
 
 
-def _mxfp8_swizzle_v2_tile_n(M, N):
-    """Choose the measured B200 N tile from the padded 128x128 CTA count."""
-    num_128_tiles = _ceil_div(M, _MXS_TM) * _ceil_div(N, _MXS_MAX_TN)
+def _mxfp8_swizzle_v2_tile_n(M, K):
+    """Choose the measured B200 K tile from the padded 128x128 CTA count."""
+    num_128_tiles = _ceil_div(M, _MXS_TM) * _ceil_div(K, _MXS_MAX_TN)
     if num_128_tiles <= 64:
         tile_n_size = 32
     elif num_128_tiles <= 512:
@@ -60,9 +60,9 @@ def _mxfp8_swizzle_v2_tile_n(M, N):
         tile_n_size = 128
 
     # Do not compute padding merely to reach the selected width for very narrow matrices.
-    if N <= 32:
+    if K <= 32:
         return 32
-    if N <= 64:
+    if K <= 64:
         return min(tile_n_size, 64)
     return tile_n_size
 
@@ -119,7 +119,7 @@ def mxfp8_swizzle_v2_kernel(
     tile_m_size: cutlass.Constexpr,
     tile_n_size: cutlass.Constexpr,
     M: cutlass.Int32,
-    N: cutlass.Int32,
+    K: cutlass.Int32,
     ragged: cutlass.Constexpr,
     mode: cutlass.Constexpr,
     stochastic: cutlass.Constexpr,
@@ -132,15 +132,15 @@ def mxfp8_swizzle_v2_kernel(
     do_dim_m = mode != _MXS_MODE_DIM_K
     if cutlass.const_expr(not ragged):
         M = cute.assume(M, divby=128)
-        N = cute.assume(N, divby=128)
+        K = cute.assume(K, divby=128)
     elif cutlass.const_expr(mode == _MXS_MODE_DIM_K):
-        N = cute.assume(N, divby=32)
+        K = cute.assume(K, divby=32)
     elif cutlass.const_expr(mode == _MXS_MODE_DIM_M):
         M = cute.assume(M, divby=32)
-        N = cute.assume(N, divby=16)
+        K = cute.assume(K, divby=16)
     else:
         M = cute.assume(M, divby=32)
-        N = cute.assume(N, divby=32)
+        K = cute.assume(K, divby=32)
     smem = utils.SmemAllocator()
     input_storage = smem.allocate_array(
         cutlass.BFloat16, tile_m_size * tile_n_size, byte_alignment=1024
@@ -293,7 +293,7 @@ def mxfp8_swizzle_v2_kernel(
             rScaleM[row_block] = biased_m.to(rScaleM.element_type)
 
         use_full_tile_m = cutlass.const_expr(not ragged) or (
-            ((tile_m_idx + 1) * tile_m_size <= M) & ((tile_n_idx + 1) * tile_n_size <= N)
+            ((tile_m_idx + 1) * tile_m_size <= M) & ((tile_n_idx + 1) * tile_n_size <= K)
         )
         if use_full_tile_m:
             _e8m0_scale_store_as_uint(
@@ -306,11 +306,11 @@ def mxfp8_swizzle_v2_kernel(
         else:
             rScaleMPadded = cute.make_rmem_tensor(row_blocks, cutlass.Uint8)
             rScaleMPadded.fill(0)
-            if output_row_m < N:
+            if output_row_m < K:
                 for row_block in cutlass.range_constexpr(row_blocks):
                     if tile_m_idx * row_blocks + row_block < M // 32:
                         rScaleMPadded[row_block] = rScaleM[row_block]
-            if output_row_m < _ceil_div(N, 128) * 128:
+            if output_row_m < _ceil_div(K, 128) * 128:
                 _e8m0_scale_store_as_uint(
                     mScaleMLogical,
                     rScaleMPadded,
@@ -337,11 +337,11 @@ def mxfp8_swizzle_v2_kernel(
         if cutlass.const_expr(stochastic):
             if cutlass.const_expr(row_owned_k):
                 sr_flat_base_k = (
-                    (tile_m_idx * tile_m_size + tidx) * N + tile_n_idx * tile_n_size
+                    (tile_m_idx * tile_m_size + tidx) * K + tile_n_idx * tile_n_size
                 )
             else:
                 sr_flat_base_k = (
-                    (tile_m_idx * tile_m_size + tidx // bpr) * N
+                    (tile_m_idx * tile_m_size + tidx // bpr) * K
                     + (tile_n_idx * bpr + tidx % bpr) * 32
                 )
         for it in cutlass.range_constexpr(iters):
@@ -349,7 +349,7 @@ def mxfp8_swizzle_v2_kernel(
                 if cutlass.const_expr(row_owned_k):
                     flat_start_k = sr_flat_base_k + it * 32
                 else:
-                    flat_start_k = sr_flat_base_k + it * 32 * N
+                    flat_start_k = sr_flat_base_k + it * 32 * K
                 sr_counter_start_k = counter_base + cutlass.Uint64(
                     flat_start_k // 16
                 )
@@ -421,7 +421,7 @@ def mxfp8_swizzle_v2_kernel(
     # Let the qdata TMA store overlap the much smaller direct scale write.
     if cutlass.const_expr(do_dim_k):
         use_full_tile_k = cutlass.const_expr(not ragged) or (
-            ((tile_m_idx + 1) * tile_m_size <= M) & ((tile_n_idx + 1) * tile_n_size <= N)
+            ((tile_m_idx + 1) * tile_m_size <= M) & ((tile_n_idx + 1) * tile_n_size <= K)
         )
         if cutlass.const_expr(row_owned_k):
             input_row_k = tile_m_idx * tile_m_size + tidx
@@ -439,7 +439,7 @@ def mxfp8_swizzle_v2_kernel(
                 rScaleKPadded.fill(0)
                 if input_row_k < M:
                     for it in cutlass.range_constexpr(iters):
-                        if tile_n_idx * bpr + it < N // 32:
+                        if tile_n_idx * bpr + it < K // 32:
                             rScaleKPadded[it] = rScaleK[it]
                 _e8m0_scale_store_as_uint(
                     mScaleKLogical,
@@ -450,8 +450,8 @@ def mxfp8_swizzle_v2_kernel(
                 )
 
             if cutlass.const_expr(ragged):
-                ncb_k = _ceil_div(N, 128)
-                grid_n = _ceil_div(N, tile_n_size)
+                ncb_k = _ceil_div(K, 128)
+                grid_n = _ceil_div(K, tile_n_size)
                 covered_groups = grid_n * bpr
                 if covered_groups < ncb_k * 4:
                     if tile_n_idx == grid_n - 1:
@@ -478,7 +478,7 @@ def mxfp8_swizzle_v2_kernel(
                 else:
                     scale_k = cutlass.Uint8(0)
                     if input_row_k < M:
-                        if scale_col_k < N // 32:
+                        if scale_col_k < K // 32:
                             scale_k = rScaleK[it]
                     mScaleKLogical[(input_row_k, scale_col_k)] = scale_k
 
@@ -492,7 +492,7 @@ def mxfp8_swizzle_v2_dim_k_jit(
     mScale,
     mSeed,
     M: cutlass.Int32,
-    N: cutlass.Int32,
+    K: cutlass.Int32,
     tile_m_size: cutlass.Constexpr,
     tile_n_size: cutlass.Constexpr,
     cluster_n: cutlass.Constexpr,
@@ -501,7 +501,7 @@ def mxfp8_swizzle_v2_dim_k_jit(
     square_scaling: cutlass.Constexpr,
 ):
     padded_M = _ceil_div(M, _MXS_TM) * _MXS_TM
-    padded_N = _ceil_div(N, tile_n_size) * tile_n_size
+    padded_N = _ceil_div(K, tile_n_size) * tile_n_size
     bpr = tile_n_size // 32
     iters = bpr
     # Match the swizzle width to the selected tile while keeping its logical shape unchanged.
@@ -553,7 +553,7 @@ def mxfp8_swizzle_v2_dim_k_jit(
         cpasync.CopyBulkTensorTileS2GOp(), mOutput, output_smem_layout, (tile_m_size, tile_n_size))
 
     nrb = _ceil_div(M, 128)
-    ncb = _ceil_div(N, 128)
+    ncb = _ceil_div(K, 128)
     # Manual scale indexing uses fewer registers, but this layout-based form is easier to follow.
     scale_layout = cute.make_layout(
         ((32, 4, nrb), (4, ncb)),
@@ -578,7 +578,7 @@ def mxfp8_swizzle_v2_dim_k_jit(
         tile_m_size,
         tile_n_size,
         M,
-        N,
+        K,
         ragged,
         _MXS_MODE_DIM_K,
         stochastic,
@@ -616,25 +616,25 @@ def _mxfp8_swizzle_v2_impl(
         assert key.dtype == torch.uint64 and key.numel() == 2, "Philox key must be uint64[2]"
     else:
         assert key is None, "RTNE rounding does not use a Philox key"
-    M, N = input.shape
-    assert M > 0 and N > 0, "v2 requires non-empty dimensions"
+    M, K = input.shape
+    assert M > 0 and K > 0, "v2 requires non-empty dimensions"
     if square_scaling:
         assert M % 32 == 0, "32x32 v2 requires M % 32 == 0"
 
     if mode != "dim_k":
         assert M % 32 == 0, "v2 dim-M requires M % 32 == 0"
-        assert N % 16 == 0, "v2 dim-M requires N % 16 == 0"
+        assert K % 16 == 0, "v2 dim-M requires K % 16 == 0"
         if mode == "dim_km":
-            assert N % 32 == 0, "v2 dim-K requires N % 32 == 0"
+            assert K % 32 == 0, "v2 dim-K requires K % 32 == 0"
 
         tile_m_size, tile_n_size = (
             _MXDMT_SMALL_TILE
-            if M * N <= 2048 * 2048
+            if M * K <= 2048 * 2048
             else (_MXDKMT_LARGE_TILE if mode == "dim_km" else _MXDMT_LARGE_TILE)
         )
-        nrb_m, ncb_m = _ceil_div(N, 128), _ceil_div(M // 32, 4)
+        nrb_m, ncb_m = _ceil_div(K, 128), _ceil_div(M // 32, 4)
         padded_M = ncb_m * 128
-        padded_N = _ceil_div(N, tile_n_size) * tile_n_size
+        padded_N = _ceil_div(K, tile_n_size) * tile_n_size
         grid_n = padded_N // tile_n_size
         grid_m = padded_M // tile_m_size
         cluster_n = 1 if mode == "dim_km" else (
@@ -644,7 +644,7 @@ def _mxfp8_swizzle_v2_impl(
         )
 
         output_m = torch.empty(
-            N, M, dtype=torch.float8_e4m3fn, device=input.device
+            K, M, dtype=torch.float8_e4m3fn, device=input.device
         )
         scale_m = torch.empty(
             nrb_m * ncb_m * 32 * 16, dtype=torch.uint8, device=input.device
@@ -666,9 +666,9 @@ def _mxfp8_swizzle_v2_impl(
             .mark_compact_shape_dynamic(mode=0, divisibility=512)
         )
         if mode == "dim_km":
-            nrb_k, ncb_k = _ceil_div(M, 128), _ceil_div(N // 32, 4)
+            nrb_k, ncb_k = _ceil_div(M, 128), _ceil_div(K // 32, 4)
             output_k = torch.empty(
-                M, N, dtype=torch.float8_e4m3fn, device=input.device
+                M, K, dtype=torch.float8_e4m3fn, device=input.device
             )
             scale_k = torch.empty(
                 nrb_k * ncb_k * 32 * 16,
@@ -696,7 +696,7 @@ def _mxfp8_swizzle_v2_impl(
         mode_id = (
             _MXS_MODE_DIM_KM if mode == "dim_km" else _MXS_MODE_DIM_M
         )
-        ragged = M != ncb_m * 128 or N != nrb_m * 128
+        ragged = M != ncb_m * 128 or K != nrb_m * 128
         fn = _compiled(
             (
                 "mxfp8_swizzle_v2", mode, tile_m_size, tile_n_size, cluster_n, ragged,
@@ -710,7 +710,7 @@ def _mxfp8_swizzle_v2_impl(
             mScaleK,
             mSeed,
             M,
-            N,
+            K,
             tile_m_size,
             tile_n_size,
             cluster_n,
@@ -718,7 +718,7 @@ def _mxfp8_swizzle_v2_impl(
             mode_id,
             stochastic,
         )
-        fn(mInput, mOutputM, mScaleM, mOutputK, mScaleK, mSeed, M, N)
+        fn(mInput, mOutputM, mScaleM, mOutputK, mScaleK, mSeed, M, K)
         scale_m = scale_m.view(nrb_m, ncb_m, 32, 16).view(
             torch.float8_e8m0fnu
         )
@@ -729,27 +729,27 @@ def _mxfp8_swizzle_v2_impl(
             return output_k, scale_k, output_m, scale_m
         return output_m, scale_m
 
-    assert N % 32 == 0, "v2 requires K % 32 == 0"
-    ngc = N // 32
+    assert K % 32 == 0, "v2 requires K % 32 == 0"
+    ngc = K // 32
     nrb, ncb = _ceil_div(M, 128), _ceil_div(ngc, 4)
-    # First choose the original adaptive N width. For small problems that would use N=64, rotate
+    # First choose the original adaptive K width. For small problems that would use K=64, rotate
     # the same-size 128x64 tile to 32x128: it keeps 128 one-group threads but gives TMA contiguous
     # rows and exposes more M-parallel CTAs.
-    tile_n_size = _mxfp8_swizzle_v2_tile_n(M, N)
-    if M * N <= 2048 * 2048 and tile_n_size >= 64:
+    tile_n_size = _mxfp8_swizzle_v2_tile_n(M, K)
+    if M * K <= 2048 * 2048 and tile_n_size >= 64:
         tile_m_size, tile_n_size = 32, 128
     else:
         tile_m_size = 128
-    grid_n = _ceil_div(N, tile_n_size)
-    # RTNE benefits from N-oriented clustering and its locality. Philox supplies enough arithmetic
+    grid_n = _ceil_div(K, tile_n_size)
+    # RTNE benefits from K-oriented clustering and its locality. Philox supplies enough arithmetic
     # latency hiding that independent CTAs are faster than forcing the same clustered schedule.
     cluster_n = (
         # Square scaling has enough independent CTAs at small/medium sizes that clustering only
-        # constrains scheduling; large shapes retain v2's N-locality-oriented clusters.
-        1 if stochastic or (square_scaling and M * N <= 4096 * 4096)
+        # constrains scheduling; large shapes retain v2's K-locality-oriented clusters.
+        1 if stochastic or (square_scaling and M * K <= 4096 * 4096)
         else next(c for c in (16, 8, 4, 2, 1) if c <= ncb and grid_n % c == 0)
     )
-    output = torch.empty(M, N, dtype=torch.float8_e4m3fn, device=input.device)
+    output = torch.empty(M, K, dtype=torch.float8_e4m3fn, device=input.device)
     # Every slot is written by the kernel, so zero-initialization would launch a redundant memset.
     scale = torch.empty(nrb * ncb * 32 * 16, dtype=torch.uint8, device=input.device)
     # TMA needs full layout/divisibility marking (leading dim contiguous, 16-elem aligned).
@@ -765,7 +765,7 @@ def _mxfp8_swizzle_v2_impl(
     )
     # The RTNE specialization never reads mSeed, so reuse mScale as a dummy argument on that path.
     mSeed = from_dlpack(key.reshape(-1).view(torch.int64)) if stochastic else mScale
-    ragged = M != nrb * 128 or N != ncb * 128
+    ragged = M != nrb * 128 or K != ncb * 128
     fn = _compiled(
         (
             "mxfp8_swizzle_v2", "dim_k", tile_m_size, tile_n_size, cluster_n, ragged,
@@ -777,7 +777,7 @@ def _mxfp8_swizzle_v2_impl(
         mScale,
         mSeed,
         M,
-        N,
+        K,
         tile_m_size,
         tile_n_size,
         cluster_n,
@@ -785,7 +785,7 @@ def _mxfp8_swizzle_v2_impl(
         stochastic,
         square_scaling,
     )
-    fn(mInput, mOutput, mScale, mSeed, M, N)
+    fn(mInput, mOutput, mScale, mSeed, M, K)
     return output, scale.view(nrb, ncb, 32, 16).view(torch.float8_e8m0fnu)
 
 
@@ -857,7 +857,7 @@ def mxfp8_swizzle_v2_dim_m_or_km_jit(
     mScaleK: cute.Tensor,
     mSeed: cute.Tensor,
     M: cutlass.Int32,
-    N: cutlass.Int32,
+    K: cutlass.Int32,
     tile_m_size: cutlass.Constexpr,
     tile_n_size: cutlass.Constexpr,
     cluster_n: cutlass.Constexpr,
@@ -866,7 +866,7 @@ def mxfp8_swizzle_v2_dim_m_or_km_jit(
     stochastic: cutlass.Constexpr,
 ):
     padded_M = _ceil_div(M, 128) * 128
-    padded_N = _ceil_div(N, tile_n_size) * tile_n_size
+    padded_N = _ceil_div(K, tile_n_size) * tile_n_size
     if cutlass.const_expr(mode == _MXS_MODE_DIM_KM):
         # Keep each 128-bit row vector intact while XORing row bits into the shared-memory bank
         # selection. This targets the dim-K phase's 16-way row-read conflicts.
@@ -925,7 +925,7 @@ def mxfp8_swizzle_v2_dim_m_or_km_jit(
         output_k_tma_atom = output_m_tma_atom
         output_k_tma_tensor = output_m_tma_tensor
 
-    nrb_m = _ceil_div(N, 128)
+    nrb_m = _ceil_div(K, 128)
     ncb_m = _ceil_div(M, 128)
     scale_m_layout = cute.make_layout(
         ((32, 4, nrb_m), (4, ncb_m)),
@@ -933,7 +933,7 @@ def mxfp8_swizzle_v2_dim_m_or_km_jit(
     )
     mScaleMLogical = cute.make_tensor(mScaleM.iterator, scale_m_layout)
     nrb_k = _ceil_div(M, 128)
-    ncb_k = _ceil_div(N, 128)
+    ncb_k = _ceil_div(K, 128)
     scale_k_layout = cute.make_layout(
         ((32, 4, nrb_k), (4, ncb_k)),
         stride=((16, 4, ncb_k * 32 * 16), (1, 32 * 16)),
@@ -972,7 +972,7 @@ def mxfp8_swizzle_v2_dim_m_or_km_jit(
         tile_m_size,
         tile_n_size,
         M,
-        N,
+        K,
         ragged,
         mode,
         stochastic,
@@ -987,7 +987,7 @@ def mxfp8_swizzle_v2_dim_m_or_km_jit(
         # an ordinary launch lets Blackwell keep nine CTAs resident per SM instead.
         kernel.launch(grid=grid, block=block)
     else:
-        # N-major scheduling keeps adjacent row-major input columns together.
+        # K-major scheduling keeps adjacent row-major input columns together.
         kernel.launch(
             grid=grid,
             block=block,

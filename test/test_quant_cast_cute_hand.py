@@ -469,7 +469,7 @@ def test_mxfp8_dim_km_swizzle_rejects_partial_group(kernel):
         pytest.skip(f"{kernel} emits Blackwell-only PTX; requires cuda capability 10.0")
     recipe = _get_recipe(kernel)
     inputs = recipe.example_input_fn(96, 144)
-    with pytest.raises(AssertionError, match="N % 32"):
+    with pytest.raises(AssertionError, match="K % 32"):
         recipe.cute_fn(*inputs)
 
 
