@@ -59,9 +59,6 @@ from quant_cast_bench.quant_cast_cute_hand.nvfp4_tma import (
     nvfp4_swizzle_dim_k_dim_m_rht_tma,
     nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_tma,
     nvfp4_swizzle_tma,
-    nvfp4_swizzle_tma_jit,
-    nvfp4_swizzle_tma_kernel,
-    nvfp4_swizzle_tma_m_jit,
 )
 from quant_cast_bench.quant_cast_cute_hand.utils import (
     COMPILE_CACHE,

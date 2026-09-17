@@ -40,6 +40,10 @@ if HAS_CUTEDSL:
         _compile_mxfp8_swizzle_v2,
         mxfp8_swizzle_v2,
     )
+    from quant_cast_bench.quant_cast_cute_hand.nvfp4_tma import (
+        _compile_nvfp4_swizzle_tma,
+        nvfp4_swizzle_tma,
+    )
     from quant_cast_bench.quant_cast_cute_hand.recipes import (
         ALL_RECIPES,
         add_v0,
@@ -308,6 +312,20 @@ def test_mxfp8_v2_dynamic_shapes_share_compile_cache():
     after_first = _compile_mxfp8_swizzle_v2.cache_info()
     mxfp8_swizzle_v2(x1)
     after_second = _compile_mxfp8_swizzle_v2.cache_info()
+
+    assert after_second.currsize == after_first.currsize
+    assert after_second.hits == after_first.hits + 1
+
+
+def test_nvfp4_tma_dynamic_shapes_share_compile_cache():
+    x0 = torch.randn(256, 256, dtype=torch.bfloat16, device="cuda")
+    x1 = torch.randn(512, 256, dtype=torch.bfloat16, device="cuda")
+    outer_scale = torch.ones(1, dtype=torch.float32, device="cuda")
+
+    nvfp4_swizzle_tma(x0, outer_scale)
+    after_first = _compile_nvfp4_swizzle_tma.cache_info()
+    nvfp4_swizzle_tma(x1, outer_scale)
+    after_second = _compile_nvfp4_swizzle_tma.cache_info()
 
     assert after_second.currsize == after_first.currsize
     assert after_second.hits == after_first.hits + 1
