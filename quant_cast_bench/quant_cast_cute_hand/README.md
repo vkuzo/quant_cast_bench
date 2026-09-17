@@ -8,9 +8,8 @@ review findings for upstreaming it into PyTorch core.
 ## `mxfp8_v2.py` upstream-readiness review
 
 The kernel supports dim-K, dim-M, and dim-KM quantization, RTNE and stochastic
-rounding, BF16/FP16/FP32 inputs, padded scale outputs, and int32/int64 indexing
-specializations. Its synchronization sequence appears coherent for currently
-supported shapes:
+rounding, BF16/FP16/FP32 inputs, padded scale outputs, and mixed-width indexing.
+Its synchronization sequence appears coherent for currently supported shapes:
 
 1. Initialize the input TMA barrier.
 2. Issue and await the input TMA transfer.
@@ -19,60 +18,6 @@ supported shapes:
 5. Fence and synchronize the qdata shared-memory writes.
 6. Issue the enabled qdata TMA stores.
 7. Overlap the dim-K global scale stores with the qdata TMA store.
-
-### Mixed-width indexing
-
-Logical dimensions, CTA coordinates, and per-dimension indices remain signed
-int32. Operations that can exceed the flattened int32 range widen before doing
-arithmetic:
-
-- stochastic-rounding counters use uint64 multiplication;
-- runtime-dependent scale-layout strides use int64;
-- TMA descriptors retain their native wide pointer/address handling.
-
-This supports tensors with more than `INT32_MAX` total elements without creating
-separate full-int32 and full-int64 kernel artifacts, provided each individual
-dimension fits signed int32. Oversized logical dimensions are rejected.
-
-The wrapper also validates CUDA grid limits. M-grid CTA counts include the extra
-tiles required to zero the padded 128-row scale layout, without materializing a
-potentially overflowing padded extent in device code.
-
-### CUDA device guarding
-
-The wrapper follows PyTorch native top-k's device-guard pattern. When the input
-is already on the current CUDA device, it takes a direct fast path. Otherwise,
-it performs allocation, DLPack conversion, compilation/cache lookup, and launch
-inside `with torch.cuda.device(input.get_device())`. Exiting the context restores
-the caller's original current device. A two-GPU regression test verifies output
-placement, numerical correctness, and current-device restoration.
-
-### Explicit host-side validation
-
-Public input, shape, orientation, rounding-mode, and Philox-key validation uses
-explicit `ValueError` checks, so invalid calls are rejected even under
-`python -O`. Assertions remain only inside the CuTe JIT/kernel, where they
-enforce compile-time specialization contracts.
-
-The shared wrapper also verifies that `kwargs` is empty. Public recipe wrappers
-retain `**kwargs` for compatibility with the benchmark recipe interface, but a
-misspelled or otherwise unsupported argument now raises `ValueError` instead of
-being silently ignored.
-
-### PyTorch-native compilation caching
-
-The v2 compile entry point uses PyTorch core's `instrumented_cutedsl_cache`,
-backed by the vendored QuACK `jit_cache`. Static specialization parameters
-(dtype, orientation, tile, cluster, masking, rounding, and square scaling) form
-the cache key, while M and K remain symbolic runtime dimensions. The cache
-provides in-process reuse, persistent TVM-FFI `.o` artifacts, cross-process
-locking, corruption recovery, and native compile instrumentation. Runtime calls
-pass PyTorch tensors directly through TVM-FFI rather than reconstructing CuTe
-DLPack tensors on every launch.
-
-This directory is registered as an additional source-fingerprint root before
-the first cache lookup, so changes to the prototype's Python kernel sources
-invalidate its persistent artifacts.
 
 The following remaining issues should be addressed before upstreaming.
 
@@ -116,14 +61,13 @@ a permanent test rather than an implicit assumption.
 
 ### API and data-contract cleanup
 
-- A contiguous view is not necessarily 16-byte aligned. Offset contiguous BF16,
-  FP16, and FP32 inputs currently fail during `from_dlpack(...,
-  assumed_align=16)` conversion. Explicitly document and validate this alignment
-  requirement, or provide a fallback/copy path.
-- Validate that the input is CUDA and that the selected device supports all TMA,
-  scale-conversion, and shared-memory features before compiling. CPU and
-  unsupported-GPU inputs currently fail inside CuTe rather than at the public
-  boundary.
+- A contiguous view is not necessarily 16-byte aligned. The TVM-FFI callable is
+  compiled from a fake input tensor with `assumed_align=16`, but the public
+  wrapper does not validate that contract for offset contiguous views. Explicitly
+  document and validate the requirement, or provide a fallback/copy path.
+- Validate that the selected CUDA device supports all required TMA,
+  scale-conversion, and shared-memory features before compiling. Unsupported
+  GPUs currently fail inside CuTe rather than at the public boundary.
 - Decide whether zero-sized tensors should return correctly shaped empty outputs.
   PyTorch operators generally support an empty fast path when meaningful.
 - The return arity changes with `quant_orientation`: dim-K and dim-M return two
@@ -154,8 +98,7 @@ bytes instead.
 
 Other cleanup expected for upstream code:
 
-- add precise types to `_COMPILE_CACHE`, `_compiled`, the implementation wrapper,
-  and all recipe-facing wrappers;
+- add precise return types to the implementation and recipe-facing wrappers;
 - use consistent PyTorch/CuTe naming conventions;
 - replace generic `"unsupported"` errors with actionable diagnostics;
 - explain the physical E8M0 scale layout and its intended GEMM consumers;
@@ -167,22 +110,17 @@ Other cleanup expected for upstream code:
 
 Before upstreaming, add coverage for:
 
-- every orientation crossed with RTNE/SR and BF16/FP16/FP32;
 - full tiles and boundary tiles for every supported dtype and orientation;
-- dim-M and dim-KM scale-padding zeros, not only dim-K;
-- current-device/input-device mismatch and repeated use across multiple GPUs;
-- heterogeneous-device compilation-cache behavior;
+- repeated use and compilation-cache isolation across heterogeneous GPUs;
 - non-default streams and CUDA graph capture;
 - aligned and offset/misaligned contiguous views;
 - concurrent first invocation and compilation;
-- shapes at and beyond CUDA grid-dimension limits;
+- shapes at the CUDA grid limits and grid-X overflow (grid-Y overflow is covered);
 - mixed-width address and stochastic-counter calculations in every orientation
   and rounding mode;
 - empty dimensions and all minimum legal shapes;
 - NaN, infinities, signed zero, subnormals, saturation boundaries, and all-zero
   groups;
-- stochastic determinism for a fixed seed/offset and non-overlapping Philox
-  counter ranges.
 
 The existing large mixed-width test allocates a multi-gigabyte tensor and covers
 only stochastic dim-K indexing. For routine upstream CI, prefer a smaller
