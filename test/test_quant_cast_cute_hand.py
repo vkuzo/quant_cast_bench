@@ -44,6 +44,10 @@ if HAS_CUTEDSL:
         _compile_nvfp4_swizzle_tma,
         nvfp4_swizzle_tma,
     )
+    from quant_cast_bench.quant_cast_cute_hand.nvfp4_pipelined import (
+        _compile_nvfp4_swizzle_dim_k_dim_m_rht_pipelined,
+        nvfp4_swizzle_dim_k_dim_m_rht_pipelined,
+    )
     from quant_cast_bench.quant_cast_cute_hand.recipes import (
         ALL_RECIPES,
         add_v0,
@@ -326,6 +330,35 @@ def test_nvfp4_tma_dynamic_shapes_share_compile_cache():
     after_first = _compile_nvfp4_swizzle_tma.cache_info()
     nvfp4_swizzle_tma(x1, outer_scale)
     after_second = _compile_nvfp4_swizzle_tma.cache_info()
+
+    assert after_second.currsize == after_first.currsize
+    assert after_second.hits == after_first.hits + 1
+
+
+def test_nvfp4_pipelined_dynamic_shapes_share_compile_cache():
+    x0 = torch.randn(128, 128, dtype=torch.bfloat16, device="cuda")
+    x1 = torch.randn(256, 128, dtype=torch.bfloat16, device="cuda")
+    outer_scale = torch.ones(1, dtype=torch.float32, device="cuda")
+    rht_sign = torch.ones(16, dtype=torch.bfloat16, device="cuda")
+
+    nvfp4_swizzle_dim_k_dim_m_rht_pipelined(
+        x0,
+        outer_scale,
+        outer_scale,
+        rht_sign,
+    )
+    after_first = (
+        _compile_nvfp4_swizzle_dim_k_dim_m_rht_pipelined.cache_info()
+    )
+    nvfp4_swizzle_dim_k_dim_m_rht_pipelined(
+        x1,
+        outer_scale,
+        outer_scale,
+        rht_sign,
+    )
+    after_second = (
+        _compile_nvfp4_swizzle_dim_k_dim_m_rht_pipelined.cache_info()
+    )
 
     assert after_second.currsize == after_first.currsize
     assert after_second.hits == after_first.hits + 1
