@@ -64,6 +64,7 @@ _DIM_KM_LARGE_TILE_64_128 = (64, 128)
 _INT32_MAX = 2**31 - 1
 _CUDA_GRID_X_MAX = _INT32_MAX
 _CUDA_GRID_Y_MAX = 2**16 - 1
+_INPUT_ALIGNMENT_BYTES = 16
 
 
 @cute.jit
@@ -945,6 +946,8 @@ def _mxfp8_swizzle_v2_impl_on_current_device(
         torch.float32,
     ):
         raise ValueError("v2 supports only bf16, fp16, and fp32 input")
+    if input.data_ptr() % _INPUT_ALIGNMENT_BYTES != 0:
+        raise ValueError("mxfp8 v2 requires a 16-byte-aligned input")
 
     rounding_mode = str(getattr(rounding_mode, "value", rounding_mode)).lower()
     if rounding_mode not in ("rtne", "stochastic"):

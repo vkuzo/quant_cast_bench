@@ -248,6 +248,17 @@ def test_mxfp8_v2_rejects_unsupported_input_dtype():
         mxfp8_swizzle_v2(x)
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_mxfp8_v2_rejects_misaligned_contiguous_input(dtype):
+    storage = torch.empty(128 * 256 + 1, dtype=dtype, device="cuda")
+    x = storage[1:].view(128, 256)
+    assert x.is_contiguous()
+    assert x.data_ptr() % 16 != 0
+
+    with pytest.raises(ValueError, match="requires a 16-byte-aligned input"):
+        mxfp8_swizzle_v2(x)
+
+
 @pytest.mark.parametrize(
     "input_transform,kwargs,error",
     [

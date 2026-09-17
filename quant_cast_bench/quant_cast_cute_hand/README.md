@@ -61,10 +61,6 @@ a permanent test rather than an implicit assumption.
 
 ### API and data-contract cleanup
 
-- A contiguous view is not necessarily 16-byte aligned. The TVM-FFI callable is
-  compiled from a fake input tensor with `assumed_align=16`, but the public
-  wrapper does not validate that contract for offset contiguous views. Explicitly
-  document and validate the requirement, or provide a fallback/copy path.
 - Validate that the selected CUDA device supports all required TMA,
   scale-conversion, and shared-memory features before compiling. Unsupported
   GPUs currently fail inside CuTe rather than at the public boundary.
@@ -113,7 +109,6 @@ Before upstreaming, add coverage for:
 - full tiles and boundary tiles for every supported dtype and orientation;
 - repeated use and compilation-cache isolation across heterogeneous GPUs;
 - non-default streams and CUDA graph capture;
-- aligned and offset/misaligned contiguous views;
 - concurrent first invocation and compilation;
 - shapes at the CUDA grid limits and grid-X overflow (grid-Y overflow is covered);
 - mixed-width address and stochastic-counter calculations in every orientation
