@@ -36,8 +36,8 @@ except (ImportError, importlib.metadata.PackageNotFoundError):
 HAS_CUTEDSL = _cutedsl_version is not None and _cutedsl_version >= _MIN_CUTEDSL
 
 if HAS_CUTEDSL:
-    from quant_cast_bench.quant_cast_cute_hand.mxfp8_v2 import (
-        _compile_mxfp8_swizzle_v2,
+    from quant_cast_bench.quant_cast_cute_hand.blockscaled_tma import (
+        _compile_blockscaled_tma,
         mxfp4_swizzle_v2,
         mxfp8_swizzle_v2,
     )
@@ -320,9 +320,9 @@ def test_mxfp8_v2_dynamic_shapes_share_compile_cache():
     x1 = torch.randn(512, 256, dtype=torch.bfloat16, device="cuda")
 
     mxfp8_swizzle_v2(x0)
-    after_first = _compile_mxfp8_swizzle_v2.cache_info()
+    after_first = _compile_blockscaled_tma.cache_info()
     mxfp8_swizzle_v2(x1)
-    after_second = _compile_mxfp8_swizzle_v2.cache_info()
+    after_second = _compile_blockscaled_tma.cache_info()
 
     assert after_second.currsize == after_first.currsize
     assert after_second.hits == after_first.hits + 1

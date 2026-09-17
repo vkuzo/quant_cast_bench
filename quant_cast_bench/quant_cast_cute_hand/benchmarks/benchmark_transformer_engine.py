@@ -25,7 +25,7 @@ import transformer_engine_torch as tex
 from torch._inductor.utils import _do_bench_using_profiling
 from transformer_engine.pytorch import MXFP8Quantizer, NVFP4Quantizer
 
-from quant_cast_bench.quant_cast_cute_hand.mxfp8_v2 import (
+from quant_cast_bench.quant_cast_cute_hand.blockscaled_tma import (
     mxfp8_32x32_swizzle_v2,
     mxfp8_swizzle_v2,
 )

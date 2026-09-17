@@ -1,4 +1,4 @@
-"""TMA-based MXFP8/MXFP4 v2 kernels and recipe definitions."""
+"""TMA-based block-scaled quantization kernels and recipe definitions."""
 
 from functools import cache, partial
 from pathlib import Path
@@ -40,9 +40,9 @@ from quant_cast_bench.quant_cast_cute_hand.utils import (
 
 # Include this prototype's Python sources in QuACK's persistent-cache fingerprint. This must
 # happen before the process's first jit_cache lookup, when that fingerprint is memoized.
-_MXFP8_V2_SOURCE_DIR = Path(__file__).resolve().parent
-if _MXFP8_V2_SOURCE_DIR not in EXTRA_SOURCE_DIRS:
-    EXTRA_SOURCE_DIRS.append(_MXFP8_V2_SOURCE_DIR)
+_BLOCKSCALED_TMA_SOURCE_DIR = Path(__file__).resolve().parent
+if _BLOCKSCALED_TMA_SOURCE_DIR not in EXTRA_SOURCE_DIRS:
+    EXTRA_SOURCE_DIRS.append(_BLOCKSCALED_TMA_SOURCE_DIR)
 
 
 _TORCH_TO_CUTE_DTYPE = {
@@ -143,7 +143,7 @@ def _mxfp4_v2_quantize_x32(
     return cute.recast_tensor(qwords, dtype=cutlass.Uint8).load()
 
 
-class _Mxfp8SwizzleV2:
+class _BlockscaledTma:
     """Compile-time MXFP8/MXFP4 configuration with a CuTe launcher and device kernel."""
 
     def __init__(
@@ -994,7 +994,7 @@ def _make_dynamic_scale_fake():
     )
 
 
-def _mxfp8_v2_compile_log_key(
+def _blockscaled_tma_compile_log_key(
     input_dtype: torch.dtype,
     tile_m_size: int,
     tile_k_size: int,
@@ -1014,10 +1014,10 @@ def _mxfp8_v2_compile_log_key(
 
 
 @instrumented_cutedsl_cache(
-    "quant_cast_bench::mxfp8_swizzle_v2",
-    key_fn=_mxfp8_v2_compile_log_key,
+    "quant_cast_bench::blockscaled_tma",
+    key_fn=_blockscaled_tma_compile_log_key,
 )
-def _compile_mxfp8_swizzle_v2(
+def _compile_blockscaled_tma(
     input_dtype: torch.dtype,
     tile_m_size: int,
     tile_k_size: int,
@@ -1035,7 +1035,7 @@ def _compile_mxfp8_swizzle_v2(
     do_dim_k = quant_orientation != _QUANT_ORIENTATION_DIM_M
     do_dim_m = quant_orientation != _QUANT_ORIENTATION_DIM_K
 
-    operation = _Mxfp8SwizzleV2(
+    operation = _BlockscaledTma(
         input_element_type,
         tile_m_size,
         tile_k_size,
@@ -1087,7 +1087,7 @@ def _compile_mxfp8_swizzle_v2(
     )
 
 
-def _mxfp8_swizzle_v2_impl_on_current_device(
+def _blockscaled_tma_impl_on_current_device(
     input: torch.Tensor,
     quant_orientation: str,
     key: torch.Tensor | None,
@@ -1324,7 +1324,7 @@ def _mxfp8_swizzle_v2_impl_on_current_device(
         else None
     )
 
-    fn = _compile_mxfp8_swizzle_v2(
+    fn = _compile_blockscaled_tma(
         input.dtype,
         tile_m_size,
         tile_k_size,
@@ -1354,7 +1354,7 @@ def _mxfp8_swizzle_v2_impl_on_current_device(
     return output_k, scale_k, output_m, scale_m
 
 
-def _mxfp8_swizzle_v2_impl(
+def _blockscaled_tma_impl(
     input: torch.Tensor,
     quant_orientation: str,
     key: torch.Tensor | None,
@@ -1380,7 +1380,7 @@ def _mxfp8_swizzle_v2_impl(
         )
 
     def launch_on_current_device():
-        return _mxfp8_swizzle_v2_impl_on_current_device(
+        return _blockscaled_tma_impl_on_current_device(
             input,
             quant_orientation=quant_orientation,
             key=key,
@@ -1402,7 +1402,7 @@ def mxfp8_swizzle_v2(
     rounding_mode: str = "rtne",
     **kwargs,
 ):
-    return _mxfp8_swizzle_v2_impl(
+    return _blockscaled_tma_impl(
         input,
         quant_orientation=quant_orientation,
         key=key,
@@ -1418,7 +1418,7 @@ MXFP8_SWIZZLE_V2 = QuantCastCuteRecipe.from_gold(
 
 
 def mxfp8_32x32_swizzle_v2(input: torch.Tensor, **kwargs):
-    return _mxfp8_swizzle_v2_impl(
+    return _blockscaled_tma_impl(
         input,
         quant_orientation="dim_k",
         key=None,
@@ -1481,7 +1481,7 @@ def mxfp4_swizzle_v2(
     quant_orientation: str = "dim_k",
     **kwargs,
 ):
-    return _mxfp8_swizzle_v2_impl(
+    return _blockscaled_tma_impl(
         input,
         quant_orientation=quant_orientation,
         key=None,

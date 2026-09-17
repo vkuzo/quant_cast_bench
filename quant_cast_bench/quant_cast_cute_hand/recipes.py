@@ -26,7 +26,7 @@ from quant_cast_bench.quant_cast_cute.recipes import (
     QuantCastCuteRecipe,
     _philox_4x32,
 )
-from quant_cast_bench.quant_cast_cute_hand.mxfp8_v2 import (
+from quant_cast_bench.quant_cast_cute_hand.blockscaled_tma import (
     MXFP4_DIM_KM_SWIZZLE_V2,
     MXFP4_DIM_M_SWIZZLE_V2,
     MXFP4_SWIZZLE_V2,

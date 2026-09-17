@@ -1,11 +1,11 @@
 # Handwritten CuTe DSL quantization kernels
 
 This directory contains optimized handwritten CuTe DSL quantization kernels. The
-`mxfp8_v2.py` implementation is an optimized prototype rather than an
+`blockscaled_tma.py` implementation is an optimized prototype rather than an
 upstream-ready PyTorch operator. The notes below capture the remaining work and
 review findings for upstreaming it into PyTorch core.
 
-## `mxfp8_v2.py` upstream-readiness review
+## `blockscaled_tma.py` upstream-readiness review
 
 The kernel supports dim-K, dim-M, and dim-KM quantization, RTNE and stochastic
 rounding, BF16/FP16/FP32 inputs, padded scale outputs.
