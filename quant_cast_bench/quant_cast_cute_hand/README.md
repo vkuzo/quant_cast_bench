@@ -61,9 +61,6 @@ a permanent test rather than an implicit assumption.
 
 ### API and data-contract cleanup
 
-- Validate that the selected CUDA device supports all required TMA,
-  scale-conversion, and shared-memory features before compiling. Unsupported
-  GPUs currently fail inside CuTe rather than at the public boundary.
 - Decide whether zero-sized tensors should return correctly shaped empty outputs.
   PyTorch operators generally support an empty fast path when meaningful.
 - The return arity changes with `quant_orientation`: dim-K and dim-M return two

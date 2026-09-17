@@ -1,6 +1,6 @@
 """TMA-based MXFP8 v2 kernels and recipe definitions."""
 
-from functools import partial
+from functools import cache, partial
 from pathlib import Path
 
 import cuda.bindings.driver as cuda
@@ -65,6 +65,11 @@ _INT32_MAX = 2**31 - 1
 _CUDA_GRID_X_MAX = _INT32_MAX
 _CUDA_GRID_Y_MAX = 2**16 - 1
 _INPUT_ALIGNMENT_BYTES = 16
+
+
+@cache
+def _cuda_capability(device: int) -> tuple[int, int]:
+    return torch.cuda.get_device_capability(device)
 
 
 @cute.jit
@@ -1148,6 +1153,14 @@ def _mxfp8_swizzle_v2_impl(
     if input.device.type != "cuda":
         raise ValueError("mxfp8 v2 requires a CUDA input")
 
+    device = input.get_device()
+    capability = _cuda_capability(device)
+    if capability < (10, 0):
+        raise RuntimeError(
+            "mxfp8 v2 requires CUDA capability 10.0 or newer; "
+            f"device {input.device} has capability {capability[0]}.{capability[1]}"
+        )
+
     def launch_on_current_device():
         return _mxfp8_swizzle_v2_impl_on_current_device(
             input,
@@ -1157,7 +1170,6 @@ def _mxfp8_swizzle_v2_impl(
             is_square_scaling=is_square_scaling,
         )
 
-    device = input.get_device()
     if device == torch.cuda.current_device():
         return launch_on_current_device()
     with torch.cuda.device(device):
