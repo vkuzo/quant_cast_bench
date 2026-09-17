@@ -6,6 +6,23 @@ from cutlass._mlir import ir
 from cutlass._mlir.dialects import arith, llvm, nvvm, vector
 from cutlass.cutlass_dsl import T, dsl_user_op
 
+from quant_cast_bench.quant_cast_cute.recipes import (
+    _cvt_rn_satfinite_e2m1x2_f32_x4,
+    _nvfp4_scale_e4m3,
+    _philox_4x32,
+)
+
+
+COMPILE_CACHE: dict = {}
+
+
+def _compiled(key, jit_fn, *cute_args):
+    fn = COMPILE_CACHE.get(key)
+    if fn is None:
+        fn = cute.compile(jit_fn, *cute_args)
+        COMPILE_CACHE[key] = fn
+    return fn
+
 
 def _ceil_div(
     num: int | cutlass.Int32 | cutlass.Int64,
@@ -263,3 +280,343 @@ def _e8m0_scale_store_as_uint(
         )
         rScalePacked = cute.recast_tensor(rScale, dtype=cutlass.Uint32)
         mScalePacked[flat // 4] = rScalePacked[0]
+
+
+_NVFP4_GROUP = 16
+_NVFP4_DIRECT_QVPT = 8
+_NVFP4_DIRECT_HALF = 8
+
+
+@dsl_user_op
+def _cvt_rs_satfinite_e2m1x4_f32_x8(
+    v0, v1, v2, v3, v4, v5, v6, v7, rbits0, rbits1, *, loc=None, ip=None
+):
+    """Pack eight f32 values into one u32 with two Blackwell E2M1x4 SR conversions."""
+    args = [
+        cutlass.Float32(value).ir_value(loc=loc, ip=ip)
+        for value in (v0, v1, v2, v3, v4, v5, v6, v7)
+    ]
+    args.extend(
+        [
+            cutlass.Uint32(rbits0).ir_value(loc=loc, ip=ip),
+            cutlass.Uint32(rbits1).ir_value(loc=loc, ip=ip),
+        ]
+    )
+    return cutlass.Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            args,
+            "{\n\t"
+            ".reg .b16 lo, hi;\n\t"
+            "cvt.rs.satfinite.e2m1x4.f32 lo, {$4, $3, $2, $1}, $9;\n\t"
+            "cvt.rs.satfinite.e2m1x4.f32 hi, {$8, $7, $6, $5}, $10;\n\t"
+            "mov.b32 $0, {lo, hi};\n\t"
+            "}",
+            "=r,f,f,f,f,f,f,f,f,r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@cute.jit
+def _nvfp4_quantize_x16(values, outer):
+    """Quantize one 1x16 NVFP4 block and return eight packed bytes plus its E4M3 scale byte."""
+    amax = cute.math.absf(values).reduce(
+        cute.ReductionOp.MAX, cutlass.Float32(0.0), 0
+    )
+    inner_e4m3, reciprocal = _nvfp4_scale_e4m3(amax, outer, outer)
+    qwords = cute.make_rmem_tensor(cute.make_layout(2), cutlass.Uint32)
+    for half in cutlass.range_constexpr(2):
+        offset = half * 8
+        qwords[half] = _cvt_rn_satfinite_e2m1x2_f32_x4(
+            values[offset + 0] * reciprocal,
+            values[offset + 1] * reciprocal,
+            values[offset + 2] * reciprocal,
+            values[offset + 3] * reciprocal,
+            values[offset + 4] * reciprocal,
+            values[offset + 5] * reciprocal,
+            values[offset + 6] * reciprocal,
+            values[offset + 7] * reciprocal,
+        )
+    return cute.recast_tensor(qwords, dtype=cutlass.Uint8).load(), inner_e4m3
+
+
+@cute.jit
+def _nvfp4_quantize_stochastic_x16(values, outer, sr_counter, k0, k1):
+    """NVFP4 x16 quantization using one Philox counter and native E2M1x4 SR conversions."""
+    amax = cute.math.absf(values).reduce(
+        cute.ReductionOp.MAX, cutlass.Float32(0.0), 0
+    )
+    inner_e4m3, reciprocal = _nvfp4_scale_e4m3(amax, outer, outer)
+    c0 = cutlass.Uint32(sr_counter & cutlass.Uint64(0xFFFFFFFF))
+    c1 = cutlass.Uint32(sr_counter >> 32)
+    zero = cutlass.Uint32(0)
+    r0, r1, r2, r3 = _philox_4x32(c0, c1, zero, zero, k0, k1)
+    # prng.bits exposes each Philox counter in [r0, r2, r1, r3] order. Feed one word to each
+    # consecutive group of four values so this specialization bit-matches the eager gold.
+    qwords = cute.make_rmem_tensor(cute.make_layout(2), cutlass.Uint32)
+    qwords[0] = _cvt_rs_satfinite_e2m1x4_f32_x8(
+        values[0] * reciprocal,
+        values[1] * reciprocal,
+        values[2] * reciprocal,
+        values[3] * reciprocal,
+        values[4] * reciprocal,
+        values[5] * reciprocal,
+        values[6] * reciprocal,
+        values[7] * reciprocal,
+        r0,
+        r2,
+    )
+    qwords[1] = _cvt_rs_satfinite_e2m1x4_f32_x8(
+        values[8] * reciprocal,
+        values[9] * reciprocal,
+        values[10] * reciprocal,
+        values[11] * reciprocal,
+        values[12] * reciprocal,
+        values[13] * reciprocal,
+        values[14] * reciprocal,
+        values[15] * reciprocal,
+        r1,
+        r3,
+    )
+    return cute.recast_tensor(qwords, dtype=cutlass.Uint8).load(), inner_e4m3
+
+
+@dsl_user_op
+def _cvt_rn_satfinite_e4m3x2_f32_packed(hi, lo, *, loc=None, ip=None):
+    """Convert two independent f32 scales to one packed E4M3x2 value."""
+    return cutlass.Uint16(
+        llvm.inline_asm(
+            T.i16(),
+            [
+                cutlass.Float32(hi).ir_value(loc=loc, ip=ip),
+                cutlass.Float32(lo).ir_value(loc=loc, ip=ip),
+            ],
+            "cvt.rn.satfinite.e4m3x2.f32 $0, $1, $2;",
+            "=h,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def _cvt_e4m3x2_to_f32x2(packed, *, loc=None, ip=None):
+    """Decode both bytes of a packed E4M3x2 value with one hardware conversion."""
+    f16x2 = cutlass.Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [cutlass.Uint16(packed).ir_value(loc=loc, ip=ip)],
+            "cvt.rn.f16x2.e4m3x2 $0, $1;",
+            "=r,h",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+    lo_bits = cutlass.Uint16(f16x2 & cutlass.Uint32(0xFFFF))
+    hi_bits = cutlass.Uint16(f16x2 >> cutlass.Uint32(16))
+    lo = cutlass.Float16(
+        llvm.bitcast(T.f16(), lo_bits.ir_value(loc=loc, ip=ip), loc=loc, ip=ip)
+    )
+    hi = cutlass.Float16(
+        llvm.bitcast(T.f16(), hi_bits.ir_value(loc=loc, ip=ip), loc=loc, ip=ip)
+    )
+    return lo.to(cutlass.Float32), hi.to(cutlass.Float32)
+
+
+@cute.jit
+def _nvfp4_scale_e4m3_fast_x2(amax0, amax1, outer):
+    """Generate and decode two inner scales with paired E4M3x2 instructions."""
+    local0 = cutlass.min(
+        cutlass.max(
+            (amax0 * (1.0 / 6.0)) * outer,
+            cutlass.Float32(1.0 / (1 << 9)),
+        ),
+        cutlass.Float32(448.0),
+    )
+    local1 = cutlass.min(
+        cutlass.max(
+            (amax1 * (1.0 / 6.0)) * outer,
+            cutlass.Float32(1.0 / (1 << 9)),
+        ),
+        cutlass.Float32(448.0),
+    )
+    packed = _cvt_rn_satfinite_e4m3x2_f32_packed(local1, local0)
+    scale0 = cutlass.Uint8(packed & cutlass.Uint16(0xFF))
+    scale1 = cutlass.Uint8(packed >> cutlass.Uint16(8))
+    decoded0, decoded1 = _cvt_e4m3x2_to_f32x2(packed)
+    reciprocal0 = outer * cute.arch.rcp_approx(decoded0)
+    reciprocal1 = outer * cute.arch.rcp_approx(decoded1)
+    return scale0, reciprocal0, scale1, reciprocal1
+
+
+@cute.jit
+def _nvfp4_quantize_fast_groups(
+    rValues: cute.Tensor,
+    rQ: cute.Tensor,
+    rScale: cute.Tensor,
+    outer,
+    counter_start,
+    k0,
+    k1,
+    group_count: cutlass.Constexpr,
+    stochastic: cutlass.Constexpr,
+):
+    """Quantize several x16 groups with scale work hoisted ahead of qdata conversion."""
+    rValueGroups = cute.tiled_divide(rValues, (_NVFP4_GROUP,))
+    rQGroups = cute.tiled_divide(rQ, (_NVFP4_DIRECT_QVPT,))
+    rReciprocal = cute.make_rmem_tensor(group_count, cutlass.Float32)
+    for pair in cutlass.range_constexpr(group_count // 2):
+        group0 = pair * 2
+        group1 = group0 + 1
+        values0 = rValueGroups[(None, group0)].load()
+        values1 = rValueGroups[(None, group1)].load()
+        amax0 = cute.math.absf(values0).reduce(
+            cute.ReductionOp.MAX, cutlass.Float32(0.0), 0
+        )
+        amax1 = cute.math.absf(values1).reduce(
+            cute.ReductionOp.MAX, cutlass.Float32(0.0), 0
+        )
+        scale0, reciprocal0, scale1, reciprocal1 = (
+            _nvfp4_scale_e4m3_fast_x2(amax0, amax1, outer)
+        )
+        rScale[group0] = scale0
+        rScale[group1] = scale1
+        rReciprocal[group0] = reciprocal0
+        rReciprocal[group1] = reciprocal1
+
+    for group in cutlass.range_constexpr(group_count):
+        values = rValueGroups[(None, group)].load()
+        reciprocal = rReciprocal[group]
+        qwords = cute.make_rmem_tensor(2, cutlass.Uint32)
+        if cutlass.const_expr(stochastic):
+            sr_counter = counter_start + cutlass.Uint64(group)
+            c0 = cutlass.Uint32(sr_counter & cutlass.Uint64(0xFFFFFFFF))
+            c1 = cutlass.Uint32(sr_counter >> 32)
+            zero = cutlass.Uint32(0)
+            r0, r1, r2, r3 = _philox_4x32(c0, c1, zero, zero, k0, k1)
+            qwords[0] = _cvt_rs_satfinite_e2m1x4_f32_x8(
+                values[0] * reciprocal,
+                values[1] * reciprocal,
+                values[2] * reciprocal,
+                values[3] * reciprocal,
+                values[4] * reciprocal,
+                values[5] * reciprocal,
+                values[6] * reciprocal,
+                values[7] * reciprocal,
+                r0,
+                r2,
+            )
+            qwords[1] = _cvt_rs_satfinite_e2m1x4_f32_x8(
+                values[8] * reciprocal,
+                values[9] * reciprocal,
+                values[10] * reciprocal,
+                values[11] * reciprocal,
+                values[12] * reciprocal,
+                values[13] * reciprocal,
+                values[14] * reciprocal,
+                values[15] * reciprocal,
+                r1,
+                r3,
+            )
+        else:
+            for half in cutlass.range_constexpr(2):
+                offset = half * 8
+                qwords[half] = _cvt_rn_satfinite_e2m1x2_f32_x4(
+                    values[offset + 0] * reciprocal,
+                    values[offset + 1] * reciprocal,
+                    values[offset + 2] * reciprocal,
+                    values[offset + 3] * reciprocal,
+                    values[offset + 4] * reciprocal,
+                    values[offset + 5] * reciprocal,
+                    values[offset + 6] * reciprocal,
+                    values[offset + 7] * reciprocal,
+                )
+        rQGroups[(None, group)].store(
+            cute.recast_tensor(qwords, dtype=cutlass.Uint8).load()
+        )
+
+
+@cute.jit
+def _nvfp4_load_philox_key(mSeed: cute.Tensor):
+    """Load one PyTorch Philox key and return its two key words plus counter base."""
+    frgKey = cute.make_rmem_tensor(cute.make_layout(2), mSeed.element_type)
+    cute.copy(
+        cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), mSeed.element_type),
+        mSeed,
+        frgKey,
+    )
+    key64 = cute.recast_tensor(frgKey, dtype=cutlass.Uint64)
+    return (
+        cutlass.Uint32(key64[0] & cutlass.Uint64(0xFFFFFFFF)),
+        cutlass.Uint32(key64[0] >> 32),
+        key64[1],
+    )
+
+
+@cute.jit
+def _nvfp4_rht_fwht_x16(
+    sInput: cute.Tensor,
+    row_start,
+    local_col,
+    sScaledSigns: cute.Tensor,
+):
+    """Structured RHT: sign flips followed by a four-stage in-register FWHT."""
+    transformed = cute.make_rmem_tensor(_NVFP4_GROUP, cutlass.Float32)
+    # Fold the exact power-of-two normalization into the signs, and consume the signed inputs
+    # directly in the first butterfly stage instead of materializing a separate intermediate.
+    for pair in cutlass.range_constexpr(8):
+        lo, hi = pair * 2, pair * 2 + 1
+        a = sInput[(row_start + lo, local_col)].to(
+            cutlass.Float32
+        ) * sScaledSigns[lo].to(cutlass.Float32)
+        b = sInput[(row_start + hi, local_col)].to(
+            cutlass.Float32
+        ) * sScaledSigns[hi].to(cutlass.Float32)
+        transformed[lo], transformed[hi] = a + b, a - b
+    for block in cutlass.range_constexpr(4):
+        base = block * 4
+        for offset in cutlass.range_constexpr(2):
+            lo, hi = base + offset, base + offset + 2
+            a, b = transformed[lo], transformed[hi]
+            transformed[lo], transformed[hi] = a + b, a - b
+    for block in cutlass.range_constexpr(2):
+        base = block * 8
+        for offset in cutlass.range_constexpr(4):
+            lo, hi = base + offset, base + offset + 4
+            a, b = transformed[lo], transformed[hi]
+            transformed[lo], transformed[hi] = a + b, a - b
+    for offset in cutlass.range_constexpr(8):
+        a, b = transformed[offset], transformed[offset + 8]
+        transformed[offset], transformed[offset + 8] = a + b, a - b
+
+    return transformed.load()
+
+
+@cute.jit
+def _nvfp4_store_scale_groups(
+    mScaleLogical: cute.Tensor,
+    rScale: cute.Tensor,
+    row,
+    scale_col,
+    group_count: cutlass.Constexpr,
+):
+    """Store a thread's adjacent scale bytes using their natural packed width."""
+    if cutlass.const_expr(group_count == 2):
+        _e8m0_scale_store_as_uint(
+            mScaleLogical, rScale, row, scale_col, 2
+        )
+    else:
+        rScalePacks = cute.tiled_divide(rScale, (4,))
+        for pack in cutlass.range_constexpr(group_count // 4):
+            _e8m0_scale_store_as_uint(
+                mScaleLogical,
+                rScalePacks[(None, pack)],
+                row,
+                scale_col + pack * 4,
+                4,
+            )
