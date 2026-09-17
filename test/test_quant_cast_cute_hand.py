@@ -37,6 +37,7 @@ HAS_CUTEDSL = _cutedsl_version is not None and _cutedsl_version >= _MIN_CUTEDSL
 
 if HAS_CUTEDSL:
     from quant_cast_bench.quant_cast_cute_hand.mxfp8_v2 import (
+        _compile_mxfp8_swizzle_v2,
         mxfp8_swizzle_v2,
     )
     from quant_cast_bench.quant_cast_cute_hand.recipes import (
@@ -286,6 +287,19 @@ def test_mxfp8_v2_rejects_unexpected_keyword_arguments():
         match="unexpected keyword arguments: global_row, roundng_mode",
     ):
         mxfp8_swizzle_v2(x, global_row=0, roundng_mode="stochastic")
+
+
+def test_mxfp8_v2_dynamic_shapes_share_compile_cache():
+    x0 = torch.randn(256, 256, dtype=torch.bfloat16, device="cuda")
+    x1 = torch.randn(512, 256, dtype=torch.bfloat16, device="cuda")
+
+    mxfp8_swizzle_v2(x0)
+    after_first = _compile_mxfp8_swizzle_v2.cache_info()
+    mxfp8_swizzle_v2(x1)
+    after_second = _compile_mxfp8_swizzle_v2.cache_info()
+
+    assert after_second.currsize == after_first.currsize
+    assert after_second.hits == after_first.hits + 1
 
 
 @pytest.mark.parametrize("M,K", [(32, 32), (96, 160), (128, 256), (1024, 1152)])

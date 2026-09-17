@@ -1,14 +1,17 @@
 """TMA-based MXFP8 v2 kernels and recipe definitions."""
 
 from functools import partial
+from pathlib import Path
 
+import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils as utils
 from cutlass.cute.nvgpu import cpasync, tcgen05
-from cutlass.cute.runtime import from_dlpack
 
 import torch
+from torch._native.instrumentation import instrumented_cutedsl_cache
+from torch._vendor.quack.cache import EXTRA_SOURCE_DIRS
 
 from quant_cast_bench.quant_cast_cute.recipes import (
     QuantCastCuteRecipe,
@@ -30,16 +33,18 @@ from quant_cast_bench.quant_cast_cute_hand.utils import (
     _e8m0_scale_store_as_uint,
 )
 
+# Include this prototype's Python sources in QuACK's persistent-cache fingerprint. This must
+# happen before the process's first jit_cache lookup, when that fingerprint is memoized.
+_MXFP8_V2_SOURCE_DIR = Path(__file__).resolve().parent
+if _MXFP8_V2_SOURCE_DIR not in EXTRA_SOURCE_DIRS:
+    EXTRA_SOURCE_DIRS.append(_MXFP8_V2_SOURCE_DIR)
 
-_COMPILE_CACHE: dict = {}
 
-
-def _compiled(key, jit_fn, *cute_args):
-    fn = _COMPILE_CACHE.get(key)
-    if fn is None:
-        fn = cute.compile(jit_fn, *cute_args)
-        _COMPILE_CACHE[key] = fn
-    return fn
+_TORCH_TO_CUTE_DTYPE = {
+    torch.bfloat16: cutlass.BFloat16,
+    torch.float16: cutlass.Float16,
+    torch.float32: cutlass.Float32,
+}
 
 
 _QUANT_ORIENTATION_DIM_K = 0
@@ -599,6 +604,7 @@ def mxfp8_swizzle_v2_jit(
     mOutputM: cute.Tensor | None,
     mScaleM: cute.Tensor | None,
     mSeed: cute.Tensor | None,
+    stream: cuda.CUstream,
     M: cutlass.Int32,
     K: cutlass.Int32,
     tile_m_size: cutlass.Constexpr,
@@ -796,7 +802,101 @@ def mxfp8_swizzle_v2_jit(
     else:
         # K-major scheduling keeps adjacent row-major input columns together.
         launch_cluster = (cluster_k, 1, 1)
-    kernel.launch(grid=grid, block=block, cluster=launch_cluster)
+    kernel.launch(grid=grid, block=block, cluster=launch_cluster, stream=stream)
+
+
+def _make_dynamic_matrix_fake(dtype):
+    """Match a 16-byte-aligned row-major tensor with a dynamic, 16-divisible K."""
+    return cute.runtime.make_fake_tensor(
+        dtype,
+        (cute.sym_int(), cute.sym_int(divisibility=16)),
+        stride=(cute.sym_int64(divisibility=16), 1),
+        assumed_align=16,
+    )
+
+
+def _make_dynamic_scale_fake():
+    """Match the compact, padded E8M0 byte allocation used by the runtime wrapper."""
+    return cute.runtime.make_fake_tensor(
+        cutlass.Uint8,
+        (cute.sym_int(divisibility=512),),
+        stride=(1,),
+        assumed_align=4,
+    )
+
+
+def _mxfp8_v2_compile_log_key(
+    input_dtype: torch.dtype,
+    tile_m_size: int,
+    tile_k_size: int,
+    cluster_k: int,
+    needs_boundary_masking: bool,
+    quant_orientation: int,
+    is_stochastic_qdata_rounding: bool,
+    is_square_scaling: bool,
+) -> str:
+    return (
+        f"dtype={input_dtype} orientation={quant_orientation} "
+        f"tile={tile_m_size}x{tile_k_size} cluster_k={cluster_k} "
+        f"masking={needs_boundary_masking} sr={is_stochastic_qdata_rounding} "
+        f"square={is_square_scaling}"
+    )
+
+
+@instrumented_cutedsl_cache(
+    "quant_cast_bench::mxfp8_swizzle_v2",
+    key_fn=_mxfp8_v2_compile_log_key,
+)
+def _compile_mxfp8_swizzle_v2(
+    input_dtype: torch.dtype,
+    tile_m_size: int,
+    tile_k_size: int,
+    cluster_k: int,
+    needs_boundary_masking: bool,
+    quant_orientation: int,
+    is_stochastic_qdata_rounding: bool,
+    is_square_scaling: bool,
+):
+    input_element_type = _TORCH_TO_CUTE_DTYPE[input_dtype]
+    do_dim_k = quant_orientation != _QUANT_ORIENTATION_DIM_M
+    do_dim_m = quant_orientation != _QUANT_ORIENTATION_DIM_K
+
+    mInput = _make_dynamic_matrix_fake(input_element_type)
+    mOutputK = _make_dynamic_matrix_fake(cutlass.Float8E4M3FN) if do_dim_k else None
+    mScaleK = _make_dynamic_scale_fake() if do_dim_k else None
+    mOutputM = _make_dynamic_matrix_fake(cutlass.Float8E4M3FN) if do_dim_m else None
+    mScaleM = _make_dynamic_scale_fake() if do_dim_m else None
+    mSeed = (
+        cute.runtime.make_fake_tensor(
+            cutlass.Int64,
+            (2,),
+            stride=(1,),
+            assumed_align=8,
+        )
+        if is_stochastic_qdata_rounding
+        else None
+    )
+
+    return cute.compile(
+        mxfp8_swizzle_v2_jit,
+        mInput,
+        mOutputK,
+        mScaleK,
+        mOutputM,
+        mScaleM,
+        mSeed,
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+        cutlass.Int32(0),
+        cutlass.Int32(0),
+        tile_m_size,
+        tile_k_size,
+        cluster_k,
+        needs_boundary_masking,
+        quant_orientation,
+        is_stochastic_qdata_rounding,
+        is_square_scaling,
+        options="--enable-tvm-ffi",
+    )
 
 
 def _mxfp8_swizzle_v2_impl_on_current_device(
@@ -913,16 +1013,6 @@ def _mxfp8_swizzle_v2_impl_on_current_device(
         )
         needs_boundary_masking = M != nrb_k * 128 or K != ncb_k * 128
         quant_orientation_id = _QUANT_ORIENTATION_DIM_K
-        compile_key = (
-            "mxfp8_swizzle_v2",
-            "dim_k",
-            tile_m_size,
-            tile_k_size,
-            cluster_k,
-            needs_boundary_masking,
-            rounding_mode,
-            is_square_scaling,
-        )
     elif quant_orientation == "dim_m":
         tile_m_size, tile_k_size = (
             _DIM_M_KM_SMALL_TILE_32_128
@@ -944,15 +1034,6 @@ def _mxfp8_swizzle_v2_impl_on_current_device(
         )
         needs_boundary_masking = M != ncb_m * 128 or K != nrb_m * 128
         quant_orientation_id = _QUANT_ORIENTATION_DIM_M
-        compile_key = (
-            "mxfp8_swizzle_v2",
-            "dim_m",
-            tile_m_size,
-            tile_k_size,
-            cluster_k,
-            needs_boundary_masking,
-            rounding_mode,
-        )
     else:
         tile_m_size, tile_k_size = (
             _DIM_M_KM_SMALL_TILE_32_128
@@ -962,15 +1043,6 @@ def _mxfp8_swizzle_v2_impl_on_current_device(
         cluster_k = 1
         needs_boundary_masking = M != ncb_m * 128 or K != nrb_m * 128
         quant_orientation_id = _QUANT_ORIENTATION_DIM_KM
-        compile_key = (
-            "mxfp8_swizzle_v2",
-            "dim_km",
-            tile_m_size,
-            tile_k_size,
-            cluster_k,
-            needs_boundary_masking,
-            rounding_mode,
-        )
 
     launch_grid_k = _ceil_div(K, tile_k_size)
     launch_grid_m = _ceil_div(M, 128) * (128 // tile_m_size)
@@ -981,9 +1053,7 @@ def _mxfp8_swizzle_v2_impl_on_current_device(
             f"maximum=({_CUDA_GRID_X_MAX}, {_CUDA_GRID_Y_MAX}, 65535)"
         )
 
-    compile_key = (*compile_key, input.dtype)
-
-    output_m = scale_m = mOutputM = mScaleM = None
+    output_m = scale_m = None
     if do_dim_m:
         output_m = torch.empty(K, M, dtype=torch.float8_e4m3fn, device=input.device)
         scale_m = torch.empty(
@@ -991,19 +1061,8 @@ def _mxfp8_swizzle_v2_impl_on_current_device(
             dtype=torch.uint8,
             device=input.device,
         )
-        mOutputM = (
-            from_dlpack(output_m, assumed_align=16)
-            .mark_layout_dynamic(leading_dim=1)
-            .mark_compact_shape_dynamic(mode=1, divisibility=16)
-        )
-        # Only the scale length varies; its compact byte stride and 512-byte block divisibility do not.
-        mScaleM = (
-            from_dlpack(scale_m, assumed_align=4)
-            .mark_layout_dynamic(leading_dim=0)
-            .mark_compact_shape_dynamic(mode=0, divisibility=512)
-        )
 
-    output_k = scale_k = mOutputK = mScaleK = None
+    output_k = scale_k = None
     if do_dim_k:
         output_k = torch.empty(M, K, dtype=torch.float8_e4m3fn, device=input.device)
         # Every slot is written by the kernel, so zero-initialization would launch a redundant
@@ -1013,41 +1072,14 @@ def _mxfp8_swizzle_v2_impl_on_current_device(
             dtype=torch.uint8,
             device=input.device,
         )
-        mOutputK = (
-            from_dlpack(output_k, assumed_align=16)
-            .mark_layout_dynamic(leading_dim=1)
-            .mark_compact_shape_dynamic(mode=1, divisibility=16)
-        )
-        # Keep the scale allocation out of the compile key while preserving packed-store alignment.
-        mScaleK = (
-            from_dlpack(scale_k, assumed_align=4)
-            .mark_layout_dynamic(leading_dim=0)
-            .mark_compact_shape_dynamic(mode=0, divisibility=512)
-        )
-
-    # TMA needs full layout/divisibility marking (leading dim contiguous, 16-element aligned).
-    mInput = (
-        from_dlpack(input, assumed_align=16)
-        .mark_layout_dynamic(leading_dim=1)
-        .mark_compact_shape_dynamic(mode=1, divisibility=16)
-    )
-    mSeed = (
-        from_dlpack(key.reshape(-1).view(torch.int64))
+    seed = (
+        key.reshape(-1).view(torch.int64)
         if is_stochastic_qdata_rounding
         else None
     )
 
-    fn = _compiled(
-        compile_key,
-        mxfp8_swizzle_v2_jit,
-        mInput,
-        mOutputK,
-        mScaleK,
-        mOutputM,
-        mScaleM,
-        mSeed,
-        cutlass.Int32(M),
-        cutlass.Int32(K),
+    fn = _compile_mxfp8_swizzle_v2(
+        input.dtype,
         tile_m_size,
         tile_k_size,
         cluster_k,
@@ -1056,7 +1088,7 @@ def _mxfp8_swizzle_v2_impl_on_current_device(
         is_stochastic_qdata_rounding,
         is_square_scaling,
     )
-    fn(mInput, mOutputK, mScaleK, mOutputM, mScaleM, mSeed, M, K)
+    fn(input, output_k, scale_k, output_m, scale_m, seed, M, K)
 
     if do_dim_m:
         scale_m = scale_m.view(nrb_m, ncb_m, 32, 16).view(torch.float8_e8m0fnu)

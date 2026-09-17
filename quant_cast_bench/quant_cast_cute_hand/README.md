@@ -59,6 +59,21 @@ retain `**kwargs` for compatibility with the benchmark recipe interface, but a
 misspelled or otherwise unsupported argument now raises `ValueError` instead of
 being silently ignored.
 
+### PyTorch-native compilation caching
+
+The v2 compile entry point uses PyTorch core's `instrumented_cutedsl_cache`,
+backed by the vendored QuACK `jit_cache`. Static specialization parameters
+(dtype, orientation, tile, cluster, masking, rounding, and square scaling) form
+the cache key, while M and K remain symbolic runtime dimensions. The cache
+provides in-process reuse, persistent TVM-FFI `.o` artifacts, cross-process
+locking, corruption recovery, and native compile instrumentation. Runtime calls
+pass PyTorch tensors directly through TVM-FFI rather than reconstructing CuTe
+DLPack tensors on every launch.
+
+This directory is registered as an additional source-fingerprint root before
+the first cache lookup, so changes to the prototype's Python kernel sources
+invalidate its persistent artifacts.
+
 The following remaining issues should be addressed before upstreaming.
 
 ### Must fix
@@ -74,18 +89,6 @@ define:
 - CUDA graph capture behavior;
 - distributed-execution behavior;
 - overflow/wraparound behavior for the counter.
-
-#### Replace the process-global compilation cache
-
-The current dictionary cache is unbounded and unsynchronized. It has no explicit
-device architecture, compiler version, fork lifecycle, or failure handling in
-its key. Concurrent first calls may also compile the same specialization more
-than once.
-
-The cache key can vary by orientation, tile shape, cluster width, masking,
-rounding, scale mode, and dtype. Use a shared thread-safe compilation cache with
-an explicit architecture/compiler-version identity and a bounded or otherwise
-managed lifecycle.
 
 ### PyTorch operator integration
 
