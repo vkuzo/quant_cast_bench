@@ -20,9 +20,14 @@ from quant_cast_bench.quant_cast_gold.recipes import (
     F4_E2M1_MAX,
     F8E4M3_MAX,
     _compute_error,
+    _from_blocked_4d,
     hadamard_rht_matrix,
     hadamard_rht_f,
     hadamard_rht_fp32_f,
+    mxfp4_dim_km_swizzle_f,
+    mxfp4_dim_m_swizzle_f,
+    mxfp4_f,
+    mxfp4_swizzle_f,
     mxfp8_dim_km_swizzle_f,
     mxfp8_dim_km_swizzle_sr_f,
     mxfp8_dim_m_swizzle_f,
@@ -78,6 +83,38 @@ def test_mxfp8_swizzle_sr_reproducible_and_preserves_scale():
     assert torch.equal(scale0.view(torch.uint8), scale1.view(torch.uint8))
     assert torch.equal(scale0.view(torch.uint8), scale_rtne.view(torch.uint8))
     assert not torch.equal(q0.view(torch.uint8), q_rtne.view(torch.uint8))
+
+
+@pytest.mark.parametrize("M,K", [(128, 128), (129, 160)])
+def test_mxfp4_swizzle_only_changes_scale_layout(M, K):
+    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+
+    qdata, blocked_scale = mxfp4_swizzle_f(x)
+    expected_qdata, expected_scale = mxfp4_f(x)
+
+    assert torch.equal(qdata.view(torch.uint8), expected_qdata.view(torch.uint8))
+    actual_scale = _from_blocked_4d(blocked_scale, M, K // 32)
+    assert torch.equal(actual_scale.view(torch.uint8), expected_scale.view(torch.uint8))
+
+
+def test_mxfp4_dim_m_swizzle_matches_transposed_dim_k():
+    x = torch.randn(160, 129, dtype=torch.bfloat16, device="cuda")
+
+    actual = mxfp4_dim_m_swizzle_f(x)
+    expected = mxfp4_swizzle_f(x.t().contiguous())
+
+    for output, reference in zip(actual, expected):
+        assert torch.equal(output.view(torch.uint8), reference.view(torch.uint8))
+
+
+def test_mxfp4_dim_km_swizzle_composes_both_orientations():
+    x = torch.randn(160, 96, dtype=torch.bfloat16, device="cuda")
+
+    actual = mxfp4_dim_km_swizzle_f(x)
+    expected = (*mxfp4_swizzle_f(x), *mxfp4_dim_m_swizzle_f(x))
+
+    for output, reference in zip(actual, expected):
+        assert torch.equal(output.view(torch.uint8), reference.view(torch.uint8))
 
 
 def test_mxfp8_swizzle_sr_nonfinite_groups_use_canonical_nan():
