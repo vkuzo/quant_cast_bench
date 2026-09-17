@@ -207,6 +207,20 @@ def _e8m0(amax: cutlass.Float32) -> tuple[cutlass.Float32, cutlass.Uint8]:
     return rcp, view_as(scale_e8m0, cutlass.Uint8)
 
 
+@cute.jit
+def _e8m0_with_max_pos(
+    amax: cutlass.Float32,
+    max_pos: cutlass.Constexpr,
+) -> tuple[cutlass.Float32, cutlass.Uint8]:
+    """Return an RCEIL E8M0 scale for a caller-specified element-format maximum."""
+    descale = amax * cutlass.Float32(1.0 / max_pos)
+    scale_e8m0 = _cvt_f32_to_ue8m0(
+        descale, rounding_mode=nvvm.FPRoundingMode.RP
+    )
+    rcp = _reciprocal_scale(scale_e8m0)
+    return rcp, view_as(scale_e8m0, cutlass.Uint8)
+
+
 @dsl_user_op
 def _cvt_rs_satfinite_e4m3x4_f32(
     v0: cutlass.Float32,

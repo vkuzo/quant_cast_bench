@@ -38,6 +38,7 @@ HAS_CUTEDSL = _cutedsl_version is not None and _cutedsl_version >= _MIN_CUTEDSL
 if HAS_CUTEDSL:
     from quant_cast_bench.quant_cast_cute_hand.mxfp8_v2 import (
         _compile_mxfp8_swizzle_v2,
+        mxfp4_swizzle_v2,
         mxfp8_swizzle_v2,
     )
     from quant_cast_bench.quant_cast_cute_hand.nvfp4_tma import (
@@ -86,6 +87,9 @@ _REQUIRES_SM100 = frozenset({
     "mxfp8_dim_m_swizzle_sr_v2",
     "mxfp8_dim_km_swizzle_v2",
     "mxfp8_dim_km_swizzle_sr_v2",
+    "mxfp4_swizzle_v2",
+    "mxfp4_dim_m_swizzle_v2",
+    "mxfp4_dim_km_swizzle_v2",
     "nvfp4_swizzle_direct",
     "nvfp4_swizzle_tma",
     "nvfp4_dim_m_swizzle_tma",
@@ -98,7 +102,7 @@ _REQUIRES_SM100 = frozenset({
     "nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_pipelined",
 })
 
-_MXFP8_V2_RECIPES = frozenset({
+_MX_V2_RECIPES = frozenset({
     "mxfp8_swizzle_v2",
     "mxfp8_swizzle_sr_v2",
     "mxfp8_32x32_swizzle_v2",
@@ -106,8 +110,11 @@ _MXFP8_V2_RECIPES = frozenset({
     "mxfp8_dim_m_swizzle_sr_v2",
     "mxfp8_dim_km_swizzle_v2",
     "mxfp8_dim_km_swizzle_sr_v2",
+    "mxfp4_swizzle_v2",
+    "mxfp4_dim_m_swizzle_v2",
+    "mxfp4_dim_km_swizzle_v2",
 })
-_SUPPORTS_NON_BFLOAT16 = _MXFP8_V2_RECIPES
+_SUPPORTS_NON_BFLOAT16 = _MX_V2_RECIPES
 
 def _get_recipe(recipe_name):
     _recipe_name, recipe = [x for x in ALL_RECIPES if x[0] == recipe_name][0]
@@ -501,6 +508,29 @@ def test_mxfp8_swizzle_v2_quant_orientation(quant_orientation, reference):
 
     outputs = recipe.cute_fn(*inputs, quant_orientation=quant_orientation)
     ref_outputs = reference_recipe.pt_ref_fn(*inputs)
+    assert len(outputs) == len(ref_outputs)
+    for output, ref_output in zip(outputs, ref_outputs):
+        assert qdata_and_scale_equal(output, ref_output)
+
+
+@pytest.mark.parametrize(
+    "quant_orientation,reference,M,K",
+    [
+        ("dim_k", "mxfp4_swizzle_v2", 129, 160),
+        ("dim_m", "mxfp4_dim_m_swizzle_v2", 160, 144),
+        ("dim_km", "mxfp4_dim_km_swizzle_v2", 160, 160),
+    ],
+)
+def test_mxfp4_swizzle_v2_quant_orientation(
+    quant_orientation, reference, M, K
+):
+    if torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip("mxfp4 v2 emits Blackwell-only PTX; requires cuda capability 10.0")
+    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+
+    outputs = mxfp4_swizzle_v2(x, quant_orientation=quant_orientation)
+    ref_outputs = _get_recipe(reference).pt_ref_fn(x)
+
     assert len(outputs) == len(ref_outputs)
     for output, ref_output in zip(outputs, ref_outputs):
         assert qdata_and_scale_equal(output, ref_output)
@@ -1045,7 +1075,7 @@ def test_cute_hand_matches_reference(name, recipe, dtype):
         "num_col": gold_inputs[0].shape[-1],
     }
     ref_outs = recipe.pt_ref_fn(*gold_inputs, **tile_kwargs)
-    cute_kwargs = {} if name in _MXFP8_V2_RECIPES else tile_kwargs
+    cute_kwargs = {} if name in _MX_V2_RECIPES else tile_kwargs
     cute_outs = recipe.cute_fn(*cute_inputs, **cute_kwargs)
 
     assert len(cute_outs) == len(ref_outs), f"{name}: output count {len(cute_outs)} != {len(ref_outs)}"

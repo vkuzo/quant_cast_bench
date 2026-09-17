@@ -27,6 +27,9 @@ from quant_cast_bench.quant_cast_cute.recipes import (
     _philox_4x32,
 )
 from quant_cast_bench.quant_cast_cute_hand.mxfp8_v2 import (
+    MXFP4_DIM_KM_SWIZZLE_V2,
+    MXFP4_DIM_M_SWIZZLE_V2,
+    MXFP4_SWIZZLE_V2,
     MXFP8_32X32_SWIZZLE_V2,
     MXFP8_DIM_KM_SWIZZLE_SR_V2,
     MXFP8_DIM_KM_SWIZZLE_V2,
@@ -34,6 +37,9 @@ from quant_cast_bench.quant_cast_cute_hand.mxfp8_v2 import (
     MXFP8_DIM_M_SWIZZLE_V2,
     MXFP8_SWIZZLE_SR_V2,
     MXFP8_SWIZZLE_V2,
+    mxfp4_dim_km_swizzle_v2,
+    mxfp4_dim_m_swizzle_v2,
+    mxfp4_swizzle_v2,
 )
 from quant_cast_bench.quant_cast_cute_hand.nvfp4_pipelined import (
     NVFP4_SWIZZLE_DIM_K_DIM_M_RHT_PIPELINED,
@@ -2595,6 +2601,9 @@ ALL_RECIPES = [
     ("mxfp8_dim_m_swizzle_sr_v2", MXFP8_DIM_M_SWIZZLE_SR_V2),
     ("mxfp8_dim_km_swizzle_v2", MXFP8_DIM_KM_SWIZZLE_V2),
     ("mxfp8_dim_km_swizzle_sr_v2", MXFP8_DIM_KM_SWIZZLE_SR_V2),
+    ("mxfp4_swizzle_v2", MXFP4_SWIZZLE_V2),
+    ("mxfp4_dim_m_swizzle_v2", MXFP4_DIM_M_SWIZZLE_V2),
+    ("mxfp4_dim_km_swizzle_v2", MXFP4_DIM_KM_SWIZZLE_V2),
     ("nvfp4_swizzle_direct", NVFP4_SWIZZLE_DIRECT),
     ("nvfp4_swizzle_tma", NVFP4_SWIZZLE_TMA),
     ("nvfp4_dim_m_swizzle_tma", NVFP4_DIM_M_SWIZZLE_TMA),

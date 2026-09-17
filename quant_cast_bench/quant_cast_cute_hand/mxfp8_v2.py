@@ -1,4 +1,4 @@
-"""TMA-based MXFP8 v2 kernels and recipe definitions."""
+"""TMA-based MXFP8/MXFP4 v2 kernels and recipe definitions."""
 
 from functools import cache, partial
 from pathlib import Path
@@ -18,6 +18,9 @@ from quant_cast_bench.quant_cast_cute.recipes import (
     _philox_4x32,
 )
 from quant_cast_bench.quant_cast_gold.recipes import (
+    Mxfp4DimKMSwizzleGold,
+    Mxfp4DimMSwizzleGold,
+    Mxfp4SwizzleGold,
     Mxfp832x32SwizzleGold,
     Mxfp8DimKmSwizzleGold,
     Mxfp8DimKmSwizzleSRGold,
@@ -28,8 +31,10 @@ from quant_cast_bench.quant_cast_gold.recipes import (
 )
 from quant_cast_bench.quant_cast_cute_hand.utils import (
     _ceil_div,
+    _cvt_rn_satfinite_e2m1x2_f32_x4,
     _cvt_rs_satfinite_e4m3x4_f32,
     _e8m0,
+    _e8m0_with_max_pos,
     _e8m0_scale_store_as_uint,
 )
 
@@ -44,6 +49,11 @@ _TORCH_TO_CUTE_DTYPE = {
     torch.bfloat16: cutlass.BFloat16,
     torch.float16: cutlass.Float16,
     torch.float32: cutlass.Float32,
+}
+
+_TORCH_TO_CUTE_QDATA_DTYPE = {
+    torch.float8_e4m3fn: cutlass.Float8E4M3FN,
+    torch.float4_e2m1fn_x2: cutlass.Float4E2M1FN,
 }
 
 
@@ -110,8 +120,31 @@ def _mxfp8_v2_quantize_stochastic_x32(
     return cute.recast_tensor(qwords, dtype=cutlass.Float8E4M3FN).load()
 
 
+@cute.jit
+def _mxfp4_v2_quantize_x32(
+    values: cute.TensorSSA,
+    rcp: cutlass.Float32,
+) -> cute.TensorSSA:
+    """Quantize 32 FP32 values into 16 packed E2M1 bytes with RTNE."""
+    scaled = values * rcp
+    qwords = cute.make_rmem_tensor(cute.make_layout(4), cutlass.Uint32)
+    for chunk in cutlass.range_constexpr(4):
+        offset = chunk * 8
+        qwords[chunk] = _cvt_rn_satfinite_e2m1x2_f32_x4(
+            scaled[offset + 0],
+            scaled[offset + 1],
+            scaled[offset + 2],
+            scaled[offset + 3],
+            scaled[offset + 4],
+            scaled[offset + 5],
+            scaled[offset + 6],
+            scaled[offset + 7],
+        )
+    return cute.recast_tensor(qwords, dtype=cutlass.Uint8).load()
+
+
 class _Mxfp8SwizzleV2:
-    """Compile-time MXFP8 configuration with a CuTe launcher and device kernel."""
+    """Compile-time MXFP8/MXFP4 configuration with a CuTe launcher and device kernel."""
 
     def __init__(
         self,
@@ -123,6 +156,7 @@ class _Mxfp8SwizzleV2:
         quant_orientation: int,
         is_stochastic_qdata_rounding: bool,
         is_square_scaling: bool,
+        qdata_dtype=cutlass.Float8E4M3FN,
     ) -> None:
         self.input_element_type = input_element_type
         self.tile_m_size = tile_m_size
@@ -132,6 +166,7 @@ class _Mxfp8SwizzleV2:
         self.quant_orientation = quant_orientation
         self.is_stochastic_qdata_rounding = is_stochastic_qdata_rounding
         self.is_square_scaling = is_square_scaling
+        self.qdata_dtype = qdata_dtype
 
     @cute.kernel
     def kernel(
@@ -149,17 +184,20 @@ class _Mxfp8SwizzleV2:
         output_k_smem_layout: cute.ComposedLayout | None,
         output_m_smem_layout: cute.ComposedLayout | None,
         data_k_tv_layout: cute.Layout | None,
+        output_k_tv_layout: cute.Layout | None,
         M: cutlass.Int32,
         K: cutlass.Int32,
     ) -> None:
         """
-        Kernel for mxfp8 quantization across (dim_k, dim_m, dim_km) x (RTNE, SR)
+        Kernel for MXFP8/MXFP4 quantization across dim-K, dim-M, and dim-KM.
+
+        MXFP8 supports RTNE and SR, while MXFP4 currently supports RTNE only.
 
         High level flow:
           0. create smem scratchpad
              a. both dim-k and dim-m use a tile_m_size * tile_k_size input-typed scratchpad,
-             b. dim-k reuses the first half of 0a for qdata (to save smem)
-             c. dim-m additionally uses a tile_m_size * tile_k_size fp8 scratchpad for qdata
+             b. dim-k reuses the leading region of 0a for qdata (to save smem)
+             c. dim-m additionally uses a packed-qdata scratchpad
           1. load input data with TMA.
              a. If SR enabled, also load the random key while input data is loading
           2. barrier to wait for (1)
@@ -188,6 +226,19 @@ class _Mxfp8SwizzleV2:
             self.is_stochastic_qdata_rounding
         )
         is_square_scaling = cutlass.const_expr(self.is_square_scaling)
+        qdata_dtype = self.qdata_dtype
+        is_packed_fp4_qdata = cutlass.const_expr(
+            qdata_dtype == cutlass.Float4E2M1FN
+        )
+        qdata_storage_element_type = (
+            cutlass.Uint8
+            if cutlass.const_expr(is_packed_fp4_qdata)
+            else cutlass.Float8E4M3FN
+        )
+        qdata_storage_elements_per_group = (
+            16 if cutlass.const_expr(is_packed_fp4_qdata) else 32
+        )
+        qdata_k_divisor = 2 if cutlass.const_expr(is_packed_fp4_qdata) else 1
 
         if cutlass.const_expr(quant_orientation == _QUANT_ORIENTATION_DIM_K):
             assert output_k_tma_atom is not None
@@ -195,6 +246,7 @@ class _Mxfp8SwizzleV2:
             assert mScaleKLogical is not None
             assert output_k_smem_layout is not None
             assert data_k_tv_layout is not None
+            assert output_k_tv_layout is not None
             assert output_m_tma_atom is None
             assert output_m_tma_tensor is None
             assert mScaleMLogical is None
@@ -205,6 +257,7 @@ class _Mxfp8SwizzleV2:
             assert mScaleKLogical is None
             assert output_k_smem_layout is None
             assert data_k_tv_layout is None
+            assert output_k_tv_layout is None
             assert output_m_tma_atom is not None
             assert output_m_tma_tensor is not None
             assert mScaleMLogical is not None
@@ -216,6 +269,7 @@ class _Mxfp8SwizzleV2:
             assert mScaleKLogical is not None
             assert output_k_smem_layout is not None
             assert data_k_tv_layout is not None
+            assert output_k_tv_layout is not None
             assert output_m_tma_atom is not None
             assert output_m_tma_tensor is not None
             assert mScaleMLogical is not None
@@ -225,6 +279,9 @@ class _Mxfp8SwizzleV2:
             assert mSeed is not None
         else:
             assert mSeed is None
+        if cutlass.const_expr(is_packed_fp4_qdata):
+            assert not is_stochastic_qdata_rounding
+            assert not is_square_scaling
 
         # bookkeeping
         tidx, _, _ = cute.arch.thread_idx()
@@ -251,7 +308,9 @@ class _Mxfp8SwizzleV2:
         )
         if cutlass.const_expr(do_dim_m):
             output_m_storage = smem.allocate_array(
-                cutlass.Float8E4M3FN, tile_m_size * tile_k_size, byte_alignment=1024
+                qdata_storage_element_type,
+                tile_m_size * tile_k_size // qdata_k_divisor,
+                byte_alignment=1024,
             )
         # Put the small barrier after the 1KB-aligned tile buffers to avoid an otherwise unused 1016B
         # alignment gap at the front of every CTA's shared-memory allocation.
@@ -288,12 +347,14 @@ class _Mxfp8SwizzleV2:
                 cute.recast_ptr(
                     input_storage,
                     output_k_smem_layout.inner,
-                    dtype=cutlass.Float8E4M3FN,
+                    dtype=qdata_storage_element_type,
                 ),
                 output_k_smem_layout.outer,
             )
             gOutputK = cute.local_tile(
-                output_k_tma_tensor, (tile_m_size, tile_k_size), (None, None)
+                output_k_tma_tensor,
+                (tile_m_size, tile_k_size // qdata_k_divisor),
+                (None, None),
             )
             tOutputsK, tOutputgK = cpasync.tma_partition(
                 output_k_tma_atom,
@@ -308,12 +369,14 @@ class _Mxfp8SwizzleV2:
                 cute.recast_ptr(
                     output_m_storage,
                     output_m_smem_layout.inner,
-                    dtype=cutlass.Float8E4M3FN,
+                    dtype=qdata_storage_element_type,
                 ),
                 output_m_smem_layout.outer,
             )
             gOutputM = cute.local_tile(
-                output_m_tma_tensor, (tile_k_size, tile_m_size), (None, None)
+                output_m_tma_tensor,
+                (tile_k_size, tile_m_size // qdata_k_divisor),
+                (None, None),
             )
             tOutputsM, tOutputgM = cpasync.tma_partition(
                 output_m_tma_atom,
@@ -357,7 +420,9 @@ class _Mxfp8SwizzleV2:
             cute.nvgpu.CopyUniversalOp(), input_element_type, num_bits_per_copy=128
         )
         smem_store_atom = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(), cutlass.Float8E4M3FN, num_bits_per_copy=128
+            cute.nvgpu.CopyUniversalOp(),
+            qdata_storage_element_type,
+            num_bits_per_copy=128,
         )
 
         if cutlass.const_expr(do_dim_m):
@@ -404,9 +469,17 @@ class _Mxfp8SwizzleV2:
                 amax_m = cute.math.absf(vm).reduce(
                     cute.ReductionOp.MAX, cutlass.Float32(0.0), 0
                 )
-                rcp_m, biased_m = _e8m0(amax_m)
-                rQM = cute.make_rmem_tensor(32, cutlass.Float8E4M3FN)
-                if cutlass.const_expr(is_stochastic_qdata_rounding):
+                if cutlass.const_expr(is_packed_fp4_qdata):
+                    rcp_m, biased_m = _e8m0_with_max_pos(amax_m, 6.0)
+                else:
+                    rcp_m, biased_m = _e8m0(amax_m)
+                rQM = cute.make_rmem_tensor(
+                    qdata_storage_elements_per_group,
+                    qdata_storage_element_type,
+                )
+                if cutlass.const_expr(is_packed_fp4_qdata):
+                    rQM.store(_mxfp4_v2_quantize_x32(vm, rcp_m))
+                elif cutlass.const_expr(is_stochastic_qdata_rounding):
                     rQM.store(
                         _mxfp8_v2_quantize_stochastic_x32(
                             vm, rcp_m, sr_counter_start_m, k0, k1
@@ -416,11 +489,20 @@ class _Mxfp8SwizzleV2:
                     rQM.store((vm * rcp_m).to(cutlass.Float8E4M3FN))
                 rQM16 = cute.tiled_divide(rQM, (16,))
                 sQM16 = cute.tiled_divide(sOutputM[(tidx, None)], (16,))
-                for vec in cutlass.range_constexpr(2):
+                for vec in cutlass.range_constexpr(
+                    qdata_storage_elements_per_group // 16
+                ):
                     cute.copy(
                         smem_store_atom,
                         rQM16[(None, vec)],
-                        sQM16[(None, row_block * 2 + vec)],
+                        sQM16[
+                            (
+                                None,
+                                row_block
+                                * (qdata_storage_elements_per_group // 16)
+                                + vec,
+                            )
+                        ],
                     )
                 rScaleM[row_block] = biased_m.to(rScaleM.element_type)
 
@@ -461,13 +543,16 @@ class _Mxfp8SwizzleV2:
             row_owned_k = tile_m_size == _DIM_K_TILE_M_SIZE_128
             iters = bpr if cutlass.const_expr(row_owned_k) else tile_m_size // 32
             tidfrgInputK = cute.composition(sInput, data_k_tv_layout)
-            tidfrgOutputK = cute.composition(sOutputK, data_k_tv_layout)
+            tidfrgOutputK = cute.composition(sOutputK, output_k_tv_layout)
             thrInputGroupsK = tidfrgInputK[(tidx, None)]
             thrOutputGroupsK = tidfrgOutputK[(tidx, None)]
             rScaleK = cute.make_rmem_tensor(iters, cutlass.Uint8)
             rQK = cute.make_rmem_tensor(
-                cute.make_layout((32, iters), stride=(1, 32)),
-                cutlass.Float8E4M3FN,
+                cute.make_layout(
+                    (qdata_storage_elements_per_group, iters),
+                    stride=(1, qdata_storage_elements_per_group),
+                ),
+                qdata_storage_element_type,
             )
             if cutlass.const_expr(is_stochastic_qdata_rounding):
                 if cutlass.const_expr(row_owned_k):
@@ -514,8 +599,13 @@ class _Mxfp8SwizzleV2:
                     # One warp owns the 32 rows of each 32-column group. Broadcast their combined
                     # maximum so every row quantizes with the same 32x32-block scale.
                     amax_k = cute.arch.warp_reduction_max(amax_k)
-                rcp_k, biased_k = _e8m0(amax_k)
-                if cutlass.const_expr(is_stochastic_qdata_rounding):
+                if cutlass.const_expr(is_packed_fp4_qdata):
+                    rcp_k, biased_k = _e8m0_with_max_pos(amax_k, 6.0)
+                else:
+                    rcp_k, biased_k = _e8m0(amax_k)
+                if cutlass.const_expr(is_packed_fp4_qdata):
+                    rQK[(None, it)].store(_mxfp4_v2_quantize_x32(vk, rcp_k))
+                elif cutlass.const_expr(is_stochastic_qdata_rounding):
                     rQK[(None, it)].store(
                         _mxfp8_v2_quantize_stochastic_x32(
                             vk, rcp_k, sr_counter_start_k, k0, k1
@@ -535,7 +625,9 @@ class _Mxfp8SwizzleV2:
                 sGroupK16 = cute.tiled_divide(
                     thrOutputGroupsK[((None, it),)], (16,)
                 )
-                for vec in cutlass.range_constexpr(2):
+                for vec in cutlass.range_constexpr(
+                    qdata_storage_elements_per_group // 16
+                ):
                     cute.copy(
                         smem_store_atom,
                         rQK16[(None, vec)],
@@ -650,6 +742,16 @@ class _Mxfp8SwizzleV2:
             self.is_stochastic_qdata_rounding
         )
         is_square_scaling = cutlass.const_expr(self.is_square_scaling)
+        qdata_dtype = self.qdata_dtype
+        is_packed_fp4_qdata = cutlass.const_expr(
+            qdata_dtype == cutlass.Float4E2M1FN
+        )
+        qdata_storage_element_type = (
+            cutlass.Uint8
+            if cutlass.const_expr(is_packed_fp4_qdata)
+            else cutlass.Float8E4M3FN
+        )
+        qdata_k_divisor = 2 if cutlass.const_expr(is_packed_fp4_qdata) else 1
 
         do_dim_k = quant_orientation != _QUANT_ORIENTATION_DIM_M
         do_dim_m = quant_orientation != _QUANT_ORIENTATION_DIM_K
@@ -677,6 +779,9 @@ class _Mxfp8SwizzleV2:
             assert mSeed is None
         if cutlass.const_expr(is_square_scaling):
             assert quant_orientation == _QUANT_ORIENTATION_DIM_K
+        if cutlass.const_expr(is_packed_fp4_qdata):
+            assert not is_stochastic_qdata_rounding
+            assert not is_square_scaling
 
         # M is padded to a full 128-row scale-layout block. Since every tile-M divides 128,
         # compute the CTA count without materializing a potentially overflowing padded extent.
@@ -717,29 +822,41 @@ class _Mxfp8SwizzleV2:
         )
 
         if cutlass.const_expr(do_dim_k):
-            if cutlass.const_expr(quant_orientation == _QUANT_ORIENTATION_DIM_K):
-                if cutlass.const_expr(tile_k_size == 32):
-                    output_k_smem_kind = tcgen05.SmemLayoutAtomKind.K_SW32
-                elif cutlass.const_expr(tile_k_size == 64):
-                    output_k_smem_kind = tcgen05.SmemLayoutAtomKind.K_SW64
+            if cutlass.const_expr(is_packed_fp4_qdata):
+                output_k_smem_layout = cute.make_composed_layout(
+                    cute.make_swizzle(0, 0, 0),
+                    0,
+                    cute.make_layout(
+                        (tile_m_size, tile_k_size // 2),
+                        stride=(tile_k_size // 2, 1),
+                    ),
+                )
+            else:
+                if cutlass.const_expr(quant_orientation == _QUANT_ORIENTATION_DIM_K):
+                    if cutlass.const_expr(tile_k_size == 32):
+                        output_k_smem_kind = tcgen05.SmemLayoutAtomKind.K_SW32
+                    elif cutlass.const_expr(tile_k_size == 64):
+                        output_k_smem_kind = tcgen05.SmemLayoutAtomKind.K_SW64
+                    else:
+                        output_k_smem_kind = tcgen05.SmemLayoutAtomKind.K_SW128
                 else:
                     output_k_smem_kind = tcgen05.SmemLayoutAtomKind.K_SW128
-            else:
-                output_k_smem_kind = tcgen05.SmemLayoutAtomKind.K_SW128
-            output_k_smem_atom = tcgen05.make_smem_layout_atom(
-                output_k_smem_kind, cutlass.Float8E4M3FN
-            )
-            output_k_smem_layout = cute.coalesce(
-                cute.tile_to_shape(
-                    output_k_smem_atom, (tile_m_size, tile_k_size), order=(0, 1)
-                ),
-                target_profile=(1, 1),
-            )
+                output_k_smem_atom = tcgen05.make_smem_layout_atom(
+                    output_k_smem_kind, qdata_storage_element_type
+                )
+                output_k_smem_layout = cute.coalesce(
+                    cute.tile_to_shape(
+                        output_k_smem_atom,
+                        (tile_m_size, tile_k_size),
+                        order=(0, 1),
+                    ),
+                    target_profile=(1, 1),
+                )
             output_k_tma_atom, output_k_tma_tensor = cpasync.make_tiled_tma_atom(
                 cpasync.CopyBulkTensorTileS2GOp(),
                 mOutputK,
                 output_k_smem_layout,
-                (tile_m_size, tile_k_size),
+                (tile_m_size, tile_k_size // qdata_k_divisor),
             )
 
             nrb_k = _ceil_div(M, 128)
@@ -769,24 +886,46 @@ class _Mxfp8SwizzleV2:
                     ((bpr, rows_per_stage), (32, row_blocks)),
                     stride=((tile_m_size * 32, 1), (tile_m_size, rows_per_stage)),
                 )
+            if cutlass.const_expr(is_packed_fp4_qdata):
+                if cutlass.const_expr(tile_m_size == _DIM_K_TILE_M_SIZE_128):
+                    output_k_tv_layout = cute.make_layout(
+                        ((tile_m_size,), (16, bpr)),
+                        stride=((1,), (tile_m_size, tile_m_size * 16)),
+                    )
+                else:
+                    rows_per_stage = _MIN_CTA_THREADS_128 // bpr
+                    row_blocks = tile_m_size // rows_per_stage
+                    output_k_tv_layout = cute.make_layout(
+                        ((bpr, rows_per_stage), (16, row_blocks)),
+                        stride=(
+                            (tile_m_size * 16, 1),
+                            (tile_m_size, rows_per_stage),
+                        ),
+                    )
+            else:
+                output_k_tv_layout = data_k_tv_layout
         else:
             output_k_smem_layout = None
             output_k_tma_atom = None
             output_k_tma_tensor = None
             mScaleKLogical = None
             data_k_tv_layout = None
+            output_k_tv_layout = None
 
         if cutlass.const_expr(do_dim_m):
             output_m_smem_layout = cute.make_composed_layout(
                 cute.make_swizzle(0, 0, 0),
                 0,
-                cute.make_layout((tile_k_size, tile_m_size), stride=(tile_m_size, 1)),
+                cute.make_layout(
+                    (tile_k_size, tile_m_size // qdata_k_divisor),
+                    stride=(tile_m_size // qdata_k_divisor, 1),
+                ),
             )
             output_m_tma_atom, output_m_tma_tensor = cpasync.make_tiled_tma_atom(
                 cpasync.CopyBulkTensorTileS2GOp(),
                 mOutputM,
                 output_m_smem_layout,
-                (tile_k_size, tile_m_size),
+                (tile_k_size, tile_m_size // qdata_k_divisor),
             )
 
             nrb_m = _ceil_div(K, 128)
@@ -817,6 +956,7 @@ class _Mxfp8SwizzleV2:
             output_k_smem_layout,
             output_m_smem_layout,
             data_k_tv_layout,
+            output_k_tv_layout,
             M,
             K,
         )
@@ -863,12 +1003,13 @@ def _mxfp8_v2_compile_log_key(
     quant_orientation: int,
     is_stochastic_qdata_rounding: bool,
     is_square_scaling: bool,
+    qdata_dtype: torch.dtype = torch.float8_e4m3fn,
 ) -> str:
     return (
         f"dtype={input_dtype} orientation={quant_orientation} "
         f"tile={tile_m_size}x{tile_k_size} cluster_k={cluster_k} "
         f"masking={needs_boundary_masking} sr={is_stochastic_qdata_rounding} "
-        f"square={is_square_scaling}"
+        f"square={is_square_scaling} qdata_dtype={qdata_dtype}"
     )
 
 
@@ -885,8 +1026,12 @@ def _compile_mxfp8_swizzle_v2(
     quant_orientation: int,
     is_stochastic_qdata_rounding: bool,
     is_square_scaling: bool,
+    qdata_dtype: torch.dtype = torch.float8_e4m3fn,
 ):
+    if qdata_dtype not in _TORCH_TO_CUTE_QDATA_DTYPE:
+        raise ValueError(f"unsupported qdata dtype: {qdata_dtype}")
     input_element_type = _TORCH_TO_CUTE_DTYPE[input_dtype]
+    qdata_element_type = _TORCH_TO_CUTE_QDATA_DTYPE[qdata_dtype]
     do_dim_k = quant_orientation != _QUANT_ORIENTATION_DIM_M
     do_dim_m = quant_orientation != _QUANT_ORIENTATION_DIM_K
 
@@ -899,12 +1044,22 @@ def _compile_mxfp8_swizzle_v2(
         quant_orientation,
         is_stochastic_qdata_rounding,
         is_square_scaling,
+        qdata_element_type,
     )
 
     mInput = _make_dynamic_matrix_fake(input_element_type)
-    mOutputK = _make_dynamic_matrix_fake(cutlass.Float8E4M3FN) if do_dim_k else None
+    qdata_storage_element_type = (
+        cutlass.Uint8
+        if qdata_dtype == torch.float4_e2m1fn_x2
+        else cutlass.Float8E4M3FN
+    )
+    mOutputK = (
+        _make_dynamic_matrix_fake(qdata_storage_element_type) if do_dim_k else None
+    )
     mScaleK = _make_dynamic_scale_fake() if do_dim_k else None
-    mOutputM = _make_dynamic_matrix_fake(cutlass.Float8E4M3FN) if do_dim_m else None
+    mOutputM = (
+        _make_dynamic_matrix_fake(qdata_storage_element_type) if do_dim_m else None
+    )
     mScaleM = _make_dynamic_scale_fake() if do_dim_m else None
     mSeed = (
         cute.runtime.make_fake_tensor(
@@ -938,6 +1093,7 @@ def _mxfp8_swizzle_v2_impl_on_current_device(
     key: torch.Tensor | None,
     rounding_mode: str,
     is_square_scaling: bool,
+    qdata_dtype: torch.dtype = torch.float8_e4m3fn,
 ):
     if quant_orientation not in ("dim_k", "dim_m", "dim_km"):
         raise ValueError(f"unsupported quant_orientation: {quant_orientation}")
@@ -951,6 +1107,8 @@ def _mxfp8_swizzle_v2_impl_on_current_device(
         torch.float32,
     ):
         raise ValueError("v2 supports only bf16, fp16, and fp32 input")
+    if qdata_dtype not in _TORCH_TO_CUTE_QDATA_DTYPE:
+        raise ValueError(f"unsupported qdata dtype: {qdata_dtype}")
     if input.data_ptr() % _INPUT_ALIGNMENT_BYTES != 0:
         raise ValueError("mxfp8 v2 requires a 16-byte-aligned input")
 
@@ -958,6 +1116,11 @@ def _mxfp8_swizzle_v2_impl_on_current_device(
     if rounding_mode not in ("rtne", "stochastic"):
         raise ValueError(f"unsupported rounding_mode: {rounding_mode}")
     is_stochastic_qdata_rounding = rounding_mode == "stochastic"
+    is_packed_fp4_qdata = qdata_dtype == torch.float4_e2m1fn_x2
+    if is_packed_fp4_qdata and is_stochastic_qdata_rounding:
+        raise ValueError("packed FP4 qdata currently supports only RTNE")
+    if is_packed_fp4_qdata and is_square_scaling:
+        raise ValueError("packed FP4 qdata does not support square scaling")
     if is_square_scaling:
         if quant_orientation != "dim_k":
             raise ValueError("32x32 v2 currently supports only dim-k output")
@@ -997,6 +1160,8 @@ def _mxfp8_swizzle_v2_impl_on_current_device(
 
     do_dim_k = quant_orientation != "dim_m"
     do_dim_m = quant_orientation != "dim_k"
+    qdata_k_divisor = 2 if is_packed_fp4_qdata else 1
+    qdata_storage_dtype = torch.uint8 if is_packed_fp4_qdata else qdata_dtype
 
     nrb_k = ncb_k = None
     if do_dim_k:
@@ -1014,7 +1179,10 @@ def _mxfp8_swizzle_v2_impl_on_current_device(
         output_k = scale_k = None
         if do_dim_k:
             output_k = torch.empty(
-                M, K, dtype=torch.float8_e4m3fn, device=input.device
+                M,
+                K // qdata_k_divisor,
+                dtype=qdata_storage_dtype,
+                device=input.device,
             )
             scale_k = torch.empty(
                 nrb_k, ncb_k, 32, 16, dtype=torch.uint8, device=input.device
@@ -1023,12 +1191,20 @@ def _mxfp8_swizzle_v2_impl_on_current_device(
         output_m = scale_m = None
         if do_dim_m:
             output_m = torch.empty(
-                K, M, dtype=torch.float8_e4m3fn, device=input.device
+                K,
+                M // qdata_k_divisor,
+                dtype=qdata_storage_dtype,
+                device=input.device,
             )
             scale_m = torch.empty(
                 nrb_m, ncb_m, 32, 16, dtype=torch.uint8, device=input.device
             ).view(torch.float8_e8m0fnu)
 
+        if is_packed_fp4_qdata:
+            if do_dim_k:
+                output_k = output_k.view(torch.float4_e2m1fn_x2)
+            if do_dim_m:
+                output_m = output_m.view(torch.float4_e2m1fn_x2)
         if quant_orientation == "dim_k":
             return output_k, scale_k
         if quant_orientation == "dim_m":
@@ -1115,7 +1291,12 @@ def _mxfp8_swizzle_v2_impl_on_current_device(
 
     output_m = scale_m = None
     if do_dim_m:
-        output_m = torch.empty(K, M, dtype=torch.float8_e4m3fn, device=input.device)
+        output_m = torch.empty(
+            K,
+            M // qdata_k_divisor,
+            dtype=qdata_storage_dtype,
+            device=input.device,
+        )
         scale_m = torch.empty(
             nrb_m * ncb_m * 32 * 16,
             dtype=torch.uint8,
@@ -1124,7 +1305,12 @@ def _mxfp8_swizzle_v2_impl_on_current_device(
 
     output_k = scale_k = None
     if do_dim_k:
-        output_k = torch.empty(M, K, dtype=torch.float8_e4m3fn, device=input.device)
+        output_k = torch.empty(
+            M,
+            K // qdata_k_divisor,
+            dtype=qdata_storage_dtype,
+            device=input.device,
+        )
         # Every slot is written by the kernel, so zero-initialization would launch a redundant
         # memset.
         scale_k = torch.empty(
@@ -1147,6 +1333,7 @@ def _mxfp8_swizzle_v2_impl_on_current_device(
         quant_orientation_id,
         is_stochastic_qdata_rounding,
         is_square_scaling,
+        qdata_dtype,
     )
     fn(input, output_k, scale_k, output_m, scale_m, seed, M, K)
 
@@ -1154,6 +1341,11 @@ def _mxfp8_swizzle_v2_impl_on_current_device(
         scale_m = scale_m.view(nrb_m, ncb_m, 32, 16).view(torch.float8_e8m0fnu)
     if do_dim_k:
         scale_k = scale_k.view(nrb_k, ncb_k, 32, 16).view(torch.float8_e8m0fnu)
+    if is_packed_fp4_qdata:
+        if do_dim_k:
+            output_k = output_k.view(torch.float4_e2m1fn_x2)
+        if do_dim_m:
+            output_m = output_m.view(torch.float4_e2m1fn_x2)
 
     if quant_orientation == "dim_k":
         return output_k, scale_k
@@ -1168,6 +1360,7 @@ def _mxfp8_swizzle_v2_impl(
     key: torch.Tensor | None,
     rounding_mode: str,
     is_square_scaling: bool,
+    qdata_dtype: torch.dtype = torch.float8_e4m3fn,
     **kwargs,
 ):
     if kwargs:
@@ -1193,6 +1386,7 @@ def _mxfp8_swizzle_v2_impl(
             key=key,
             rounding_mode=rounding_mode,
             is_square_scaling=is_square_scaling,
+            qdata_dtype=qdata_dtype,
         )
 
     if device == torch.cuda.current_device():
@@ -1279,4 +1473,46 @@ def _mxfp8_dim_km_swizzle_sr_v2(input, key, **kwargs):
 
 MXFP8_DIM_KM_SWIZZLE_SR_V2 = QuantCastCuteRecipe.from_gold(
     Mxfp8DimKmSwizzleSRGold, cute_fn=_mxfp8_dim_km_swizzle_sr_v2
+)
+
+
+def mxfp4_swizzle_v2(
+    input: torch.Tensor,
+    quant_orientation: str = "dim_k",
+    **kwargs,
+):
+    return _mxfp8_swizzle_v2_impl(
+        input,
+        quant_orientation=quant_orientation,
+        key=None,
+        rounding_mode="rtne",
+        is_square_scaling=False,
+        qdata_dtype=torch.float4_e2m1fn_x2,
+        **kwargs,
+    )
+
+
+MXFP4_SWIZZLE_V2 = QuantCastCuteRecipe.from_gold(
+    Mxfp4SwizzleGold,
+    cute_fn=mxfp4_swizzle_v2,
+)
+
+
+def mxfp4_dim_m_swizzle_v2(input: torch.Tensor, **kwargs):
+    return mxfp4_swizzle_v2(input, quant_orientation="dim_m", **kwargs)
+
+
+MXFP4_DIM_M_SWIZZLE_V2 = QuantCastCuteRecipe.from_gold(
+    Mxfp4DimMSwizzleGold,
+    cute_fn=mxfp4_dim_m_swizzle_v2,
+)
+
+
+def mxfp4_dim_km_swizzle_v2(input: torch.Tensor, **kwargs):
+    return mxfp4_swizzle_v2(input, quant_orientation="dim_km", **kwargs)
+
+
+MXFP4_DIM_KM_SWIZZLE_V2 = QuantCastCuteRecipe.from_gold(
+    Mxfp4DimKMSwizzleGold,
+    cute_fn=mxfp4_dim_km_swizzle_v2,
 )
