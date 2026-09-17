@@ -104,705 +104,728 @@ def _mxfp8_v2_quantize_stochastic_x32(
     return cute.recast_tensor(qwords, dtype=cutlass.Float8E4M3FN).load()
 
 
-@cute.kernel
-def mxfp8_swizzle_v2_kernel(
-    input_tma_atom: cute.CopyAtom,
-    input_tma_tensor: cute.Tensor,
-    output_k_tma_atom: cute.CopyAtom | None,
-    output_k_tma_tensor: cute.Tensor | None,
-    output_m_tma_atom: cute.CopyAtom | None,
-    output_m_tma_tensor: cute.Tensor | None,
-    mScaleKLogical: cute.Tensor | None,
-    mScaleMLogical: cute.Tensor | None,
-    mSeed: cute.Tensor | None,
-    input_smem_layout: cute.ComposedLayout,
-    output_k_smem_layout: cute.ComposedLayout | None,
-    output_m_smem_layout: cute.ComposedLayout | None,
-    data_k_tv_layout: cute.Layout | None,
-    input_element_type: cutlass.Constexpr,
-    tile_m_size: cutlass.Constexpr,
-    tile_k_size: cutlass.Constexpr,
-    M: cutlass.Int32,
-    K: cutlass.Int32,
-    needs_boundary_masking: cutlass.Constexpr,
-    quant_orientation: cutlass.Constexpr,
-    is_stochastic_qdata_rounding: cutlass.Constexpr,
-    is_square_scaling: cutlass.Constexpr,
-) -> None:
-    """
-    Kernel for mxfp8 quantization across (dim_k, dim_m, dim_km) x (RTNE, SR)
+class _Mxfp8SwizzleV2:
+    """Compile-time MXFP8 configuration with a CuTe launcher and device kernel."""
 
-    High level flow:
-      0. create smem scratchpad
-         a. both dim-k and dim-m use a tile_m_size * tile_k_size input-typed scratchpad,
-         b. dim-k reuses the first half of 0a for qdata (to save smem)
-         c. dim-m additionally uses a tile_m_size * tile_k_size fp8 scratchpad for qdata
-      1. load input data with TMA.
-         a. If SR enabled, also load the random key while input data is loading
-      2. barrier to wait for (1)
-      3. if do_dim_m:
-         - read input data from smem and quantize in registers
-         - store scale to global memory
-         - store qdata to smem scratchpad from 0c
-      4. if do_dim_k:
-         - read input data from smem and quantize in registers
-         - store scale in registers
-         - syncthreads for dim-k smem input reads
-         - store qdata to smem scratchpad from 0b
-      5. syncthreads for dim-m and dim-k smem output writes
-      6. if do_dim_k, kick off dim_k TMA qdata store
-      7. if do_dim_m, kick off dim_m TMA qdata store
-      8. if do_dim_k, store scales from registers to global memory
+    def __init__(
+        self,
+        input_element_type,
+        tile_m_size: int,
+        tile_k_size: int,
+        cluster_k: int,
+        needs_boundary_masking: bool,
+        quant_orientation: int,
+        is_stochastic_qdata_rounding: bool,
+        is_square_scaling: bool,
+    ) -> None:
+        self.input_element_type = input_element_type
+        self.tile_m_size = tile_m_size
+        self.tile_k_size = tile_k_size
+        self.cluster_k = cluster_k
+        self.needs_boundary_masking = needs_boundary_masking
+        self.quant_orientation = quant_orientation
+        self.is_stochastic_qdata_rounding = is_stochastic_qdata_rounding
+        self.is_square_scaling = is_square_scaling
 
-    """
+    @cute.kernel
+    def kernel(
+        self,
+        input_tma_atom: cute.CopyAtom,
+        input_tma_tensor: cute.Tensor,
+        output_k_tma_atom: cute.CopyAtom | None,
+        output_k_tma_tensor: cute.Tensor | None,
+        output_m_tma_atom: cute.CopyAtom | None,
+        output_m_tma_tensor: cute.Tensor | None,
+        mScaleKLogical: cute.Tensor | None,
+        mScaleMLogical: cute.Tensor | None,
+        mSeed: cute.Tensor | None,
+        input_smem_layout: cute.ComposedLayout,
+        output_k_smem_layout: cute.ComposedLayout | None,
+        output_m_smem_layout: cute.ComposedLayout | None,
+        data_k_tv_layout: cute.Layout | None,
+        M: cutlass.Int32,
+        K: cutlass.Int32,
+    ) -> None:
+        """
+        Kernel for mxfp8 quantization across (dim_k, dim_m, dim_km) x (RTNE, SR)
 
-    if cutlass.const_expr(quant_orientation == _QUANT_ORIENTATION_DIM_K):
-        assert output_k_tma_atom is not None
-        assert output_k_tma_tensor is not None
-        assert mScaleKLogical is not None
-        assert output_k_smem_layout is not None
-        assert data_k_tv_layout is not None
-        assert output_m_tma_atom is None
-        assert output_m_tma_tensor is None
-        assert mScaleMLogical is None
-        assert output_m_smem_layout is None
-    elif cutlass.const_expr(quant_orientation == _QUANT_ORIENTATION_DIM_M):
-        assert output_k_tma_atom is None
-        assert output_k_tma_tensor is None
-        assert mScaleKLogical is None
-        assert output_k_smem_layout is None
-        assert data_k_tv_layout is None
-        assert output_m_tma_atom is not None
-        assert output_m_tma_tensor is not None
-        assert mScaleMLogical is not None
-        assert output_m_smem_layout is not None
-    else:
-        assert quant_orientation == _QUANT_ORIENTATION_DIM_KM
-        assert output_k_tma_atom is not None
-        assert output_k_tma_tensor is not None
-        assert mScaleKLogical is not None
-        assert output_k_smem_layout is not None
-        assert data_k_tv_layout is not None
-        assert output_m_tma_atom is not None
-        assert output_m_tma_tensor is not None
-        assert mScaleMLogical is not None
-        assert output_m_smem_layout is not None
+        High level flow:
+          0. create smem scratchpad
+             a. both dim-k and dim-m use a tile_m_size * tile_k_size input-typed scratchpad,
+             b. dim-k reuses the first half of 0a for qdata (to save smem)
+             c. dim-m additionally uses a tile_m_size * tile_k_size fp8 scratchpad for qdata
+          1. load input data with TMA.
+             a. If SR enabled, also load the random key while input data is loading
+          2. barrier to wait for (1)
+          3. if do_dim_m:
+             - read input data from smem and quantize in registers
+             - store scale to global memory
+             - store qdata to smem scratchpad from 0c
+          4. if do_dim_k:
+             - read input data from smem and quantize in registers
+             - store scale in registers
+             - syncthreads for dim-k smem input reads
+             - store qdata to smem scratchpad from 0b
+          5. syncthreads for dim-m and dim-k smem output writes
+          6. if do_dim_k, kick off dim_k TMA qdata store
+          7. if do_dim_m, kick off dim_m TMA qdata store
+          8. if do_dim_k, store scales from registers to global memory
 
-    if cutlass.const_expr(is_stochastic_qdata_rounding):
-        assert mSeed is not None
-    else:
-        assert mSeed is None
+        """
 
-    # bookkeeping
-    tidx, _, _ = cute.arch.thread_idx()
-    tile_k_idx, tile_m_idx, _ = cute.arch.block_idx()
-    warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
-    do_dim_k = quant_orientation != _QUANT_ORIENTATION_DIM_M
-    do_dim_m = quant_orientation != _QUANT_ORIENTATION_DIM_K
-    if cutlass.const_expr(not needs_boundary_masking):
-        M = cute.assume(M, divby=128)
-        K = cute.assume(K, divby=128)
-    elif cutlass.const_expr(quant_orientation == _QUANT_ORIENTATION_DIM_K):
-        K = cute.assume(K, divby=32)
-    elif cutlass.const_expr(quant_orientation == _QUANT_ORIENTATION_DIM_M):
-        M = cute.assume(M, divby=32)
-        K = cute.assume(K, divby=16)
-    else:
-        M = cute.assume(M, divby=32)
-        K = cute.assume(K, divby=32)
-
-    # create smem scratchpad
-    smem = utils.SmemAllocator()
-    input_storage = smem.allocate_array(
-        input_element_type, tile_m_size * tile_k_size, byte_alignment=1024
-    )
-    if cutlass.const_expr(do_dim_m):
-        output_m_storage = smem.allocate_array(
-            cutlass.Float8E4M3FN, tile_m_size * tile_k_size, byte_alignment=1024
+        input_element_type = self.input_element_type
+        tile_m_size = cutlass.const_expr(self.tile_m_size)
+        tile_k_size = cutlass.const_expr(self.tile_k_size)
+        needs_boundary_masking = cutlass.const_expr(self.needs_boundary_masking)
+        quant_orientation = cutlass.const_expr(self.quant_orientation)
+        is_stochastic_qdata_rounding = cutlass.const_expr(
+            self.is_stochastic_qdata_rounding
         )
-    # Put the small barrier after the 1KB-aligned tile buffers to avoid an otherwise unused 1016B
-    # alignment gap at the front of every CTA's shared-memory allocation.
-    tma_bar_ptr = smem.allocate_array(cutlass.Int64, 1)
+        is_square_scaling = cutlass.const_expr(self.is_square_scaling)
 
-    # create smem barrier for input data TMA load
-    if tidx == 0:
-        cute.arch.mbarrier_init(tma_bar_ptr, 1)
-    cute.arch.mbarrier_init_fence()
-    cute.arch.sync_threads()
-
-    # set up TMA machinery
-    # Note:
-    # * All quant orientations share one input TMA load
-    # * Dim-K aliases the input buffer for qdata output, to save smem
-    # * Dim-M does not alias the input and has a separate qdata smem buffer
-    sInput = cute.make_tensor(
-        cute.recast_ptr(
-            input_storage, input_smem_layout.inner, dtype=input_element_type
-        ),
-        input_smem_layout.outer,
-    )
-    gInput = cute.local_tile(input_tma_tensor, (tile_m_size, tile_k_size), (None, None))
-    tInputsInput, tInputgInput = cpasync.tma_partition(
-        input_tma_atom,
-        0,
-        cute.make_layout(1),
-        cute.group_modes(sInput, 0, 2),
-        cute.group_modes(gInput, 0, 2),
-    )
-
-    if cutlass.const_expr(do_dim_k):
-        sOutputK = cute.make_tensor(
-            cute.recast_ptr(
-                input_storage,
-                output_k_smem_layout.inner,
-                dtype=cutlass.Float8E4M3FN,
-            ),
-            output_k_smem_layout.outer,
-        )
-        gOutputK = cute.local_tile(
-            output_k_tma_tensor, (tile_m_size, tile_k_size), (None, None)
-        )
-        tOutputsK, tOutputgK = cpasync.tma_partition(
-            output_k_tma_atom,
-            0,
-            cute.make_layout(1),
-            cute.group_modes(sOutputK, 0, 2),
-            cute.group_modes(gOutputK, 0, 2),
-        )
-
-    if cutlass.const_expr(do_dim_m):
-        sOutputM = cute.make_tensor(
-            cute.recast_ptr(
-                output_m_storage,
-                output_m_smem_layout.inner,
-                dtype=cutlass.Float8E4M3FN,
-            ),
-            output_m_smem_layout.outer,
-        )
-        gOutputM = cute.local_tile(
-            output_m_tma_tensor, (tile_k_size, tile_m_size), (None, None)
-        )
-        tOutputsM, tOutputgM = cpasync.tma_partition(
-            output_m_tma_atom,
-            0,
-            cute.make_layout(1),
-            cute.group_modes(sOutputM, 0, 2),
-            cute.group_modes(gOutputM, 0, 2),
-        )
-
-    # kick off input data TMA
-    if warp == 0:
-        with cute.arch.elect_one():
-            cute.arch.mbarrier_arrive_and_expect_tx(
-                tma_bar_ptr,
-                tile_m_size * tile_k_size * input_element_type.width // 8,
-            )
-        cute.copy(
-            input_tma_atom,
-            tInputgInput[(None, tile_m_idx, tile_k_idx)],
-            tInputsInput,
-            tma_bar_ptr=tma_bar_ptr,
-        )
-
-    if cutlass.const_expr(is_stochastic_qdata_rounding):
-        # The Philox key is independent of the tile, so load and unpack it while TMA fills sInput.
-        frgKey = cute.make_rmem_tensor(cute.make_layout(2), mSeed.element_type)
-        cute.copy(
-            cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), mSeed.element_type),
-            mSeed,
-            frgKey,
-        )
-        key64 = cute.recast_tensor(frgKey, dtype=cutlass.Uint64)
-        k0 = cutlass.Uint32(key64[0] & cutlass.Uint64(0xFFFFFFFF))
-        k1 = cutlass.Uint32(key64[0] >> 32)
-        counter_base = key64[1]
-
-    # wait for input data to arrive
-    cute.arch.mbarrier_wait(tma_bar_ptr, 0)
-
-    smem_load_atom = cute.make_copy_atom(
-        cute.nvgpu.CopyUniversalOp(), input_element_type, num_bits_per_copy=128
-    )
-    smem_store_atom = cute.make_copy_atom(
-        cute.nvgpu.CopyUniversalOp(), cutlass.Float8E4M3FN, num_bits_per_copy=128
-    )
-
-    if cutlass.const_expr(do_dim_m):
-        # dim_m main pass (for dim_m and dim_km)
-        # * read input data from smem and quantize in registers
-        # * store scale to global memory
-        # * store qdata to smem (to be stored to global memory) with TMA later
-        #
-        # Note:
-        # Each dim-M thread owns one input column and processes every 32-row group. Its transposed
-        # qdata uses separate shared memory, so the optional dim-K pass can still read sInput.
-        row_blocks = tile_m_size // 32
-        output_row_m = tile_k_idx * tile_k_size + tidx
-        scale_col_m = tile_m_idx * row_blocks
-        rScaleM = cute.make_rmem_tensor(row_blocks, cutlass.Uint8)
-        if cutlass.const_expr(is_stochastic_qdata_rounding):
-            # M is divisible by 16, so divide before the wide multiply and form the Philox
-            # counter directly instead of materializing the larger flat element index.
-            global_col_m = tile_k_idx * tile_k_size + tidx
-            if cutlass.const_expr(do_dim_k):
-                # In dim-KM, place dim-M after dim-K's M*K elements in the Philox stream.
-                # Folding K into the transposed output row retains a single wide multiply.
-                sr_counter_base_m = (
-                    counter_base
-                    + (cutlass.Uint64(K) + cutlass.Uint64(global_col_m))
-                    * cutlass.Uint64(M // 16)
-                    + cutlass.Uint64(tile_m_idx * tile_m_size // 16)
-                )
-            else:
-                sr_counter_base_m = (
-                    counter_base
-                    + cutlass.Uint64(global_col_m) * cutlass.Uint64(M // 16)
-                    + cutlass.Uint64(tile_m_idx * tile_m_size // 16)
-                )
-        for row_block in cutlass.range_constexpr(row_blocks):
-            if cutlass.const_expr(is_stochastic_qdata_rounding):
-                sr_counter_start_m = sr_counter_base_m + cutlass.Uint64(row_block * 2)
-            rInputM = cute.make_rmem_tensor(32, cutlass.Float32)
-            for row in cutlass.range_constexpr(32):
-                rInputM[row] = sInput[row_block * 32 + row, tidx].to(
-                    cutlass.Float32
-                )
-            vm = rInputM.load()
-            amax_m = cute.math.absf(vm).reduce(
-                cute.ReductionOp.MAX, cutlass.Float32(0.0), 0
-            )
-            rcp_m, biased_m = _e8m0(amax_m)
-            rQM = cute.make_rmem_tensor(32, cutlass.Float8E4M3FN)
-            if cutlass.const_expr(is_stochastic_qdata_rounding):
-                rQM.store(
-                    _mxfp8_v2_quantize_stochastic_x32(
-                        vm, rcp_m, sr_counter_start_m, k0, k1
-                    )
-                )
-            else:
-                rQM.store((vm * rcp_m).to(cutlass.Float8E4M3FN))
-            rQM16 = cute.tiled_divide(rQM, (16,))
-            sQM16 = cute.tiled_divide(sOutputM[(tidx, None)], (16,))
-            for vec in cutlass.range_constexpr(2):
-                cute.copy(
-                    smem_store_atom,
-                    rQM16[(None, vec)],
-                    sQM16[(None, row_block * 2 + vec)],
-                )
-            rScaleM[row_block] = biased_m.to(rScaleM.element_type)
-
-        use_full_tile_m = cutlass.const_expr(not needs_boundary_masking) or (
-            (tile_m_idx < M // tile_m_size) & (tile_k_idx < K // tile_k_size)
-        )
-        if use_full_tile_m:
-            _e8m0_scale_store_as_uint(
-                mScaleMLogical,
-                rScaleM,
-                output_row_m,
-                scale_col_m,
-                row_blocks,
-            )
+        if cutlass.const_expr(quant_orientation == _QUANT_ORIENTATION_DIM_K):
+            assert output_k_tma_atom is not None
+            assert output_k_tma_tensor is not None
+            assert mScaleKLogical is not None
+            assert output_k_smem_layout is not None
+            assert data_k_tv_layout is not None
+            assert output_m_tma_atom is None
+            assert output_m_tma_tensor is None
+            assert mScaleMLogical is None
+            assert output_m_smem_layout is None
+        elif cutlass.const_expr(quant_orientation == _QUANT_ORIENTATION_DIM_M):
+            assert output_k_tma_atom is None
+            assert output_k_tma_tensor is None
+            assert mScaleKLogical is None
+            assert output_k_smem_layout is None
+            assert data_k_tv_layout is None
+            assert output_m_tma_atom is not None
+            assert output_m_tma_tensor is not None
+            assert mScaleMLogical is not None
+            assert output_m_smem_layout is not None
         else:
-            rScaleMPadded = cute.make_rmem_tensor(row_blocks, cutlass.Uint8)
-            # pad unused scale entries with zeros
-            rScaleMPadded.fill(0)
-            if output_row_m < K:
-                for row_block in cutlass.range_constexpr(row_blocks):
-                    if tile_m_idx * row_blocks + row_block < M // 32:
-                        rScaleMPadded[row_block] = rScaleM[row_block]
-            if output_row_m < _ceil_div(K, 128) * 128:
+            assert quant_orientation == _QUANT_ORIENTATION_DIM_KM
+            assert output_k_tma_atom is not None
+            assert output_k_tma_tensor is not None
+            assert mScaleKLogical is not None
+            assert output_k_smem_layout is not None
+            assert data_k_tv_layout is not None
+            assert output_m_tma_atom is not None
+            assert output_m_tma_tensor is not None
+            assert mScaleMLogical is not None
+            assert output_m_smem_layout is not None
+
+        if cutlass.const_expr(is_stochastic_qdata_rounding):
+            assert mSeed is not None
+        else:
+            assert mSeed is None
+
+        # bookkeeping
+        tidx, _, _ = cute.arch.thread_idx()
+        tile_k_idx, tile_m_idx, _ = cute.arch.block_idx()
+        warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        do_dim_k = quant_orientation != _QUANT_ORIENTATION_DIM_M
+        do_dim_m = quant_orientation != _QUANT_ORIENTATION_DIM_K
+        if cutlass.const_expr(not needs_boundary_masking):
+            M = cute.assume(M, divby=128)
+            K = cute.assume(K, divby=128)
+        elif cutlass.const_expr(quant_orientation == _QUANT_ORIENTATION_DIM_K):
+            K = cute.assume(K, divby=32)
+        elif cutlass.const_expr(quant_orientation == _QUANT_ORIENTATION_DIM_M):
+            M = cute.assume(M, divby=32)
+            K = cute.assume(K, divby=16)
+        else:
+            M = cute.assume(M, divby=32)
+            K = cute.assume(K, divby=32)
+
+        # create smem scratchpad
+        smem = utils.SmemAllocator()
+        input_storage = smem.allocate_array(
+            input_element_type, tile_m_size * tile_k_size, byte_alignment=1024
+        )
+        if cutlass.const_expr(do_dim_m):
+            output_m_storage = smem.allocate_array(
+                cutlass.Float8E4M3FN, tile_m_size * tile_k_size, byte_alignment=1024
+            )
+        # Put the small barrier after the 1KB-aligned tile buffers to avoid an otherwise unused 1016B
+        # alignment gap at the front of every CTA's shared-memory allocation.
+        tma_bar_ptr = smem.allocate_array(cutlass.Int64, 1)
+
+        # create smem barrier for input data TMA load
+        if tidx == 0:
+            cute.arch.mbarrier_init(tma_bar_ptr, 1)
+        cute.arch.mbarrier_init_fence()
+        cute.arch.sync_threads()
+
+        # set up TMA machinery
+        # Note:
+        # * All quant orientations share one input TMA load
+        # * Dim-K aliases the input buffer for qdata output, to save smem
+        # * Dim-M does not alias the input and has a separate qdata smem buffer
+        sInput = cute.make_tensor(
+            cute.recast_ptr(
+                input_storage, input_smem_layout.inner, dtype=input_element_type
+            ),
+            input_smem_layout.outer,
+        )
+        gInput = cute.local_tile(input_tma_tensor, (tile_m_size, tile_k_size), (None, None))
+        tInputsInput, tInputgInput = cpasync.tma_partition(
+            input_tma_atom,
+            0,
+            cute.make_layout(1),
+            cute.group_modes(sInput, 0, 2),
+            cute.group_modes(gInput, 0, 2),
+        )
+
+        if cutlass.const_expr(do_dim_k):
+            sOutputK = cute.make_tensor(
+                cute.recast_ptr(
+                    input_storage,
+                    output_k_smem_layout.inner,
+                    dtype=cutlass.Float8E4M3FN,
+                ),
+                output_k_smem_layout.outer,
+            )
+            gOutputK = cute.local_tile(
+                output_k_tma_tensor, (tile_m_size, tile_k_size), (None, None)
+            )
+            tOutputsK, tOutputgK = cpasync.tma_partition(
+                output_k_tma_atom,
+                0,
+                cute.make_layout(1),
+                cute.group_modes(sOutputK, 0, 2),
+                cute.group_modes(gOutputK, 0, 2),
+            )
+
+        if cutlass.const_expr(do_dim_m):
+            sOutputM = cute.make_tensor(
+                cute.recast_ptr(
+                    output_m_storage,
+                    output_m_smem_layout.inner,
+                    dtype=cutlass.Float8E4M3FN,
+                ),
+                output_m_smem_layout.outer,
+            )
+            gOutputM = cute.local_tile(
+                output_m_tma_tensor, (tile_k_size, tile_m_size), (None, None)
+            )
+            tOutputsM, tOutputgM = cpasync.tma_partition(
+                output_m_tma_atom,
+                0,
+                cute.make_layout(1),
+                cute.group_modes(sOutputM, 0, 2),
+                cute.group_modes(gOutputM, 0, 2),
+            )
+
+        # kick off input data TMA
+        if warp == 0:
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_arrive_and_expect_tx(
+                    tma_bar_ptr,
+                    tile_m_size * tile_k_size * input_element_type.width // 8,
+                )
+            cute.copy(
+                input_tma_atom,
+                tInputgInput[(None, tile_m_idx, tile_k_idx)],
+                tInputsInput,
+                tma_bar_ptr=tma_bar_ptr,
+            )
+
+        if cutlass.const_expr(is_stochastic_qdata_rounding):
+            # The Philox key is independent of the tile, so load and unpack it while TMA fills sInput.
+            frgKey = cute.make_rmem_tensor(cute.make_layout(2), mSeed.element_type)
+            cute.copy(
+                cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), mSeed.element_type),
+                mSeed,
+                frgKey,
+            )
+            key64 = cute.recast_tensor(frgKey, dtype=cutlass.Uint64)
+            k0 = cutlass.Uint32(key64[0] & cutlass.Uint64(0xFFFFFFFF))
+            k1 = cutlass.Uint32(key64[0] >> 32)
+            counter_base = key64[1]
+
+        # wait for input data to arrive
+        cute.arch.mbarrier_wait(tma_bar_ptr, 0)
+
+        smem_load_atom = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(), input_element_type, num_bits_per_copy=128
+        )
+        smem_store_atom = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(), cutlass.Float8E4M3FN, num_bits_per_copy=128
+        )
+
+        if cutlass.const_expr(do_dim_m):
+            # dim_m main pass (for dim_m and dim_km)
+            # * read input data from smem and quantize in registers
+            # * store scale to global memory
+            # * store qdata to smem (to be stored to global memory) with TMA later
+            #
+            # Note:
+            # Each dim-M thread owns one input column and processes every 32-row group. Its transposed
+            # qdata uses separate shared memory, so the optional dim-K pass can still read sInput.
+            row_blocks = tile_m_size // 32
+            output_row_m = tile_k_idx * tile_k_size + tidx
+            scale_col_m = tile_m_idx * row_blocks
+            rScaleM = cute.make_rmem_tensor(row_blocks, cutlass.Uint8)
+            if cutlass.const_expr(is_stochastic_qdata_rounding):
+                # M is divisible by 16, so divide before the wide multiply and form the Philox
+                # counter directly instead of materializing the larger flat element index.
+                global_col_m = tile_k_idx * tile_k_size + tidx
+                if cutlass.const_expr(do_dim_k):
+                    # In dim-KM, place dim-M after dim-K's M*K elements in the Philox stream.
+                    # Folding K into the transposed output row retains a single wide multiply.
+                    sr_counter_base_m = (
+                        counter_base
+                        + (cutlass.Uint64(K) + cutlass.Uint64(global_col_m))
+                        * cutlass.Uint64(M // 16)
+                        + cutlass.Uint64(tile_m_idx * tile_m_size // 16)
+                    )
+                else:
+                    sr_counter_base_m = (
+                        counter_base
+                        + cutlass.Uint64(global_col_m) * cutlass.Uint64(M // 16)
+                        + cutlass.Uint64(tile_m_idx * tile_m_size // 16)
+                    )
+            for row_block in cutlass.range_constexpr(row_blocks):
+                if cutlass.const_expr(is_stochastic_qdata_rounding):
+                    sr_counter_start_m = sr_counter_base_m + cutlass.Uint64(row_block * 2)
+                rInputM = cute.make_rmem_tensor(32, cutlass.Float32)
+                for row in cutlass.range_constexpr(32):
+                    rInputM[row] = sInput[row_block * 32 + row, tidx].to(
+                        cutlass.Float32
+                    )
+                vm = rInputM.load()
+                amax_m = cute.math.absf(vm).reduce(
+                    cute.ReductionOp.MAX, cutlass.Float32(0.0), 0
+                )
+                rcp_m, biased_m = _e8m0(amax_m)
+                rQM = cute.make_rmem_tensor(32, cutlass.Float8E4M3FN)
+                if cutlass.const_expr(is_stochastic_qdata_rounding):
+                    rQM.store(
+                        _mxfp8_v2_quantize_stochastic_x32(
+                            vm, rcp_m, sr_counter_start_m, k0, k1
+                        )
+                    )
+                else:
+                    rQM.store((vm * rcp_m).to(cutlass.Float8E4M3FN))
+                rQM16 = cute.tiled_divide(rQM, (16,))
+                sQM16 = cute.tiled_divide(sOutputM[(tidx, None)], (16,))
+                for vec in cutlass.range_constexpr(2):
+                    cute.copy(
+                        smem_store_atom,
+                        rQM16[(None, vec)],
+                        sQM16[(None, row_block * 2 + vec)],
+                    )
+                rScaleM[row_block] = biased_m.to(rScaleM.element_type)
+
+            use_full_tile_m = cutlass.const_expr(not needs_boundary_masking) or (
+                (tile_m_idx < M // tile_m_size) & (tile_k_idx < K // tile_k_size)
+            )
+            if use_full_tile_m:
                 _e8m0_scale_store_as_uint(
                     mScaleMLogical,
-                    rScaleMPadded,
+                    rScaleM,
                     output_row_m,
                     scale_col_m,
                     row_blocks,
                 )
-
-    if cutlass.const_expr(do_dim_k):
-        # dim-k main pass (for dim_k and dim_km)
-        # * read input data from smem and quantize in registers
-        # * keep scale to registers
-        # * store qdata in smem, overwriting the first half of input data (to save smem)
-        bpr = tile_k_size // 32
-        row_owned_k = tile_m_size == _DIM_K_TILE_M_SIZE_128
-        iters = bpr if cutlass.const_expr(row_owned_k) else tile_m_size // 32
-        tidfrgInputK = cute.composition(sInput, data_k_tv_layout)
-        tidfrgOutputK = cute.composition(sOutputK, data_k_tv_layout)
-        thrInputGroupsK = tidfrgInputK[(tidx, None)]
-        thrOutputGroupsK = tidfrgOutputK[(tidx, None)]
-        rScaleK = cute.make_rmem_tensor(iters, cutlass.Uint8)
-        rQK = cute.make_rmem_tensor(
-            cute.make_layout((32, iters), stride=(1, 32)),
-            cutlass.Float8E4M3FN,
-        )
-        if cutlass.const_expr(is_stochastic_qdata_rounding):
-            if cutlass.const_expr(row_owned_k):
-                global_row_k = tile_m_idx * tile_m_size + tidx
-                global_col_k = tile_k_idx * tile_k_size
-                sr_counter_base_k = (
-                    counter_base
-                    + cutlass.Uint64(global_row_k) * cutlass.Uint64(K // 16)
-                    + cutlass.Uint64(global_col_k // 16)
-                )
             else:
-                global_row_k = tile_m_idx * tile_m_size + tidx // bpr
-                global_group_k = tile_k_idx * bpr + tidx % bpr
-                sr_counter_base_k = (
-                    counter_base
-                    + cutlass.Uint64(global_row_k) * cutlass.Uint64(K // 16)
-                    + cutlass.Uint64(global_group_k * 2)
-                )
-        for it in cutlass.range_constexpr(iters):
+                rScaleMPadded = cute.make_rmem_tensor(row_blocks, cutlass.Uint8)
+                # pad unused scale entries with zeros
+                rScaleMPadded.fill(0)
+                if output_row_m < K:
+                    for row_block in cutlass.range_constexpr(row_blocks):
+                        if tile_m_idx * row_blocks + row_block < M // 32:
+                            rScaleMPadded[row_block] = rScaleM[row_block]
+                if output_row_m < _ceil_div(K, 128) * 128:
+                    _e8m0_scale_store_as_uint(
+                        mScaleMLogical,
+                        rScaleMPadded,
+                        output_row_m,
+                        scale_col_m,
+                        row_blocks,
+                    )
+
+        if cutlass.const_expr(do_dim_k):
+            # dim-k main pass (for dim_k and dim_km)
+            # * read input data from smem and quantize in registers
+            # * keep scale to registers
+            # * store qdata in smem, overwriting the first half of input data (to save smem)
+            bpr = tile_k_size // 32
+            row_owned_k = tile_m_size == _DIM_K_TILE_M_SIZE_128
+            iters = bpr if cutlass.const_expr(row_owned_k) else tile_m_size // 32
+            tidfrgInputK = cute.composition(sInput, data_k_tv_layout)
+            tidfrgOutputK = cute.composition(sOutputK, data_k_tv_layout)
+            thrInputGroupsK = tidfrgInputK[(tidx, None)]
+            thrOutputGroupsK = tidfrgOutputK[(tidx, None)]
+            rScaleK = cute.make_rmem_tensor(iters, cutlass.Uint8)
+            rQK = cute.make_rmem_tensor(
+                cute.make_layout((32, iters), stride=(1, 32)),
+                cutlass.Float8E4M3FN,
+            )
             if cutlass.const_expr(is_stochastic_qdata_rounding):
                 if cutlass.const_expr(row_owned_k):
-                    sr_counter_start_k = sr_counter_base_k + cutlass.Uint64(it * 2)
+                    global_row_k = tile_m_idx * tile_m_size + tidx
+                    global_col_k = tile_k_idx * tile_k_size
+                    sr_counter_base_k = (
+                        counter_base
+                        + cutlass.Uint64(global_row_k) * cutlass.Uint64(K // 16)
+                        + cutlass.Uint64(global_col_k // 16)
+                    )
                 else:
-                    sr_counter_start_k = (
-                        sr_counter_base_k
-                        + cutlass.Uint64(it * 2) * cutlass.Uint64(K)
+                    global_row_k = tile_m_idx * tile_m_size + tidx // bpr
+                    global_group_k = tile_k_idx * bpr + tidx % bpr
+                    sr_counter_base_k = (
+                        counter_base
+                        + cutlass.Uint64(global_row_k) * cutlass.Uint64(K // 16)
+                        + cutlass.Uint64(global_group_k * 2)
                     )
-            sGroupK = thrInputGroupsK[((None, it),)]
-            rInputK = cute.make_rmem_tensor(32, input_element_type)
-            input_values_per_copy = 128 // input_element_type.width
-            sGroupKVec = cute.tiled_divide(sGroupK, (input_values_per_copy,))
-            rInputKVec = cute.tiled_divide(rInputK, (input_values_per_copy,))
-            for vec in cutlass.range_constexpr(32 // input_values_per_copy):
-                cute.copy(
-                    smem_load_atom,
-                    sGroupKVec[(None, vec)],
-                    rInputKVec[(None, vec)],
-                )
-            vk = rInputK.load().to(cutlass.Float32)
-            amax_k = cute.math.absf(vk).reduce(
-                cute.ReductionOp.MAX, cutlass.Float32(0.0), 0
-            )
-            if cutlass.const_expr(is_square_scaling):
-                # One warp owns the 32 rows of each 32-column group. Broadcast their combined
-                # maximum so every row quantizes with the same 32x32-block scale.
-                amax_k = cute.arch.warp_reduction_max(amax_k)
-            rcp_k, biased_k = _e8m0(amax_k)
-            if cutlass.const_expr(is_stochastic_qdata_rounding):
-                rQK[(None, it)].store(
-                    _mxfp8_v2_quantize_stochastic_x32(
-                        vk, rcp_k, sr_counter_start_k, k0, k1
-                    )
-                )
-            else:
-                # Keep the original dim-K RTNE conversion unchanged in its specialization.
-                rQK[(None, it)].store(
-                    (vk * rcp_k).to(cutlass.Float8E4M3FN)
-                )
-            rScaleK[it] = biased_k.to(rScaleK.element_type)
-
-        # All input reads must finish before the aliased qK view overwrites the input tile.
-        cute.arch.sync_threads()
-        for it in cutlass.range_constexpr(iters):
-            rQK16 = cute.tiled_divide(rQK[(None, it)], (16,))
-            sGroupK16 = cute.tiled_divide(
-                thrOutputGroupsK[((None, it),)], (16,)
-            )
-            for vec in cutlass.range_constexpr(2):
-                cute.copy(
-                    smem_store_atom,
-                    rQK16[(None, vec)],
-                    sGroupK16[(None, vec)],
-                )
-
-    # Publish all enabled qdata writes to the async shared-memory proxy and wait for every thread
-    # before launching the enabled qdata TMA store(s).
-    cute.arch.fence_proxy("async.shared", space="cta")
-    cute.arch.sync_threads()
-    if cutlass.const_expr(do_dim_k):
-        # kick off dim-k TMA qdata store
-        if warp == 0:
-            cute.copy(
-                output_k_tma_atom,
-                tOutputsK,
-                tOutputgK[(None, tile_m_idx, tile_k_idx)],
-            )
-    if cutlass.const_expr(do_dim_m):
-        # The fused SR specialization issues its independent output transfers from separate warps.
-        output_m_warp = 1 if cutlass.const_expr(is_stochastic_qdata_rounding and do_dim_k) else 0
-        if warp == output_m_warp:
-            cute.copy(
-                output_m_tma_atom,
-                tOutputsM,
-                tOutputgM[(None, tile_k_idx, tile_m_idx)],
-            )
-
-    if cutlass.const_expr(do_dim_k):
-        # do the dim-k scale write (overlaps with qdata TMA store)
-        use_full_tile_k = cutlass.const_expr(not needs_boundary_masking) or (
-            (tile_m_idx < M // tile_m_size) & (tile_k_idx < K // tile_k_size)
-        )
-        if cutlass.const_expr(row_owned_k):
-            input_row_k = tile_m_idx * tile_m_size + tidx
-            scale_col_k = tile_k_idx * bpr
-            if use_full_tile_k:
-                _e8m0_scale_store_as_uint(
-                    mScaleKLogical,
-                    rScaleK,
-                    input_row_k,
-                    scale_col_k,
-                    iters,
-                )
-            else:
-                rScaleKPadded = cute.make_rmem_tensor(iters, cutlass.Uint8)
-                rScaleKPadded.fill(0)
-                if input_row_k < M:
-                    for it in cutlass.range_constexpr(iters):
-                        if tile_k_idx * bpr + it < K // 32:
-                            rScaleKPadded[it] = rScaleK[it]
-                _e8m0_scale_store_as_uint(
-                    mScaleKLogical,
-                    rScaleKPadded,
-                    input_row_k,
-                    scale_col_k,
-                    iters,
-                )
-
-            if cutlass.const_expr(needs_boundary_masking):
-                ncb_k = _ceil_div(K, 128)
-                grid_n = _ceil_div(K, tile_k_size)
-                covered_groups = grid_n * bpr
-                if covered_groups < ncb_k * 4:
-                    if tile_k_idx == grid_n - 1:
-                        input_row_k = tile_m_idx * tile_m_size + tidx
-                        for offset in cutlass.range_constexpr(3):
-                            col = covered_groups + offset
-                            if col < ncb_k * 4:
-                                mScaleKLogical[(input_row_k, col)] = cutlass.Uint8(0)
-        else:
-            # Short tiles distribute (row, 1x32 group) pairs across all threads. The fused 1D path
-            # is group-major; square scaling is warp/block-major. Both need individual scale stores
-            # because their slots are strided across rows.
-            if cutlass.const_expr(is_square_scaling):
-                local_group_k = tidx // 32
-                local_row_k = tidx % 32
-            else:
-                local_group_k = tidx % bpr
-                local_row_k = tidx // bpr
             for it in cutlass.range_constexpr(iters):
-                input_row_k = tile_m_idx * tile_m_size + local_row_k + it * 32
-                scale_col_k = tile_k_idx * bpr + local_group_k
-                if use_full_tile_k:
-                    mScaleKLogical[(input_row_k, scale_col_k)] = rScaleK[it]
+                if cutlass.const_expr(is_stochastic_qdata_rounding):
+                    if cutlass.const_expr(row_owned_k):
+                        sr_counter_start_k = sr_counter_base_k + cutlass.Uint64(it * 2)
+                    else:
+                        sr_counter_start_k = (
+                            sr_counter_base_k
+                            + cutlass.Uint64(it * 2) * cutlass.Uint64(K)
+                        )
+                sGroupK = thrInputGroupsK[((None, it),)]
+                rInputK = cute.make_rmem_tensor(32, input_element_type)
+                input_values_per_copy = 128 // input_element_type.width
+                sGroupKVec = cute.tiled_divide(sGroupK, (input_values_per_copy,))
+                rInputKVec = cute.tiled_divide(rInputK, (input_values_per_copy,))
+                for vec in cutlass.range_constexpr(32 // input_values_per_copy):
+                    cute.copy(
+                        smem_load_atom,
+                        sGroupKVec[(None, vec)],
+                        rInputKVec[(None, vec)],
+                    )
+                vk = rInputK.load().to(cutlass.Float32)
+                amax_k = cute.math.absf(vk).reduce(
+                    cute.ReductionOp.MAX, cutlass.Float32(0.0), 0
+                )
+                if cutlass.const_expr(is_square_scaling):
+                    # One warp owns the 32 rows of each 32-column group. Broadcast their combined
+                    # maximum so every row quantizes with the same 32x32-block scale.
+                    amax_k = cute.arch.warp_reduction_max(amax_k)
+                rcp_k, biased_k = _e8m0(amax_k)
+                if cutlass.const_expr(is_stochastic_qdata_rounding):
+                    rQK[(None, it)].store(
+                        _mxfp8_v2_quantize_stochastic_x32(
+                            vk, rcp_k, sr_counter_start_k, k0, k1
+                        )
+                    )
                 else:
-                    scale_k = cutlass.Uint8(0)
-                    if input_row_k < M:
-                        if scale_col_k < K // 32:
-                            scale_k = rScaleK[it]
-                    mScaleKLogical[(input_row_k, scale_col_k)] = scale_k
+                    # Keep the original dim-K RTNE conversion unchanged in its specialization.
+                    rQK[(None, it)].store(
+                        (vk * rcp_k).to(cutlass.Float8E4M3FN)
+                    )
+                rScaleK[it] = biased_k.to(rScaleK.element_type)
 
+            # All input reads must finish before the aliased qK view overwrites the input tile.
+            cute.arch.sync_threads()
+            for it in cutlass.range_constexpr(iters):
+                rQK16 = cute.tiled_divide(rQK[(None, it)], (16,))
+                sGroupK16 = cute.tiled_divide(
+                    thrOutputGroupsK[((None, it),)], (16,)
+                )
+                for vec in cutlass.range_constexpr(2):
+                    cute.copy(
+                        smem_store_atom,
+                        rQK16[(None, vec)],
+                        sGroupK16[(None, vec)],
+                    )
 
-@cute.jit
-def mxfp8_swizzle_v2_jit(
-    mInput: cute.Tensor,
-    mOutputK: cute.Tensor | None,
-    mScaleK: cute.Tensor | None,
-    mOutputM: cute.Tensor | None,
-    mScaleM: cute.Tensor | None,
-    mSeed: cute.Tensor | None,
-    stream: cuda.CUstream,
-    M: cutlass.Int32,
-    K: cutlass.Int32,
-    tile_m_size: cutlass.Constexpr,
-    tile_k_size: cutlass.Constexpr,
-    cluster_k: cutlass.Constexpr,
-    needs_boundary_masking: cutlass.Constexpr,
-    quant_orientation: cutlass.Constexpr,
-    is_stochastic_qdata_rounding: cutlass.Constexpr,
-    is_square_scaling: cutlass.Constexpr,
-) -> None:
-    do_dim_k = quant_orientation != _QUANT_ORIENTATION_DIM_M
-    do_dim_m = quant_orientation != _QUANT_ORIENTATION_DIM_K
+        # Publish all enabled qdata writes to the async shared-memory proxy and wait for every thread
+        # before launching the enabled qdata TMA store(s).
+        cute.arch.fence_proxy("async.shared", space="cta")
+        cute.arch.sync_threads()
+        if cutlass.const_expr(do_dim_k):
+            # kick off dim-k TMA qdata store
+            if warp == 0:
+                cute.copy(
+                    output_k_tma_atom,
+                    tOutputsK,
+                    tOutputgK[(None, tile_m_idx, tile_k_idx)],
+                )
+        if cutlass.const_expr(do_dim_m):
+            # The fused SR specialization issues its independent output transfers from separate warps.
+            output_m_warp = 1 if cutlass.const_expr(is_stochastic_qdata_rounding and do_dim_k) else 0
+            if warp == output_m_warp:
+                cute.copy(
+                    output_m_tma_atom,
+                    tOutputsM,
+                    tOutputgM[(None, tile_k_idx, tile_m_idx)],
+                )
 
-    if cutlass.const_expr(quant_orientation == _QUANT_ORIENTATION_DIM_K):
-        assert mOutputK is not None
-        assert mScaleK is not None
-        assert mOutputM is None
-        assert mScaleM is None
-    elif cutlass.const_expr(quant_orientation == _QUANT_ORIENTATION_DIM_M):
-        assert mOutputK is None
-        assert mScaleK is None
-        assert mOutputM is not None
-        assert mScaleM is not None
-    else:
-        assert quant_orientation == _QUANT_ORIENTATION_DIM_KM
-        assert mOutputK is not None
-        assert mScaleK is not None
-        assert mOutputM is not None
-        assert mScaleM is not None
-
-    if cutlass.const_expr(is_stochastic_qdata_rounding):
-        assert mSeed is not None
-    else:
-        assert mSeed is None
-    if cutlass.const_expr(is_square_scaling):
-        assert quant_orientation == _QUANT_ORIENTATION_DIM_K
-
-    # M is padded to a full 128-row scale-layout block. Since every tile-M divides 128,
-    # compute the CTA count without materializing a potentially overflowing padded extent.
-    grid_m = _ceil_div(M, 128) * (128 // tile_m_size)
-    grid_k = _ceil_div(K, tile_k_size)
-
-    if cutlass.const_expr(quant_orientation == _QUANT_ORIENTATION_DIM_M):
-        # Keep the kernel argument type uniform while retaining the original unswizzled dim-M
-        # address mapping.
-        input_smem_layout = cute.make_composed_layout(
-            cute.make_swizzle(0, 0, 0),
-            0,
-            cute.make_layout((tile_m_size, tile_k_size), stride=(tile_k_size, 1)),
-        )
-    else:
-        # Keep each 128-bit row vector intact while XORing row bits into the shared-memory bank
-        # selection. This targets the dim-K phase's 16-way row-read conflicts.
-        input_smem_kind = (
-            tcgen05.SmemLayoutAtomKind.K_SW64
-            if cutlass.const_expr(
-                quant_orientation == _QUANT_ORIENTATION_DIM_K and tile_k_size == 32
+        if cutlass.const_expr(do_dim_k):
+            # do the dim-k scale write (overlaps with qdata TMA store)
+            use_full_tile_k = cutlass.const_expr(not needs_boundary_masking) or (
+                (tile_m_idx < M // tile_m_size) & (tile_k_idx < K // tile_k_size)
             )
-            else tcgen05.SmemLayoutAtomKind.K_SW128
-        )
-        input_smem_atom = tcgen05.make_smem_layout_atom(
-            input_smem_kind, mInput.element_type
-        )
-        input_smem_layout = cute.coalesce(
-            cute.tile_to_shape(input_smem_atom, (tile_m_size, tile_k_size), order=(0, 1)),
-            target_profile=(1, 1),
-        )
+            if cutlass.const_expr(row_owned_k):
+                input_row_k = tile_m_idx * tile_m_size + tidx
+                scale_col_k = tile_k_idx * bpr
+                if use_full_tile_k:
+                    _e8m0_scale_store_as_uint(
+                        mScaleKLogical,
+                        rScaleK,
+                        input_row_k,
+                        scale_col_k,
+                        iters,
+                    )
+                else:
+                    rScaleKPadded = cute.make_rmem_tensor(iters, cutlass.Uint8)
+                    rScaleKPadded.fill(0)
+                    if input_row_k < M:
+                        for it in cutlass.range_constexpr(iters):
+                            if tile_k_idx * bpr + it < K // 32:
+                                rScaleKPadded[it] = rScaleK[it]
+                    _e8m0_scale_store_as_uint(
+                        mScaleKLogical,
+                        rScaleKPadded,
+                        input_row_k,
+                        scale_col_k,
+                        iters,
+                    )
 
-    input_tma_atom, input_tma_tensor = cpasync.make_tiled_tma_atom(
-        cpasync.CopyBulkTensorTileG2SOp(),
-        mInput,
-        input_smem_layout,
-        (tile_m_size, tile_k_size),
-    )
-
-    if cutlass.const_expr(do_dim_k):
-        if cutlass.const_expr(quant_orientation == _QUANT_ORIENTATION_DIM_K):
-            if cutlass.const_expr(tile_k_size == 32):
-                output_k_smem_kind = tcgen05.SmemLayoutAtomKind.K_SW32
-            elif cutlass.const_expr(tile_k_size == 64):
-                output_k_smem_kind = tcgen05.SmemLayoutAtomKind.K_SW64
+                if cutlass.const_expr(needs_boundary_masking):
+                    ncb_k = _ceil_div(K, 128)
+                    grid_n = _ceil_div(K, tile_k_size)
+                    covered_groups = grid_n * bpr
+                    if covered_groups < ncb_k * 4:
+                        if tile_k_idx == grid_n - 1:
+                            input_row_k = tile_m_idx * tile_m_size + tidx
+                            for offset in cutlass.range_constexpr(3):
+                                col = covered_groups + offset
+                                if col < ncb_k * 4:
+                                    mScaleKLogical[(input_row_k, col)] = cutlass.Uint8(0)
             else:
-                output_k_smem_kind = tcgen05.SmemLayoutAtomKind.K_SW128
+                # Short tiles distribute (row, 1x32 group) pairs across all threads. The fused 1D path
+                # is group-major; square scaling is warp/block-major. Both need individual scale stores
+                # because their slots are strided across rows.
+                if cutlass.const_expr(is_square_scaling):
+                    local_group_k = tidx // 32
+                    local_row_k = tidx % 32
+                else:
+                    local_group_k = tidx % bpr
+                    local_row_k = tidx // bpr
+                for it in cutlass.range_constexpr(iters):
+                    input_row_k = tile_m_idx * tile_m_size + local_row_k + it * 32
+                    scale_col_k = tile_k_idx * bpr + local_group_k
+                    if use_full_tile_k:
+                        mScaleKLogical[(input_row_k, scale_col_k)] = rScaleK[it]
+                    else:
+                        scale_k = cutlass.Uint8(0)
+                        if input_row_k < M:
+                            if scale_col_k < K // 32:
+                                scale_k = rScaleK[it]
+                        mScaleKLogical[(input_row_k, scale_col_k)] = scale_k
+
+    @cute.jit
+    def __call__(
+        self,
+        mInput: cute.Tensor,
+        mOutputK: cute.Tensor | None,
+        mScaleK: cute.Tensor | None,
+        mOutputM: cute.Tensor | None,
+        mScaleM: cute.Tensor | None,
+        mSeed: cute.Tensor | None,
+        stream: cuda.CUstream,
+        M: cutlass.Int32,
+        K: cutlass.Int32,
+    ) -> None:
+        tile_m_size = cutlass.const_expr(self.tile_m_size)
+        tile_k_size = cutlass.const_expr(self.tile_k_size)
+        cluster_k = cutlass.const_expr(self.cluster_k)
+        needs_boundary_masking = cutlass.const_expr(self.needs_boundary_masking)
+        quant_orientation = cutlass.const_expr(self.quant_orientation)
+        is_stochastic_qdata_rounding = cutlass.const_expr(
+            self.is_stochastic_qdata_rounding
+        )
+        is_square_scaling = cutlass.const_expr(self.is_square_scaling)
+
+        do_dim_k = quant_orientation != _QUANT_ORIENTATION_DIM_M
+        do_dim_m = quant_orientation != _QUANT_ORIENTATION_DIM_K
+
+        if cutlass.const_expr(quant_orientation == _QUANT_ORIENTATION_DIM_K):
+            assert mOutputK is not None
+            assert mScaleK is not None
+            assert mOutputM is None
+            assert mScaleM is None
+        elif cutlass.const_expr(quant_orientation == _QUANT_ORIENTATION_DIM_M):
+            assert mOutputK is None
+            assert mScaleK is None
+            assert mOutputM is not None
+            assert mScaleM is not None
         else:
-            output_k_smem_kind = tcgen05.SmemLayoutAtomKind.K_SW128
-        output_k_smem_atom = tcgen05.make_smem_layout_atom(
-            output_k_smem_kind, cutlass.Float8E4M3FN
-        )
-        output_k_smem_layout = cute.coalesce(
-            cute.tile_to_shape(
-                output_k_smem_atom, (tile_m_size, tile_k_size), order=(0, 1)
-            ),
-            target_profile=(1, 1),
-        )
-        output_k_tma_atom, output_k_tma_tensor = cpasync.make_tiled_tma_atom(
-            cpasync.CopyBulkTensorTileS2GOp(),
-            mOutputK,
-            output_k_smem_layout,
+            assert quant_orientation == _QUANT_ORIENTATION_DIM_KM
+            assert mOutputK is not None
+            assert mScaleK is not None
+            assert mOutputM is not None
+            assert mScaleM is not None
+
+        if cutlass.const_expr(is_stochastic_qdata_rounding):
+            assert mSeed is not None
+        else:
+            assert mSeed is None
+        if cutlass.const_expr(is_square_scaling):
+            assert quant_orientation == _QUANT_ORIENTATION_DIM_K
+
+        # M is padded to a full 128-row scale-layout block. Since every tile-M divides 128,
+        # compute the CTA count without materializing a potentially overflowing padded extent.
+        grid_m = _ceil_div(M, 128) * (128 // tile_m_size)
+        grid_k = _ceil_div(K, tile_k_size)
+
+        if cutlass.const_expr(quant_orientation == _QUANT_ORIENTATION_DIM_M):
+            # Keep the kernel argument type uniform while retaining the original unswizzled dim-M
+            # address mapping.
+            input_smem_layout = cute.make_composed_layout(
+                cute.make_swizzle(0, 0, 0),
+                0,
+                cute.make_layout((tile_m_size, tile_k_size), stride=(tile_k_size, 1)),
+            )
+        else:
+            # Keep each 128-bit row vector intact while XORing row bits into the shared-memory bank
+            # selection. This targets the dim-K phase's 16-way row-read conflicts.
+            input_smem_kind = (
+                tcgen05.SmemLayoutAtomKind.K_SW64
+                if cutlass.const_expr(
+                    quant_orientation == _QUANT_ORIENTATION_DIM_K and tile_k_size == 32
+                )
+                else tcgen05.SmemLayoutAtomKind.K_SW128
+            )
+            input_smem_atom = tcgen05.make_smem_layout_atom(
+                input_smem_kind, mInput.element_type
+            )
+            input_smem_layout = cute.coalesce(
+                cute.tile_to_shape(input_smem_atom, (tile_m_size, tile_k_size), order=(0, 1)),
+                target_profile=(1, 1),
+            )
+
+        input_tma_atom, input_tma_tensor = cpasync.make_tiled_tma_atom(
+            cpasync.CopyBulkTensorTileG2SOp(),
+            mInput,
+            input_smem_layout,
             (tile_m_size, tile_k_size),
         )
 
-        nrb_k = _ceil_div(M, 128)
-        ncb_k = _ceil_div(K, 128)
-        scale_k_row_block_stride = cutlass.Int64(ncb_k) * 32 * 16
-        scale_k_layout = cute.make_layout(
-            ((32, 4, nrb_k), (4, ncb_k)),
-            stride=((16, 4, scale_k_row_block_stride), (1, 32 * 16)),
-        )
-        mScaleKLogical = cute.make_tensor(mScaleK.iterator, scale_k_layout)
+        if cutlass.const_expr(do_dim_k):
+            if cutlass.const_expr(quant_orientation == _QUANT_ORIENTATION_DIM_K):
+                if cutlass.const_expr(tile_k_size == 32):
+                    output_k_smem_kind = tcgen05.SmemLayoutAtomKind.K_SW32
+                elif cutlass.const_expr(tile_k_size == 64):
+                    output_k_smem_kind = tcgen05.SmemLayoutAtomKind.K_SW64
+                else:
+                    output_k_smem_kind = tcgen05.SmemLayoutAtomKind.K_SW128
+            else:
+                output_k_smem_kind = tcgen05.SmemLayoutAtomKind.K_SW128
+            output_k_smem_atom = tcgen05.make_smem_layout_atom(
+                output_k_smem_kind, cutlass.Float8E4M3FN
+            )
+            output_k_smem_layout = cute.coalesce(
+                cute.tile_to_shape(
+                    output_k_smem_atom, (tile_m_size, tile_k_size), order=(0, 1)
+                ),
+                target_profile=(1, 1),
+            )
+            output_k_tma_atom, output_k_tma_tensor = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileS2GOp(),
+                mOutputK,
+                output_k_smem_layout,
+                (tile_m_size, tile_k_size),
+            )
 
-        bpr = tile_k_size // 32
-        if cutlass.const_expr(tile_m_size == _DIM_K_TILE_M_SIZE_128):
-            data_k_tv_layout = cute.make_layout(
-                ((tile_m_size,), (32, bpr)),
-                stride=((1,), (tile_m_size, tile_m_size * 32)),
+            nrb_k = _ceil_div(M, 128)
+            ncb_k = _ceil_div(K, 128)
+            scale_k_row_block_stride = cutlass.Int64(ncb_k) * 32 * 16
+            scale_k_layout = cute.make_layout(
+                ((32, 4, nrb_k), (4, ncb_k)),
+                stride=((16, 4, scale_k_row_block_stride), (1, 32 * 16)),
             )
-        elif cutlass.const_expr(is_square_scaling):
-            data_k_tv_layout = cute.make_layout(
-                ((32, bpr), (32, 1)),
-                stride=((1, tile_m_size * 32), (tile_m_size, tile_m_size * tile_k_size)),
-            )
+            mScaleKLogical = cute.make_tensor(mScaleK.iterator, scale_k_layout)
+
+            bpr = tile_k_size // 32
+            if cutlass.const_expr(tile_m_size == _DIM_K_TILE_M_SIZE_128):
+                data_k_tv_layout = cute.make_layout(
+                    ((tile_m_size,), (32, bpr)),
+                    stride=((1,), (tile_m_size, tile_m_size * 32)),
+                )
+            elif cutlass.const_expr(is_square_scaling):
+                data_k_tv_layout = cute.make_layout(
+                    ((32, bpr), (32, 1)),
+                    stride=((1, tile_m_size * 32), (tile_m_size, tile_m_size * tile_k_size)),
+                )
+            else:
+                rows_per_stage = _MIN_CTA_THREADS_128 // bpr
+                row_blocks = tile_m_size // rows_per_stage
+                data_k_tv_layout = cute.make_layout(
+                    ((bpr, rows_per_stage), (32, row_blocks)),
+                    stride=((tile_m_size * 32, 1), (tile_m_size, rows_per_stage)),
+                )
         else:
-            rows_per_stage = _MIN_CTA_THREADS_128 // bpr
-            row_blocks = tile_m_size // rows_per_stage
-            data_k_tv_layout = cute.make_layout(
-                ((bpr, rows_per_stage), (32, row_blocks)),
-                stride=((tile_m_size * 32, 1), (tile_m_size, rows_per_stage)),
+            output_k_smem_layout = None
+            output_k_tma_atom = None
+            output_k_tma_tensor = None
+            mScaleKLogical = None
+            data_k_tv_layout = None
+
+        if cutlass.const_expr(do_dim_m):
+            output_m_smem_layout = cute.make_composed_layout(
+                cute.make_swizzle(0, 0, 0),
+                0,
+                cute.make_layout((tile_k_size, tile_m_size), stride=(tile_m_size, 1)),
             )
-    else:
-        output_k_smem_layout = None
-        output_k_tma_atom = None
-        output_k_tma_tensor = None
-        mScaleKLogical = None
-        data_k_tv_layout = None
+            output_m_tma_atom, output_m_tma_tensor = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileS2GOp(),
+                mOutputM,
+                output_m_smem_layout,
+                (tile_k_size, tile_m_size),
+            )
 
-    if cutlass.const_expr(do_dim_m):
-        output_m_smem_layout = cute.make_composed_layout(
-            cute.make_swizzle(0, 0, 0),
-            0,
-            cute.make_layout((tile_k_size, tile_m_size), stride=(tile_m_size, 1)),
-        )
-        output_m_tma_atom, output_m_tma_tensor = cpasync.make_tiled_tma_atom(
-            cpasync.CopyBulkTensorTileS2GOp(),
-            mOutputM,
+            nrb_m = _ceil_div(K, 128)
+            ncb_m = _ceil_div(M, 128)
+            scale_m_row_block_stride = cutlass.Int64(ncb_m) * 32 * 16
+            scale_m_layout = cute.make_layout(
+                ((32, 4, nrb_m), (4, ncb_m)),
+                stride=((16, 4, scale_m_row_block_stride), (1, 32 * 16)),
+            )
+            mScaleMLogical = cute.make_tensor(mScaleM.iterator, scale_m_layout)
+        else:
+            output_m_smem_layout = None
+            output_m_tma_atom = None
+            output_m_tma_tensor = None
+            mScaleMLogical = None
+
+        kernel = self.kernel(
+            input_tma_atom,
+            input_tma_tensor,
+            output_k_tma_atom,
+            output_k_tma_tensor,
+            output_m_tma_atom,
+            output_m_tma_tensor,
+            mScaleKLogical,
+            mScaleMLogical,
+            mSeed,
+            input_smem_layout,
+            output_k_smem_layout,
             output_m_smem_layout,
-            (tile_k_size, tile_m_size),
+            data_k_tv_layout,
+            M,
+            K,
         )
-
-        nrb_m = _ceil_div(K, 128)
-        ncb_m = _ceil_div(M, 128)
-        scale_m_row_block_stride = cutlass.Int64(ncb_m) * 32 * 16
-        scale_m_layout = cute.make_layout(
-            ((32, 4, nrb_m), (4, ncb_m)),
-            stride=((16, 4, scale_m_row_block_stride), (1, 32 * 16)),
-        )
-        mScaleMLogical = cute.make_tensor(mScaleM.iterator, scale_m_layout)
-    else:
-        output_m_smem_layout = None
-        output_m_tma_atom = None
-        output_m_tma_tensor = None
-        mScaleMLogical = None
-
-    kernel = mxfp8_swizzle_v2_kernel(
-        input_tma_atom,
-        input_tma_tensor,
-        output_k_tma_atom,
-        output_k_tma_tensor,
-        output_m_tma_atom,
-        output_m_tma_tensor,
-        mScaleKLogical,
-        mScaleMLogical,
-        mSeed,
-        input_smem_layout,
-        output_k_smem_layout,
-        output_m_smem_layout,
-        data_k_tv_layout,
-        mInput.element_type,
-        tile_m_size,
-        tile_k_size,
-        M,
-        K,
-        needs_boundary_masking,
-        quant_orientation,
-        is_stochastic_qdata_rounding,
-        is_square_scaling,
-    )
-    grid = (grid_k, grid_m, 1)
-    block = (max(_MIN_CTA_THREADS_128, tile_k_size), 1, 1)
-    if cutlass.const_expr(
-        quant_orientation == _QUANT_ORIENTATION_DIM_KM and not is_stochastic_qdata_rounding and tile_m_size != 32
-    ):
-        # A degenerate cluster constrains residency for this larger two-output specialization;
-        # an ordinary launch lets Blackwell keep nine CTAs resident per SM instead.
-        launch_cluster = None
-    else:
-        # K-major scheduling keeps adjacent row-major input columns together.
-        launch_cluster = (cluster_k, 1, 1)
-    kernel.launch(grid=grid, block=block, cluster=launch_cluster, stream=stream)
+        grid = (grid_k, grid_m, 1)
+        block = (max(_MIN_CTA_THREADS_128, tile_k_size), 1, 1)
+        if cutlass.const_expr(
+            quant_orientation == _QUANT_ORIENTATION_DIM_KM and not is_stochastic_qdata_rounding and tile_m_size != 32
+        ):
+            # A degenerate cluster constrains residency for this larger two-output specialization;
+            # an ordinary launch lets Blackwell keep nine CTAs resident per SM instead.
+            launch_cluster = None
+        else:
+            # K-major scheduling keeps adjacent row-major input columns together.
+            launch_cluster = (cluster_k, 1, 1)
+        kernel.launch(grid=grid, block=block, cluster=launch_cluster, stream=stream)
 
 
 def _make_dynamic_matrix_fake(dtype):
@@ -861,6 +884,17 @@ def _compile_mxfp8_swizzle_v2(
     do_dim_k = quant_orientation != _QUANT_ORIENTATION_DIM_M
     do_dim_m = quant_orientation != _QUANT_ORIENTATION_DIM_K
 
+    operation = _Mxfp8SwizzleV2(
+        input_element_type,
+        tile_m_size,
+        tile_k_size,
+        cluster_k,
+        needs_boundary_masking,
+        quant_orientation,
+        is_stochastic_qdata_rounding,
+        is_square_scaling,
+    )
+
     mInput = _make_dynamic_matrix_fake(input_element_type)
     mOutputK = _make_dynamic_matrix_fake(cutlass.Float8E4M3FN) if do_dim_k else None
     mScaleK = _make_dynamic_scale_fake() if do_dim_k else None
@@ -878,7 +912,7 @@ def _compile_mxfp8_swizzle_v2(
     )
 
     return cute.compile(
-        mxfp8_swizzle_v2_jit,
+        operation,
         mInput,
         mOutputK,
         mScaleK,
@@ -888,13 +922,6 @@ def _compile_mxfp8_swizzle_v2(
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
         cutlass.Int32(0),
         cutlass.Int32(0),
-        tile_m_size,
-        tile_k_size,
-        cluster_k,
-        needs_boundary_masking,
-        quant_orientation,
-        is_stochastic_qdata_rounding,
-        is_square_scaling,
         options="--enable-tvm-ffi",
     )
 
