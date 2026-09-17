@@ -8,7 +8,7 @@ review findings for upstreaming it into PyTorch core.
 ## `mxfp8_v2.py` upstream-readiness review
 
 The kernel supports dim-K, dim-M, and dim-KM quantization, RTNE and stochastic
-rounding, BF16/FP16/FP32 inputs, padded scale outputs, and mixed-width indexing.
+rounding, BF16/FP16/FP32 inputs, padded scale outputs.
 Its synchronization sequence appears coherent for currently supported shapes:
 
 1. Initialize the input TMA barrier.
@@ -21,7 +21,7 @@ Its synchronization sequence appears coherent for currently supported shapes:
 
 The following remaining issues should be addressed before upstreaming.
 
-### Must fix
+### For later
 
 #### Define the stochastic-rounding RNG contract
 
@@ -34,85 +34,3 @@ define:
 - CUDA graph capture behavior;
 - distributed-execution behavior;
 - overflow/wraparound behavior for the counter.
-
-### PyTorch operator integration
-
-Production kernel code should be separated from the benchmark harness. The
-current module imports gold recipes, `QuantCastCuteRecipe`, and a private Philox
-helper, and it registers benchmark recipe objects at the bottom of the file.
-Split it into:
-
-1. Stable low-level kernel helpers and the CuTe kernel.
-2. A pure, testable launch-policy selector.
-3. A dispatcher-facing allocation, validation, and launch wrapper.
-4. Gold references and benchmark recipe registration outside production code.
-
-An upstream operator also needs:
-
-- an operator schema;
-- CUDA-only dispatch and an explicit supported-hardware check;
-- FakeTensor/meta support;
-- defined `torch.compile` behavior;
-- an explicit autograd policy;
-- current-stream and CUDA-graph integration tests.
-
-A non-default-stream dependency test passed during review, but it should become
-a permanent test rather than an implicit assumption.
-
-### API and data-contract cleanup
-
-- The return arity changes with `quant_orientation`: dim-K and dim-M return two
-  tensors, while dim-KM returns four. Decide whether separate schemas or a fixed
-  structured result would provide a cleaner dispatcher and tracing contract.
-- Add public return annotations and docstrings that define qdata orientation,
-  scale shape/swizzle, scale padding, dtype support, alignment requirements, and
-  stochastic semantics.
-- `functools.partial` recipe wrappers allow a caller to override their supposedly
-  fixed `quant_orientation`. Fixed-orientation public wrappers should not expose
-  that override.
-- The launch heuristics and comments are tuned specifically for B200. Isolate the
-  launch policy so other Blackwell products and future architectures can select
-  their own policy without changing the semantic kernel code.
-
-### Kernel documentation and maintenance
-
-The input TMA and output TMA copies use an unusual participation contract: one
-selected warp invokes `cute.copy`, while only one elected lane performs the
-input barrier arrival. Document why this generates exactly one transfer, which
-operations are warp-collective versus lane-elected, and which CuTe/CUDA contract
-guarantees it.
-
-The kernel docstring and dim-K comments say that qdata occupies the first half of
-the aliased input buffer. That is true for 16-bit inputs, but FP32 qdata occupies
-only the first quarter. Describe it as the initial `tile_m_size * tile_k_size`
-bytes instead.
-
-Other cleanup expected for upstream code:
-
-- add precise return types to the implementation and recipe-facing wrappers;
-- use consistent PyTorch/CuTe naming conventions;
-- replace generic `"unsupported"` errors with actionable diagnostics;
-- explain the physical E8M0 scale layout and its intended GEMM consumers;
-- document why each shape divisibility restriction is required;
-- preserve the existing local-variable layout names where they help connect code
-  to CuTe layouts, but avoid benchmark-specific naming in the public API.
-
-### Required test coverage
-
-Before upstreaming, add coverage for:
-
-- full tiles and boundary tiles for every supported dtype and orientation;
-- repeated use and compilation-cache isolation across heterogeneous GPUs;
-- non-default streams and CUDA graph capture;
-- concurrent first invocation and compilation;
-- shapes at the CUDA grid limits and grid-X overflow (grid-Y overflow is covered);
-- mixed-width address and stochastic-counter calculations in every orientation
-  and rounding mode;
-- all minimum non-empty legal shapes;
-- NaN, infinities, signed zero, subnormals, saturation boundaries, and all-zero
-  groups;
-
-The existing large mixed-width test allocates a multi-gigabyte tensor and covers
-only stochastic dim-K indexing. For routine upstream CI, prefer a smaller
-synthetic test of the address/counter calculation and reserve the full allocation
-test for large-GPU or periodic testing.
