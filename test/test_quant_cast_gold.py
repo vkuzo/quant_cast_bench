@@ -80,6 +80,23 @@ def test_mxfp8_swizzle_sr_reproducible_and_preserves_scale():
     assert not torch.equal(q0.view(torch.uint8), q_rtne.view(torch.uint8))
 
 
+def test_mxfp8_swizzle_sr_nonfinite_groups_use_canonical_nan():
+    x = torch.zeros(32, 32, dtype=torch.bfloat16, device="cuda")
+    x[0, 0] = float("nan")
+    x[1, 1] = float("inf")
+    x[2, 2] = -float("inf")
+    key = prng.key(7, device=x.device)
+
+    q_k, _ = mxfp8_swizzle_sr_f(x, key)
+    q_m, _ = mxfp8_dim_m_swizzle_sr_f(x, key)
+    q_km, _, q_m_km, _ = mxfp8_dim_km_swizzle_sr_f(x, key)
+
+    # Each non-finite value poisons its whole 32-element scaling group. The E8M0 0xff scale makes
+    # every scaled value in that group a NaN, which cvt.rs encodes as canonical positive E4M3 NaN.
+    for qdata in (q_k, q_m, q_km, q_m_km):
+        assert torch.all(qdata[:3].view(torch.uint8) == 0x7F)
+
+
 @pytest.mark.parametrize(
     "sr_fn,rtne_fn",
     [

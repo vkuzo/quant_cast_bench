@@ -1050,7 +1050,9 @@ def _f32_to_fp8_nvidia_sr(x, key):
 
     One Philox word supplies four 16-bit random operands in the same lane and bit order as the
     hardware instruction. The exponent-dependent discarded-bit width handles both normal and
-    subnormal E4M3 values; the bottom bin rounds directly between zero and 2**-9.
+    subnormal E4M3 values; the bottom bin rounds directly between zero and 2**-9. NaNs use the
+    instruction's canonical positive E4M3 NaN encoding instead of entering the finite bit
+    arithmetic below.
     """
     flat = x.contiguous().reshape(-1)
     assert flat.numel() % 4 == 0, "NVIDIA fp8 SR requires numel divisible by 4"
@@ -1071,9 +1073,12 @@ def _f32_to_fp8_nvidia_sr(x, key):
         [low, low_reversed, high, high_reversed], dim=1
     ).reshape(-1).double()
 
+    is_nan = torch.isnan(flat)
+    rounding_input = torch.where(is_nan, torch.zeros_like(flat), flat)
+
     # E4M3 keeps three mantissa bits and has minimum normal exponent -6. For normal values this
     # discards 20 fp32 mantissa bits; each subnormal binade discards one additional bit.
-    clamped = flat.clamp(-448.0, 448.0)
+    clamped = rounding_input.clamp(-448.0, 448.0)
     exponent = (
         (clamped.abs().view(torch.int32).to(torch.int64) >> 23) & 0xFF
     ) - 127
@@ -1088,9 +1093,9 @@ def _f32_to_fp8_nvidia_sr(x, key):
     # Values below the smallest subnormal require a direct probabilistic choice between zero and
     # 2**-9 because zero has no exponent field on which the add-and-truncate rule can operate.
     subnormal_ulp = 2.0**-9
-    magnitude = flat.abs().double()
+    magnitude = rounding_input.abs().double()
     promote = magnitude / subnormal_ulp + random16 / (1 << 16) >= 1.0
-    sign = torch.where(torch.signbit(flat), -1.0, 1.0)
+    sign = torch.where(torch.signbit(rounding_input), -1.0, 1.0)
     bottom = sign.double() * torch.where(
         promote,
         torch.full_like(magnitude, subnormal_ulp),
@@ -1099,7 +1104,14 @@ def _f32_to_fp8_nvidia_sr(x, key):
     rounded = torch.where(
         magnitude < subnormal_ulp, bottom.to(torch.float32), rounded
     )
+    rounded = torch.where(
+        is_nan, torch.full_like(rounded, float("nan")), rounded
+    )
     return rounded.to(torch.float8_e4m3fn).reshape(x.shape)
+
+
+# TODO(future): audit the other SR gold conversions and give each one explicit non-finite handling
+# matching its corresponding hardware instruction or portable algorithm.
 
 
 def mxfp8_swizzle_sr_f(x, key, **kwargs):
