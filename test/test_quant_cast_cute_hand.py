@@ -323,12 +323,31 @@ def test_mxfp8_32x32_swizzle_v2(M, K):
     assert qdata_and_scale_equal(outputs[1], ref_outputs[1])
 
 
-@pytest.mark.parametrize("M,K", [(0, 32), (32, 0), (31, 32), (32, 31)])
+@pytest.mark.parametrize("M,K", [(31, 32), (32, 31)])
 def test_mxfp8_32x32_swizzle_v2_rejects_invalid_shapes(M, K):
     recipe = _get_recipe("mxfp8_32x32_swizzle_v2")
     inputs = recipe.example_input_fn(M, K, torch.bfloat16)
     with pytest.raises(ValueError):
         recipe.cute_fn(*inputs)
+
+
+@pytest.mark.parametrize(
+    "M,K,expected_shapes",
+    [
+        (0, 32, ((0, 32), (0, 1, 32, 16))),
+        (32, 0, ((32, 0), (1, 0, 32, 16))),
+    ],
+)
+def test_mxfp8_32x32_swizzle_v2_empty(M, K, expected_shapes):
+    x = torch.empty(M, K, dtype=torch.bfloat16, device="cuda")
+    outputs = _get_recipe("mxfp8_32x32_swizzle_v2").cute_fn(x)
+
+    assert tuple(output.shape for output in outputs) == expected_shapes
+    assert all(output.numel() == 0 for output in outputs)
+    assert tuple(output.dtype for output in outputs) == (
+        torch.float8_e4m3fn,
+        torch.float8_e8m0fnu,
+    )
 
 
 def test_mxfp8_swizzle_sr_v2_folded_key_and_padding():
@@ -471,7 +490,7 @@ def test_mxfp8_swizzle_v2_padding(M, K):
     assert torch.count_nonzero(padded[:M, ngc:]) == 0
 
 
-@pytest.mark.parametrize("M,K", [(0, 32), (1, 0), (1, 31), (1, 33)])
+@pytest.mark.parametrize("M,K", [(1, 31), (1, 33)])
 def test_mxfp8_swizzle_v2_rejects_invalid_shapes(M, K):
     if "mxfp8_swizzle_v2" in _REQUIRES_SM100 and torch.cuda.get_device_capability() != (10, 0):
         pytest.skip("mxfp8_swizzle_v2 emits Blackwell-only PTX; requires cuda capability 10.0")
@@ -479,6 +498,55 @@ def test_mxfp8_swizzle_v2_rejects_invalid_shapes(M, K):
     inputs = recipe.example_input_fn(M, K, torch.bfloat16)
     with pytest.raises(ValueError):
         recipe.cute_fn(*inputs)
+
+
+@pytest.mark.parametrize(
+    "quant_orientation,M,K,expected_shapes",
+    [
+        ("dim_k", 0, 32, ((0, 32), (0, 1, 32, 16))),
+        ("dim_k", 1, 0, ((1, 0), (1, 0, 32, 16))),
+        ("dim_m", 0, 16, ((16, 0), (1, 0, 32, 16))),
+        ("dim_m", 32, 0, ((0, 32), (0, 1, 32, 16))),
+        (
+            "dim_km",
+            0,
+            32,
+            ((0, 32), (0, 1, 32, 16), (32, 0), (1, 0, 32, 16)),
+        ),
+        (
+            "dim_km",
+            32,
+            0,
+            ((32, 0), (1, 0, 32, 16), (0, 32), (0, 1, 32, 16)),
+        ),
+        ("dim_km", 0, 0, ((0, 0), (0, 0, 32, 16)) * 2),
+    ],
+)
+@pytest.mark.parametrize("rounding_mode", ["rtne", "stochastic"])
+def test_mxfp8_swizzle_v2_empty(
+    quant_orientation, M, K, expected_shapes, rounding_mode
+):
+    x = torch.empty(M, K, dtype=torch.bfloat16, device="cuda")
+    key = prng.key(0, device=x.device) if rounding_mode == "stochastic" else None
+    outputs = mxfp8_swizzle_v2(
+        x,
+        quant_orientation=quant_orientation,
+        key=key,
+        rounding_mode=rounding_mode,
+    )
+
+    assert tuple(output.shape for output in outputs) == expected_shapes
+    assert all(output.numel() == 0 for output in outputs)
+    assert tuple(output.dtype for output in outputs) == (
+        (torch.float8_e4m3fn, torch.float8_e8m0fnu)
+        if quant_orientation != "dim_km"
+        else (
+            torch.float8_e4m3fn,
+            torch.float8_e8m0fnu,
+            torch.float8_e4m3fn,
+            torch.float8_e8m0fnu,
+        )
+    )
 
 
 def test_mxfp8_swizzle_v2_rejects_grid_y_overflow():

@@ -977,8 +977,6 @@ def _mxfp8_swizzle_v2_impl_on_current_device(
             raise ValueError("RTNE rounding does not use a Philox key")
 
     M, K = input.shape
-    if M <= 0 or K <= 0:
-        raise ValueError("v2 requires non-empty dimensions")
     if M > _INT32_MAX or K > _INT32_MAX:
         raise ValueError(
             "mxfp8 v2 requires each logical dimension to fit in signed int32; "
@@ -1009,6 +1007,33 @@ def _mxfp8_swizzle_v2_impl_on_current_device(
     if do_dim_m:
         nrb_m = _ceil_div(K, 128)
         ncb_m = _ceil_div(M // 32, 4)
+
+    # CUDA cannot launch a zero-sized grid. Return the correctly oriented empty
+    # tensors directly, preserving the padded scale layout in every mode.
+    if M == 0 or K == 0:
+        output_k = scale_k = None
+        if do_dim_k:
+            output_k = torch.empty(
+                M, K, dtype=torch.float8_e4m3fn, device=input.device
+            )
+            scale_k = torch.empty(
+                nrb_k, ncb_k, 32, 16, dtype=torch.uint8, device=input.device
+            ).view(torch.float8_e8m0fnu)
+
+        output_m = scale_m = None
+        if do_dim_m:
+            output_m = torch.empty(
+                K, M, dtype=torch.float8_e4m3fn, device=input.device
+            )
+            scale_m = torch.empty(
+                nrb_m, ncb_m, 32, 16, dtype=torch.uint8, device=input.device
+            ).view(torch.float8_e8m0fnu)
+
+        if quant_orientation == "dim_k":
+            return output_k, scale_k
+        if quant_orientation == "dim_m":
+            return output_m, scale_m
+        return output_k, scale_k, output_m, scale_m
 
     if quant_orientation == "dim_k":
         # First choose the original adaptive K width. For small problems that would use K=64,

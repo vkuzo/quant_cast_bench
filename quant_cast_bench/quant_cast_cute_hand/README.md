@@ -61,8 +61,6 @@ a permanent test rather than an implicit assumption.
 
 ### API and data-contract cleanup
 
-- Decide whether zero-sized tensors should return correctly shaped empty outputs.
-  PyTorch operators generally support an empty fast path when meaningful.
 - The return arity changes with `quant_orientation`: dim-K and dim-M return two
   tensors, while dim-KM returns four. Decide whether separate schemas or a fixed
   structured result would provide a cleaner dispatcher and tracing contract.
@@ -110,7 +108,7 @@ Before upstreaming, add coverage for:
 - shapes at the CUDA grid limits and grid-X overflow (grid-Y overflow is covered);
 - mixed-width address and stochastic-counter calculations in every orientation
   and rounding mode;
-- empty dimensions and all minimum legal shapes;
+- all minimum non-empty legal shapes;
 - NaN, infinities, signed zero, subnormals, saturation boundaries, and all-zero
   groups;
 
