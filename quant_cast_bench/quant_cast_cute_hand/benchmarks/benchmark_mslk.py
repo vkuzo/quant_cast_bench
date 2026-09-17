@@ -1,13 +1,19 @@
-"""Compare the CuTe-hand TMA NVFP4 kernel with MSLK's dense NVFP4 kernel.
+"""Compare CuTe-hand dim-K FP4 kernels with the corresponding MSLK kernels.
 
-Both implementations receive the same precomputed global scale. Reported bandwidths use the
-same logical BF16 input + packed FP4 qdata + padded Blackwell-scale byte count.
+For NVFP4, both implementations receive the same precomputed global scale. Reported bandwidths
+use the same logical BF16 input + packed FP4 qdata + padded Blackwell-scale byte count.
+
+The MXFP4 paths use different E8M0 scale-selection conventions: CuTe-hand uses
+``ceil_pow2(amax / 6)``, while MSLK uses ``ceil(log2(amax)) - 2``. They perform the same class of
+1x32 E2M1/E8M0 cast but are not expected to produce bitwise-identical outputs.
 
     python -m quant_cast_bench.quant_cast_cute_hand.benchmarks.benchmark_mslk
     python -m quant_cast_bench.quant_cast_cute_hand.benchmarks.benchmark_mslk \
         --M 2048,4096 --K 8192,16384 --mk_mode pair
     python -m quant_cast_bench.quant_cast_cute_hand.benchmarks.benchmark_mslk \
         --shapes_for_model gpt-oss-120b
+    python -m quant_cast_bench.quant_cast_cute_hand.benchmarks.benchmark_mslk \
+        --kernel nvfp4_swizzle_tma,mxfp4_swizzle_v2
 """
 
 import csv
@@ -21,20 +27,31 @@ os.environ.setdefault("KINETO_LOG_LEVEL", "6")
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 import fire
-from mslk.quantize.triton.fp4_quantize import triton_quantize_nvfp4
+from mslk.quantize.triton.fp4_quantize import (
+    triton_quantize_mx4,
+    triton_quantize_nvfp4,
+)
 from mslk.quantize.triton.fp4_utils import global_scale_nvfp4
 import torch
 from torch._inductor.utils import _do_bench_using_profiling
 
-from quant_cast_bench.quant_cast_cute_hand.recipes import nvfp4_swizzle_tma
+from quant_cast_bench.quant_cast_cute_hand.recipes import (
+    mxfp4_swizzle_v2,
+    nvfp4_swizzle_tma,
+)
 from quant_cast_bench.quant_cast_cute_hand.benchmarks.shape_utils import (
     gpt_oss_120b_m8192_tp8_ep8,
+)
+from quant_cast_bench.quant_cast_gold.recipes import (
+    _compute_error,
+    mxfp4_swizzle_dq_f,
 )
 
 
 SHAPES = (2048, 3072, 4096, 6144, 8192, 12288, 16384, 24576)
 
-_KERNELS = ("nvfp4_swizzle_tma",)
+_KERNELS = ("nvfp4_swizzle_tma", "mxfp4_swizzle_v2")
+_MIN_MXFP4_SQNR_DB = 10.0
 
 _MODEL_SHAPES = {
     "gpt-oss-120b": gpt_oss_120b_m8192_tp8_ep8,
@@ -51,6 +68,8 @@ CSV_FIELDS = (
     "ours_tb_s",
     "mslk_tb_s",
     "speedup_vs_mslk",
+    "ours_sqnr_db",
+    "mslk_sqnr_db",
 )
 
 
@@ -58,11 +77,55 @@ def _ceil_div(x: int, y: int) -> int:
     return (x + y - 1) // y
 
 
-def _logical_bytes(M: int, K: int) -> int:
+def _logical_bytes(M: int, K: int, group_size: int) -> int:
     numel = M * K
     qdata_bytes = numel // 2
-    scale_bytes = _ceil_div(M, 128) * _ceil_div(_ceil_div(K, 16), 4) * 32 * 16
+    scale_bytes = (
+        _ceil_div(M, 128)
+        * _ceil_div(_ceil_div(K, group_size), 4)
+        * 32
+        * 16
+    )
     return 2 * numel + qdata_bytes + scale_bytes
+
+
+def _make_runs(name: str, x: torch.Tensor):
+    if name == "nvfp4_swizzle_tma":
+        # Match MSLK's normal API usage, but keep this global reduction outside both
+        # timed regions because both quantization kernels take it as a precomputed input.
+        global_scale = global_scale_nvfp4(x)
+        return (
+            lambda: nvfp4_swizzle_tma(x, global_scale),
+            lambda: triton_quantize_nvfp4(x, global_scale),
+            "nvfp4",
+            16,
+        )
+    if name == "mxfp4_swizzle_v2":
+        return (
+            lambda: mxfp4_swizzle_v2(x),
+            lambda: triton_quantize_mx4(x),
+            "mxfp4",
+            32,
+        )
+    raise AssertionError(f"missing benchmark implementation for {name}")
+
+
+def _mxfp4_sqnr_db(
+    x: torch.Tensor,
+    qdata: torch.Tensor,
+    scale: torch.Tensor,
+) -> float:
+    M, K = x.shape
+    blocked_scale = scale.view(torch.uint8).reshape(
+        _ceil_div(M, 128),
+        _ceil_div(K // 32, 4),
+        32,
+        16,
+    ).view(torch.float8_e8m0fnu)
+    dequantized = mxfp4_swizzle_dq_f(
+        qdata.view(torch.float4_e2m1fn_x2), blocked_scale
+    )
+    return _compute_error(x.float(), dequantized.float()).item()
 
 
 def _time(run) -> float:
@@ -118,7 +181,7 @@ def main(
     csv_output: str = "",
     shapes_for_model: str = "",
 ) -> None:
-    """Compare CuTe-hand and MSLK NVFP4 kernels over an M-by-K shape grid."""
+    """Compare CuTe-hand and MSLK FP4 kernels over an M-by-K shape grid."""
     kernels = _parse_kernels(kernel)
 
     shapes_for_model = shapes_for_model.strip().lower()
@@ -180,37 +243,56 @@ def main(
             for M, K in shapes:
                 torch.manual_seed(0)
                 x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
-                # Match MSLK's normal API usage, but keep this global reduction outside both
-                # timed regions because both quantization kernels take it as a precomputed input.
-                global_scale = global_scale_nvfp4(x)
-
-                mslk_run = lambda: triton_quantize_nvfp4(x, global_scale)
-                ours_run = lambda: nvfp4_swizzle_tma(x, global_scale)
+                ours_run, mslk_run, family, group_size = _make_runs(name, x)
 
                 ours_qdata, ours_scale = ours_run()
                 mslk_qdata, mslk_scale = mslk_run()
                 torch.cuda.synchronize()
-                assert torch.equal(
-                    ours_qdata.view(torch.uint8), mslk_qdata.view(torch.uint8)
-                ), "qdata mismatch between CuTe-hand and MSLK"
-                assert torch.equal(
-                    ours_scale.view(torch.uint8).flatten(),
-                    mslk_scale.view(torch.uint8).flatten(),
-                ), "scale mismatch between CuTe-hand and MSLK"
+                assert ours_qdata.shape == mslk_qdata.shape
+                assert ours_scale.numel() == mslk_scale.numel()
+                ours_sqnr_db = mslk_sqnr_db = None
+                if family == "nvfp4":
+                    assert torch.equal(
+                        ours_qdata.view(torch.uint8), mslk_qdata.view(torch.uint8)
+                    ), "qdata mismatch between CuTe-hand and MSLK"
+                    assert torch.equal(
+                        ours_scale.view(torch.uint8).flatten(),
+                        mslk_scale.view(torch.uint8).flatten(),
+                    ), "scale mismatch between CuTe-hand and MSLK"
+                else:
+                    ours_sqnr_db = _mxfp4_sqnr_db(
+                        x, ours_qdata, ours_scale
+                    )
+                    mslk_sqnr_db = _mxfp4_sqnr_db(
+                        x, mslk_qdata, mslk_scale
+                    )
+                    assert ours_sqnr_db > _MIN_MXFP4_SQNR_DB, (
+                        f"CuTe-hand MXFP4 SQNR {ours_sqnr_db:.2f} dB is below "
+                        f"{_MIN_MXFP4_SQNR_DB:.1f} dB"
+                    )
+                    assert mslk_sqnr_db > _MIN_MXFP4_SQNR_DB, (
+                        f"MSLK MXFP4 SQNR {mslk_sqnr_db:.2f} dB is below "
+                        f"{_MIN_MXFP4_SQNR_DB:.1f} dB"
+                    )
                 del ours_qdata, ours_scale, mslk_qdata, mslk_scale
 
                 mslk_ms = _time(mslk_run)
                 ours_ms = _time(ours_run)
-                byte_count = _logical_bytes(M, K)
+                byte_count = _logical_bytes(M, K, group_size)
                 ours_tb_s = byte_count / (ours_ms * 1e-3) / 1e12
                 mslk_tb_s = byte_count / (mslk_ms * 1e-3) / 1e12
                 speedup = mslk_ms / ours_ms
 
+                sqnr_summary = (
+                    f" SQNR=ours:{ours_sqnr_db:.2f}/MSLK:{mslk_sqnr_db:.2f} dB"
+                    if ours_sqnr_db is not None
+                    else ""
+                )
                 print(
                     f"{name:48s} {M:5d}x{K:<5d} "
                     f"ours={ours_ms:.4f} ms/{ours_tb_s:.3f} TB/s "
                     f"MSLK={mslk_ms:.4f} ms/{mslk_tb_s:.3f} TB/s "
-                    f"speedup={speedup:.3f}x",
+                    f"speedup={speedup:.3f}x{sqnr_summary}",
                     flush=True,
                 )
 
@@ -218,7 +300,7 @@ def main(
                     csv_writer.writerow(
                         {
                             "kernel": name,
-                            "family": "nvfp4",
+                            "family": family,
                             "mode": "dim_k",
                             "M": M,
                             "K": K,
@@ -227,6 +309,16 @@ def main(
                             "ours_tb_s": f"{ours_tb_s:.6f}",
                             "mslk_tb_s": f"{mslk_tb_s:.6f}",
                             "speedup_vs_mslk": f"{speedup:.6f}",
+                            "ours_sqnr_db": (
+                                f"{ours_sqnr_db:.6f}"
+                                if ours_sqnr_db is not None
+                                else ""
+                            ),
+                            "mslk_sqnr_db": (
+                                f"{mslk_sqnr_db:.6f}"
+                                if mslk_sqnr_db is not None
+                                else ""
+                            ),
                         }
                     )
                     csv_file.flush()
