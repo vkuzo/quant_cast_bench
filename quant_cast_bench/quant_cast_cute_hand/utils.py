@@ -1,7 +1,5 @@
 """Shared helpers for handwritten CuTe DSL quantization kernels."""
 
-from enum import IntEnum
-
 import cutlass
 import cutlass.cute as cute
 import torch
@@ -14,16 +12,10 @@ from quant_cast_bench.quant_cast_cute.recipes import (
     _nvfp4_scale_e4m3,
     _philox_4x32,
 )
+from quant_cast_bench.quant_cast_cute_hand.blockscale_tma_plan import ScaleAlgo
 
 
 COMPILE_CACHE: dict = {}
-
-
-class ScaleAlgo(IntEnum):
-    """Compile-time algorithm used to derive and encode each block scale."""
-
-    RCEIL_E8M0 = 0
-    NVFP4_FP8_E4M3 = 1
 
 
 def _compiled(key, jit_fn, *cute_args):

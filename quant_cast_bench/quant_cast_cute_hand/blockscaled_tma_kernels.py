@@ -12,8 +12,8 @@ import torch
 from torch._native.instrumentation import instrumented_cutedsl_cache
 from torch._vendor.quack.cache import EXTRA_SOURCE_DIRS
 
+from quant_cast_bench.quant_cast_cute_hand.blockscale_tma_plan import ScaleAlgo
 from quant_cast_bench.quant_cast_cute_hand.utils import (
-    ScaleAlgo,
     _blockscaled_quantize_group,
     _ceil_div,
     _nvfp4_load_philox_key,
@@ -1331,5 +1331,4 @@ def _compile_blockscaled_tma(
         cutlass.Int32(0),
         options="--enable-tvm-ffi",
     )
-
 
