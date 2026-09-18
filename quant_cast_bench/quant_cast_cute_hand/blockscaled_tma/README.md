@@ -6,14 +6,6 @@ below in priority order.
 
 ## Safety and maintainability
 
-### Replace host-facing assertions with explicit exceptions
-
-NVFP4 shape, outer-scale, mode, and unexpected-keyword validation still uses
-Python `assert`. These checks disappear under `python -O`, potentially letting
-invalid shapes reach kernel layout and address calculations. Replace public
-boundary assertions with `ValueError` or `TypeError`. Compile-time assertions
-inside the CuTe kernel remain appropriate.
-
 ### Use one source of truth for launch-grid calculation
 
 `select_blockscaled_tma_plan` computes `grid_m` and `grid_k`, and the host uses

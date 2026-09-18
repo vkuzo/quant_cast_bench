@@ -840,7 +840,7 @@ def test_nvfp4_swizzle_tma_rejects_unaligned_packed_stride():
         pytest.skip("nvfp4_swizzle_tma emits Blackwell-only PTX; requires cuda capability 10.0")
     recipe = _get_recipe("nvfp4_swizzle_tma")
     inputs = recipe.example_input_fn(32, 16, torch.bfloat16)
-    with pytest.raises(AssertionError, match="K % 32"):
+    with pytest.raises(ValueError, match="K % 32"):
         recipe.cute_fn(*inputs)
 
 
@@ -850,8 +850,31 @@ def test_nvfp4_swizzle_tma_rejects_rht_argument():
     x = torch.randn(128, 128, dtype=torch.bfloat16, device="cuda")
     outer_scale = torch.ones(1, dtype=torch.float32, device=x.device)
     rht_sign = torch.ones(16, dtype=torch.bfloat16, device=x.device)
-    with pytest.raises(AssertionError, match="unexpected keyword arguments: rht_sign"):
+    with pytest.raises(ValueError, match="unexpected keyword arguments: rht_sign"):
         nvfp4_swizzle_tma(x, outer_scale, rht_sign=rht_sign)
+
+
+@pytest.mark.parametrize(
+    "kwargs,error,exception_type",
+    [
+        ({"mode": "rows"}, "unsupported mode", ValueError),
+        ({"mode": "dim_m"}, "M % 32", ValueError),
+        ({"outer_scale": None}, "dim-K outer scale is required", ValueError),
+        (
+            {"outer_scale": 1.0},
+            "dim-K outer scale must be a torch.Tensor",
+            TypeError,
+        ),
+    ],
+)
+def test_nvfp4_swizzle_tma_rejects_invalid_arguments(
+    kwargs, error, exception_type
+):
+    x = torch.randn(31, 32, dtype=torch.bfloat16, device="cuda")
+    outer_scale = torch.ones(1, dtype=torch.float32, device=x.device)
+    kwargs = {"outer_scale": outer_scale, **kwargs}
+    with pytest.raises(exception_type, match=error):
+        nvfp4_swizzle_tma(x, **kwargs)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])

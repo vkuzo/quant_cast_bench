@@ -78,8 +78,10 @@ def _blockscaled_tma_impl_on_current_device(
         raise ValueError("blockscaled TMA requires a 16-byte-aligned input")
 
     if is_nvfp4:
-        assert qdata_dtype == torch.float4_e2m1fn_x2
-        assert not is_square_scaling
+        if qdata_dtype != torch.float4_e2m1fn_x2:
+            raise ValueError("NVFP4 scaling requires float4_e2m1fn_x2 qdata")
+        if is_square_scaling:
+            raise ValueError("NVFP4 scaling does not support square scaling")
     else:
         if outer_scale_k is not None or outer_scale_m is not None:
             raise ValueError("RCEIL scaling does not use outer scales")
@@ -102,7 +104,8 @@ def _blockscaled_tma_impl_on_current_device(
         if is_stochastic_qdata_rounding:
             raise ValueError("32x32 v2 currently supports only RTNE")
     if is_nvfp4:
-        assert key is None, "RTNE rounding does not use a Philox key"
+        if key is not None:
+            raise ValueError("RTNE rounding does not use a Philox key")
     else:
         if is_stochastic_qdata_rounding:
             if key is None:
@@ -124,31 +127,35 @@ def _blockscaled_tma_impl_on_current_device(
         )
     if is_nvfp4:
         k_multiple = 32 if do_dim_k else 16
-        assert K % k_multiple == 0, (
-            f"nvfp4_swizzle_tma requires K % {k_multiple} == 0"
-        )
-        if do_dim_m:
-            assert M % 32 == 0, "nvfp4 dim-M TMA requires M % 32 == 0"
+        if K % k_multiple != 0:
+            raise ValueError(f"nvfp4_swizzle_tma requires K % {k_multiple} == 0")
+        if do_dim_m and M % 32 != 0:
+            raise ValueError("nvfp4 dim-M TMA requires M % 32 == 0")
 
         def validate_outer_scale(
             outer_scale: torch.Tensor | None, name: str
         ) -> None:
-            assert outer_scale is not None, f"{name} outer scale is required"
-            assert outer_scale.device == input.device, (
-                f"input and {name} outer scale must be on the same device"
-            )
-            assert outer_scale.dtype == torch.float32 and outer_scale.numel() == 1, (
-                f"{name} outer scale must be a float32 scalar"
-            )
+            if outer_scale is None:
+                raise ValueError(f"{name} outer scale is required")
+            if not isinstance(outer_scale, torch.Tensor):
+                raise TypeError(f"{name} outer scale must be a torch.Tensor")
+            if outer_scale.device != input.device:
+                raise ValueError(
+                    f"input and {name} outer scale must be on the same device"
+                )
+            if outer_scale.dtype != torch.float32 or outer_scale.numel() != 1:
+                raise ValueError(f"{name} outer scale must be a float32 scalar")
 
         if do_dim_k:
             validate_outer_scale(outer_scale_k, "dim-K")
         else:
-            assert outer_scale_k is None, "dim-M does not use a dim-K outer scale"
+            if outer_scale_k is not None:
+                raise ValueError("dim-M does not use a dim-K outer scale")
         if do_dim_m:
             validate_outer_scale(outer_scale_m, "dim-M")
         else:
-            assert outer_scale_m is None, "dim-K does not use a dim-M outer scale"
+            if outer_scale_m is not None:
+                raise ValueError("dim-K does not use a dim-M outer scale")
     else:
         if is_square_scaling and M % 32 != 0:
             raise ValueError("32x32 v2 requires M % 32 == 0")
@@ -489,12 +496,16 @@ def nvfp4_swizzle_tma(
     mode: str = "dim_k",
     **kwargs,
 ):
-    assert not kwargs, f"unexpected keyword arguments: {', '.join(sorted(kwargs))}"
-    assert mode in ("dim_k", "dim_m", "dim_km"), f"unsupported mode: {mode}"
+    if kwargs:
+        unexpected = ", ".join(sorted(kwargs))
+        raise ValueError(f"unexpected keyword arguments: {unexpected}")
+    if mode not in ("dim_k", "dim_m", "dim_km"):
+        raise ValueError(f"unsupported mode: {mode}")
     if mode == "dim_k":
         outer_scale_k_arg, outer_scale_m_arg = outer_scale, outer_scale_m
     elif mode == "dim_m":
-        assert outer_scale_m is None, "dim-m takes one outer scale"
+        if outer_scale_m is not None:
+            raise ValueError("dim-m takes one outer scale")
         outer_scale_k_arg, outer_scale_m_arg = None, outer_scale
     else:
         outer_scale_k_arg, outer_scale_m_arg = outer_scale, outer_scale_m
