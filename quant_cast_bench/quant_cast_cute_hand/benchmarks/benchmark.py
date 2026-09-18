@@ -37,7 +37,7 @@ import torch.func._random as prng
 from torch._inductor.utils import do_bench_using_profiling
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
-from quant_cast_bench.quant_cast_cute_hand.blockscaled_tma import (
+from quant_cast_bench.quant_cast_cute_hand.blockscaled_tma_impl import (
     mxfp4_dim_km_swizzle_v2,
     mxfp4_dim_m_swizzle_v2,
     mxfp4_swizzle_v2,
