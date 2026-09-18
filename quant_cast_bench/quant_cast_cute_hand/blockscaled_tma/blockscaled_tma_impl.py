@@ -5,11 +5,11 @@ from functools import cache, partial
 import torch
 
 from quant_cast_bench.quant_cast_cute.recipes import QuantCastCuteRecipe
-from quant_cast_bench.quant_cast_cute_hand.blockscale_tma_plan import (
+from quant_cast_bench.quant_cast_cute_hand.blockscaled_tma.blockscale_tma_plan import (
     ScaleAlgo,
     select_blockscaled_tma_plan,
 )
-from quant_cast_bench.quant_cast_cute_hand.blockscaled_tma_kernels import (
+from quant_cast_bench.quant_cast_cute_hand.blockscaled_tma.blockscaled_tma_kernels import (
     _QUANT_ORIENTATION_DIM_K,
     _QUANT_ORIENTATION_DIM_KM,
     _QUANT_ORIENTATION_DIM_M,

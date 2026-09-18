@@ -1,4 +1,4 @@
-"""Host-side launch policy for block-scaled TMA quantization kernels."""
+"""Launch policy for TMA-based block-scaled quantization kernels."""
 
 from enum import IntEnum
 from typing import NamedTuple

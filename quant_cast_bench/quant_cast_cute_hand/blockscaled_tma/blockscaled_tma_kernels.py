@@ -12,7 +12,9 @@ import torch
 from torch._native.instrumentation import instrumented_cutedsl_cache
 from torch._vendor.quack.cache import EXTRA_SOURCE_DIRS
 
-from quant_cast_bench.quant_cast_cute_hand.blockscale_tma_plan import ScaleAlgo
+from quant_cast_bench.quant_cast_cute_hand.blockscaled_tma.blockscale_tma_plan import (
+    ScaleAlgo,
+)
 from quant_cast_bench.quant_cast_cute_hand.utils import (
     _blockscaled_quantize_group,
     _ceil_div,
@@ -22,7 +24,7 @@ from quant_cast_bench.quant_cast_cute_hand.utils import (
 
 # Include this prototype's Python sources in QuACK's persistent-cache fingerprint. This must
 # happen before the process's first jit_cache lookup, when that fingerprint is memoized.
-_BLOCKSCALED_TMA_SOURCE_DIR = Path(__file__).resolve().parent
+_BLOCKSCALED_TMA_SOURCE_DIR = Path(__file__).resolve().parent.parent
 if _BLOCKSCALED_TMA_SOURCE_DIR not in EXTRA_SOURCE_DIRS:
     EXTRA_SOURCE_DIRS.append(_BLOCKSCALED_TMA_SOURCE_DIR)
 

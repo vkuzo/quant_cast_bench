@@ -12,7 +12,9 @@ from quant_cast_bench.quant_cast_cute.recipes import (
     _nvfp4_scale_e4m3,
     _philox_4x32,
 )
-from quant_cast_bench.quant_cast_cute_hand.blockscale_tma_plan import ScaleAlgo
+from quant_cast_bench.quant_cast_cute_hand.blockscaled_tma.blockscale_tma_plan import (
+    ScaleAlgo,
+)
 
 
 COMPILE_CACHE: dict = {}
