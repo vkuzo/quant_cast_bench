@@ -40,9 +40,6 @@ if HAS_CUTEDSL:
         _compile_blockscaled_tma,
         mxfp4_swizzle_v2,
         mxfp8_swizzle_v2,
-    )
-    from quant_cast_bench.quant_cast_cute_hand.nvfp4_tma import (
-        _compile_nvfp4_swizzle_tma,
         nvfp4_swizzle_tma,
     )
     from quant_cast_bench.quant_cast_cute_hand.nvfp4_pipelined import (
@@ -141,12 +138,11 @@ def _nvfp4_dim_km_rht_test_inputs(M, K, *, stochastic=False):
     outer_scale_k = nvfp4_gs_scale(x).reciprocal()
     outer_scale_m = nvfp4_gs_scale(x_t_rht).reciprocal()
     if stochastic:
-        key_k = prng.key(0, device=x.device)
-        key_m = prng.key(1, device=x.device)
+        key = prng.fold_in(prng.key(7, device=x.device), 12345)
         return (
-            x, outer_scale_k, outer_scale_m, rht_sign, key_k, key_m
+            x, outer_scale_k, outer_scale_m, rht_sign, key
         ), (
-            x, outer_scale_k, outer_scale_m, rht, key_k, key_m
+            x, outer_scale_k, outer_scale_m, rht, key
         )
     return (
         x, outer_scale_k, outer_scale_m, rht_sign
@@ -334,9 +330,9 @@ def test_nvfp4_tma_dynamic_shapes_share_compile_cache():
     outer_scale = torch.ones(1, dtype=torch.float32, device="cuda")
 
     nvfp4_swizzle_tma(x0, outer_scale)
-    after_first = _compile_nvfp4_swizzle_tma.cache_info()
+    after_first = _compile_blockscaled_tma.cache_info()
     nvfp4_swizzle_tma(x1, outer_scale)
-    after_second = _compile_nvfp4_swizzle_tma.cache_info()
+    after_second = _compile_blockscaled_tma.cache_info()
 
     assert after_second.currsize == after_first.currsize
     assert after_second.hits == after_first.hits + 1

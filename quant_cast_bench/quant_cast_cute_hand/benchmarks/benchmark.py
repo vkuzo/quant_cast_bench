@@ -701,8 +701,7 @@ def _bench_nvfp4_dim_km_rht_tma(M, K, *, stochastic, pipelined=False):
     outer_scale_k = nvfp4_gs_scale(x).reciprocal()
     outer_scale_m = nvfp4_gs_scale(x_t_rht).reciprocal()
     if stochastic:
-        key_k = prng.key(0, device=x.device)
-        key_m = prng.key(1, device=x.device)
+        key = prng.key(0, device=x.device)
 
         def run():
             fn = (
@@ -710,12 +709,10 @@ def _bench_nvfp4_dim_km_rht_tma(M, K, *, stochastic, pipelined=False):
                 if pipelined
                 else nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_tma
             )
-            return fn(
-                x, outer_scale_k, outer_scale_m, rht_sign, key_k, key_m
-            )
+            return fn(x, outer_scale_k, outer_scale_m, rht_sign, key)
 
         gold = Nvfp4GsSwizzle_DimKSR_DimMRHTSR_Gold
-        gold_inputs = (x, outer_scale_k, outer_scale_m, rht, key_k, key_m)
+        gold_inputs = (x, outer_scale_k, outer_scale_m, rht, key)
     else:
 
         def run():
