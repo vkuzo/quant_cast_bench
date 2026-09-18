@@ -17,7 +17,7 @@ from quant_cast_bench.quant_cast_cute_hand.utils import (
     _NVFP4_DIRECT_HALF,
     _NVFP4_GROUP,
     _ceil_div,
-    _nvfp4_load_philox_key,
+    _load_philox_key_and_counter,
     _nvfp4_quantize_fast_groups,
     _store_swizzled_scale_groups_as_uint,
 )
@@ -229,7 +229,7 @@ class _Nvfp4UmmaPipelinedRht:
         counter_base_k = cutlass.Uint64(0)
         if cutlass.const_expr(self.stochastic):
             assert mSeed is not None
-            k0_k, k1_k, counter_base_k = _nvfp4_load_philox_key(mSeed)
+            k0_k, k1_k, counter_base_k = _load_philox_key_and_counter(mSeed)
         load128 = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(),
             cutlass.BFloat16,
@@ -614,7 +614,7 @@ class _Nvfp4UmmaPipelinedRht:
             k1_m = cutlass.Uint32(0)
             counter_base_m = cutlass.Uint64(0)
             if cutlass.const_expr(self.stochastic):
-                k0_m, k1_m, counter_base_m = _nvfp4_load_philox_key(mSeed)
+                k0_m, k1_m, counter_base_m = _load_philox_key_and_counter(mSeed)
             store256 = cute.make_copy_atom(
                 cute.nvgpu.CopyR2GOp(),
                 cutlass.Uint8,
@@ -838,4 +838,3 @@ def _compile_nvfp4_rht_pipelined(
         cutlass.Int32(0),
         options="--enable-tvm-ffi",
     )
-

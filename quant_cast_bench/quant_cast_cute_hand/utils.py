@@ -12,7 +12,7 @@ from quant_cast_bench.quant_cast_cute.recipes import (
     _nvfp4_scale_e4m3,
     _philox_4x32,
 )
-from quant_cast_bench.quant_cast_cute_hand.blockscaled_tma.blockscale_tma_plan import (
+from quant_cast_bench.quant_cast_cute_hand.blockscaled_tma.blockscaled_tma_config import (
     ScaleAlgo,
 )
 
@@ -297,14 +297,14 @@ def _cvt_rs_satfinite_e4m3x4_f32(
 
 
 @cute.jit
-def _e8m0_scale_store_as_uint(
+def _store_scale_bytes_as_uint(
     mScaleLogical: cute.Tensor,
     rScale: cute.Tensor,
     row: cutlass.Int32,
     col: cutlass.Int32,
     count: cutlass.Constexpr,
 ) -> None:
-    """Store adjacent E8M0 bytes with one naturally sized integer write.
+    """Store adjacent one-byte scale values with one naturally sized integer write.
 
     Args:
         mScaleLogical: Global scale tensor with the logical-to-blocked layout.
@@ -771,7 +771,9 @@ def _nvfp4_quantize_fast_groups(
 
 
 @cute.jit
-def _nvfp4_load_philox_key(mSeed: cute.Tensor):
+def _load_philox_key_and_counter(
+    mSeed: cute.Tensor,
+) -> tuple[cutlass.Uint32, cutlass.Uint32, cutlass.Uint64]:
     """Load one PyTorch Philox key and return its two key words plus counter base."""
     frgKey = cute.make_rmem_tensor(cute.make_layout(2), mSeed.element_type)
     cute.copy(
@@ -797,14 +799,14 @@ def _store_swizzled_scale_groups_as_uint(
 ):
     """Store a thread's adjacent scale bytes using their natural packed width."""
     if cutlass.const_expr(group_count in (1, 2, 4)):
-        _e8m0_scale_store_as_uint(
+        _store_scale_bytes_as_uint(
             mScaleLogical, rScale, row, scale_col, group_count
         )
     else:
         assert group_count % 4 == 0
         rScalePacks = cute.tiled_divide(rScale, (4,))
         for pack in cutlass.range_constexpr(group_count // 4):
-            _e8m0_scale_store_as_uint(
+            _store_scale_bytes_as_uint(
                 mScaleLogical,
                 rScalePacks[(None, pack)],
                 row,

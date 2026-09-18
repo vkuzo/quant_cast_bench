@@ -857,8 +857,13 @@ def test_nvfp4_swizzle_tma_rejects_rht_argument():
 @pytest.mark.parametrize(
     "kwargs,error,exception_type",
     [
-        ({"mode": "rows"}, "unsupported mode", ValueError),
-        ({"mode": "dim_m"}, "M % 32", ValueError),
+        (
+            {"quant_orientation": "rows"},
+            "unsupported quant_orientation",
+            ValueError,
+        ),
+        ({"quant_orientation": "dim_m"}, "M % 32", ValueError),
+        ({"mode": "dim_m"}, "unexpected keyword arguments: mode", ValueError),
         ({"outer_scale": None}, "dim-K outer scale is required", ValueError),
         (
             {"outer_scale": 1.0},
@@ -879,7 +884,7 @@ def test_nvfp4_swizzle_tma_rejects_invalid_arguments(
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize(
-    "mode,M,K,expected_shapes",
+    "quant_orientation,M,K,expected_shapes",
     [
         ("dim_k", 0, 32, ((0, 16), (0, 1, 32, 16))),
         ("dim_k", 1, 0, ((1, 0), (1, 0, 32, 16))),
@@ -900,21 +905,21 @@ def test_nvfp4_swizzle_tma_rejects_invalid_arguments(
         ("dim_km", 0, 0, ((0, 0), (0, 0, 32, 16)) * 2),
     ],
 )
-def test_nvfp4_swizzle_tma_empty(dtype, mode, M, K, expected_shapes):
+def test_nvfp4_swizzle_tma_empty(dtype, quant_orientation, M, K, expected_shapes):
     x = torch.empty(M, K, dtype=dtype, device="cuda")
     outer_scale = torch.ones(1, dtype=torch.float32, device=x.device)
     outputs = nvfp4_swizzle_tma(
         x,
         outer_scale,
-        outer_scale_m=outer_scale if mode == "dim_km" else None,
-        mode=mode,
+        outer_scale_m=outer_scale if quant_orientation == "dim_km" else None,
+        quant_orientation=quant_orientation,
     )
 
     assert tuple(output.shape for output in outputs) == expected_shapes
     assert all(output.numel() == 0 for output in outputs)
     assert tuple(output.dtype for output in outputs) == (
         (torch.float4_e2m1fn_x2, torch.float8_e4m3fn)
-        if mode != "dim_km"
+        if quant_orientation != "dim_km"
         else (
             torch.float4_e2m1fn_x2,
             torch.float8_e4m3fn,
@@ -983,7 +988,7 @@ def test_nvfp4_dim_km_tma_scale_stores_stay_within_allocations(
         x,
         outer_scale,
         outer_scale_m=outer_scale,
-        mode="dim_km",
+        quant_orientation="dim_km",
     )
     torch.cuda.synchronize()
 
@@ -1021,7 +1026,7 @@ def test_nvfp4_dim_km_tma_scale_stores_stay_within_allocations(
         x,
         outer_scale,
         outer_scale_m=outer_scale,
-        mode="dim_km",
+        quant_orientation="dim_km",
     )
     torch.cuda.synchronize()
 

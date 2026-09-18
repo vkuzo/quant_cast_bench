@@ -35,18 +35,6 @@ benchmark/reference layer. Move recipe registration to the parent
 `quant_cast_cute_hand/recipes.py` module so this package contains only launch
 planning, validation, compilation, and kernel implementation.
 
-### Clean up package boundaries and naming
-
-- Move `ScaleAlgo` out of the launch-plan module because it describes kernel
-  semantics and is also imported by shared utilities.
-- Standardize `mode` and `quant_orientation` in the NVFP4 and MX entry points.
-- Rename `blockscale_tma_plan.py` to match the `blockscaled_tma` package name.
-- Rename generic helpers such as `_nvfp4_load_philox_key` and
-  `_e8m0_scale_store_as_uint`; they are now used outside their original NVFP4
-  or E8M0-specific contexts.
-- Add complete input and return annotations to the host wrappers and fake
-  tensor helpers.
-
 ## Validation performed during review
 
 - 43 targeted CUDA tests covering NVFP4 padding and empty tensors, grid-limit

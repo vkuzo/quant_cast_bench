@@ -67,8 +67,6 @@ from quant_cast_bench.quant_cast_cute_hand.utils import (
     _compiled,
     _cvt_rs_satfinite_e4m3x4_f32,
     _e8m0,
-    _e8m0_scale_store_as_uint,
-    _nvfp4_load_philox_key,
     _nvfp4_quantize_fast_groups,
     _nvfp4_quantize_stochastic_x16,
     _nvfp4_quantize_x16,

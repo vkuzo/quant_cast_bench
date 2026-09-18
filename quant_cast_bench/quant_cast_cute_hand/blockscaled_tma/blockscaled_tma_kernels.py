@@ -1,6 +1,7 @@
 """CuTe DSL kernels and compilation for TMA-based block-scaled quantization."""
 
 from pathlib import Path
+from typing import Callable
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -12,13 +13,13 @@ import torch
 from torch._native.instrumentation import instrumented_cutedsl_cache
 from torch._vendor.quack.cache import EXTRA_SOURCE_DIRS
 
-from quant_cast_bench.quant_cast_cute_hand.blockscaled_tma.blockscale_tma_plan import (
+from quant_cast_bench.quant_cast_cute_hand.blockscaled_tma.blockscaled_tma_config import (
     ScaleAlgo,
 )
 from quant_cast_bench.quant_cast_cute_hand.utils import (
     _blockscaled_quantize_group,
     _ceil_div,
-    _nvfp4_load_philox_key,
+    _load_philox_key_and_counter,
     _store_swizzled_scale_groups_as_uint,
 )
 
@@ -54,7 +55,7 @@ class _BlockscaledTma:
 
     def __init__(
         self,
-        input_element_type,
+        input_element_type: type[cutlass.Numeric],
         tile_m_size: int,
         tile_k_size: int,
         cluster_k: int,
@@ -62,7 +63,7 @@ class _BlockscaledTma:
         quant_orientation: int,
         is_stochastic_qdata_rounding: bool,
         is_square_scaling: bool,
-        qdata_dtype=cutlass.Float8E4M3FN,
+        qdata_dtype: type[cutlass.Numeric] = cutlass.Float8E4M3FN,
         scale_algo: ScaleAlgo = ScaleAlgo.RCEIL_E8M0,
     ) -> None:
         self.input_element_type = input_element_type
@@ -349,7 +350,9 @@ class _BlockscaledTma:
         if cutlass.const_expr(is_stochastic_qdata_rounding):
             # The key is tile-independent, so load it while TMA fills sInput. In dim-KM, dim-M
             # follows dim-K's M*K elements in the same Philox stream.
-            philox_k0, philox_k1, sr_counter_base = _nvfp4_load_philox_key(mSeed)
+            philox_k0, philox_k1, sr_counter_base = _load_philox_key_and_counter(
+                mSeed
+            )
 
         if cutlass.const_expr(
             scale_algo == ScaleAlgo.NVFP4_FP8_E4M3 and do_dim_k
@@ -1139,9 +1142,7 @@ class _BlockscaledTma:
         kernel.launch(grid=grid, block=block, cluster=launch_cluster, stream=stream)
 
 
-
-
-def _make_dynamic_matrix_fake(dtype):
+def _make_dynamic_matrix_fake(dtype: type[cutlass.Numeric]) -> cute.Tensor:
     """Match a 16-byte-aligned row-major tensor with a dynamic, 16-divisible K."""
     return cute.runtime.make_fake_tensor(
         dtype,
@@ -1151,7 +1152,7 @@ def _make_dynamic_matrix_fake(dtype):
     )
 
 
-def _make_dynamic_scale_fake():
+def _make_dynamic_scale_fake() -> cute.Tensor:
     """Match the compact, padded byte-scale allocation used by the runtime wrapper."""
     return cute.runtime.make_fake_tensor(
         cutlass.Uint8,
@@ -1161,7 +1162,9 @@ def _make_dynamic_scale_fake():
     )
 
 
-def _make_static_vector_fake(dtype, size: int, assumed_align: int):
+def _make_static_vector_fake(
+    dtype: type[cutlass.Numeric], size: int, assumed_align: int
+) -> cute.Tensor:
     return cute.runtime.make_fake_tensor(
         dtype,
         (size,),
@@ -1206,7 +1209,7 @@ def _compile_blockscaled_tma(
     is_square_scaling: bool,
     qdata_dtype: torch.dtype = torch.float8_e4m3fn,
     scale_algo: ScaleAlgo = ScaleAlgo.RCEIL_E8M0,
-):
+) -> Callable[..., None]:
     if qdata_dtype not in _TORCH_TO_CUTE_QDATA_DTYPE:
         raise ValueError(f"unsupported qdata dtype: {qdata_dtype}")
     input_element_type = _TORCH_TO_CUTE_DTYPE[input_dtype]

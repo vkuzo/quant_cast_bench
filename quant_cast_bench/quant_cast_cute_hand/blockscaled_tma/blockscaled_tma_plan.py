@@ -1,16 +1,12 @@
 """Launch policy for TMA-based block-scaled quantization kernels."""
 
-from enum import IntEnum
 from typing import NamedTuple
 
 import torch
 
-
-class ScaleAlgo(IntEnum):
-    """Compile-time algorithm used to derive and encode each block scale."""
-
-    RCEIL_E8M0 = 0
-    NVFP4_FP8_E4M3 = 1
+from quant_cast_bench.quant_cast_cute_hand.blockscaled_tma.blockscaled_tma_config import (
+    ScaleAlgo,
+)
 
 
 _DIM_K_TILE_M_SIZE_128 = 128

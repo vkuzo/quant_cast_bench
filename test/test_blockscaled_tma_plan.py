@@ -1,9 +1,11 @@
 import pytest
 import torch
 
-from quant_cast_bench.quant_cast_cute_hand.blockscaled_tma.blockscale_tma_plan import (
-    BlockscaledTmaPlan,
+from quant_cast_bench.quant_cast_cute_hand.blockscaled_tma.blockscaled_tma_config import (
     ScaleAlgo,
+)
+from quant_cast_bench.quant_cast_cute_hand.blockscaled_tma.blockscaled_tma_plan import (
+    BlockscaledTmaPlan,
     select_blockscaled_tma_plan,
 )
 

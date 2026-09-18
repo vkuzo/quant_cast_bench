@@ -2,8 +2,8 @@
 
 This directory contains optimized handwritten CuTe DSL quantization kernels. The
 block-scaled TMA implementation lives in the `blockscaled_tma/` package, split
-across `blockscale_tma_plan.py`, `blockscaled_tma_impl.py`, and
-`blockscaled_tma_kernels.py`. It is an optimized
+across `blockscaled_tma_config.py`, `blockscaled_tma_plan.py`,
+`blockscaled_tma_impl.py`, and `blockscaled_tma_kernels.py`. It is an optimized
 prototype rather than an upstream-ready PyTorch operator. The notes below capture
 the remaining work and review findings for upstreaming it into PyTorch core.
 The persistent NVFP4 RHT implementation follows the same plan/kernel/host split
