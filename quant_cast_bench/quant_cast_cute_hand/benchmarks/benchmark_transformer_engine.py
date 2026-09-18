@@ -238,6 +238,9 @@ KERNELS_SUPPORTING_FLOAT16_AND_FLOAT32 = frozenset({
     "mxfp8_dim_m_swizzle_sr_v2",
     "mxfp8_dim_km_swizzle_v2",
     "mxfp8_dim_km_swizzle_sr_v2",
+    "nvfp4_swizzle_tma",
+    "nvfp4_dim_m_swizzle_tma",
+    "nvfp4_dim_km_swizzle_tma",
 })
 
 DTYPES = {

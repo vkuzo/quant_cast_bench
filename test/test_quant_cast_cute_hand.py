@@ -118,7 +118,7 @@ _BLOCKSCALED_TMA_RECIPES = _MX_V2_RECIPES | {
     "nvfp4_dim_m_swizzle_tma",
     "nvfp4_dim_km_swizzle_tma",
 }
-_SUPPORTS_NON_BFLOAT16 = _MX_V2_RECIPES
+_SUPPORTS_NON_BFLOAT16 = _BLOCKSCALED_TMA_RECIPES
 
 def _get_recipe(recipe_name):
     _recipe_name, recipe = [x for x in ALL_RECIPES if x[0] == recipe_name][0]
@@ -804,11 +804,14 @@ def test_nvfp4_dim_m_rht_pipelined(kernel, M, K):
         ("nvfp4_swizzle_tma", 129, 160),
     ],
 )
-def test_nvfp4_swizzle_cute_hand(kernel, M, K):
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_nvfp4_swizzle_cute_hand(kernel, M, K, dtype):
     if torch.cuda.get_device_capability() != (10, 0):
         pytest.skip(f"{kernel} emits Blackwell-only PTX; requires cuda capability 10.0")
+    if kernel == "nvfp4_swizzle_direct" and dtype != torch.bfloat16:
+        pytest.skip("nvfp4_swizzle_direct is bf16-only")
     recipe = _get_recipe(kernel)
-    inputs = recipe.example_input_fn(M, K, torch.bfloat16)
+    inputs = recipe.example_input_fn(M, K, dtype)
     outputs = recipe.cute_fn(*inputs)
     ref_outputs = recipe.pt_ref_fn(*inputs)
     assert qdata_and_scale_equal(outputs[0], ref_outputs[0])
@@ -852,11 +855,12 @@ def test_nvfp4_swizzle_tma_rejects_rht_argument():
         ("nvfp4_dim_km_swizzle_tma", 160, 96),
     ],
 )
-def test_nvfp4_dim_m_tma_padding(kernel, M, K):
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_nvfp4_dim_m_tma_padding(kernel, M, K, dtype):
     if torch.cuda.get_device_capability() != (10, 0):
         pytest.skip(f"{kernel} emits Blackwell-only PTX; requires cuda capability 10.0")
     recipe = _get_recipe(kernel)
-    cute_inputs = gold_inputs = recipe.example_input_fn(M, K, torch.bfloat16)
+    cute_inputs = gold_inputs = recipe.example_input_fn(M, K, dtype)
     outputs = recipe.cute_fn(*cute_inputs)
     references = recipe.pt_ref_fn(*gold_inputs)
     for output, reference in zip(outputs, references):

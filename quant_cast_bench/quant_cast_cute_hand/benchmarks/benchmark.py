@@ -570,9 +570,9 @@ def _bench_mxfp8_dim_km_swizzle_sr_v2(M, K, dtype):
     return run, bytes_per_iter
 
 
-def _bench_nvfp4_swizzle_impl(M, K, kernel_fn):
+def _bench_nvfp4_swizzle_impl(M, K, kernel_fn, dtype=torch.bfloat16):
     torch.manual_seed(0)
-    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+    x = torch.randn(M, K, dtype=dtype, device="cuda")
     outer_scale = nvfp4_gs_scale(x).reciprocal()
 
     def run():
@@ -599,13 +599,13 @@ def _bench_nvfp4_swizzle_direct(M, K):
     return _bench_nvfp4_swizzle_impl(M, K, nvfp4_swizzle_direct)
 
 
-def _bench_nvfp4_swizzle_tma(M, K):
-    return _bench_nvfp4_swizzle_impl(M, K, nvfp4_swizzle_tma)
+def _bench_nvfp4_swizzle_tma(M, K, dtype=torch.bfloat16):
+    return _bench_nvfp4_swizzle_impl(M, K, nvfp4_swizzle_tma, dtype)
 
 
-def _bench_nvfp4_dim_m_swizzle_tma(M, K):
+def _bench_nvfp4_dim_m_swizzle_tma(M, K, dtype=torch.bfloat16):
     torch.manual_seed(0)
-    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+    x = torch.randn(M, K, dtype=dtype, device="cuda")
     outer_scale = nvfp4_gs_scale(x).reciprocal()
 
     def run():
@@ -622,9 +622,9 @@ def _bench_nvfp4_dim_m_swizzle_tma(M, K):
     return run, bytes_per_iter
 
 
-def _bench_nvfp4_dim_km_swizzle_tma(M, K):
+def _bench_nvfp4_dim_km_swizzle_tma(M, K, dtype=torch.bfloat16):
     torch.manual_seed(0)
-    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+    x = torch.randn(M, K, dtype=dtype, device="cuda")
     outer_scale = nvfp4_gs_scale(x).reciprocal()
 
     def run():
@@ -815,6 +815,9 @@ _KERNELS_SUPPORTING_FLOAT16_AND_FLOAT32 = frozenset({
     "mxfp4_swizzle_v2",
     "mxfp4_dim_m_swizzle_v2",
     "mxfp4_dim_km_swizzle_v2",
+    "nvfp4_swizzle_tma",
+    "nvfp4_dim_m_swizzle_tma",
+    "nvfp4_dim_km_swizzle_tma",
 })
 
 _DTYPES = {

@@ -226,7 +226,6 @@ class _BlockscaledTma:
             assert not is_square_scaling
         if cutlass.const_expr(scale_algo == ScaleAlgo.NVFP4_FP8_E4M3):
             assert is_packed_fp4_qdata
-            assert input_element_type == cutlass.BFloat16
             assert not is_square_scaling
 
         # bookkeeping
@@ -1193,8 +1192,6 @@ def _compile_blockscaled_tma(
     input_element_type = _TORCH_TO_CUTE_DTYPE[input_dtype]
     qdata_element_type = _TORCH_TO_CUTE_QDATA_DTYPE[qdata_dtype]
     if scale_algo == ScaleAlgo.NVFP4_FP8_E4M3:
-        if input_dtype != torch.bfloat16:
-            raise ValueError("NVFP4 TMA supports only bfloat16 input")
         if qdata_dtype != torch.float4_e2m1fn_x2:
             raise ValueError("NVFP4 scaling requires float4_e2m1fn_x2 qdata")
         if is_square_scaling:

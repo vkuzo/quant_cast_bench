@@ -68,9 +68,7 @@ def _blockscaled_tma_impl_on_current_device(
         )
     if not input.is_contiguous():
         raise ValueError("blockscaled TMA requires a contiguous input")
-    if is_nvfp4:
-        assert input.dtype == torch.bfloat16, "nvfp4_swizzle_tma is bf16-only"
-    elif input.dtype not in (torch.bfloat16, torch.float16, torch.float32):
+    if input.dtype not in (torch.bfloat16, torch.float16, torch.float32):
         raise ValueError(
             "blockscaled TMA supports only bf16, fp16, and fp32 input"
         )
