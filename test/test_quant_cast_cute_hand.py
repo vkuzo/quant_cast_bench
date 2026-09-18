@@ -36,11 +36,13 @@ except (ImportError, importlib.metadata.PackageNotFoundError):
 HAS_CUTEDSL = _cutedsl_version is not None and _cutedsl_version >= _MIN_CUTEDSL
 
 if HAS_CUTEDSL:
-    from quant_cast_bench.quant_cast_cute_hand.blockscaled_tma import (
-        _compile_blockscaled_tma,
+    from quant_cast_bench.quant_cast_cute_hand.blockscaled_tma_impl import (
         mxfp4_swizzle_v2,
         mxfp8_swizzle_v2,
         nvfp4_swizzle_tma,
+    )
+    from quant_cast_bench.quant_cast_cute_hand.blockscaled_tma_kernels import (
+        _compile_blockscaled_tma,
     )
     from quant_cast_bench.quant_cast_cute_hand.nvfp4_pipelined import (
         _compile_nvfp4_swizzle_dim_k_dim_m_rht_pipelined,

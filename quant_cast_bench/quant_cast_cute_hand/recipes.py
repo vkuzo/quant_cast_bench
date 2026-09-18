@@ -26,7 +26,7 @@ from quant_cast_bench.quant_cast_cute.recipes import (
     QuantCastCuteRecipe,
     _philox_4x32,
 )
-from quant_cast_bench.quant_cast_cute_hand.blockscaled_tma import (
+from quant_cast_bench.quant_cast_cute_hand.blockscaled_tma_impl import (
     MXFP4_DIM_KM_SWIZZLE_V2,
     MXFP4_DIM_M_SWIZZLE_V2,
     MXFP4_SWIZZLE_V2,
@@ -2143,7 +2143,7 @@ MXFP8_SWIZZLE_V5 = QuantCastCuteRecipe.from_gold(
 #   qdata = fp4_rne(input * outer / inner), packed two values per byte
 # The dim-K direct version uses v4-style vector loads for small problems and switches to a
 # row-owned, load-ILP mapping for larger ones. The TMA and pipelined RHT families live in
-# blockscaled_tma.py and nvfp4_pipelined.py, respectively.
+# blockscaled_tma_impl.py and nvfp4_pipelined.py, respectively.
 _NVFP4_GROUP = 16
 
 _NVFP4_DIRECT_VPT = 16

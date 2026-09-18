@@ -1,11 +1,11 @@
 # Handwritten CuTe DSL quantization kernels
 
 This directory contains optimized handwritten CuTe DSL quantization kernels. The
-`blockscaled_tma.py` implementation is an optimized prototype rather than an
+The `blockscaled_tma_impl.py` and `blockscaled_tma_kernels.py` implementation is an
 upstream-ready PyTorch operator. The notes below capture the remaining work and
 review findings for upstreaming it into PyTorch core.
 
-## `blockscaled_tma.py` upstream-readiness review
+## Block-scaled TMA upstream-readiness review
 
 The kernel supports dim-K, dim-M, and dim-KM quantization, RTNE and stochastic
 rounding, BF16/FP16/FP32 inputs, padded scale outputs.
