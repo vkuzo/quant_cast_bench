@@ -777,6 +777,8 @@ class _BlockscaledTma:
         stream: cuda.CUstream,
         M: cutlass.Int32,
         K: cutlass.Int32,
+        grid_m: cutlass.Int32,
+        grid_k: cutlass.Int32,
     ) -> None:
         tile_m_size = cutlass.const_expr(self.tile_m_size)
         tile_k_size = cutlass.const_expr(self.tile_k_size)
@@ -852,17 +854,6 @@ class _BlockscaledTma:
             assert not is_square_scaling
         if cutlass.const_expr(scale_algo == ScaleAlgo.NVFP4_FP8_E4M3):
             assert is_packed_fp4_qdata
-
-        # M is padded to a full 128-row scale-layout block. Since every tile-M divides 128,
-        # compute the CTA count without materializing a potentially overflowing padded extent.
-        if cutlass.const_expr(
-            scale_algo == ScaleAlgo.NVFP4_FP8_E4M3
-            and quant_orientation == _QUANT_ORIENTATION_DIM_M
-        ):
-            grid_m = _ceil_div(M, 64) * 64 // tile_m_size
-        else:
-            grid_m = _ceil_div(M, 128) * (128 // tile_m_size)
-        grid_k = _ceil_div(K, tile_k_size)
 
         if cutlass.const_expr(quant_orientation == _QUANT_ORIENTATION_DIM_M):
             # Keep the kernel argument type uniform while retaining the original unswizzled dim-M
@@ -1288,6 +1279,8 @@ def _compile_blockscaled_tma(
         mOuterScaleM,
         mSeed,
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+        cutlass.Int32(0),
+        cutlass.Int32(0),
         cutlass.Int32(0),
         cutlass.Int32(0),
         options="--enable-tvm-ffi",

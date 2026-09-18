@@ -300,6 +300,8 @@ def _blockscaled_tma_impl_on_current_device(
         seed,
         M,
         K,
+        plan.grid_m,
+        plan.grid_k,
     )
 
     if do_dim_m:

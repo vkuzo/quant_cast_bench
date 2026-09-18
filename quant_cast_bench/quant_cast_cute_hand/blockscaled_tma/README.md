@@ -6,16 +6,6 @@ below in priority order.
 
 ## Safety and maintainability
 
-### Use one source of truth for launch-grid calculation
-
-`select_blockscaled_tma_plan` computes `grid_m` and `grid_k`, and the host uses
-those values for CUDA grid-limit validation. `_BlockscaledTma.__call__` then
-recomputes the grid independently for the actual launch. A future change can
-therefore make the validated grid differ from the launched grid.
-
-Centralize the grid formulas or pass the validated runtime grid values into
-the launcher.
-
 ### Make launch policy architecture-aware
 
 The launch planner is explicitly tuned for B200, while the public eligibility
