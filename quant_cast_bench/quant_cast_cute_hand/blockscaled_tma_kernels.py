@@ -17,7 +17,6 @@ from quant_cast_bench.quant_cast_cute_hand.utils import (
     _blockscaled_quantize_group,
     _ceil_div,
     _nvfp4_load_philox_key,
-    _nvfp4_rht_fwht_x16,
     _store_swizzled_scale_groups_as_uint,
 )
 
@@ -48,10 +47,6 @@ _DIM_K_TILE_M_SIZE_128 = 128
 _MIN_CTA_WARPS_4 = 4
 _MIN_CTA_THREADS_128 = _MIN_CTA_WARPS_4 * 32
 
-_NVFP4_GROUP = 16
-_NVFP4_DIRECT_HALF = 8
-
-
 class _BlockscaledTma:
     """Compile-time MXFP8, MXFP4, or NVFP4 TMA kernel configuration."""
 
@@ -67,7 +62,6 @@ class _BlockscaledTma:
         is_square_scaling: bool,
         qdata_dtype=cutlass.Float8E4M3FN,
         scale_algo: ScaleAlgo = ScaleAlgo.RCEIL_E8M0,
-        has_dim_m_rht: bool = False,
     ) -> None:
         self.input_element_type = input_element_type
         self.tile_m_size = tile_m_size
@@ -79,7 +73,6 @@ class _BlockscaledTma:
         self.is_square_scaling = is_square_scaling
         self.qdata_dtype = qdata_dtype
         self.scale_algo = scale_algo
-        self.has_dim_m_rht = has_dim_m_rht
         self.scale_group_size = (
             16 if scale_algo == ScaleAlgo.NVFP4_FP8_E4M3 else 32
         )
@@ -97,7 +90,6 @@ class _BlockscaledTma:
         mScaleMLogical: cute.Tensor | None,
         mOuterScaleK: cute.Tensor | None,
         mOuterScaleM: cute.Tensor | None,
-        mRhtSign: cute.Tensor | None,
         mSeed: cute.Tensor | None,
         input_smem_layout: cute.ComposedLayout,
         output_k_smem_layout: cute.ComposedLayout | None,
@@ -110,7 +102,7 @@ class _BlockscaledTma:
         """
         Kernel for MXFP8, MXFP4, and NVFP4 quantization across dim-K, dim-M, and dim-KM.
 
-        MXFP8 and NVFP4 support RTNE and SR, while MXFP4 currently supports RTNE only.
+        MXFP8 supports RTNE and SR, while MXFP4 and NVFP4 currently support RTNE only.
 
         High level flow:
           0. create smem scratchpad
@@ -146,7 +138,6 @@ class _BlockscaledTma:
         )
         is_square_scaling = cutlass.const_expr(self.is_square_scaling)
         scale_algo = cutlass.const_expr(self.scale_algo)
-        has_dim_m_rht = cutlass.const_expr(self.has_dim_m_rht)
         scale_group_size = cutlass.const_expr(self.scale_group_size)
         qdata_dtype = self.qdata_dtype
         is_packed_fp4_qdata = cutlass.const_expr(
@@ -222,12 +213,6 @@ class _BlockscaledTma:
             else:
                 assert mOuterScaleM is None
 
-        if cutlass.const_expr(has_dim_m_rht):
-            assert scale_algo == ScaleAlgo.NVFP4_FP8_E4M3
-            assert do_dim_m
-            assert mRhtSign is not None
-        else:
-            assert mRhtSign is None
         if cutlass.const_expr(is_stochastic_qdata_rounding):
             assert mSeed is not None
         else:
@@ -268,15 +253,6 @@ class _BlockscaledTma:
                 qdata_storage_element_type,
                 tile_m_size * tile_k_size // qdata_k_divisor,
                 byte_alignment=1024,
-            )
-        if cutlass.const_expr(has_dim_m_rht):
-            sign_storage = smem.allocate_array(
-                cutlass.BFloat16,
-                _NVFP4_GROUP,
-                byte_alignment=16,
-            )
-            sSigns = cute.make_tensor(
-                sign_storage, cute.make_layout(_NVFP4_GROUP)
             )
         # Put the small barrier after the 1KB-aligned tile buffers to avoid an otherwise unused 1016B
         # alignment gap at the front of every CTA's shared-memory allocation.
@@ -374,13 +350,6 @@ class _BlockscaledTma:
             # follows dim-K's M*K elements in the same Philox stream.
             philox_k0, philox_k1, sr_counter_base = _nvfp4_load_philox_key(mSeed)
 
-        if cutlass.const_expr(has_dim_m_rht):
-            if tidx < _NVFP4_GROUP:
-                sSigns[tidx] = (
-                    mRhtSign[tidx].to(cutlass.Float32) * cutlass.Float32(0.25)
-                ).to(cutlass.BFloat16)
-            cute.arch.sync_threads()
-
         if cutlass.const_expr(
             scale_algo == ScaleAlgo.NVFP4_FP8_E4M3 and do_dim_k
         ):
@@ -450,17 +419,6 @@ class _BlockscaledTma:
                         + cutlass.Uint64(global_col_m) * cutlass.Uint64(M // 16)
                         + cutlass.Uint64(tile_m_idx * tile_m_size // 16)
                     )
-            if cutlass.const_expr(has_dim_m_rht):
-                # Keep the scaled sign vector in registers across every RHT group this thread owns.
-                rSigns = cute.make_rmem_tensor(_NVFP4_GROUP, cutlass.BFloat16)
-                rSignHalves = cute.tiled_divide(rSigns, (_NVFP4_DIRECT_HALF,))
-                sSignHalves = cute.tiled_divide(sSigns, (_NVFP4_DIRECT_HALF,))
-                for half in cutlass.range_constexpr(2):
-                    cute.copy(
-                        smem_load_atom,
-                        sSignHalves[(None, half)],
-                        rSignHalves[(None, half)],
-                    )
             for row_block in cutlass.range_constexpr(row_blocks):
                 rQM = cute.make_rmem_tensor(
                     qdata_storage_elements_per_32,
@@ -471,17 +429,12 @@ class _BlockscaledTma:
                 )
                 for group in cutlass.range_constexpr(groups_per_row_block):
                     row_start = row_block * 32 + group * scale_group_size
-                    if cutlass.const_expr(has_dim_m_rht):
-                        vm = _nvfp4_rht_fwht_x16(
-                            sInput, row_start, tidx, rSigns
-                        )
-                    else:
-                        rInputM = cute.make_rmem_tensor(
-                            scale_group_size, input_element_type
-                        )
-                        for value in cutlass.range_constexpr(scale_group_size):
-                            rInputM[value] = sInput[(row_start + value, tidx)]
-                        vm = rInputM.load().to(cutlass.Float32)
+                    rInputM = cute.make_rmem_tensor(
+                        scale_group_size, input_element_type
+                    )
+                    for value in cutlass.range_constexpr(scale_group_size):
+                        rInputM[value] = sInput[(row_start + value, tidx)]
+                    vm = rInputM.load().to(cutlass.Float32)
                     if cutlass.const_expr(is_stochastic_qdata_rounding):
                         sr_counter_m = sr_counter_base_m + cutlass.Uint64(
                             row_block * (32 // 16)
@@ -790,7 +743,6 @@ class _BlockscaledTma:
         mOutputM: cute.Tensor | None,
         mScaleM: cute.Tensor | None,
         mOuterScaleM: cute.Tensor | None,
-        mRhtSign: cute.Tensor | None,
         mSeed: cute.Tensor | None,
         stream: cuda.CUstream,
         M: cutlass.Int32,
@@ -806,7 +758,6 @@ class _BlockscaledTma:
         )
         is_square_scaling = cutlass.const_expr(self.is_square_scaling)
         scale_algo = cutlass.const_expr(self.scale_algo)
-        has_dim_m_rht = cutlass.const_expr(self.has_dim_m_rht)
         scale_group_size = cutlass.const_expr(self.scale_group_size)
         qdata_dtype = self.qdata_dtype
         is_packed_fp4_qdata = cutlass.const_expr(
@@ -858,14 +809,6 @@ class _BlockscaledTma:
                 scale_algo == ScaleAlgo.NVFP4_FP8_E4M3
             )
 
-        if cutlass.const_expr(has_dim_m_rht):
-            assert (
-                scale_algo == ScaleAlgo.NVFP4_FP8_E4M3
-                and do_dim_m
-                and mRhtSign is not None
-            )
-        else:
-            assert mRhtSign is None
         if cutlass.const_expr(is_stochastic_qdata_rounding):
             assert mSeed is not None
         else:
@@ -1139,7 +1082,6 @@ class _BlockscaledTma:
             mScaleMLogical,
             mOuterScaleK,
             mOuterScaleM,
-            mRhtSign,
             mSeed,
             input_smem_layout,
             output_k_smem_layout,
@@ -1218,14 +1160,13 @@ def _blockscaled_tma_compile_log_key(
     is_square_scaling: bool,
     qdata_dtype: torch.dtype = torch.float8_e4m3fn,
     scale_algo: ScaleAlgo = ScaleAlgo.RCEIL_E8M0,
-    has_dim_m_rht: bool = False,
 ) -> str:
     return (
         f"dtype={input_dtype} orientation={quant_orientation} "
         f"tile={tile_m_size}x{tile_k_size} cluster_k={cluster_k} "
         f"masking={needs_boundary_masking} sr={is_stochastic_qdata_rounding} "
         f"square={is_square_scaling} qdata_dtype={qdata_dtype} "
-        f"scale_algo={scale_algo.name} dim_m_rht={has_dim_m_rht}"
+        f"scale_algo={scale_algo.name}"
     )
 
 
@@ -1244,7 +1185,6 @@ def _compile_blockscaled_tma(
     is_square_scaling: bool,
     qdata_dtype: torch.dtype = torch.float8_e4m3fn,
     scale_algo: ScaleAlgo = ScaleAlgo.RCEIL_E8M0,
-    has_dim_m_rht: bool = False,
 ):
     if qdata_dtype not in _TORCH_TO_CUTE_QDATA_DTYPE:
         raise ValueError(f"unsupported qdata dtype: {qdata_dtype}")
@@ -1271,7 +1211,6 @@ def _compile_blockscaled_tma(
         is_square_scaling,
         qdata_element_type,
         scale_algo,
-        has_dim_m_rht,
     )
 
     mInput = _make_dynamic_matrix_fake(input_element_type)
@@ -1299,11 +1238,6 @@ def _compile_blockscaled_tma(
         if is_nvfp4 and do_dim_m
         else None
     )
-    mRhtSign = (
-        _make_static_vector_fake(cutlass.BFloat16, _NVFP4_GROUP, assumed_align=16)
-        if is_nvfp4 and has_dim_m_rht
-        else None
-    )
     mSeed = (
         cute.runtime.make_fake_tensor(
             cutlass.Int64,
@@ -1324,11 +1258,9 @@ def _compile_blockscaled_tma(
         mOutputM,
         mScaleM,
         mOuterScaleM,
-        mRhtSign,
         mSeed,
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
         cutlass.Int32(0),
         cutlass.Int32(0),
         options="--enable-tvm-ffi",
     )
-

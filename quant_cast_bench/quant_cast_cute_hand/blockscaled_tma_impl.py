@@ -30,10 +30,6 @@ from quant_cast_bench.quant_cast_gold.recipes import (
     Mxfp8SwizzleSRGold,
     Nvfp4GsDimKMSwizzleGold,
     Nvfp4GsDimMSwizzleGold,
-    Nvfp4GsDimMSwizzleRHTSRGold,
-    Nvfp4GsSwizzle_DimK_DimMRHT_Gold,
-    Nvfp4GsSwizzle_DimKSR_DimMRHTSR_Gold,
-    Nvfp4GsSwizzleDimMRHTGold,
     Nvfp4GsSwizzleGold,
 )
 
@@ -59,14 +55,12 @@ def _blockscaled_tma_impl_on_current_device(
     scale_algo: ScaleAlgo = ScaleAlgo.RCEIL_E8M0,
     outer_scale_k: torch.Tensor | None = None,
     outer_scale_m: torch.Tensor | None = None,
-    rht_sign: torch.Tensor | None = None,
 ):
     if quant_orientation not in ("dim_k", "dim_m", "dim_km"):
         raise ValueError(f"unsupported quant_orientation: {quant_orientation}")
     do_dim_k = quant_orientation != "dim_m"
     do_dim_m = quant_orientation != "dim_k"
     is_nvfp4 = scale_algo == ScaleAlgo.NVFP4_FP8_E4M3
-    has_dim_m_rht = rht_sign is not None
 
     if input.dim() != 2:
         raise ValueError(
@@ -91,13 +85,10 @@ def _blockscaled_tma_impl_on_current_device(
     else:
         if outer_scale_k is not None or outer_scale_m is not None:
             raise ValueError("RCEIL scaling does not use outer scales")
-        if rht_sign is not None:
-            raise ValueError("RCEIL scaling does not use an RHT sign tensor")
     rounding_mode = str(getattr(rounding_mode, "value", rounding_mode)).lower()
     if is_nvfp4:
-        assert rounding_mode in ("rtne", "stochastic"), (
-            f"unsupported rounding_mode: {rounding_mode}"
-        )
+        if rounding_mode != "rtne":
+            raise ValueError("NVFP4 TMA supports only RTNE")
     elif rounding_mode not in ("rtne", "stochastic"):
         raise ValueError(f"unsupported rounding_mode: {rounding_mode}")
     is_stochastic_qdata_rounding = rounding_mode == "stochastic"
@@ -113,27 +104,7 @@ def _blockscaled_tma_impl_on_current_device(
         if is_stochastic_qdata_rounding:
             raise ValueError("32x32 v2 currently supports only RTNE")
     if is_nvfp4:
-        if has_dim_m_rht:
-            assert do_dim_m, "RHT requires a dim-m output"
-            assert rht_sign.shape == (16,), "RHT sign input must have shape (16,)"
-            assert (
-                rht_sign.dtype == torch.bfloat16
-                and rht_sign.device == input.device
-            ), "RHT sign input must be bf16 on the input device"
-            assert rht_sign.is_contiguous(), "RHT sign input must be contiguous"
-        if is_stochastic_qdata_rounding:
-            assert has_dim_m_rht and do_dim_m, (
-                "stochastic rounding currently requires an RHT dim-m output"
-            )
-            assert key is not None, "stochastic rounding requires a Philox key"
-            assert key.device == input.device, (
-                "input and Philox key must be on the same device"
-            )
-            assert key.dtype == torch.uint64 and key.numel() == 2, (
-                "Philox key must be uint64[2]"
-            )
-        else:
-            assert key is None, "RTNE rounding does not use a Philox key"
+        assert key is None, "RTNE rounding does not use a Philox key"
     else:
         if is_stochastic_qdata_rounding:
             if key is None:
@@ -260,7 +231,6 @@ def _blockscaled_tma_impl_on_current_device(
         is_stochastic_qdata_rounding=is_stochastic_qdata_rounding,
         is_square_scaling=is_square_scaling,
         scale_algo=scale_algo,
-        has_dim_m_rht=has_dim_m_rht,
     )
     if plan.grid_k > _CUDA_GRID_X_MAX or plan.grid_m > _CUDA_GRID_Y_MAX:
         raise ValueError(
@@ -313,7 +283,6 @@ def _blockscaled_tma_impl_on_current_device(
         is_square_scaling,
         qdata_dtype,
         scale_algo,
-        has_dim_m_rht,
     )
     fn(
         input,
@@ -323,7 +292,6 @@ def _blockscaled_tma_impl_on_current_device(
         output_m,
         scale_m,
         outer_scale_m_arg,
-        rht_sign,
         seed,
         M,
         K,
@@ -357,7 +325,6 @@ def _blockscaled_tma_impl(
     scale_algo: ScaleAlgo = ScaleAlgo.RCEIL_E8M0,
     outer_scale_k: torch.Tensor | None = None,
     outer_scale_m: torch.Tensor | None = None,
-    rht_sign: torch.Tensor | None = None,
     **kwargs,
 ):
     if kwargs:
@@ -387,7 +354,6 @@ def _blockscaled_tma_impl(
             scale_algo=scale_algo,
             outer_scale_k=outer_scale_k,
             outer_scale_m=outer_scale_m,
-            rht_sign=rht_sign,
         )
 
     if device == torch.cuda.current_device():
@@ -524,11 +490,9 @@ def nvfp4_swizzle_tma(
     outer_scale: torch.Tensor,
     outer_scale_m: torch.Tensor | None = None,
     mode: str = "dim_k",
-    rht_sign: torch.Tensor | None = None,
-    key: torch.Tensor | None = None,
-    rounding_mode: str = "rtne",
     **kwargs,
 ):
+    assert not kwargs, f"unexpected keyword arguments: {', '.join(sorted(kwargs))}"
     assert mode in ("dim_k", "dim_m", "dim_km"), f"unsupported mode: {mode}"
     if mode == "dim_k":
         outer_scale_k_arg, outer_scale_m_arg = outer_scale, outer_scale_m
@@ -541,14 +505,13 @@ def nvfp4_swizzle_tma(
     return _blockscaled_tma_impl(
         input,
         quant_orientation=mode,
-        key=key,
-        rounding_mode=rounding_mode,
+        key=None,
+        rounding_mode="rtne",
         is_square_scaling=False,
         qdata_dtype=torch.float4_e2m1fn_x2,
         scale_algo=ScaleAlgo.NVFP4_FP8_E4M3,
         outer_scale_k=outer_scale_k_arg,
         outer_scale_m=outer_scale_m_arg,
-        rht_sign=rht_sign,
     )
 
 
@@ -580,84 +543,4 @@ def nvfp4_dim_km_swizzle_tma(input, outer_scale_k, outer_scale_m, **kwargs):
 
 NVFP4_DIM_KM_SWIZZLE_TMA = QuantCastCuteRecipe.from_gold(
     Nvfp4GsDimKMSwizzleGold, cute_fn=nvfp4_dim_km_swizzle_tma
-)
-
-
-def nvfp4_dim_m_rht_swizzle_tma(input, outer_scale, rht_sign, **kwargs):
-    return nvfp4_swizzle_tma(
-        input,
-        outer_scale,
-        mode="dim_m",
-        rht_sign=rht_sign,
-        **kwargs,
-    )
-
-
-NVFP4_DIM_M_RHT_SWIZZLE_TMA = QuantCastCuteRecipe.from_gold(
-    Nvfp4GsSwizzleDimMRHTGold, cute_fn=nvfp4_dim_m_rht_swizzle_tma
-)
-
-
-def nvfp4_dim_m_swizzle_rht_sr_tma(
-    input, outer_scale, rht_sign, key, **kwargs
-):
-    return nvfp4_swizzle_tma(
-        input,
-        outer_scale,
-        mode="dim_m",
-        rht_sign=rht_sign,
-        key=key,
-        rounding_mode="stochastic",
-        **kwargs,
-    )
-
-
-NVFP4_DIM_M_SWIZZLE_RHT_SR_TMA = QuantCastCuteRecipe.from_gold(
-    Nvfp4GsDimMSwizzleRHTSRGold,
-    cute_fn=nvfp4_dim_m_swizzle_rht_sr_tma,
-)
-
-
-def nvfp4_swizzle_dim_k_dim_m_rht_tma(
-    input, outer_scale_k, outer_scale_m, rht_sign, **kwargs
-):
-    return nvfp4_swizzle_tma(
-        input,
-        outer_scale_k,
-        outer_scale_m=outer_scale_m,
-        mode="dim_km",
-        rht_sign=rht_sign,
-        **kwargs,
-    )
-
-
-NVFP4_SWIZZLE_DIM_K_DIM_M_RHT_TMA = QuantCastCuteRecipe.from_gold(
-    Nvfp4GsSwizzle_DimK_DimMRHT_Gold,
-    cute_fn=nvfp4_swizzle_dim_k_dim_m_rht_tma,
-)
-
-
-def nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_tma(
-    input,
-    outer_scale_k,
-    outer_scale_m,
-    rht_sign,
-    key,
-    **kwargs,
-):
-    return nvfp4_swizzle_tma(
-        input,
-        outer_scale_k,
-        outer_scale_m=outer_scale_m,
-        mode="dim_km",
-        rht_sign=rht_sign,
-        key=key,
-        rounding_mode="stochastic",
-        **kwargs,
-    )
-
-
-NVFP4_SWIZZLE_DIM_K_SR_DIM_M_RHT_SR_TMA = QuantCastCuteRecipe.from_gold(
-    Nvfp4GsSwizzle_DimKSR_DimMRHTSR_Gold,
-    cute_fn=nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_tma,
 )

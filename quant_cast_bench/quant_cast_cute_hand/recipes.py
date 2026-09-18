@@ -38,21 +38,13 @@ from quant_cast_bench.quant_cast_cute_hand.blockscaled_tma_impl import (
     MXFP8_SWIZZLE_SR_V2,
     MXFP8_SWIZZLE_V2,
     NVFP4_DIM_KM_SWIZZLE_TMA,
-    NVFP4_DIM_M_RHT_SWIZZLE_TMA,
-    NVFP4_DIM_M_SWIZZLE_RHT_SR_TMA,
     NVFP4_DIM_M_SWIZZLE_TMA,
-    NVFP4_SWIZZLE_DIM_K_DIM_M_RHT_TMA,
-    NVFP4_SWIZZLE_DIM_K_SR_DIM_M_RHT_SR_TMA,
     NVFP4_SWIZZLE_TMA,
     mxfp4_dim_km_swizzle_v2,
     mxfp4_dim_m_swizzle_v2,
     mxfp4_swizzle_v2,
     nvfp4_dim_km_swizzle_tma,
-    nvfp4_dim_m_rht_swizzle_tma,
-    nvfp4_dim_m_swizzle_rht_sr_tma,
     nvfp4_dim_m_swizzle_tma,
-    nvfp4_swizzle_dim_k_dim_m_rht_tma,
-    nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_tma,
     nvfp4_swizzle_tma,
 )
 from quant_cast_bench.quant_cast_cute_hand.nvfp4_pipelined import (
@@ -80,7 +72,6 @@ from quant_cast_bench.quant_cast_cute_hand.utils import (
     _nvfp4_quantize_fast_groups,
     _nvfp4_quantize_stochastic_x16,
     _nvfp4_quantize_x16,
-    _nvfp4_rht_fwht_x16,
     _nvfp4_scale_e4m3_fast_x2,
     _store_swizzled_scale_groups_as_uint,
     _validate_nvfp4_swizzle_inputs,
@@ -2146,7 +2137,7 @@ MXFP8_SWIZZLE_V5 = QuantCastCuteRecipe.from_gold(
 #   inner = clamp((amax / 6) * outer, e4m3_tiny, 448) -> e4m3
 #   qdata = fp4_rne(input * outer / inner), packed two values per byte
 # The dim-K direct version uses v4-style vector loads for small problems and switches to a
-# row-owned, load-ILP mapping for larger ones. The TMA and pipelined RHT families live in
+# row-owned, load-ILP mapping for larger ones. The non-RHT TMA and RHT pipelined families live in
 # blockscaled_tma_impl.py and nvfp4_pipelined.py, respectively.
 _NVFP4_GROUP = 16
 
@@ -2605,13 +2596,6 @@ ALL_RECIPES = [
     ("nvfp4_swizzle_tma", NVFP4_SWIZZLE_TMA),
     ("nvfp4_dim_m_swizzle_tma", NVFP4_DIM_M_SWIZZLE_TMA),
     ("nvfp4_dim_km_swizzle_tma", NVFP4_DIM_KM_SWIZZLE_TMA),
-    ("nvfp4_dim_m_rht_swizzle_tma", NVFP4_DIM_M_RHT_SWIZZLE_TMA),
-    ("nvfp4_dim_m_swizzle_rht_sr_tma", NVFP4_DIM_M_SWIZZLE_RHT_SR_TMA),
-    ("nvfp4_swizzle_dim_k_dim_m_rht_tma", NVFP4_SWIZZLE_DIM_K_DIM_M_RHT_TMA),
-    (
-        "nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_tma",
-        NVFP4_SWIZZLE_DIM_K_SR_DIM_M_RHT_SR_TMA,
-    ),
     (
         "nvfp4_dim_m_rht_swizzle_pipelined",
         NVFP4_DIM_M_RHT_SWIZZLE_PIPELINED,

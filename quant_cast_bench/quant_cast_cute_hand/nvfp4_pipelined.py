@@ -15,11 +15,9 @@ from torch._native.instrumentation import instrumented_cutedsl_cache
 from torch._vendor.quack.cache import EXTRA_SOURCE_DIRS
 
 from quant_cast_bench.quant_cast_cute.recipes import QuantCastCuteRecipe
-from quant_cast_bench.quant_cast_cute_hand.blockscaled_tma_kernels import (
+from quant_cast_bench.quant_cast_cute_hand.utils import (
     _NVFP4_DIRECT_HALF,
     _NVFP4_GROUP,
-)
-from quant_cast_bench.quant_cast_cute_hand.utils import (
     _allocate_nvfp4_swizzle_outputs,
     _ceil_div,
     _nvfp4_load_philox_key,
