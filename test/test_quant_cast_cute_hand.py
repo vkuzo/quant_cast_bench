@@ -844,6 +844,53 @@ def test_nvfp4_swizzle_tma_rejects_rht_argument():
         nvfp4_swizzle_tma(x, outer_scale, rht_sign=rht_sign)
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize(
+    "mode,M,K,expected_shapes",
+    [
+        ("dim_k", 0, 32, ((0, 16), (0, 1, 32, 16))),
+        ("dim_k", 1, 0, ((1, 0), (1, 0, 32, 16))),
+        ("dim_m", 0, 16, ((16, 0), (1, 0, 32, 16))),
+        ("dim_m", 32, 0, ((0, 16), (0, 1, 32, 16))),
+        (
+            "dim_km",
+            0,
+            32,
+            ((0, 16), (0, 1, 32, 16), (32, 0), (1, 0, 32, 16)),
+        ),
+        (
+            "dim_km",
+            32,
+            0,
+            ((32, 0), (1, 0, 32, 16), (0, 16), (0, 1, 32, 16)),
+        ),
+        ("dim_km", 0, 0, ((0, 0), (0, 0, 32, 16)) * 2),
+    ],
+)
+def test_nvfp4_swizzle_tma_empty(dtype, mode, M, K, expected_shapes):
+    x = torch.empty(M, K, dtype=dtype, device="cuda")
+    outer_scale = torch.ones(1, dtype=torch.float32, device=x.device)
+    outputs = nvfp4_swizzle_tma(
+        x,
+        outer_scale,
+        outer_scale_m=outer_scale if mode == "dim_km" else None,
+        mode=mode,
+    )
+
+    assert tuple(output.shape for output in outputs) == expected_shapes
+    assert all(output.numel() == 0 for output in outputs)
+    assert tuple(output.dtype for output in outputs) == (
+        (torch.float4_e2m1fn_x2, torch.float8_e4m3fn)
+        if mode != "dim_km"
+        else (
+            torch.float4_e2m1fn_x2,
+            torch.float8_e4m3fn,
+            torch.float4_e2m1fn_x2,
+            torch.float8_e4m3fn,
+        )
+    )
+
+
 @pytest.mark.parametrize(
     "kernel,M,K",
     [

@@ -123,7 +123,6 @@ def _blockscaled_tma_impl_on_current_device(
             f"got shape ({M}, {K})"
         )
     if is_nvfp4:
-        assert M > 0 and K > 0, "nvfp4_swizzle_tma requires non-empty dimensions"
         k_multiple = 32 if do_dim_k else 16
         assert K % k_multiple == 0, (
             f"nvfp4_swizzle_tma requires K % {k_multiple} == 0"
@@ -166,6 +165,7 @@ def _blockscaled_tma_impl_on_current_device(
     scale_group_size = 16 if is_nvfp4 else 32
     qdata_k_divisor = 2 if is_packed_fp4_qdata else 1
     qdata_storage_dtype = torch.uint8 if is_packed_fp4_qdata else qdata_dtype
+    scale_dtype = torch.float8_e4m3fn if is_nvfp4 else torch.float8_e8m0fnu
 
     nrb_k = ncb_k = None
     if do_dim_k:
@@ -179,7 +179,7 @@ def _blockscaled_tma_impl_on_current_device(
 
     # CUDA cannot launch a zero-sized grid. Return the correctly oriented empty
     # tensors directly, preserving the padded scale layout in every mode.
-    if not is_nvfp4 and (M == 0 or K == 0):
+    if M == 0 or K == 0:
         output_k = scale_k = None
         if do_dim_k:
             output_k = torch.empty(
@@ -190,7 +190,7 @@ def _blockscaled_tma_impl_on_current_device(
             )
             scale_k = torch.empty(
                 nrb_k, ncb_k, 32, 16, dtype=torch.uint8, device=input.device
-            ).view(torch.float8_e8m0fnu)
+            ).view(scale_dtype)
 
         output_m = scale_m = None
         if do_dim_m:
@@ -202,7 +202,7 @@ def _blockscaled_tma_impl_on_current_device(
             )
             scale_m = torch.empty(
                 nrb_m, ncb_m, 32, 16, dtype=torch.uint8, device=input.device
-            ).view(torch.float8_e8m0fnu)
+            ).view(scale_dtype)
 
         if is_packed_fp4_qdata:
             if do_dim_k:
@@ -295,7 +295,6 @@ def _blockscaled_tma_impl_on_current_device(
         K,
     )
 
-    scale_dtype = torch.float8_e4m3fn if is_nvfp4 else torch.float8_e8m0fnu
     if do_dim_m:
         scale_m = scale_m.view(nrb_m, ncb_m, 32, 16).view(scale_dtype)
     if do_dim_k:
