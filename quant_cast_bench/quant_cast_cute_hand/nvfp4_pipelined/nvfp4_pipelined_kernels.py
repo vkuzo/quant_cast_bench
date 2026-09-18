@@ -1,4 +1,4 @@
-"""Persistent TMA/UMMA NVFP4 RHT kernels and recipe definitions."""
+"""CuTe DSL kernels and compilation for persistent TMA/UMMA NVFP4 RHT quantization."""
 
 from pathlib import Path
 
@@ -10,30 +10,20 @@ import cutlass.utils as utils
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
-import torch
 from torch._native.instrumentation import instrumented_cutedsl_cache
 from torch._vendor.quack.cache import EXTRA_SOURCE_DIRS
 
-from quant_cast_bench.quant_cast_cute.recipes import QuantCastCuteRecipe
 from quant_cast_bench.quant_cast_cute_hand.utils import (
     _NVFP4_DIRECT_HALF,
     _NVFP4_GROUP,
-    _allocate_nvfp4_swizzle_outputs,
     _ceil_div,
     _nvfp4_load_philox_key,
     _nvfp4_quantize_fast_groups,
     _store_swizzled_scale_groups_as_uint,
-    _validate_nvfp4_swizzle_inputs,
-)
-from quant_cast_bench.quant_cast_gold.recipes import (
-    Nvfp4GsDimMSwizzleRHTSRGold,
-    Nvfp4GsSwizzle_DimK_DimMRHT_Gold,
-    Nvfp4GsSwizzle_DimKSR_DimMRHTSR_Gold,
-    Nvfp4GsSwizzleDimMRHTGold,
 )
 
 
-_NVFP4_PIPELINED_SOURCE_DIR = Path(__file__).resolve().parent
+_NVFP4_PIPELINED_SOURCE_DIR = Path(__file__).resolve().parent.parent
 if _NVFP4_PIPELINED_SOURCE_DIR not in EXTRA_SOURCE_DIRS:
     EXTRA_SOURCE_DIRS.append(_NVFP4_PIPELINED_SOURCE_DIR)
 
@@ -849,211 +839,3 @@ def _compile_nvfp4_rht_pipelined(
         options="--enable-tvm-ffi",
     )
 
-
-def _nvfp4_rht_pipelined_on_current_device(
-    input,
-    outer_scale_m,
-    rht_sign,
-    key=None,
-    *,
-    outer_scale_k=None,
-    stochastic,
-    do_dim_k,
-):
-    M, N = _validate_nvfp4_swizzle_inputs(
-        input, outer_scale_m, "nvfp4 RHT pipelined", 32
-    )
-    assert M % 128 == 0 and N % 128 == 0, (
-        "nvfp4 RHT pipelined requires M % 128 == 0 and K % 128 == 0"
-    )
-    assert outer_scale_m.device == input.device
-    assert outer_scale_m.dtype == torch.float32 and outer_scale_m.numel() == 1
-    if do_dim_k:
-        assert outer_scale_k is not None
-        assert outer_scale_k.device == input.device
-        assert outer_scale_k.dtype == torch.float32
-        assert outer_scale_k.numel() == 1
-    else:
-        assert outer_scale_k is None
-    assert rht_sign.shape == (16,)
-    assert rht_sign.dtype == torch.bfloat16 and rht_sign.device == input.device
-    assert rht_sign.is_contiguous()
-    if stochastic:
-        assert key is not None, "stochastic rounding requires a key"
-        assert key.device == input.device
-        assert key.dtype == torch.uint64 and key.numel() == 2
-    else:
-        assert key is None
-
-    if do_dim_k:
-        output_k, scale_k, nrb_k, ncb_k = (
-            _allocate_nvfp4_swizzle_outputs(input, M, N)
-        )
-    else:
-        output_k = None
-        scale_k = None
-        nrb_k = None
-        ncb_k = None
-    output_m, scale_m, nrb_m, ncb_m = _allocate_nvfp4_swizzle_outputs(
-        input, N, M
-    )
-    tiles_m = M // 128
-    tiles_n = N // 128
-    # Amortize fixed RHT/TMEM setup while retaining at least 128 CTAs. Dim-M-only SR benefits from
-    # a longer persistent run because it has no row-warp consumer and more epilogue work per tile.
-    max_tiles_per_cta = 32 if stochastic and not do_dim_k else 16
-    min_ctas = 128
-    tiles_per_cta = next(
-        candidate
-        for candidate in (32, 16, 8, 4, 2, 1)
-        if candidate <= max_tiles_per_cta
-        and tiles_n % candidate == 0
-        and (candidate == 1 or tiles_m * tiles_n // candidate >= min_ctas)
-    )
-    seed = key.reshape(-1).view(torch.int64) if stochastic else None
-    fn = _compile_nvfp4_rht_pipelined(
-        stochastic,
-        do_dim_k,
-        tiles_per_cta,
-    )
-    fn(
-        input,
-        output_k,
-        scale_k,
-        outer_scale_k.reshape(1) if do_dim_k else None,
-        output_m,
-        scale_m,
-        outer_scale_m.reshape(1),
-        rht_sign,
-        seed,
-        M,
-        N,
-    )
-    outputs_m = (
-        output_m.view(torch.float4_e2m1fn_x2),
-        scale_m.view(nrb_m, ncb_m, 32, 16).view(torch.float8_e4m3fn),
-    )
-    if not do_dim_k:
-        return outputs_m
-    return (
-        output_k.view(torch.float4_e2m1fn_x2),
-        scale_k.view(nrb_k, ncb_k, 32, 16).view(torch.float8_e4m3fn),
-        *outputs_m,
-    )
-
-
-def _nvfp4_rht_pipelined(
-    input,
-    outer_scale_m,
-    rht_sign,
-    key=None,
-    *,
-    outer_scale_k=None,
-    stochastic,
-    do_dim_k,
-):
-    device = input.get_device()
-
-    def launch_on_current_device():
-        return _nvfp4_rht_pipelined_on_current_device(
-            input,
-            outer_scale_m,
-            rht_sign,
-            key,
-            outer_scale_k=outer_scale_k,
-            stochastic=stochastic,
-            do_dim_k=do_dim_k,
-        )
-
-    if device == torch.cuda.current_device():
-        return launch_on_current_device()
-    with torch.cuda.device(device):
-        return launch_on_current_device()
-
-
-def nvfp4_swizzle_dim_k_dim_m_rht_pipelined(
-    input, outer_scale_k, outer_scale_m, rht_sign, **kwargs
-):
-    return _nvfp4_rht_pipelined(
-        input,
-        outer_scale_m,
-        rht_sign,
-        outer_scale_k=outer_scale_k,
-        stochastic=False,
-        do_dim_k=True,
-    )
-
-
-NVFP4_SWIZZLE_DIM_K_DIM_M_RHT_PIPELINED = QuantCastCuteRecipe.from_gold(
-    Nvfp4GsSwizzle_DimK_DimMRHT_Gold,
-    cute_fn=nvfp4_swizzle_dim_k_dim_m_rht_pipelined,
-)
-
-
-def nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_pipelined(
-    input,
-    outer_scale_k,
-    outer_scale_m,
-    rht_sign,
-    key,
-    **kwargs,
-):
-    return _nvfp4_rht_pipelined(
-        input,
-        outer_scale_m,
-        rht_sign,
-        key,
-        outer_scale_k=outer_scale_k,
-        stochastic=True,
-        do_dim_k=True,
-    )
-
-
-NVFP4_SWIZZLE_DIM_K_SR_DIM_M_RHT_SR_PIPELINED = QuantCastCuteRecipe.from_gold(
-    Nvfp4GsSwizzle_DimKSR_DimMRHTSR_Gold,
-    cute_fn=nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_pipelined,
-)
-
-
-def nvfp4_dim_m_rht_swizzle_pipelined(
-    input,
-    outer_scale,
-    rht_sign,
-    **kwargs,
-):
-    return _nvfp4_rht_pipelined(
-        input,
-        outer_scale,
-        rht_sign,
-        stochastic=False,
-        do_dim_k=False,
-    )
-
-
-NVFP4_DIM_M_RHT_SWIZZLE_PIPELINED = QuantCastCuteRecipe.from_gold(
-    Nvfp4GsSwizzleDimMRHTGold,
-    cute_fn=nvfp4_dim_m_rht_swizzle_pipelined,
-)
-
-
-def nvfp4_dim_m_swizzle_rht_sr_pipelined(
-    input,
-    outer_scale,
-    rht_sign,
-    key,
-    **kwargs,
-):
-    return _nvfp4_rht_pipelined(
-        input,
-        outer_scale,
-        rht_sign,
-        key,
-        stochastic=True,
-        do_dim_k=False,
-    )
-
-
-NVFP4_DIM_M_SWIZZLE_RHT_SR_PIPELINED = QuantCastCuteRecipe.from_gold(
-    Nvfp4GsDimMSwizzleRHTSRGold,
-    cute_fn=nvfp4_dim_m_swizzle_rht_sr_pipelined,
-)

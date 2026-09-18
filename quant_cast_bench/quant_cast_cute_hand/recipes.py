@@ -47,7 +47,7 @@ from quant_cast_bench.quant_cast_cute_hand.blockscaled_tma.blockscaled_tma_impl 
     nvfp4_dim_m_swizzle_tma,
     nvfp4_swizzle_tma,
 )
-from quant_cast_bench.quant_cast_cute_hand.nvfp4_pipelined import (
+from quant_cast_bench.quant_cast_cute_hand.nvfp4_pipelined.nvfp4_pipelined_impl import (
     NVFP4_DIM_M_RHT_SWIZZLE_PIPELINED,
     NVFP4_DIM_M_SWIZZLE_RHT_SR_PIPELINED,
     NVFP4_SWIZZLE_DIM_K_DIM_M_RHT_PIPELINED,
@@ -2138,7 +2138,7 @@ MXFP8_SWIZZLE_V5 = QuantCastCuteRecipe.from_gold(
 #   qdata = fp4_rne(input * outer / inner), packed two values per byte
 # The dim-K direct version uses v4-style vector loads for small problems and switches to a
 # row-owned, load-ILP mapping for larger ones. The non-RHT TMA and RHT pipelined families live in
-# blockscaled_tma/blockscaled_tma_impl.py and nvfp4_pipelined.py, respectively.
+# blockscaled_tma/ and nvfp4_pipelined/, respectively.
 _NVFP4_GROUP = 16
 
 _NVFP4_DIRECT_VPT = 16

@@ -44,9 +44,11 @@ if HAS_CUTEDSL:
     from quant_cast_bench.quant_cast_cute_hand.blockscaled_tma.blockscaled_tma_kernels import (
         _compile_blockscaled_tma,
     )
-    from quant_cast_bench.quant_cast_cute_hand.nvfp4_pipelined import (
-        _compile_nvfp4_rht_pipelined,
+    from quant_cast_bench.quant_cast_cute_hand.nvfp4_pipelined.nvfp4_pipelined_impl import (
         nvfp4_swizzle_dim_k_dim_m_rht_pipelined,
+    )
+    from quant_cast_bench.quant_cast_cute_hand.nvfp4_pipelined.nvfp4_pipelined_kernels import (
+        _compile_nvfp4_rht_pipelined,
     )
     from quant_cast_bench.quant_cast_cute_hand.recipes import (
         ALL_RECIPES,
