@@ -11,6 +11,7 @@ PYTHONUNBUFFERED=1 python "${script_dir}/benchmark_transformer_engine.py" \
   --M 2048,3072,4096,6144,8192,12288,16384,24576 \
   --K 2048,3072,4096,6144,8192,12288,16384,24576 \
   --mk_mode pair \
+  --dtype bfloat16 \
   --csv_output "${csv_path}"
 python "${script_dir}/plot_transformer_engine_comparison.py" \
   --csv "${csv_path}" \

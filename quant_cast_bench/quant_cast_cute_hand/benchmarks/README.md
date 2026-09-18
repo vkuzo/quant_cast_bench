@@ -2,15 +2,18 @@
 
 ## Performance versus TransformerEngine
 
-The charts report logical throughput for BF16 square inputs on B200. Each panel compares
+The charts report logical throughput for BF16 square inputs on B200, and every panel
+labels its input dtype explicitly. Each panel compares
 matching kernels exposed by `benchmark_transformer_engine.py`. CuTe-hand results are blue,
 TransformerEngine results are red, RTNE is solid, and stochastic rounding is dashed. RHT
 and non-RHT kernels remain in separate panels. A missing red SR line means that
-TransformerEngine has no comparable stochastic MXFP8 implementation. The MXFP8 comparisons
+TransformerEngine has no comparable implementation for that recipe. The MXFP8 comparisons
 include both the conventional 1x32 scale blocks and the 32x32 scale blocks used by
-`mxfp8_32x32_swizzle_v2`. Panels are grouped into MXFP8 and NVFP4 sections. RHT recipes
-use the pipelined kernel family; the NVFP4 section includes shared RTNE/SR panels for its
-dim-M and dim-KM variants.
+`mxfp8_32x32_swizzle_v2`. The MXFP4 section includes dim-K, dim-M, and dim-KM CuTe-hand
+measurements; the installed TransformerEngine has no comparable optimized MXFP4 quantizer,
+so those panels explicitly mark the TE result as unavailable. Panels are grouped into
+MXFP8, MXFP4, and NVFP4 sections. RHT recipes use the pipelined kernel family; the NVFP4
+section includes shared RTNE/SR panels for its dim-M and dim-KM variants.
 
 ![CuTe-hand versus TransformerEngine throughput](transformer_engine_comparison.png)
 
@@ -28,10 +31,13 @@ figure with Matplotlib.
 
 ## Performance versus MSLK
 
-This chart compares the CuTe-hand TMA NVFP4 Dim-K kernel with MSLK's dense Triton
-NVFP4 kernel on BF16 square inputs. Both kernels receive the same precomputed global
-scale, produce bitwise-identical packed FP4 data and swizzled scale bytes, and are
-reported using the same logical byte count. CuTe hand is blue and MSLK is red.
+These charts compare the CuTe-hand TMA dim-K kernels with MSLK's dense Triton kernels
+for both MXFP4 and NVFP4. Every panel explicitly labels the input dtype as BF16. The
+NVFP4 kernels receive the same precomputed global scale and produce bitwise-identical
+packed FP4 data and swizzled scale bytes. The MXFP4 kernels implement the same 1x32
+E2M1/E8M0 quantization class but use different scale-selection conventions, so the
+benchmark validates both through dequantized SQNR rather than bitwise equality. All
+results use the same logical byte count; CuTe hand is blue and MSLK is red.
 
 ![CuTe-hand versus MSLK throughput](mslk_comparison.png)
 

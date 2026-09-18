@@ -26,9 +26,9 @@ def _is_true(value: str) -> bool:
 
 
 def _implementation(kernel: str, family: str) -> str:
-    if family == "mxfp8":
+    if family in ("mxfp8", "mxfp4"):
         implementation = kernel.rsplit("_", 1)[-1]
-        if "32x32" in kernel:
+        if family == "mxfp8" and "32x32" in kernel:
             return f"32x32_{implementation}"
         return implementation
     return "pipelined" if kernel.endswith("_pipelined") else "tma"
@@ -63,7 +63,11 @@ def _read_results(
 
 def _section_name(variants: dict[bool, list[dict[str, str]]]) -> str:
     family = next(iter(next(iter(variants.values()))))["family"]
-    return "MXFP8" if family == "mxfp8" else "NVFP4"
+    return {
+        "mxfp8": "MXFP8",
+        "mxfp4": "MXFP4",
+        "nvfp4": "NVFP4",
+    }[family]
 
 
 def _plot_chart(
@@ -75,6 +79,15 @@ def _plot_chart(
     shape_to_x = {shape: index for index, shape in enumerate(shapes)}
     titles = []
     missing_te_rounding = []
+    input_dtypes = {
+        row.get("dtype", "bfloat16")
+        for rows in variants.values()
+        for row in rows
+    }
+    if input_dtypes != {"bfloat16"}:
+        raise ValueError(
+            f"README charts require BF16 inputs, got {sorted(input_dtypes)}"
+        )
 
     for stochastic in (False, True):
         rows = variants.get(stochastic)
@@ -121,7 +134,9 @@ def _plot_chart(
             transform=axis.transAxes,
         )
 
-    axis.set_title("\n".join(titles), fontsize=TITLE_FONT_SIZE)
+    axis.set_title(
+        "\n".join((*titles, "Input dtype: BF16")), fontsize=TITLE_FONT_SIZE
+    )
     axis.set_xticks(range(len(shapes)), [str(shape) for shape in shapes])
     axis.set_xlabel("M == K", fontsize=LABEL_FONT_SIZE)
     axis.set_ylabel("TB/s", fontsize=LABEL_FONT_SIZE)
@@ -143,7 +158,7 @@ def _plot_chart(
 def plot(csv_path: Path, output_path: Path) -> None:
     charts = _read_results(csv_path)
     column_count = 2
-    section_order = ("MXFP8", "NVFP4")
+    section_order = ("MXFP8", "MXFP4", "NVFP4")
     sections = {
         name: [
             variants

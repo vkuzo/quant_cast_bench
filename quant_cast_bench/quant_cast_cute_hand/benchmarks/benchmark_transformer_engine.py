@@ -26,6 +26,9 @@ from torch._inductor.utils import _do_bench_using_profiling
 from transformer_engine.pytorch import MXFP8Quantizer, NVFP4Quantizer
 
 from quant_cast_bench.quant_cast_cute_hand.blockscaled_tma.blockscaled_tma_impl import (
+    mxfp4_dim_km_swizzle_v2,
+    mxfp4_dim_m_swizzle_v2,
+    mxfp4_swizzle_v2,
     mxfp8_32x32_swizzle_v2,
     mxfp8_swizzle_v2,
 )
@@ -68,8 +71,14 @@ def _logical_bytes(
     M: int, K: int, family: str, mode: str, input_element_size: int
 ) -> int:
     numel = M * K
-    qbytes = numel if family == "mxfp8" else numel // 2
-    group = 32 if family == "mxfp8" else 16
+    if family == "mxfp8":
+        qbytes, group = numel, 32
+    elif family == "mxfp4":
+        qbytes, group = numel // 2, 32
+    elif family == "nvfp4":
+        qbytes, group = numel // 2, 16
+    else:
+        raise ValueError(f"unsupported quantization family: {family}")
     total = input_element_size * numel
     if mode in ("dim_k", "dim_km"):
         total += qbytes + _scale_bytes(M, K, group, dim_m=False)
@@ -122,6 +131,12 @@ def _make_ours(name: str, x: torch.Tensor):
         return lambda: mxfp8_swizzle_v2(
             x, quant_orientation="dim_km", key=key, rounding_mode="stochastic"
         )
+    if name == "mxfp4_swizzle_v2":
+        return lambda: mxfp4_swizzle_v2(x)
+    if name == "mxfp4_dim_m_swizzle_v2":
+        return lambda: mxfp4_dim_m_swizzle_v2(x)
+    if name == "mxfp4_dim_km_swizzle_v2":
+        return lambda: mxfp4_dim_km_swizzle_v2(x)
     if name == "nvfp4_swizzle_direct":
         return lambda: nvfp4_swizzle_direct(x, outer)
     if name == "nvfp4_swizzle_tma":
@@ -168,6 +183,11 @@ def _make_te(
         quantizer.optimize_for_gemm = True
         output = quantizer.make_empty(x.shape, dtype=x.dtype, device=x.device)
         return lambda: quantizer.update_quantized(x, output)
+
+    if family != "nvfp4":
+        raise ValueError(
+            f"TransformerEngine has no comparable {family} quantizer"
+        )
 
     quantizer = NVFP4Quantizer(
         fp4_dtype=tex.DType.kFloat4E2M1,
@@ -221,11 +241,14 @@ CASES = (
 )
 
 # These are useful CuTe-hand measurements, but TransformerEngine has no matching
-# stochastic MXFP8 API to put on the other side of the comparison.
+# optimized API to put on the other side of the comparison.
 NO_TE_CASES = (
     ("mxfp8_swizzle_sr_v2", "mxfp8", "dim_k", False, True),
     ("mxfp8_dim_m_swizzle_sr_v2", "mxfp8", "dim_m", False, True),
     ("mxfp8_dim_km_swizzle_sr_v2", "mxfp8", "dim_km", False, True),
+    ("mxfp4_swizzle_v2", "mxfp4", "dim_k", False, False),
+    ("mxfp4_dim_m_swizzle_v2", "mxfp4", "dim_m", False, False),
+    ("mxfp4_dim_km_swizzle_v2", "mxfp4", "dim_km", False, False),
 )
 
 ALL_CASES = CASES + NO_TE_CASES
@@ -238,6 +261,9 @@ KERNELS_SUPPORTING_FLOAT16_AND_FLOAT32 = frozenset({
     "mxfp8_dim_m_swizzle_sr_v2",
     "mxfp8_dim_km_swizzle_v2",
     "mxfp8_dim_km_swizzle_sr_v2",
+    "mxfp4_swizzle_v2",
+    "mxfp4_dim_m_swizzle_v2",
+    "mxfp4_dim_km_swizzle_v2",
     "nvfp4_swizzle_tma",
     "nvfp4_dim_m_swizzle_tma",
     "nvfp4_dim_km_swizzle_tma",

@@ -59,6 +59,7 @@ _MODEL_SHAPES = {
 
 CSV_FIELDS = (
     "kernel",
+    "dtype",
     "family",
     "mode",
     "M",
@@ -174,7 +175,7 @@ def _parse_kernels(value: str) -> list[str]:
     shapes_for_model=str,
 )
 def main(
-    kernel: str = "nvfp4_swizzle_tma",
+    kernel: str = ",".join(_KERNELS),
     M: str | None = None,
     K: str | None = None,
     mk_mode: str | None = None,
@@ -289,7 +290,7 @@ def main(
                     else ""
                 )
                 print(
-                    f"{name:48s} {M:5d}x{K:<5d} "
+                    f"{name:48s} {M:5d}x{K:<5d} dtype=bfloat16 "
                     f"ours={ours_ms:.4f} ms/{ours_tb_s:.3f} TB/s "
                     f"MSLK={mslk_ms:.4f} ms/{mslk_tb_s:.3f} TB/s "
                     f"speedup={speedup:.3f}x{sqnr_summary}",
@@ -300,6 +301,7 @@ def main(
                     csv_writer.writerow(
                         {
                             "kernel": name,
+                            "dtype": "bfloat16",
                             "family": family,
                             "mode": "dim_k",
                             "M": M,
