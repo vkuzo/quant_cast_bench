@@ -45,7 +45,7 @@ if HAS_CUTEDSL:
         _compile_blockscaled_tma,
     )
     from quant_cast_bench.quant_cast_cute_hand.nvfp4_pipelined import (
-        _compile_nvfp4_swizzle_dim_k_dim_m_rht_pipelined,
+        _compile_nvfp4_rht_pipelined,
         nvfp4_swizzle_dim_k_dim_m_rht_pipelined,
     )
     from quant_cast_bench.quant_cast_cute_hand.recipes import (
@@ -97,6 +97,8 @@ _REQUIRES_SM100 = frozenset({
     "nvfp4_dim_km_swizzle_tma",
     "nvfp4_swizzle_dim_k_dim_m_rht_tma",
     "nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_tma",
+    "nvfp4_dim_m_rht_swizzle_pipelined",
+    "nvfp4_dim_m_swizzle_rht_sr_pipelined",
     "nvfp4_swizzle_dim_k_dim_m_rht_pipelined",
     "nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_pipelined",
 })
@@ -353,7 +355,7 @@ def test_nvfp4_pipelined_dynamic_shapes_share_compile_cache():
         rht_sign,
     )
     after_first = (
-        _compile_nvfp4_swizzle_dim_k_dim_m_rht_pipelined.cache_info()
+        _compile_nvfp4_rht_pipelined.cache_info()
     )
     nvfp4_swizzle_dim_k_dim_m_rht_pipelined(
         x1,
@@ -362,7 +364,7 @@ def test_nvfp4_pipelined_dynamic_shapes_share_compile_cache():
         rht_sign,
     )
     after_second = (
-        _compile_nvfp4_swizzle_dim_k_dim_m_rht_pipelined.cache_info()
+        _compile_nvfp4_rht_pipelined.cache_info()
     )
 
     assert after_second.currsize == after_first.currsize
@@ -764,6 +766,32 @@ def test_mxfp8_dim_km_swizzle_rejects_partial_group(kernel):
 @pytest.mark.parametrize(
     "kernel,M,K",
     [
+        ("nvfp4_dim_m_rht_swizzle_pipelined", 256, 384),
+        ("nvfp4_dim_m_rht_swizzle_pipelined", 384, 256),
+        ("nvfp4_dim_m_swizzle_rht_sr_pipelined", 256, 384),
+        ("nvfp4_dim_m_swizzle_rht_sr_pipelined", 384, 256),
+    ],
+)
+def test_nvfp4_dim_m_rht_pipelined(kernel, M, K):
+    if torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip(f"{kernel} emits Blackwell-only PTX; requires cuda capability 10.0")
+    recipe = _get_recipe(kernel)
+    cute_inputs, gold_inputs = _nvfp4_dim_m_rht_test_inputs(
+        M,
+        K,
+        stochastic="swizzle_rht_sr" in kernel,
+    )
+    outputs = recipe.cute_fn(*cute_inputs)
+    assert tuple(output.shape for output in outputs) == (
+        (K, M // 2),
+        (K // 128, M // 64, 32, 16),
+    )
+    recipe.correctness_fn(gold_inputs, outputs)
+
+
+@pytest.mark.parametrize(
+    "kernel,M,K",
+    [
         ("nvfp4_swizzle_direct", 1, 16),
         ("nvfp4_swizzle_direct", 128, 64),
         ("nvfp4_swizzle_direct", 33, 80),
@@ -887,17 +915,28 @@ def test_nvfp4_dim_m_tma_padding(kernel, M, K):
         ("nvfp4_swizzle_dim_k_dim_m_rht_pipelined", 128, 160),
         ("nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_pipelined", 96, 128),
         ("nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_pipelined", 128, 160),
+        ("nvfp4_dim_m_rht_swizzle_pipelined", 96, 128),
+        ("nvfp4_dim_m_rht_swizzle_pipelined", 128, 160),
+        ("nvfp4_dim_m_swizzle_rht_sr_pipelined", 96, 128),
+        ("nvfp4_dim_m_swizzle_rht_sr_pipelined", 128, 160),
     ],
 )
 def test_nvfp4_rht_pipelined_requires_full_tiles(kernel, M, K):
     if torch.cuda.get_device_capability() != (10, 0):
         pytest.skip(f"{kernel} emits Blackwell-only PTX; requires cuda capability 10.0")
     recipe = _get_recipe(kernel)
-    cute_inputs, _ = _nvfp4_dim_km_rht_test_inputs(
-        M,
-        K,
-        stochastic="_sr_dim_m_" in kernel,
-    )
+    if "dim_k" in kernel:
+        cute_inputs, _ = _nvfp4_dim_km_rht_test_inputs(
+            M,
+            K,
+            stochastic="_sr_dim_m_" in kernel,
+        )
+    else:
+        cute_inputs, _ = _nvfp4_dim_m_rht_test_inputs(
+            M,
+            K,
+            stochastic="_sr_pipelined" in kernel,
+        )
     with pytest.raises(AssertionError, match="M % 128.*K % 128"):
         recipe.cute_fn(*cute_inputs)
 
@@ -1058,11 +1097,13 @@ def test_cute_hand_matches_reference(name, recipe, dtype):
     elif name in (
         "nvfp4_dim_m_rht_swizzle_tma",
         "nvfp4_dim_m_swizzle_rht_sr_tma",
+        "nvfp4_dim_m_rht_swizzle_pipelined",
+        "nvfp4_dim_m_swizzle_rht_sr_pipelined",
     ):
         cute_inputs, gold_inputs = _nvfp4_dim_m_rht_test_inputs(
             512,
             512,
-            stochastic=name == "nvfp4_dim_m_swizzle_rht_sr_tma",
+            stochastic="swizzle_rht_sr" in name,
         )
     else:
         cute_inputs = gold_inputs = recipe.example_input_fn(512, 512, dtype)

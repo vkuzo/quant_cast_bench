@@ -35,7 +35,9 @@ from quant_cast_bench.quant_cast_cute_hand.recipes import (
     mxfp8_swizzle_v4,
     mxfp8_swizzle_v5,
     nvfp4_dim_km_swizzle_tma,
+    nvfp4_dim_m_rht_swizzle_pipelined,
     nvfp4_dim_m_rht_swizzle_tma,
+    nvfp4_dim_m_swizzle_rht_sr_pipelined,
     nvfp4_dim_m_swizzle_rht_sr_tma,
     nvfp4_dim_m_swizzle_tma,
     nvfp4_swizzle_dim_k_dim_m_rht_tma,
@@ -134,8 +136,14 @@ def _make_ours(name: str, x: torch.Tensor):
         return lambda: nvfp4_dim_km_swizzle_tma(x, outer, outer)
     if name == "nvfp4_dim_m_rht_swizzle_tma":
         return lambda: nvfp4_dim_m_rht_swizzle_tma(x, outer, sign)
+    if name == "nvfp4_dim_m_rht_swizzle_pipelined":
+        return lambda: nvfp4_dim_m_rht_swizzle_pipelined(x, outer, sign)
     if name == "nvfp4_dim_m_swizzle_rht_sr_tma":
         return lambda: nvfp4_dim_m_swizzle_rht_sr_tma(x, outer, sign, key)
+    if name == "nvfp4_dim_m_swizzle_rht_sr_pipelined":
+        return lambda: nvfp4_dim_m_swizzle_rht_sr_pipelined(
+            x, outer, sign, key
+        )
     if name == "nvfp4_swizzle_dim_k_dim_m_rht_tma":
         return lambda: nvfp4_swizzle_dim_k_dim_m_rht_tma(x, outer, outer, sign)
     if name == "nvfp4_swizzle_dim_k_dim_m_rht_pipelined":
@@ -203,7 +211,15 @@ CASES = (
     ("nvfp4_dim_m_swizzle_tma", "nvfp4", "dim_m", False, False),
     ("nvfp4_dim_km_swizzle_tma", "nvfp4", "dim_km", False, False),
     ("nvfp4_dim_m_rht_swizzle_tma", "nvfp4", "dim_m", True, False),
+    ("nvfp4_dim_m_rht_swizzle_pipelined", "nvfp4", "dim_m", True, False),
     ("nvfp4_dim_m_swizzle_rht_sr_tma", "nvfp4", "dim_m", True, True),
+    (
+        "nvfp4_dim_m_swizzle_rht_sr_pipelined",
+        "nvfp4",
+        "dim_m",
+        True,
+        True,
+    ),
     ("nvfp4_swizzle_dim_k_dim_m_rht_tma", "nvfp4", "dim_km", True, False),
     (
         "nvfp4_swizzle_dim_k_dim_m_rht_pipelined",

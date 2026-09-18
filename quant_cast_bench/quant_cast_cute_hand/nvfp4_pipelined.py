@@ -28,8 +28,10 @@ from quant_cast_bench.quant_cast_cute_hand.utils import (
     _validate_nvfp4_swizzle_inputs,
 )
 from quant_cast_bench.quant_cast_gold.recipes import (
+    Nvfp4GsDimMSwizzleRHTSRGold,
     Nvfp4GsSwizzle_DimK_DimMRHT_Gold,
     Nvfp4GsSwizzle_DimKSR_DimMRHTSR_Gold,
+    Nvfp4GsSwizzleDimMRHTGold,
 )
 
 
@@ -56,11 +58,15 @@ class _Nvfp4UmmaPipelineStorage:
 
 
 class _Nvfp4UmmaPipelinedRht:
-    """Persistent Blackwell TMA/UMMA kernel modeled after TransformerEngine's RHT fusion."""
+    """Persistent Blackwell RHT kernel with an unconditional dim-M path and optional dim-K path."""
 
-    def __init__(self, stochastic: bool, tiles_per_cta: int):
+    def __init__(self, stochastic: bool, do_dim_k: bool, tiles_per_cta: int):
         self.stochastic = stochastic
+        self.do_dim_k = do_dim_k
         self.tiles_per_cta = tiles_per_cta
+        # Dim-M-only SR needs one fewer input stage; the saved shared memory outweighs its slightly
+        # shorter TMA lookahead. Every other specialization benefits from four stages.
+        self.input_stages = 3 if stochastic and not do_dim_k else 4
         self.acc_stages = 1 if stochastic else 2
         self.mma_tiler = (128, 16, 128)
         self.cta_tile_shape_mnk = (128, 16, 16)
@@ -96,9 +102,9 @@ class _Nvfp4UmmaPipelinedRht:
     def __call__(
         self,
         mInput: cute.Tensor,
-        mOutputK: cute.Tensor,
-        mScaleK: cute.Tensor,
-        mOuterScaleK: cute.Tensor,
+        mOutputK: cute.Tensor | None,
+        mScaleK: cute.Tensor | None,
+        mOuterScaleK: cute.Tensor | None,
         mOutputM: cute.Tensor,
         mScaleM: cute.Tensor,
         mOuterScaleM: cute.Tensor,
@@ -108,6 +114,14 @@ class _Nvfp4UmmaPipelinedRht:
         M: cutlass.Int32,
         N: cutlass.Int32,
     ) -> None:
+        if cutlass.const_expr(self.do_dim_k):
+            assert mOutputK is not None
+            assert mScaleK is not None
+            assert mOuterScaleK is not None
+        else:
+            assert mOutputK is None
+            assert mScaleK is None
+            assert mOuterScaleK is None
         if cutlass.const_expr(self.stochastic):
             assert mSeed is not None
         else:
@@ -126,7 +140,7 @@ class _Nvfp4UmmaPipelinedRht:
             tiled_mma,
             self.mma_tiler,
             cutlass.BFloat16,
-            _NVFP4_UMMA_INPUT_STAGES,
+            self.input_stages,
         )
         b_layout = utils.sm100.make_smem_layout_b(
             tiled_mma, (128, 16, 16), cutlass.BFloat16, 1
@@ -152,12 +166,14 @@ class _Nvfp4UmmaPipelinedRht:
         )
         num_tmem_cols = utils.get_num_tmem_alloc_cols(acc_fake, arch="sm_100")
 
-        nrb_k, ncb_k = _ceil_div(M, 128), _ceil_div(N, 64)
-        scale_k_layout = cute.make_layout(
-            ((32, 4, nrb_k), (4, ncb_k)),
-            stride=((16, 4, ncb_k * 32 * 16), (1, 32 * 16)),
-        )
-        mScaleKLogical = cute.make_tensor(mScaleK.iterator, scale_k_layout)
+        mScaleKLogical = None
+        if cutlass.const_expr(self.do_dim_k):
+            nrb_k, ncb_k = _ceil_div(M, 128), _ceil_div(N, 64)
+            scale_k_layout = cute.make_layout(
+                ((32, 4, nrb_k), (4, ncb_k)),
+                stride=((16, 4, ncb_k * 32 * 16), (1, 32 * 16)),
+            )
+            mScaleKLogical = cute.make_tensor(mScaleK.iterator, scale_k_layout)
         nrb_m, ncb_m = _ceil_div(N, 128), _ceil_div(M, 64)
         scale_m_layout = cute.make_layout(
             ((32, 4, nrb_m), (4, ncb_m)),
@@ -195,6 +211,121 @@ class _Nvfp4UmmaPipelinedRht:
             stream=stream,
         )
 
+    @cute.jit
+    def _run_dim_k(
+        self,
+        tidx: cutlass.Int32,
+        input_pipeline: pipeline.PipelineTmaMultiConsumersAsync,
+        sA: cute.Tensor,
+        mOutputK: cute.Tensor,
+        mScaleKLogical: cute.Tensor,
+        mOuterScaleK: cute.Tensor,
+        mSeed: cute.Tensor | None,
+        n_tile_base: cutlass.Int32,
+        m_tile: cutlass.Int32,
+        N: cutlass.Int32,
+    ) -> None:
+        """Run the optional row-warp dim-K consumer for one CTA's persistent tile range."""
+        if cutlass.const_expr(self.stochastic):
+            cute.arch.setmaxregister_increase(136)
+        frgOuterScaleK = cute.make_rmem_tensor(1, mOuterScaleK.element_type)
+        cute.copy(
+            cute.make_copy_atom(
+                cute.nvgpu.CopyUniversalOp(), mOuterScaleK.element_type
+            ),
+            mOuterScaleK,
+            frgOuterScaleK,
+        )
+        k0_k = cutlass.Uint32(0)
+        k1_k = cutlass.Uint32(0)
+        counter_base_k = cutlass.Uint64(0)
+        if cutlass.const_expr(self.stochastic):
+            assert mSeed is not None
+            k0_k, k1_k, counter_base_k = _nvfp4_load_philox_key(mSeed)
+        load128 = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(),
+            cutlass.BFloat16,
+            num_bits_per_copy=128,
+        )
+        store256 = cute.make_copy_atom(
+            cute.nvgpu.CopyR2GOp(),
+            cutlass.Uint8,
+            num_bits_per_copy=256,
+            l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
+        )
+        local_thread = tidx - self.row_first_warp * 32
+        local_row = local_thread // 2
+        local_group = (local_thread % 2) * 4
+        input_consumer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Consumer,
+            self.input_stages,
+        )
+        for tile_offset in cutlass.range(self.tiles_per_cta, unroll=1):
+            input_pipeline.consumer_wait(input_consumer_state)
+            sAFlat = cute.group_modes(sA, 0, 3)
+            sTile = cute.tiled_divide(
+                sAFlat[(None, input_consumer_state.index)], (128,)
+            )
+            # Copy the complete owned fragment before releasing the shared stage, allowing the
+            # producer to overlap the next TMA while row quantization runs from registers.
+            rInputK = cute.make_rmem_tensor(64, cutlass.BFloat16)
+            rInputK8 = cute.tiled_divide(rInputK, (_NVFP4_DIRECT_HALF,))
+            sInputK8 = cute.tiled_divide(
+                sTile[(None, local_row)], (_NVFP4_DIRECT_HALF,)
+            )
+            first_vec = local_group * 2
+            for vec in cutlass.range_constexpr(8):
+                cute.copy(
+                    load128,
+                    sInputK8[(None, first_vec + vec)],
+                    rInputK8[(None, vec)],
+                )
+            cute.arch.fence_view_async_shared()
+            input_pipeline.consumer_release(
+                input_consumer_state, pipeline.PipelineOp.AsyncThread
+            )
+            input_consumer_state.advance()
+
+            n_tile = n_tile_base + tile_offset
+            row_k = m_tile * 128 + local_row
+            scale_col_k = n_tile * 8 + local_group
+            rValuesK = cute.make_rmem_tensor(64, cutlass.Float32)
+            rValuesK.store(rInputK.load().to(cutlass.Float32))
+            rQK = cute.make_rmem_tensor(32, cutlass.Uint8)
+            rScaleK = cute.make_rmem_tensor(4, cutlass.Uint8)
+            counter_start_k = counter_base_k + cutlass.Uint64(
+                row_k * (N // _NVFP4_GROUP) + scale_col_k
+            )
+            _nvfp4_quantize_fast_groups(
+                rValuesK,
+                rQK,
+                rScaleK,
+                frgOuterScaleK[0],
+                counter_start_k,
+                k0_k,
+                k1_k,
+                4,
+                self.stochastic,
+            )
+            output_offset_k = cute.assume(
+                row_k * (N // 2) + scale_col_k * 8, divby=32
+            )
+            cute.copy(
+                store256,
+                rQK,
+                cute.make_tensor(
+                    mOutputK.iterator + output_offset_k,
+                    cute.make_layout(32),
+                ),
+            )
+            _store_swizzled_scale_groups_as_uint(
+                mScaleKLogical,
+                rScaleK,
+                row_k,
+                scale_col_k,
+                4,
+            )
+
     @cute.kernel
     def kernel(
         self,
@@ -202,9 +333,9 @@ class _Nvfp4UmmaPipelinedRht:
         tma_a: cute.CopyAtom,
         mA: cute.Tensor,
         mInput: cute.Tensor,
-        mOutputK: cute.Tensor,
-        mScaleKLogical: cute.Tensor,
-        mOuterScaleK: cute.Tensor,
+        mOutputK: cute.Tensor | None,
+        mScaleKLogical: cute.Tensor | None,
+        mOuterScaleK: cute.Tensor | None,
         mOutputM: cute.Tensor,
         mScaleMLogical: cute.Tensor,
         mOuterScaleM: cute.Tensor,
@@ -218,6 +349,14 @@ class _Nvfp4UmmaPipelinedRht:
         M: cutlass.Int32,
         N: cutlass.Int32,
     ) -> None:
+        if cutlass.const_expr(self.do_dim_k):
+            assert mOutputK is not None
+            assert mScaleKLogical is not None
+            assert mOuterScaleK is not None
+        else:
+            assert mOutputK is None
+            assert mScaleKLogical is None
+            assert mOuterScaleK is None
         if cutlass.const_expr(self.stochastic):
             assert mSeed is not None
         else:
@@ -236,25 +375,48 @@ class _Nvfp4UmmaPipelinedRht:
             if warp < 4:
                 cute.arch.setmaxregister_increase(192)
             if warp >= 8:
-                cute.arch.setmaxregister_increase(136)
+                if cutlass.const_expr(self.do_dim_k):
+                    cute.arch.setmaxregister_increase(136)
+                else:
+                    cute.arch.setmaxregister_decrease(32)
 
         smem = utils.SmemAllocator()
         storage = smem.allocate(_Nvfp4UmmaPipelineStorage)
-        input_pipeline = pipeline.PipelineTmaMultiConsumersAsync.create(
-            barrier_storage=storage.input_mbars.data_ptr(),
-            num_stages=_NVFP4_UMMA_INPUT_STAGES,
-            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
-            consumer_group_umma=pipeline.CooperativeGroup(
-                pipeline.Agent.Thread
-            ),
-            consumer_group_async=pipeline.CooperativeGroup(
-                pipeline.Agent.Thread, self.row_warps
-            ),
-            tx_count=num_tma_bytes,
-            cta_layout_vmnk=cluster_layout,
-            defer_sync=True,
-            force_deprecated_per_lane_signaling=False,
-        )
+        if cutlass.const_expr(self.do_dim_k):
+            # Dim-K row warps and the UMMA warp independently consume each input stage.
+            input_pipeline = pipeline.PipelineTmaMultiConsumersAsync.create(
+                barrier_storage=storage.input_mbars.data_ptr(),
+                num_stages=self.input_stages,
+                producer_group=pipeline.CooperativeGroup(
+                    pipeline.Agent.Thread
+                ),
+                consumer_group_umma=pipeline.CooperativeGroup(
+                    pipeline.Agent.Thread
+                ),
+                consumer_group_async=pipeline.CooperativeGroup(
+                    pipeline.Agent.Thread, self.row_warps
+                ),
+                tx_count=num_tma_bytes,
+                cta_layout_vmnk=cluster_layout,
+                defer_sync=True,
+                force_deprecated_per_lane_signaling=False,
+            )
+        else:
+            # Dim-M alone has only the UMMA consumer. Using the single-consumer pipeline avoids
+            # reserving empty-barrier arrivals for row warps which do not exist in this specialization.
+            input_pipeline = pipeline.PipelineTmaUmma.create(
+                barrier_storage=storage.input_mbars.data_ptr(),
+                num_stages=self.input_stages,
+                producer_group=pipeline.CooperativeGroup(
+                    pipeline.Agent.Thread
+                ),
+                consumer_group=pipeline.CooperativeGroup(
+                    pipeline.Agent.Thread
+                ),
+                tx_count=num_tma_bytes,
+                cta_layout_vmnk=cluster_layout,
+                defer_sync=True,
+            )
         acc_pipeline = pipeline.PipelineUmmaAsync.create(
             barrier_storage=storage.acc_mbars.data_ptr(),
             num_stages=self.acc_stages,
@@ -342,7 +504,7 @@ class _Nvfp4UmmaPipelinedRht:
                 cute.arch.setmaxregister_decrease(32)
             input_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer,
-                _NVFP4_UMMA_INPUT_STAGES,
+                self.input_stages,
             )
             for tile_offset in cutlass.range(
                 self.tiles_per_cta, unroll=1
@@ -367,7 +529,7 @@ class _Nvfp4UmmaPipelinedRht:
             tCtAcc = cute.make_tensor(tmem_ptr, tCtAccFake.layout)
             input_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer,
-                _NVFP4_UMMA_INPUT_STAGES,
+                self.input_stages,
             )
             acc_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer,
@@ -395,117 +557,34 @@ class _Nvfp4UmmaPipelinedRht:
                     )
                 acc_pipeline.producer_commit(acc_producer_state)
                 acc_producer_state.advance()
-                input_pipeline.consumer_release(
-                    input_consumer_state, pipeline.PipelineOp.TCGen05Mma
-                )
+                if cutlass.const_expr(self.do_dim_k):
+                    input_pipeline.consumer_release(
+                        input_consumer_state,
+                        pipeline.PipelineOp.TCGen05Mma,
+                    )
+                else:
+                    input_pipeline.consumer_release(input_consumer_state)
                 input_consumer_state.advance()
             acc_pipeline.producer_tail(acc_producer_state)
 
         elif (warp >= self.row_first_warp) & (
             warp < self.row_first_warp + self.row_warps
         ):
-            if cutlass.const_expr(self.stochastic):
-                cute.arch.setmaxregister_increase(136)
-            frgOuterScaleK = cute.make_rmem_tensor(1, mOuterScaleK.element_type)
-            cute.copy(
-                cute.make_copy_atom(
-                    cute.nvgpu.CopyUniversalOp(), mOuterScaleK.element_type
-                ),
-                mOuterScaleK,
-                frgOuterScaleK,
-            )
-            k0_k = cutlass.Uint32(0)
-            k1_k = cutlass.Uint32(0)
-            counter_base_k = cutlass.Uint64(0)
-            if cutlass.const_expr(self.stochastic):
-                k0_k, k1_k, counter_base_k = _nvfp4_load_philox_key(mSeed)
-            load128 = cute.make_copy_atom(
-                cute.nvgpu.CopyUniversalOp(),
-                cutlass.BFloat16,
-                num_bits_per_copy=128,
-            )
-            store256 = cute.make_copy_atom(
-                cute.nvgpu.CopyR2GOp(),
-                cutlass.Uint8,
-                num_bits_per_copy=256,
-                l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
-            )
-            local_thread = tidx - self.row_first_warp * 32
-            local_row = local_thread // 2
-            local_group = (local_thread % 2) * 4
-            input_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer,
-                _NVFP4_UMMA_INPUT_STAGES,
-            )
-            for tile_offset in cutlass.range(
-                self.tiles_per_cta, unroll=1
-            ):
-                input_pipeline.consumer_wait(input_consumer_state)
-                sAFlat = cute.group_modes(sA, 0, 3)
-                sTile = cute.tiled_divide(
-                    sAFlat[(None, input_consumer_state.index)], (128,)
-                )
-                # Copy the complete owned fragment before releasing the shared stage, allowing the
-                # producer to overlap the next TMA while row quantization runs from registers.
-                rInputK = cute.make_rmem_tensor(64, cutlass.BFloat16)
-                rInputK8 = cute.tiled_divide(
-                    rInputK, (_NVFP4_DIRECT_HALF,)
-                )
-                sInputK8 = cute.tiled_divide(
-                    sTile[(None, local_row)], (_NVFP4_DIRECT_HALF,)
-                )
-                first_vec = local_group * 2
-                for vec in cutlass.range_constexpr(8):
-                    cute.copy(
-                        load128,
-                        sInputK8[(None, first_vec + vec)],
-                        rInputK8[(None, vec)],
-                    )
-                cute.arch.fence_view_async_shared()
-                input_pipeline.consumer_release(
-                    input_consumer_state, pipeline.PipelineOp.AsyncThread
-                )
-                input_consumer_state.advance()
-
-                n_tile = n_tile_base + tile_offset
-                row_k = m_tile * 128 + local_row
-                scale_col_k = n_tile * 8 + local_group
-                rValuesK = cute.make_rmem_tensor(64, cutlass.Float32)
-                rValuesK.store(rInputK.load().to(cutlass.Float32))
-                rQK = cute.make_rmem_tensor(32, cutlass.Uint8)
-                rScaleK = cute.make_rmem_tensor(4, cutlass.Uint8)
-                counter_start_k = counter_base_k + cutlass.Uint64(
-                    row_k * (N // _NVFP4_GROUP) + scale_col_k
-                )
-                _nvfp4_quantize_fast_groups(
-                    rValuesK,
-                    rQK,
-                    rScaleK,
-                    frgOuterScaleK[0],
-                    counter_start_k,
-                    k0_k,
-                    k1_k,
-                    4,
-                    self.stochastic,
-                )
-                output_offset_k = cute.assume(
-                    row_k * (N // 2) + scale_col_k * 8, divby=32
-                )
-                cute.copy(
-                    store256,
-                    rQK,
-                    cute.make_tensor(
-                        mOutputK.iterator + output_offset_k,
-                        cute.make_layout(32),
-                    ),
-                )
-                _store_swizzled_scale_groups_as_uint(
+            if cutlass.const_expr(self.do_dim_k):
+                self._run_dim_k(
+                    tidx,
+                    input_pipeline,
+                    sA,
+                    mOutputK,
                     mScaleKLogical,
-                    rScaleK,
-                    row_k,
-                    scale_col_k,
-                    4,
+                    mOuterScaleK,
+                    mSeed,
+                    n_tile_base,
+                    m_tile,
+                    N,
                 )
+            elif cutlass.const_expr(self.stochastic):
+                cute.arch.setmaxregister_decrease(32)
 
         elif warp < self.epilogue_warps:
             if cutlass.const_expr(self.stochastic):
@@ -597,15 +676,18 @@ class _Nvfp4UmmaPipelinedRht:
                 scale_col_m = m_tile * 8
                 rQM = cute.make_rmem_tensor(64, cutlass.Uint8)
                 rScaleM = cute.make_rmem_tensor(8, cutlass.Uint8)
-                # Dim-M follows dim-K's M*N elements in the shared Philox stream. Each counter
-                # supplies the random words for 16 FP4 values.
                 counter_start_m = (
                     counter_base_m
-                    + cutlass.Uint64(N) * cutlass.Uint64(M // _NVFP4_GROUP)
                     + cutlass.Uint64(
                         output_row_m * (M // _NVFP4_GROUP) + scale_col_m
                     )
                 )
+                if cutlass.const_expr(self.do_dim_k):
+                    # In dim-KM, dim-M follows dim-K's M*N values in the shared stream. Each
+                    # counter supplies the random words for 16 FP4 values.
+                    counter_start_m += cutlass.Uint64(N) * cutlass.Uint64(
+                        M // _NVFP4_GROUP
+                    )
                 _nvfp4_quantize_fast_groups(
                     rValuesM,
                     rQM,
@@ -690,32 +772,50 @@ def _make_static_vector_fake(dtype, size: int, assumed_align: int):
 
 def _nvfp4_pipelined_compile_log_key(
     stochastic: bool,
+    do_dim_k: bool,
     tiles_per_cta: int,
 ) -> str:
-    return f"sr={stochastic} tiles_per_cta={tiles_per_cta}"
+    return (
+        f"sr={stochastic} do_dim_k={do_dim_k} "
+        f"tiles_per_cta={tiles_per_cta}"
+    )
 
 
 @instrumented_cutedsl_cache(
     "quant_cast_bench::nvfp4_rht_pipelined",
     key_fn=_nvfp4_pipelined_compile_log_key,
 )
-def _compile_nvfp4_swizzle_dim_k_dim_m_rht_pipelined(
+def _compile_nvfp4_rht_pipelined(
     stochastic: bool,
+    do_dim_k: bool,
     tiles_per_cta: int,
 ):
-    operation = _Nvfp4UmmaPipelinedRht(stochastic, tiles_per_cta)
+    operation = _Nvfp4UmmaPipelinedRht(
+        stochastic,
+        do_dim_k,
+        tiles_per_cta,
+    )
     mInput = _make_dynamic_matrix_fake(
         cutlass.BFloat16,
         compact_dim_divisibility=128,
         assumed_align=16,
     )
-    mOutputK = _make_dynamic_matrix_fake(
-        cutlass.Uint8,
-        compact_dim_divisibility=64,
-        assumed_align=32,
-    )
-    mScaleK = _make_dynamic_scale_fake()
-    mOuterScaleK = _make_static_vector_fake(cutlass.Float32, 1, assumed_align=4)
+    if do_dim_k:
+        mOutputK = _make_dynamic_matrix_fake(
+            cutlass.Uint8,
+            compact_dim_divisibility=64,
+            assumed_align=32,
+        )
+        mScaleK = _make_dynamic_scale_fake()
+        mOuterScaleK = _make_static_vector_fake(
+            cutlass.Float32,
+            1,
+            assumed_align=4,
+        )
+    else:
+        mOutputK = None
+        mScaleK = None
+        mOuterScaleK = None
     mOutputM = _make_dynamic_matrix_fake(
         cutlass.Uint8,
         compact_dim_divisibility=64,
@@ -752,23 +852,31 @@ def _compile_nvfp4_swizzle_dim_k_dim_m_rht_pipelined(
     )
 
 
-def _nvfp4_swizzle_dim_k_dim_m_rht_pipelined_on_current_device(
+def _nvfp4_rht_pipelined_on_current_device(
     input,
-    outer_scale_k,
     outer_scale_m,
     rht_sign,
     key=None,
     *,
+    outer_scale_k=None,
     stochastic,
+    do_dim_k,
 ):
     M, N = _validate_nvfp4_swizzle_inputs(
-        input, outer_scale_k, "nvfp4 RHT pipelined", 32
+        input, outer_scale_m, "nvfp4 RHT pipelined", 32
     )
     assert M % 128 == 0 and N % 128 == 0, (
         "nvfp4 RHT pipelined requires M % 128 == 0 and K % 128 == 0"
     )
     assert outer_scale_m.device == input.device
     assert outer_scale_m.dtype == torch.float32 and outer_scale_m.numel() == 1
+    if do_dim_k:
+        assert outer_scale_k is not None
+        assert outer_scale_k.device == input.device
+        assert outer_scale_k.dtype == torch.float32
+        assert outer_scale_k.numel() == 1
+    else:
+        assert outer_scale_k is None
     assert rht_sign.shape == (16,)
     assert rht_sign.dtype == torch.bfloat16 and rht_sign.device == input.device
     assert rht_sign.is_contiguous()
@@ -779,34 +887,42 @@ def _nvfp4_swizzle_dim_k_dim_m_rht_pipelined_on_current_device(
     else:
         assert key is None
 
-    output_k, scale_k, nrb_k, ncb_k = _allocate_nvfp4_swizzle_outputs(
-        input, M, N
-    )
+    if do_dim_k:
+        output_k, scale_k, nrb_k, ncb_k = (
+            _allocate_nvfp4_swizzle_outputs(input, M, N)
+        )
+    else:
+        output_k = None
+        scale_k = None
+        nrb_k = None
+        ncb_k = None
     output_m, scale_m, nrb_m, ncb_m = _allocate_nvfp4_swizzle_outputs(
         input, N, M
     )
     tiles_m = M // 128
     tiles_n = N // 128
-    # Amortize the fixed RHT/TMEM setup while retaining enough CTAs to smooth producer/consumer
-    # imbalance. Parallel RHT setup makes 16 tiles/CTA optimal for both RTNE and SR.
-    max_tiles_per_cta = 16
+    # Amortize fixed RHT/TMEM setup while retaining at least 128 CTAs. Dim-M-only SR benefits from
+    # a longer persistent run because it has no row-warp consumer and more epilogue work per tile.
+    max_tiles_per_cta = 32 if stochastic and not do_dim_k else 16
+    min_ctas = 128
     tiles_per_cta = next(
         candidate
         for candidate in (32, 16, 8, 4, 2, 1)
         if candidate <= max_tiles_per_cta
         and tiles_n % candidate == 0
-        and (candidate == 1 or tiles_m * tiles_n // candidate >= 128)
+        and (candidate == 1 or tiles_m * tiles_n // candidate >= min_ctas)
     )
     seed = key.reshape(-1).view(torch.int64) if stochastic else None
-    fn = _compile_nvfp4_swizzle_dim_k_dim_m_rht_pipelined(
+    fn = _compile_nvfp4_rht_pipelined(
         stochastic,
+        do_dim_k,
         tiles_per_cta,
     )
     fn(
         input,
         output_k,
         scale_k,
-        outer_scale_k.reshape(1),
+        outer_scale_k.reshape(1) if do_dim_k else None,
         output_m,
         scale_m,
         outer_scale_m.reshape(1),
@@ -815,33 +931,40 @@ def _nvfp4_swizzle_dim_k_dim_m_rht_pipelined_on_current_device(
         M,
         N,
     )
-    return (
-        output_k.view(torch.float4_e2m1fn_x2),
-        scale_k.view(nrb_k, ncb_k, 32, 16).view(torch.float8_e4m3fn),
+    outputs_m = (
         output_m.view(torch.float4_e2m1fn_x2),
         scale_m.view(nrb_m, ncb_m, 32, 16).view(torch.float8_e4m3fn),
     )
+    if not do_dim_k:
+        return outputs_m
+    return (
+        output_k.view(torch.float4_e2m1fn_x2),
+        scale_k.view(nrb_k, ncb_k, 32, 16).view(torch.float8_e4m3fn),
+        *outputs_m,
+    )
 
 
-def _nvfp4_swizzle_dim_k_dim_m_rht_pipelined(
+def _nvfp4_rht_pipelined(
     input,
-    outer_scale_k,
     outer_scale_m,
     rht_sign,
     key=None,
     *,
+    outer_scale_k=None,
     stochastic,
+    do_dim_k,
 ):
     device = input.get_device()
 
     def launch_on_current_device():
-        return _nvfp4_swizzle_dim_k_dim_m_rht_pipelined_on_current_device(
+        return _nvfp4_rht_pipelined_on_current_device(
             input,
-            outer_scale_k,
             outer_scale_m,
             rht_sign,
             key,
+            outer_scale_k=outer_scale_k,
             stochastic=stochastic,
+            do_dim_k=do_dim_k,
         )
 
     if device == torch.cuda.current_device():
@@ -853,12 +976,13 @@ def _nvfp4_swizzle_dim_k_dim_m_rht_pipelined(
 def nvfp4_swizzle_dim_k_dim_m_rht_pipelined(
     input, outer_scale_k, outer_scale_m, rht_sign, **kwargs
 ):
-    return _nvfp4_swizzle_dim_k_dim_m_rht_pipelined(
+    return _nvfp4_rht_pipelined(
         input,
-        outer_scale_k,
         outer_scale_m,
         rht_sign,
+        outer_scale_k=outer_scale_k,
         stochastic=False,
+        do_dim_k=True,
     )
 
 
@@ -876,17 +1000,62 @@ def nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_pipelined(
     key,
     **kwargs,
 ):
-    return _nvfp4_swizzle_dim_k_dim_m_rht_pipelined(
+    return _nvfp4_rht_pipelined(
         input,
-        outer_scale_k,
         outer_scale_m,
         rht_sign,
         key,
+        outer_scale_k=outer_scale_k,
         stochastic=True,
+        do_dim_k=True,
     )
 
 
 NVFP4_SWIZZLE_DIM_K_SR_DIM_M_RHT_SR_PIPELINED = QuantCastCuteRecipe.from_gold(
     Nvfp4GsSwizzle_DimKSR_DimMRHTSR_Gold,
     cute_fn=nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_pipelined,
+)
+
+
+def nvfp4_dim_m_rht_swizzle_pipelined(
+    input,
+    outer_scale,
+    rht_sign,
+    **kwargs,
+):
+    return _nvfp4_rht_pipelined(
+        input,
+        outer_scale,
+        rht_sign,
+        stochastic=False,
+        do_dim_k=False,
+    )
+
+
+NVFP4_DIM_M_RHT_SWIZZLE_PIPELINED = QuantCastCuteRecipe.from_gold(
+    Nvfp4GsSwizzleDimMRHTGold,
+    cute_fn=nvfp4_dim_m_rht_swizzle_pipelined,
+)
+
+
+def nvfp4_dim_m_swizzle_rht_sr_pipelined(
+    input,
+    outer_scale,
+    rht_sign,
+    key,
+    **kwargs,
+):
+    return _nvfp4_rht_pipelined(
+        input,
+        outer_scale,
+        rht_sign,
+        key,
+        stochastic=True,
+        do_dim_k=False,
+    )
+
+
+NVFP4_DIM_M_SWIZZLE_RHT_SR_PIPELINED = QuantCastCuteRecipe.from_gold(
+    Nvfp4GsDimMSwizzleRHTSRGold,
+    cute_fn=nvfp4_dim_m_swizzle_rht_sr_pipelined,
 )
