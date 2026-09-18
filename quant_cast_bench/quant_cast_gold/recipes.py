@@ -2009,7 +2009,7 @@ def _nvfp4_gs_swizzle_dim_k_dim_m_rht_sr_correctness(
     """Same SQNR check as the RNE gold: dequant each orientation (inverting the dim-m RHT with
     rht.t()) and assert SQNR above the 12 dB fp4 floor. SR adds a little more quantization noise than
     RNE but is unbiased, so the floor is unchanged."""
-    x, outer_scale_k, outer_scale_m, rht, _key_k, _key_m = inputs
+    x, outer_scale_k, outer_scale_m, rht, *_keys = inputs
     qk, sk, qm, sm = outputs
     x_hat_k = nvfp4_gs_swizzle_dq_f(qk, sk, outer_scale_k)  # (M, N) ~ x
     x_t_rht_hat = nvfp4_gs_swizzle_dq_f(qm, sm, outer_scale_m)  # (N, M) ~ RHT(x.t())
@@ -2133,11 +2133,14 @@ Nvfp4GsDimMSwizzleRHTSRGold = QuantCastSingleKernelGold(
 
 
 def nvfp4_gs_swizzle_dim_k_dim_m_rht_nvidia_sr_f(
-    x, outer_scale_k, outer_scale_m, rht, key_k, key_m, **kwargs
+    x, outer_scale_k, outer_scale_m, rht, key, **kwargs
 ):
-    """Dim-K and FP32 dim-M RHT NVFP4 using independent NVIDIA ``cvt.rs`` SR streams."""
-    qk, sk = nvfp4_gs_swizzle_nvidia_sr_f(x, outer_scale_k, key_k)
+    """Dim-K and FP32 dim-M RHT NVFP4 using disjoint ranges of one ``cvt.rs`` SR stream."""
+    M, K = x.shape
+    qk, sk = nvfp4_gs_swizzle_nvidia_sr_f(x, outer_scale_k, key)
     (x_t_rht,) = hadamard_rht_fp32_f(x.t().contiguous(), rht)
+    # One Philox counter supplies the four random words consumed by 16 FP4 output values.
+    key_m = _advance_philox_key_by_counters(key, M * K // 16)
     qm, sm = nvfp4_gs_swizzle_nvidia_sr_f(x_t_rht, outer_scale_m, key_m)
     return qk, sk, qm, sm
 
@@ -2155,7 +2158,6 @@ def _nvfp4_gs_swizzle_dim_k_dim_m_rht_nvidia_sr_inputs(M, K, dtype):
         outer_scale_m.reciprocal(),
         rht,
         prng.key(0, device=x.device),
-        prng.key(1, device=x.device),
     )
 
 

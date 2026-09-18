@@ -191,10 +191,11 @@ def test_nvfp4_rht_nvidia_sr_variants_compose_the_nvidia_sr_gold():
         x_t_rht_fp32.abs().amax()
         / (F8E4M3_MAX * F4_E2M1_MAX)
     ).reciprocal()
-    key_k = prng.key(7, device=x.device)
-    key_m = prng.key(11, device=x.device)
+    key = prng.fold_in(prng.key(7, device=x.device), 12345)
+    key_i64 = key.view(torch.int64)
+    key_m = torch.stack((key_i64[0], key_i64[1] + M * K // 16)).view(torch.uint64)
 
-    expected_k = nvfp4_gs_swizzle_nvidia_sr_f(x, outer_scale_k, key_k)
+    expected_k = nvfp4_gs_swizzle_nvidia_sr_f(x, outer_scale_k, key)
     expected_m = nvfp4_gs_swizzle_nvidia_sr_f(
         x_t_rht_fp32, outer_scale_m_fp32, key_m
     )
@@ -202,7 +203,7 @@ def test_nvfp4_rht_nvidia_sr_variants_compose_the_nvidia_sr_gold():
         x, outer_scale_m_fp32, rht, key_m
     )
     actual_km = nvfp4_gs_swizzle_dim_k_dim_m_rht_nvidia_sr_f(
-        x, outer_scale_k, outer_scale_m_fp32, rht, key_k, key_m
+        x, outer_scale_k, outer_scale_m_fp32, rht, key
     )
 
     for actual, expected in zip(actual_m, expected_m):

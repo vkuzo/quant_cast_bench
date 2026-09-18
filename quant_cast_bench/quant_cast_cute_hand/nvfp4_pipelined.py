@@ -15,17 +15,17 @@ from torch._native.instrumentation import instrumented_cutedsl_cache
 from torch._vendor.quack.cache import EXTRA_SOURCE_DIRS
 
 from quant_cast_bench.quant_cast_cute.recipes import QuantCastCuteRecipe
-from quant_cast_bench.quant_cast_cute_hand.nvfp4_tma import (
+from quant_cast_bench.quant_cast_cute_hand.blockscaled_tma import (
     _NVFP4_DIRECT_HALF,
     _NVFP4_GROUP,
-    _allocate_nvfp4_swizzle_outputs,
-    _validate_nvfp4_swizzle_inputs,
 )
 from quant_cast_bench.quant_cast_cute_hand.utils import (
+    _allocate_nvfp4_swizzle_outputs,
     _ceil_div,
     _nvfp4_load_philox_key,
     _nvfp4_quantize_fast_groups,
-    _nvfp4_store_scale_groups,
+    _store_swizzled_scale_groups_as_uint,
+    _validate_nvfp4_swizzle_inputs,
 )
 from quant_cast_bench.quant_cast_gold.recipes import (
     Nvfp4GsSwizzle_DimK_DimMRHT_Gold,
@@ -98,23 +98,20 @@ class _Nvfp4UmmaPipelinedRht:
         mInput: cute.Tensor,
         mOutputK: cute.Tensor,
         mScaleK: cute.Tensor,
-        mOuterK: cute.Tensor,
+        mOuterScaleK: cute.Tensor,
         mOutputM: cute.Tensor,
         mScaleM: cute.Tensor,
-        mOuterM: cute.Tensor,
+        mOuterScaleM: cute.Tensor,
         mRhtSign: cute.Tensor,
-        mSeedK: cute.Tensor | None,
-        mSeedM: cute.Tensor | None,
+        mSeed: cute.Tensor | None,
         stream: cuda.CUstream,
         M: cutlass.Int32,
         N: cutlass.Int32,
     ) -> None:
         if cutlass.const_expr(self.stochastic):
-            assert mSeedK is not None
-            assert mSeedM is not None
+            assert mSeed is not None
         else:
-            assert mSeedK is None
-            assert mSeedM is None
+            assert mSeed is None
 
         # A is x.T logically: UMMA's M dimension walks original columns and K walks rows.
         mA = cute.make_tensor(
@@ -175,13 +172,12 @@ class _Nvfp4UmmaPipelinedRht:
             mInput,
             mOutputK,
             mScaleKLogical,
-            mOuterK,
+            mOuterScaleK,
             mOutputM,
             mScaleMLogical,
-            mOuterM,
+            mOuterScaleM,
             mRhtSign,
-            mSeedK,
-            mSeedM,
+            mSeed,
             cluster_layout,
             a_layout,
             b_layout,
@@ -208,13 +204,12 @@ class _Nvfp4UmmaPipelinedRht:
         mInput: cute.Tensor,
         mOutputK: cute.Tensor,
         mScaleKLogical: cute.Tensor,
-        mOuterK: cute.Tensor,
+        mOuterScaleK: cute.Tensor,
         mOutputM: cute.Tensor,
         mScaleMLogical: cute.Tensor,
-        mOuterM: cute.Tensor,
+        mOuterScaleM: cute.Tensor,
         mRhtSign: cute.Tensor,
-        mSeedK: cute.Tensor | None,
-        mSeedM: cute.Tensor | None,
+        mSeed: cute.Tensor | None,
         cluster_layout: cute.Layout,
         a_layout: cute.ComposedLayout,
         b_layout: cute.ComposedLayout,
@@ -224,11 +219,9 @@ class _Nvfp4UmmaPipelinedRht:
         N: cutlass.Int32,
     ) -> None:
         if cutlass.const_expr(self.stochastic):
-            assert mSeedK is not None
-            assert mSeedM is not None
+            assert mSeed is not None
         else:
-            assert mSeedK is None
-            assert mSeedM is None
+            assert mSeed is None
 
         tidx, _, _ = cute.arch.thread_idx()
         n_chunk, m_tile, _ = cute.arch.block_idx()
@@ -413,19 +406,19 @@ class _Nvfp4UmmaPipelinedRht:
         ):
             if cutlass.const_expr(self.stochastic):
                 cute.arch.setmaxregister_increase(136)
-            frgOuterK = cute.make_rmem_tensor(1, mOuterK.element_type)
+            frgOuterScaleK = cute.make_rmem_tensor(1, mOuterScaleK.element_type)
             cute.copy(
                 cute.make_copy_atom(
-                    cute.nvgpu.CopyUniversalOp(), mOuterK.element_type
+                    cute.nvgpu.CopyUniversalOp(), mOuterScaleK.element_type
                 ),
-                mOuterK,
-                frgOuterK,
+                mOuterScaleK,
+                frgOuterScaleK,
             )
             k0_k = cutlass.Uint32(0)
             k1_k = cutlass.Uint32(0)
             counter_base_k = cutlass.Uint64(0)
             if cutlass.const_expr(self.stochastic):
-                k0_k, k1_k, counter_base_k = _nvfp4_load_philox_key(mSeedK)
+                k0_k, k1_k, counter_base_k = _nvfp4_load_philox_key(mSeed)
             load128 = cute.make_copy_atom(
                 cute.nvgpu.CopyUniversalOp(),
                 cutlass.BFloat16,
@@ -488,7 +481,7 @@ class _Nvfp4UmmaPipelinedRht:
                     rValuesK,
                     rQK,
                     rScaleK,
-                    frgOuterK[0],
+                    frgOuterScaleK[0],
                     counter_start_k,
                     k0_k,
                     k1_k,
@@ -506,7 +499,7 @@ class _Nvfp4UmmaPipelinedRht:
                         cute.make_layout(32),
                     ),
                 )
-                _nvfp4_store_scale_groups(
+                _store_swizzled_scale_groups_as_uint(
                     mScaleKLogical,
                     rScaleK,
                     row_k,
@@ -542,19 +535,19 @@ class _Nvfp4UmmaPipelinedRht:
                     False,
                 )
             )
-            frgOuterM = cute.make_rmem_tensor(1, mOuterM.element_type)
+            frgOuterScaleM = cute.make_rmem_tensor(1, mOuterScaleM.element_type)
             cute.copy(
                 cute.make_copy_atom(
-                    cute.nvgpu.CopyUniversalOp(), mOuterM.element_type
+                    cute.nvgpu.CopyUniversalOp(), mOuterScaleM.element_type
                 ),
-                mOuterM,
-                frgOuterM,
+                mOuterScaleM,
+                frgOuterScaleM,
             )
             k0_m = cutlass.Uint32(0)
             k1_m = cutlass.Uint32(0)
             counter_base_m = cutlass.Uint64(0)
             if cutlass.const_expr(self.stochastic):
-                k0_m, k1_m, counter_base_m = _nvfp4_load_philox_key(mSeedM)
+                k0_m, k1_m, counter_base_m = _nvfp4_load_philox_key(mSeed)
             store256 = cute.make_copy_atom(
                 cute.nvgpu.CopyR2GOp(),
                 cutlass.Uint8,
@@ -604,14 +597,20 @@ class _Nvfp4UmmaPipelinedRht:
                 scale_col_m = m_tile * 8
                 rQM = cute.make_rmem_tensor(64, cutlass.Uint8)
                 rScaleM = cute.make_rmem_tensor(8, cutlass.Uint8)
-                counter_start_m = counter_base_m + cutlass.Uint64(
-                    output_row_m * (M // _NVFP4_GROUP) + scale_col_m
+                # Dim-M follows dim-K's M*N elements in the shared Philox stream. Each counter
+                # supplies the random words for 16 FP4 values.
+                counter_start_m = (
+                    counter_base_m
+                    + cutlass.Uint64(N) * cutlass.Uint64(M // _NVFP4_GROUP)
+                    + cutlass.Uint64(
+                        output_row_m * (M // _NVFP4_GROUP) + scale_col_m
+                    )
                 )
                 _nvfp4_quantize_fast_groups(
                     rValuesM,
                     rQM,
                     rScaleM,
-                    frgOuterM[0],
+                    frgOuterScaleM[0],
                     counter_start_m,
                     k0_m,
                     k1_m,
@@ -634,7 +633,7 @@ class _Nvfp4UmmaPipelinedRht:
                             cute.make_layout(32),
                         ),
                     )
-                _nvfp4_store_scale_groups(
+                _store_swizzled_scale_groups_as_uint(
                     mScaleMLogical,
                     rScaleM,
                     output_row_m,
@@ -716,25 +715,20 @@ def _compile_nvfp4_swizzle_dim_k_dim_m_rht_pipelined(
         assumed_align=32,
     )
     mScaleK = _make_dynamic_scale_fake()
-    mOuterK = _make_static_vector_fake(cutlass.Float32, 1, assumed_align=4)
+    mOuterScaleK = _make_static_vector_fake(cutlass.Float32, 1, assumed_align=4)
     mOutputM = _make_dynamic_matrix_fake(
         cutlass.Uint8,
         compact_dim_divisibility=64,
         assumed_align=32,
     )
     mScaleM = _make_dynamic_scale_fake()
-    mOuterM = _make_static_vector_fake(cutlass.Float32, 1, assumed_align=4)
+    mOuterScaleM = _make_static_vector_fake(cutlass.Float32, 1, assumed_align=4)
     mRhtSign = _make_static_vector_fake(
         cutlass.BFloat16,
         _NVFP4_GROUP,
         assumed_align=16,
     )
-    mSeedK = (
-        _make_static_vector_fake(cutlass.Int64, 2, assumed_align=8)
-        if stochastic
-        else None
-    )
-    mSeedM = (
+    mSeed = (
         _make_static_vector_fake(cutlass.Int64, 2, assumed_align=8)
         if stochastic
         else None
@@ -745,13 +739,12 @@ def _compile_nvfp4_swizzle_dim_k_dim_m_rht_pipelined(
         mInput,
         mOutputK,
         mScaleK,
-        mOuterK,
+        mOuterScaleK,
         mOutputM,
         mScaleM,
-        mOuterM,
+        mOuterScaleM,
         mRhtSign,
-        mSeedK,
-        mSeedM,
+        mSeed,
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
         cutlass.Int32(0),
         cutlass.Int32(0),
@@ -764,8 +757,7 @@ def _nvfp4_swizzle_dim_k_dim_m_rht_pipelined_on_current_device(
     outer_scale_k,
     outer_scale_m,
     rht_sign,
-    key_k=None,
-    key_m=None,
+    key=None,
     *,
     stochastic,
 ):
@@ -781,12 +773,11 @@ def _nvfp4_swizzle_dim_k_dim_m_rht_pipelined_on_current_device(
     assert rht_sign.dtype == torch.bfloat16 and rht_sign.device == input.device
     assert rht_sign.is_contiguous()
     if stochastic:
-        for name, key in (("dim-K", key_k), ("dim-M", key_m)):
-            assert key is not None, f"{name} stochastic rounding requires a key"
-            assert key.device == input.device
-            assert key.dtype == torch.uint64 and key.numel() == 2
+        assert key is not None, "stochastic rounding requires a key"
+        assert key.device == input.device
+        assert key.dtype == torch.uint64 and key.numel() == 2
     else:
-        assert key_k is None and key_m is None
+        assert key is None
 
     output_k, scale_k, nrb_k, ncb_k = _allocate_nvfp4_swizzle_outputs(
         input, M, N
@@ -806,12 +797,7 @@ def _nvfp4_swizzle_dim_k_dim_m_rht_pipelined_on_current_device(
         and tiles_n % candidate == 0
         and (candidate == 1 or tiles_m * tiles_n // candidate >= 128)
     )
-    seed_k = (
-        key_k.reshape(-1).view(torch.int64) if stochastic else None
-    )
-    seed_m = (
-        key_m.reshape(-1).view(torch.int64) if stochastic else None
-    )
+    seed = key.reshape(-1).view(torch.int64) if stochastic else None
     fn = _compile_nvfp4_swizzle_dim_k_dim_m_rht_pipelined(
         stochastic,
         tiles_per_cta,
@@ -825,8 +811,7 @@ def _nvfp4_swizzle_dim_k_dim_m_rht_pipelined_on_current_device(
         scale_m,
         outer_scale_m.reshape(1),
         rht_sign,
-        seed_k,
-        seed_m,
+        seed,
         M,
         N,
     )
@@ -843,8 +828,7 @@ def _nvfp4_swizzle_dim_k_dim_m_rht_pipelined(
     outer_scale_k,
     outer_scale_m,
     rht_sign,
-    key_k=None,
-    key_m=None,
+    key=None,
     *,
     stochastic,
 ):
@@ -856,8 +840,7 @@ def _nvfp4_swizzle_dim_k_dim_m_rht_pipelined(
             outer_scale_k,
             outer_scale_m,
             rht_sign,
-            key_k,
-            key_m,
+            key,
             stochastic=stochastic,
         )
 
@@ -890,8 +873,7 @@ def nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_pipelined(
     outer_scale_k,
     outer_scale_m,
     rht_sign,
-    key_k,
-    key_m,
+    key,
     **kwargs,
 ):
     return _nvfp4_swizzle_dim_k_dim_m_rht_pipelined(
@@ -899,8 +881,7 @@ def nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_pipelined(
         outer_scale_k,
         outer_scale_m,
         rht_sign,
-        key_k,
-        key_m,
+        key,
         stochastic=True,
     )
 

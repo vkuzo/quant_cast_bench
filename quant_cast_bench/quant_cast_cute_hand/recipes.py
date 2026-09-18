@@ -37,17 +37,6 @@ from quant_cast_bench.quant_cast_cute_hand.blockscaled_tma import (
     MXFP8_DIM_M_SWIZZLE_V2,
     MXFP8_SWIZZLE_SR_V2,
     MXFP8_SWIZZLE_V2,
-    mxfp4_dim_km_swizzle_v2,
-    mxfp4_dim_m_swizzle_v2,
-    mxfp4_swizzle_v2,
-)
-from quant_cast_bench.quant_cast_cute_hand.nvfp4_pipelined import (
-    NVFP4_SWIZZLE_DIM_K_DIM_M_RHT_PIPELINED,
-    NVFP4_SWIZZLE_DIM_K_SR_DIM_M_RHT_SR_PIPELINED,
-    nvfp4_swizzle_dim_k_dim_m_rht_pipelined,
-    nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_pipelined,
-)
-from quant_cast_bench.quant_cast_cute_hand.nvfp4_tma import (
     NVFP4_DIM_KM_SWIZZLE_TMA,
     NVFP4_DIM_M_RHT_SWIZZLE_TMA,
     NVFP4_DIM_M_SWIZZLE_RHT_SR_TMA,
@@ -55,13 +44,9 @@ from quant_cast_bench.quant_cast_cute_hand.nvfp4_tma import (
     NVFP4_SWIZZLE_DIM_K_DIM_M_RHT_TMA,
     NVFP4_SWIZZLE_DIM_K_SR_DIM_M_RHT_SR_TMA,
     NVFP4_SWIZZLE_TMA,
-    _NVFP4_MODE_DIM_K,
-    _NVFP4_MODE_DIM_KM,
-    _NVFP4_MODE_DIM_M,
-    _NVFP4_TMA_THREADS,
-    _allocate_nvfp4_swizzle_outputs,
-    _nvfp4_tma_dim_m_column,
-    _validate_nvfp4_swizzle_inputs,
+    mxfp4_dim_km_swizzle_v2,
+    mxfp4_dim_m_swizzle_v2,
+    mxfp4_swizzle_v2,
     nvfp4_dim_km_swizzle_tma,
     nvfp4_dim_m_rht_swizzle_tma,
     nvfp4_dim_m_swizzle_rht_sr_tma,
@@ -70,8 +55,15 @@ from quant_cast_bench.quant_cast_cute_hand.nvfp4_tma import (
     nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_tma,
     nvfp4_swizzle_tma,
 )
+from quant_cast_bench.quant_cast_cute_hand.nvfp4_pipelined import (
+    NVFP4_SWIZZLE_DIM_K_DIM_M_RHT_PIPELINED,
+    NVFP4_SWIZZLE_DIM_K_SR_DIM_M_RHT_SR_PIPELINED,
+    nvfp4_swizzle_dim_k_dim_m_rht_pipelined,
+    nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_pipelined,
+)
 from quant_cast_bench.quant_cast_cute_hand.utils import (
     COMPILE_CACHE,
+    _allocate_nvfp4_swizzle_outputs,
     _ceil_div,
     _cvt_e4m3x2_to_f32x2,
     _cvt_rn_satfinite_e4m3x2_f32_packed,
@@ -86,7 +78,8 @@ from quant_cast_bench.quant_cast_cute_hand.utils import (
     _nvfp4_quantize_x16,
     _nvfp4_rht_fwht_x16,
     _nvfp4_scale_e4m3_fast_x2,
-    _nvfp4_store_scale_groups,
+    _store_swizzled_scale_groups_as_uint,
+    _validate_nvfp4_swizzle_inputs,
 )
 from quant_cast_bench.quant_cast_gold.recipes import (
     Deepseek1x128Gold, Deepseek1x128DimMGold, Mxfp8SwizzleGold, Mxfp8SwizzleSRGold,
@@ -2150,7 +2143,7 @@ MXFP8_SWIZZLE_V5 = QuantCastCuteRecipe.from_gold(
 #   qdata = fp4_rne(input * outer / inner), packed two values per byte
 # The dim-K direct version uses v4-style vector loads for small problems and switches to a
 # row-owned, load-ILP mapping for larger ones. The TMA and pipelined RHT families live in
-# nvfp4_tma.py and nvfp4_pipelined.py, respectively.
+# blockscaled_tma.py and nvfp4_pipelined.py, respectively.
 _NVFP4_GROUP = 16
 
 _NVFP4_DIRECT_VPT = 16

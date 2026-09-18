@@ -94,8 +94,7 @@ def _time(run) -> float:
 def _make_ours(name: str, x: torch.Tensor):
     outer = torch.ones(1, dtype=torch.float32, device=x.device)
     sign = torch.tensor([1, -1] * 8, dtype=torch.bfloat16, device=x.device)
-    key_k = prng.key(0, device=x.device)
-    key_m = prng.key(1, device=x.device)
+    key = prng.key(0, device=x.device)
 
     if name == "mxfp8_swizzle":
         return lambda: mxfp8_swizzle(x)
@@ -115,15 +114,15 @@ def _make_ours(name: str, x: torch.Tensor):
         return lambda: mxfp8_swizzle_v2(x, quant_orientation="dim_km")
     if name == "mxfp8_swizzle_sr_v2":
         return lambda: mxfp8_swizzle_v2(
-            x, key=key_k, rounding_mode="stochastic"
+            x, key=key, rounding_mode="stochastic"
         )
     if name == "mxfp8_dim_m_swizzle_sr_v2":
         return lambda: mxfp8_swizzle_v2(
-            x, quant_orientation="dim_m", key=key_k, rounding_mode="stochastic"
+            x, quant_orientation="dim_m", key=key, rounding_mode="stochastic"
         )
     if name == "mxfp8_dim_km_swizzle_sr_v2":
         return lambda: mxfp8_swizzle_v2(
-            x, quant_orientation="dim_km", key=key_k, rounding_mode="stochastic"
+            x, quant_orientation="dim_km", key=key, rounding_mode="stochastic"
         )
     if name == "nvfp4_swizzle_direct":
         return lambda: nvfp4_swizzle_direct(x, outer)
@@ -136,7 +135,7 @@ def _make_ours(name: str, x: torch.Tensor):
     if name == "nvfp4_dim_m_rht_swizzle_tma":
         return lambda: nvfp4_dim_m_rht_swizzle_tma(x, outer, sign)
     if name == "nvfp4_dim_m_swizzle_rht_sr_tma":
-        return lambda: nvfp4_dim_m_swizzle_rht_sr_tma(x, outer, sign, key_k)
+        return lambda: nvfp4_dim_m_swizzle_rht_sr_tma(x, outer, sign, key)
     if name == "nvfp4_swizzle_dim_k_dim_m_rht_tma":
         return lambda: nvfp4_swizzle_dim_k_dim_m_rht_tma(x, outer, outer, sign)
     if name == "nvfp4_swizzle_dim_k_dim_m_rht_pipelined":
@@ -145,11 +144,11 @@ def _make_ours(name: str, x: torch.Tensor):
         )
     if name == "nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_tma":
         return lambda: nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_tma(
-            x, outer, outer, sign, key_k, key_m
+            x, outer, outer, sign, key
         )
     if name == "nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_pipelined":
         return lambda: nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_pipelined(
-            x, outer, outer, sign, key_k, key_m
+            x, outer, outer, sign, key
         )
     raise KeyError(name)
 

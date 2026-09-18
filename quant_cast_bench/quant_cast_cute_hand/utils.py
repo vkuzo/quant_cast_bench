@@ -2,6 +2,7 @@
 
 import cutlass
 import cutlass.cute as cute
+import torch
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import arith, llvm, nvvm, vector
 from cutlass.cutlass_dsl import T, dsl_user_op
@@ -29,6 +30,42 @@ def _ceil_div(
     den: int | cutlass.Int32 | cutlass.Int64 | cutlass.Constexpr,
 ) -> int | cutlass.Int32 | cutlass.Int64:
     return (num + den - 1) // den
+
+
+def _validate_nvfp4_swizzle_inputs(
+    input: torch.Tensor,
+    outer_scale: torch.Tensor,
+    kernel_name: str,
+    k_multiple: int,
+) -> tuple[int, int]:
+    assert input.dim() == 2, f"{kernel_name} requires a 2-D input"
+    assert input.is_contiguous(), f"{kernel_name} requires contiguous input"
+    assert input.dtype == torch.bfloat16, f"{kernel_name} is bf16-only"
+    assert outer_scale.device == input.device, (
+        "input and outer scale must be on the same device"
+    )
+    assert outer_scale.dtype == torch.float32 and outer_scale.numel() == 1, (
+        "outer scale must be a float32 scalar"
+    )
+    M, K = input.shape
+    assert M > 0 and K > 0, f"{kernel_name} requires non-empty dimensions"
+    assert K % k_multiple == 0, (
+        f"{kernel_name} requires K % {k_multiple} == 0"
+    )
+    return M, K
+
+
+def _allocate_nvfp4_swizzle_outputs(
+    input: torch.Tensor,
+    M: int,
+    K: int,
+) -> tuple[torch.Tensor, torch.Tensor, int, int]:
+    nrb, ncb = _ceil_div(M, 128), _ceil_div(K, 64)
+    output = torch.empty(M, K // 2, dtype=torch.uint8, device=input.device)
+    scale = torch.empty(
+        nrb * ncb * 32 * 16, dtype=torch.uint8, device=input.device
+    )
+    return output, scale, nrb, ncb
 
 
 @dsl_user_op
@@ -612,7 +649,7 @@ def _nvfp4_rht_fwht_x16(
 
 
 @cute.jit
-def _nvfp4_store_scale_groups(
+def _store_swizzled_scale_groups_as_uint(
     mScaleLogical: cute.Tensor,
     rScale: cute.Tensor,
     row,
@@ -620,11 +657,12 @@ def _nvfp4_store_scale_groups(
     group_count: cutlass.Constexpr,
 ):
     """Store a thread's adjacent scale bytes using their natural packed width."""
-    if cutlass.const_expr(group_count == 2):
+    if cutlass.const_expr(group_count in (1, 2, 4)):
         _e8m0_scale_store_as_uint(
-            mScaleLogical, rScale, row, scale_col, 2
+            mScaleLogical, rScale, row, scale_col, group_count
         )
     else:
+        assert group_count % 4 == 0
         rScalePacks = cute.tiled_divide(rScale, (4,))
         for pack in cutlass.range_constexpr(group_count // 4):
             _e8m0_scale_store_as_uint(
