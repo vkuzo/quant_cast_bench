@@ -509,7 +509,19 @@ class _BlockscaledTma:
                     for group in cutlass.range_constexpr(scale_groups_m):
                         if scale_col_m + group < M // scale_group_size:
                             rScaleMPadded[group] = rScaleM[group]
-                if output_row_m < _ceil_div(K, 128) * 128:
+                scale_row_m_in_bounds = output_row_m < _ceil_div(K, 128) * 128
+                if cutlass.const_expr(
+                    scale_algo == ScaleAlgo.NVFP4_FP8_E4M3 and do_dim_k
+                ):
+                    # Dim-KM pads its CTA grid to 128 elements for the dim-K scale rows,
+                    # while NVFP4's dim-M scale columns are padded only to 4x16=64.
+                    scale_col_m_in_bounds = (
+                        scale_col_m // 4 * (scale_group_size * 4) < M
+                    )
+                    scale_row_m_in_bounds = (
+                        scale_row_m_in_bounds & scale_col_m_in_bounds
+                    )
+                if scale_row_m_in_bounds:
                     _store_swizzled_scale_groups_as_uint(
                         mScaleMLogical,
                         rScaleMPadded,
@@ -692,13 +704,30 @@ class _BlockscaledTma:
                         for it in cutlass.range_constexpr(iters):
                             if scale_col_k + it < K // scale_group_size:
                                 rScaleKPadded[it] = rScaleK[it]
-                    _store_swizzled_scale_groups_as_uint(
-                        mScaleKLogical,
-                        rScaleKPadded,
-                        input_row_k,
-                        scale_col_k,
-                        iters,
-                    )
+                    if cutlass.const_expr(
+                        scale_algo == ScaleAlgo.NVFP4_FP8_E4M3 and do_dim_m
+                    ):
+                        # Dim-KM pads its K tile to 128 elements, but an NVFP4 scale
+                        # allocation contains only the required 4x16=64-element blocks.
+                        scale_col_k_in_bounds = (
+                            scale_col_k // 4 * (scale_group_size * 4) < K
+                        )
+                        if scale_col_k_in_bounds:
+                            _store_swizzled_scale_groups_as_uint(
+                                mScaleKLogical,
+                                rScaleKPadded,
+                                input_row_k,
+                                scale_col_k,
+                                iters,
+                            )
+                    else:
+                        _store_swizzled_scale_groups_as_uint(
+                            mScaleKLogical,
+                            rScaleKPadded,
+                            input_row_k,
+                            scale_col_k,
+                            iters,
+                        )
 
                 if cutlass.const_expr(needs_boundary_masking):
                     ncb_k = _ceil_div(K, scale_group_size * 4)

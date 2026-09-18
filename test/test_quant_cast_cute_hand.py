@@ -4,6 +4,7 @@ the playground module we iterate on.
 """
 
 import importlib.metadata
+import math
 import os
 import sys
 
@@ -931,6 +932,70 @@ def test_nvfp4_dim_m_tma_padding(kernel, M, K, dtype):
         )
         assert torch.count_nonzero(sk_padded[M:, :]) == 0
         assert torch.count_nonzero(sk_padded[:M, K // 16:]) == 0
+
+
+@pytest.mark.parametrize("M,K", [(32, 32), (2080, 2080)])
+def test_nvfp4_dim_km_tma_scale_stores_stay_within_allocations(
+    monkeypatch, M, K
+):
+    if torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip(
+            "nvfp4 dim-KM TMA emits Blackwell-only PTX; requires cuda capability 10.0"
+        )
+
+    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+    outer_scale = torch.ones(1, dtype=torch.float32, device=x.device)
+
+    # Compile before replacing torch.empty so compiler-internal allocations are unaffected.
+    nvfp4_swizzle_tma(
+        x,
+        outer_scale,
+        outer_scale_m=outer_scale,
+        mode="dim_km",
+    )
+    torch.cuda.synchronize()
+
+    real_empty = torch.empty
+    sentinel = 0xA5
+    guard_bytes = 1024
+    allocation_alignment = 1024
+    qdata_bytes = M * K
+    scale_k_bytes = ((M + 127) // 128) * ((K + 63) // 64) * 32 * 16
+    scale_m_bytes = ((K + 127) // 128) * ((M + 63) // 64) * 32 * 16
+    arena_bytes = qdata_bytes + scale_k_bytes + scale_m_bytes + 8 * guard_bytes
+    arena = real_empty(arena_bytes, dtype=torch.uint8, device=x.device)
+    arena.fill_(sentinel)
+    guarded_ranges = []
+    next_offset = 0
+
+    def guarded_empty(*size, **kwargs):
+        nonlocal next_offset
+        if kwargs.get("dtype") == torch.uint8 and kwargs.get("device") == x.device:
+            shape = size[0] if len(size) == 1 and isinstance(size[0], tuple) else size
+            numel = math.prod(shape)
+            start = (
+                (next_offset + allocation_alignment - 1) // allocation_alignment
+            ) * allocation_alignment
+            end = start + numel
+            guard_end = end + guard_bytes
+            assert guard_end <= arena.numel()
+            guarded_ranges.append((end, guard_end))
+            next_offset = guard_end
+            return arena[start:end].view(shape)
+        return real_empty(*size, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", guarded_empty)
+    nvfp4_swizzle_tma(
+        x,
+        outer_scale,
+        outer_scale_m=outer_scale,
+        mode="dim_km",
+    )
+    torch.cuda.synchronize()
+
+    assert len(guarded_ranges) == 4
+    for start, end in guarded_ranges:
+        assert torch.all(arena[start:end] == sentinel)
 
 
 @pytest.mark.parametrize(

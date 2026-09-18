@@ -6,31 +6,6 @@ below in priority order.
 
 ## Correctness blockers
 
-### Bound NVFP4 dim-KM scale stores
-
-NVFP4 scale storage pads each quantized dimension in 64-element units, while
-the dim-KM CTA grid pads the dimensions to 128 elements. On shapes for which
-the number of 64-element blocks is odd, CTAs covering the second half of the
-final 128-element block can issue packed scale stores beyond the allocated
-dim-K and dim-M scale tensors.
-
-For example, with `M = K = 32`, each scale tensor contains one 512-byte block.
-A guarded-allocation test observed writes to all 512 bytes immediately after
-both scale allocations. Ordinary numerical tests can miss this because the
-out-of-bounds writes may land in allocator padding or be overwritten by a
-later qdata transfer.
-
-The boundary paths must suppress a packed scale store when its starting scale
-column is outside the padded 64-element scale extent. This applies to both
-directions of NVFP4 dim-KM.
-
-Relevant locations:
-
-- `blockscale_tma_plan.py`: dim-KM pads the CTA grid to 128 elements.
-- `blockscaled_tma_kernels.py`: the boundary dim-M and dim-K packed scale
-  stores do not guard the destination scale column.
-- `blockscaled_tma_impl.py`: scale allocations use 64-element NVFP4 blocks.
-
 ### Make runtime ceil division overflow-safe
 
 The host wrapper permits each logical dimension to be as large as
@@ -114,8 +89,6 @@ planning, validation, compilation, and kernel implementation.
   rejection, and compilation-cache reuse passed.
 - All 10 launch-plan tests passed.
 - Python bytecode compilation passed for the package.
-- A guarded-allocation experiment exposed the NVFP4 dim-KM out-of-bounds scale
-  writes described above.
 - CUDA Compute Sanitizer could not be used in this environment because it
   failed during initialization with `cuGetProcAddress_v2` invalid-argument
   errors.
