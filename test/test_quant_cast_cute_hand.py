@@ -37,6 +37,7 @@ except (ImportError, importlib.metadata.PackageNotFoundError):
 HAS_CUTEDSL = _cutedsl_version is not None and _cutedsl_version >= _MIN_CUTEDSL
 
 if HAS_CUTEDSL:
+    from cutedsl_test_utils import run_i32_ceil_div
     from quant_cast_bench.quant_cast_cute_hand.blockscaled_tma.blockscaled_tma_impl import (
         mxfp4_swizzle_v2,
         mxfp8_swizzle_v2,
@@ -640,6 +641,14 @@ def test_mxfp8_swizzle_v2_rejects_grid_y_overflow():
     x = torch.empty((4_194_368, 16), dtype=torch.bfloat16, device="cuda")
     with pytest.raises(ValueError, match="launch grid exceeds CUDA limits"):
         mxfp8_swizzle_v2(x, quant_orientation="dim_m")
+
+
+def test_cute_i32_ceil_div_does_not_overflow():
+    numerator = 2_147_483_616  # Largest multiple of 32 below INT32_MAX.
+    denominator = 128
+    assert run_i32_ceil_div(numerator, denominator) == (
+        numerator + denominator - 1
+    ) // denominator
 
 
 def test_mxfp8_swizzle_v3():

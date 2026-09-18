@@ -32,7 +32,8 @@ def _ceil_div(
     num: int | cutlass.Int32 | cutlass.Int64,
     den: int | cutlass.Int32 | cutlass.Int64 | cutlass.Constexpr,
 ) -> int | cutlass.Int32 | cutlass.Int64:
-    return (num + den - 1) // den
+    # Avoid overflowing a fixed-width numerator close to its maximum value.
+    return num // den + (num % den != 0)
 
 
 def _validate_nvfp4_swizzle_inputs(

@@ -4,24 +4,6 @@ The implementation supports MXFP8, MXFP4, and NVFP4 quantization across
 dim-K, dim-M, and dim-KM orientations. Before upstreaming, address the issues
 below in priority order.
 
-## Correctness blockers
-
-### Make runtime ceil division overflow-safe
-
-The host wrapper permits each logical dimension to be as large as
-`INT32_MAX`, but the shared runtime helper implements ceil division as
-`(num + den - 1) // den`. When `num` is a `cutlass.Int32`, the addition can
-overflow before the division.
-
-For example, `K = 2,147,483,616` is a legal multiple of 32 below `INT32_MAX`,
-but `K + 127` overflows. Runtime grid and scale-layout calculations use this
-operation even though the corresponding host calculations are safe Python
-integer arithmetic.
-
-Use an overflow-safe form such as `num // den + (num % den != 0)`, or widen
-before adding. Audit all runtime grid, padded-extent, and scale-layout
-calculations that consume `M` or `K`.
-
 ## Safety and maintainability
 
 ### Replace host-facing assertions with explicit exceptions
