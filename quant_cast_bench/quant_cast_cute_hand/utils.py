@@ -785,45 +785,6 @@ def _nvfp4_load_philox_key(mSeed: cute.Tensor):
 
 
 @cute.jit
-def _nvfp4_rht_fwht_x16(
-    sInput: cute.Tensor,
-    row_start,
-    local_col,
-    sScaledSigns: cute.Tensor,
-):
-    """Structured RHT: sign flips followed by a four-stage in-register FWHT."""
-    transformed = cute.make_rmem_tensor(_NVFP4_GROUP, cutlass.Float32)
-    # Fold the exact power-of-two normalization into the signs, and consume the signed inputs
-    # directly in the first butterfly stage instead of materializing a separate intermediate.
-    for pair in cutlass.range_constexpr(8):
-        lo, hi = pair * 2, pair * 2 + 1
-        a = sInput[(row_start + lo, local_col)].to(
-            cutlass.Float32
-        ) * sScaledSigns[lo].to(cutlass.Float32)
-        b = sInput[(row_start + hi, local_col)].to(
-            cutlass.Float32
-        ) * sScaledSigns[hi].to(cutlass.Float32)
-        transformed[lo], transformed[hi] = a + b, a - b
-    for block in cutlass.range_constexpr(4):
-        base = block * 4
-        for offset in cutlass.range_constexpr(2):
-            lo, hi = base + offset, base + offset + 2
-            a, b = transformed[lo], transformed[hi]
-            transformed[lo], transformed[hi] = a + b, a - b
-    for block in cutlass.range_constexpr(2):
-        base = block * 8
-        for offset in cutlass.range_constexpr(4):
-            lo, hi = base + offset, base + offset + 4
-            a, b = transformed[lo], transformed[hi]
-            transformed[lo], transformed[hi] = a + b, a - b
-    for offset in cutlass.range_constexpr(8):
-        a, b = transformed[offset], transformed[offset + 8]
-        transformed[offset], transformed[offset + 8] = a + b, a - b
-
-    return transformed.load()
-
-
-@cute.jit
 def _store_swizzled_scale_groups_as_uint(
     mScaleLogical: cute.Tensor,
     rScale: cute.Tensor,

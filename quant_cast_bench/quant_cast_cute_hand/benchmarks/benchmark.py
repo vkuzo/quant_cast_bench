@@ -49,13 +49,9 @@ from quant_cast_bench.quant_cast_cute_hand.recipes import (
     fp8_deepseek_1x128_dim_m_v2, mxfp8_swizzle,
     mxfp8_swizzle_v3, mxfp8_swizzle_v4, mxfp8_swizzle_v5,
     nvfp4_dim_km_swizzle_tma, nvfp4_dim_m_rht_swizzle_pipelined,
-    nvfp4_dim_m_rht_swizzle_tma,
     nvfp4_dim_m_swizzle_rht_sr_pipelined,
-    nvfp4_dim_m_swizzle_rht_sr_tma,
     nvfp4_dim_m_swizzle_tma, nvfp4_swizzle_direct, nvfp4_swizzle_tma,
-    nvfp4_swizzle_dim_k_dim_m_rht_tma,
     nvfp4_swizzle_dim_k_dim_m_rht_pipelined,
-    nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_tma,
     nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_pipelined,
     transpose_v0, transpose_v1,
 )
@@ -645,7 +641,7 @@ def _bench_nvfp4_dim_km_swizzle_tma(M, K):
     return run, bytes_per_iter
 
 
-def _bench_nvfp4_dim_m_rht(M, K, *, stochastic, pipelined):
+def _bench_nvfp4_dim_m_rht(M, K, *, stochastic):
     torch.manual_seed(0)
     x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
     rht_sign = torch.tensor([1, -1] * 8, device=x.device, dtype=x.dtype)
@@ -657,61 +653,40 @@ def _bench_nvfp4_dim_m_rht(M, K, *, stochastic, pipelined):
         key = prng.key(0, device=x.device)
 
         def run():
-            fn = (
-                nvfp4_dim_m_swizzle_rht_sr_pipelined
-                if pipelined
-                else nvfp4_dim_m_swizzle_rht_sr_tma
+            return nvfp4_dim_m_swizzle_rht_sr_pipelined(
+                x, outer_scale, rht_sign, key
             )
-            return fn(x, outer_scale, rht_sign, key)
 
         gold = Nvfp4GsDimMSwizzleRHTSRGold
         gold_inputs = (x, outer_scale, rht, key)
     else:
 
         def run():
-            fn = (
-                nvfp4_dim_m_rht_swizzle_pipelined
-                if pipelined
-                else nvfp4_dim_m_rht_swizzle_tma
+            return nvfp4_dim_m_rht_swizzle_pipelined(
+                x, outer_scale, rht_sign
             )
-            return fn(x, outer_scale, rht_sign)
 
         gold = Nvfp4GsSwizzleDimMRHTGold
         gold_inputs = (x, outer_scale, rht)
 
     outputs = run()
     torch.cuda.synchronize()
-    references = gold.pt_ref_fn(*gold_inputs)
-    if pipelined:
-        gold.correctness_fn(gold_inputs, outputs)
-    else:
-        for output, reference in zip(outputs, references):
-            assert torch.equal(
-                output.view(torch.uint8), reference.view(torch.uint8)
-            )
+    gold.correctness_fn(gold_inputs, outputs)
     bytes_per_iter = x.numel() * x.element_size() + sum(
         output.numel() * output.element_size() for output in outputs
     )
     return run, bytes_per_iter
 
 
-def _bench_nvfp4_dim_m_rht_swizzle_tma(M, K):
-    return _bench_nvfp4_dim_m_rht(M, K, stochastic=False, pipelined=False)
-
-
 def _bench_nvfp4_dim_m_rht_swizzle_pipelined(M, K):
-    return _bench_nvfp4_dim_m_rht(M, K, stochastic=False, pipelined=True)
-
-
-def _bench_nvfp4_dim_m_swizzle_rht_sr_tma(M, K):
-    return _bench_nvfp4_dim_m_rht(M, K, stochastic=True, pipelined=False)
+    return _bench_nvfp4_dim_m_rht(M, K, stochastic=False)
 
 
 def _bench_nvfp4_dim_m_swizzle_rht_sr_pipelined(M, K):
-    return _bench_nvfp4_dim_m_rht(M, K, stochastic=True, pipelined=True)
+    return _bench_nvfp4_dim_m_rht(M, K, stochastic=True)
 
 
-def _bench_nvfp4_dim_km_rht_tma(M, K, *, stochastic, pipelined=False):
+def _bench_nvfp4_dim_km_rht_pipelined(M, K, *, stochastic):
     torch.manual_seed(0)
     x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
     rht_sign = torch.tensor([1, -1] * 8, device=x.device, dtype=x.dtype)
@@ -723,24 +698,16 @@ def _bench_nvfp4_dim_km_rht_tma(M, K, *, stochastic, pipelined=False):
         key = prng.key(0, device=x.device)
 
         def run():
-            fn = (
-                nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_pipelined
-                if pipelined
-                else nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_tma
+            return nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_pipelined(
+                x, outer_scale_k, outer_scale_m, rht_sign, key
             )
-            return fn(x, outer_scale_k, outer_scale_m, rht_sign, key)
 
         gold = Nvfp4GsSwizzle_DimKSR_DimMRHTSR_Gold
         gold_inputs = (x, outer_scale_k, outer_scale_m, rht, key)
     else:
 
         def run():
-            fn = (
-                nvfp4_swizzle_dim_k_dim_m_rht_pipelined
-                if pipelined
-                else nvfp4_swizzle_dim_k_dim_m_rht_tma
-            )
-            return fn(
+            return nvfp4_swizzle_dim_k_dim_m_rht_pipelined(
                 x, outer_scale_k, outer_scale_m, rht_sign
             )
 
@@ -749,37 +716,20 @@ def _bench_nvfp4_dim_km_rht_tma(M, K, *, stochastic, pipelined=False):
 
     outputs = run()
     torch.cuda.synchronize()
-    references = gold.pt_ref_fn(*gold_inputs)
-    if pipelined:
-        # The TE-style path intentionally uses BF16 UMMA plus approximate reciprocal math.
-        gold.correctness_fn(gold_inputs, outputs)
-    else:
-        for output, reference in zip(outputs, references):
-            assert torch.equal(output.view(torch.uint8), reference.view(torch.uint8))
+    # The TE-style path intentionally uses BF16 UMMA plus approximate reciprocal math.
+    gold.correctness_fn(gold_inputs, outputs)
     bytes_per_iter = x.numel() * x.element_size() + sum(
         output.numel() * output.element_size() for output in outputs
     )
     return run, bytes_per_iter
 
 
-def _bench_nvfp4_swizzle_dim_k_dim_m_rht_tma(M, K):
-    return _bench_nvfp4_dim_km_rht_tma(M, K, stochastic=False)
-
-
-def _bench_nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_tma(M, K):
-    return _bench_nvfp4_dim_km_rht_tma(M, K, stochastic=True)
-
-
 def _bench_nvfp4_swizzle_dim_k_dim_m_rht_pipelined(M, K):
-    return _bench_nvfp4_dim_km_rht_tma(
-        M, K, stochastic=False, pipelined=True
-    )
+    return _bench_nvfp4_dim_km_rht_pipelined(M, K, stochastic=False)
 
 
 def _bench_nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_pipelined(M, K):
-    return _bench_nvfp4_dim_km_rht_tma(
-        M, K, stochastic=True, pipelined=True
-    )
+    return _bench_nvfp4_dim_km_rht_pipelined(M, K, stochastic=True)
 
 
 def _bench_transpose_v0(M, K):
@@ -846,12 +796,8 @@ _KERNELS = {
     "nvfp4_swizzle_tma": _bench_nvfp4_swizzle_tma,
     "nvfp4_dim_m_swizzle_tma": _bench_nvfp4_dim_m_swizzle_tma,
     "nvfp4_dim_km_swizzle_tma": _bench_nvfp4_dim_km_swizzle_tma,
-    "nvfp4_dim_m_rht_swizzle_tma": _bench_nvfp4_dim_m_rht_swizzle_tma,
     "nvfp4_dim_m_rht_swizzle_pipelined": _bench_nvfp4_dim_m_rht_swizzle_pipelined,
-    "nvfp4_dim_m_swizzle_rht_sr_tma": _bench_nvfp4_dim_m_swizzle_rht_sr_tma,
     "nvfp4_dim_m_swizzle_rht_sr_pipelined": _bench_nvfp4_dim_m_swizzle_rht_sr_pipelined,
-    "nvfp4_swizzle_dim_k_dim_m_rht_tma": _bench_nvfp4_swizzle_dim_k_dim_m_rht_tma,
-    "nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_tma": _bench_nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_tma,
     "nvfp4_swizzle_dim_k_dim_m_rht_pipelined": _bench_nvfp4_swizzle_dim_k_dim_m_rht_pipelined,
     "nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_pipelined": _bench_nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_pipelined,
     "transpose_v0": _bench_transpose_v0,

@@ -8,9 +8,9 @@ TransformerEngine results are red, RTNE is solid, and stochastic rounding is das
 and non-RHT kernels remain in separate panels. A missing red SR line means that
 TransformerEngine has no comparable stochastic MXFP8 implementation. The MXFP8 comparisons
 include both the conventional 1x32 scale blocks and the 32x32 scale blocks used by
-`mxfp8_32x32_swizzle_v2`. Panels are grouped into MXFP8, NVFP4, and deprecated NVFP4
-sections. The NVFP4 section includes a shared RTNE/SR panel for the dim-M RHT pipelined
-recipes.
+`mxfp8_32x32_swizzle_v2`. Panels are grouped into MXFP8 and NVFP4 sections. RHT recipes
+use the pipelined kernel family; the NVFP4 section includes shared RTNE/SR panels for its
+dim-M and dim-KM variants.
 
 ![CuTe-hand versus TransformerEngine throughput](transformer_engine_comparison.png)
 

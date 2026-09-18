@@ -92,11 +92,7 @@ _REQUIRES_SM100 = frozenset({
     "nvfp4_swizzle_direct",
     "nvfp4_swizzle_tma",
     "nvfp4_dim_m_swizzle_tma",
-    "nvfp4_dim_m_rht_swizzle_tma",
-    "nvfp4_dim_m_swizzle_rht_sr_tma",
     "nvfp4_dim_km_swizzle_tma",
-    "nvfp4_swizzle_dim_k_dim_m_rht_tma",
-    "nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_tma",
     "nvfp4_dim_m_rht_swizzle_pipelined",
     "nvfp4_dim_m_swizzle_rht_sr_pipelined",
     "nvfp4_swizzle_dim_k_dim_m_rht_pipelined",
@@ -115,6 +111,11 @@ _MX_V2_RECIPES = frozenset({
     "mxfp4_dim_m_swizzle_v2",
     "mxfp4_dim_km_swizzle_v2",
 })
+_BLOCKSCALED_TMA_RECIPES = _MX_V2_RECIPES | {
+    "nvfp4_swizzle_tma",
+    "nvfp4_dim_m_swizzle_tma",
+    "nvfp4_dim_km_swizzle_tma",
+}
 _SUPPORTS_NON_BFLOAT16 = _MX_V2_RECIPES
 
 def _get_recipe(recipe_name):
@@ -828,55 +829,32 @@ def test_nvfp4_swizzle_tma_rejects_unaligned_packed_stride():
         recipe.cute_fn(*inputs)
 
 
+def test_nvfp4_swizzle_tma_rejects_rht_argument():
+    if torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip("nvfp4_swizzle_tma emits Blackwell-only PTX; requires cuda capability 10.0")
+    x = torch.randn(128, 128, dtype=torch.bfloat16, device="cuda")
+    outer_scale = torch.ones(1, dtype=torch.float32, device=x.device)
+    rht_sign = torch.ones(16, dtype=torch.bfloat16, device=x.device)
+    with pytest.raises(AssertionError, match="unexpected keyword arguments: rht_sign"):
+        nvfp4_swizzle_tma(x, outer_scale, rht_sign=rht_sign)
+
+
 @pytest.mark.parametrize(
     "kernel,M,K",
     [
         ("nvfp4_dim_m_swizzle_tma", 32, 16),
         ("nvfp4_dim_m_swizzle_tma", 96, 48),
         ("nvfp4_dim_m_swizzle_tma", 160, 144),
-        ("nvfp4_dim_m_rht_swizzle_tma", 32, 16),
-        ("nvfp4_dim_m_rht_swizzle_tma", 96, 48),
-        ("nvfp4_dim_m_rht_swizzle_tma", 160, 144),
-        ("nvfp4_dim_m_swizzle_rht_sr_tma", 32, 16),
-        ("nvfp4_dim_m_swizzle_rht_sr_tma", 96, 48),
-        ("nvfp4_dim_m_swizzle_rht_sr_tma", 160, 144),
         ("nvfp4_dim_km_swizzle_tma", 32, 32),
         ("nvfp4_dim_km_swizzle_tma", 96, 160),
         ("nvfp4_dim_km_swizzle_tma", 160, 96),
-        ("nvfp4_swizzle_dim_k_dim_m_rht_tma", 32, 32),
-        ("nvfp4_swizzle_dim_k_dim_m_rht_tma", 96, 160),
-        ("nvfp4_swizzle_dim_k_dim_m_rht_tma", 160, 96),
-        ("nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_tma", 32, 32),
-        ("nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_tma", 96, 160),
-        ("nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_tma", 160, 96),
     ],
 )
 def test_nvfp4_dim_m_tma_padding(kernel, M, K):
     if torch.cuda.get_device_capability() != (10, 0):
         pytest.skip(f"{kernel} emits Blackwell-only PTX; requires cuda capability 10.0")
     recipe = _get_recipe(kernel)
-    if kernel in (
-        "nvfp4_swizzle_dim_k_dim_m_rht_tma",
-        "nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_tma",
-        "nvfp4_swizzle_dim_k_dim_m_rht_pipelined",
-        "nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_pipelined",
-    ):
-        cute_inputs, gold_inputs = _nvfp4_dim_km_rht_test_inputs(
-            M,
-            K,
-            stochastic="_sr_dim_m_" in kernel,
-        )
-    elif kernel in (
-        "nvfp4_dim_m_rht_swizzle_tma",
-        "nvfp4_dim_m_swizzle_rht_sr_tma",
-    ):
-        cute_inputs, gold_inputs = _nvfp4_dim_m_rht_test_inputs(
-            M,
-            K,
-            stochastic=kernel == "nvfp4_dim_m_swizzle_rht_sr_tma",
-        )
-    else:
-        cute_inputs = gold_inputs = recipe.example_input_fn(M, K, torch.bfloat16)
+    cute_inputs = gold_inputs = recipe.example_input_fn(M, K, torch.bfloat16)
     outputs = recipe.cute_fn(*cute_inputs)
     references = recipe.pt_ref_fn(*gold_inputs)
     for output, reference in zip(outputs, references):
@@ -890,13 +868,7 @@ def test_nvfp4_dim_m_tma_padding(kernel, M, K):
     assert torch.count_nonzero(sm_padded[K:, :]) == 0
     assert torch.count_nonzero(sm_padded[:K, M // 16:]) == 0
 
-    if kernel in (
-        "nvfp4_dim_km_swizzle_tma",
-        "nvfp4_swizzle_dim_k_dim_m_rht_tma",
-        "nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_tma",
-        "nvfp4_swizzle_dim_k_dim_m_rht_pipelined",
-        "nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_pipelined",
-    ):
+    if kernel == "nvfp4_dim_km_swizzle_tma":
         qk, sk = outputs[:2]
         assert qk.shape == (M, K // 2)
         nrb_k, ncb_k = (M + 127) // 128, ((K // 16) + 3) // 4
@@ -1084,8 +1056,6 @@ def test_cute_hand_matches_reference(name, recipe, dtype):
         pytest.skip(f"{name} does not support {dtype} input")
     torch.manual_seed(0)
     if name in (
-        "nvfp4_swizzle_dim_k_dim_m_rht_tma",
-        "nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_tma",
         "nvfp4_swizzle_dim_k_dim_m_rht_pipelined",
         "nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_pipelined",
     ):
@@ -1095,8 +1065,6 @@ def test_cute_hand_matches_reference(name, recipe, dtype):
             stochastic="_sr_dim_m_" in name,
         )
     elif name in (
-        "nvfp4_dim_m_rht_swizzle_tma",
-        "nvfp4_dim_m_swizzle_rht_sr_tma",
         "nvfp4_dim_m_rht_swizzle_pipelined",
         "nvfp4_dim_m_swizzle_rht_sr_pipelined",
     ):
@@ -1114,7 +1082,7 @@ def test_cute_hand_matches_reference(name, recipe, dtype):
         "num_col": gold_inputs[0].shape[-1],
     }
     ref_outs = recipe.pt_ref_fn(*gold_inputs, **tile_kwargs)
-    cute_kwargs = {} if name in _MX_V2_RECIPES else tile_kwargs
+    cute_kwargs = {} if name in _BLOCKSCALED_TMA_RECIPES else tile_kwargs
     cute_outs = recipe.cute_fn(*cute_inputs, **cute_kwargs)
 
     assert len(cute_outs) == len(ref_outs), f"{name}: output count {len(cute_outs)} != {len(ref_outs)}"

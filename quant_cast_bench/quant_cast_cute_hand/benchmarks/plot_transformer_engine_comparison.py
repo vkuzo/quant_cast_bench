@@ -21,13 +21,6 @@ TICK_FONT_SIZE = 11
 LEGEND_FONT_SIZE = 10
 ANNOTATION_FONT_SIZE = 10
 
-DIM_M_RHT_TMA_KERNELS = {
-    "nvfp4_dim_m_rht_swizzle_tma",
-    "nvfp4_dim_m_swizzle_rht_sr_tma",
-}
-DEPRECATED_KERNEL = "nvfp4_swizzle_dim_k_dim_m_rht_tma"
-
-
 def _is_true(value: str) -> bool:
     return value.lower() == "true"
 
@@ -69,11 +62,6 @@ def _read_results(
 
 
 def _section_name(variants: dict[bool, list[dict[str, str]]]) -> str:
-    kernels = {
-        row["kernel"] for rows in variants.values() for row in rows
-    }
-    if DEPRECATED_KERNEL in kernels:
-        return "NVFP4 deprecated"
     family = next(iter(next(iter(variants.values()))))["family"]
     return "MXFP8" if family == "mxfp8" else "NVFP4"
 
@@ -133,28 +121,6 @@ def _plot_chart(
             transform=axis.transAxes,
         )
 
-    title_set = set(titles)
-    if title_set & DIM_M_RHT_TMA_KERNELS:
-        axis.text(
-            0.5,
-            0.16,
-            "we need a _pipelined kernel instead of _tma\nfor this to catch TE, TODO",
-            color=TE_COLOR,
-            fontsize=ANNOTATION_FONT_SIZE,
-            ha="center",
-            transform=axis.transAxes,
-        )
-    if DEPRECATED_KERNEL in title_set:
-        axis.text(
-            0.5,
-            0.16,
-            "the _pipelined kernel implements the same thing\nand catches TE",
-            color=TE_COLOR,
-            fontsize=ANNOTATION_FONT_SIZE,
-            ha="center",
-            transform=axis.transAxes,
-        )
-
     axis.set_title("\n".join(titles), fontsize=TITLE_FONT_SIZE)
     axis.set_xticks(range(len(shapes)), [str(shape) for shape in shapes])
     axis.set_xlabel("M == K", fontsize=LABEL_FONT_SIZE)
@@ -177,7 +143,7 @@ def _plot_chart(
 def plot(csv_path: Path, output_path: Path) -> None:
     charts = _read_results(csv_path)
     column_count = 2
-    section_order = ("MXFP8", "NVFP4", "NVFP4 deprecated")
+    section_order = ("MXFP8", "NVFP4")
     sections = {
         name: [
             variants

@@ -45,7 +45,6 @@ def select_blockscaled_tma_plan(
     is_stochastic_qdata_rounding: bool,
     is_square_scaling: bool,
     scale_algo: ScaleAlgo,
-    has_dim_m_rht: bool,
 ) -> BlockscaledTmaPlan:
     """Select the existing B200-tuned tile, cluster, masking, and grid policy."""
     if quant_orientation not in ("dim_k", "dim_m", "dim_km"):
@@ -79,32 +78,12 @@ def select_blockscaled_tma_plan(
         cluster_k = 1
         needs_boundary_masking = M % 128 != 0 or K % 128 != 0
     elif is_nvfp4:
-        fused_rht = quant_orientation == "dim_km" and has_dim_m_rht
-        if fused_rht:
-            tile_m_size = 32 if M * K <= 2048 * 2048 else 64
-            tile_k_size = 128
-        elif M * K <= 2048 * 2048:
-            tile_m_size, tile_k_size = 32, 128
-        elif is_stochastic_qdata_rounding and M * K >= 8192 * 8192:
-            tile_m_size, tile_k_size = 128, 128
-        else:
-            tile_m_size, tile_k_size = 64, 128
-        grid_k = _ceil_div(K, tile_k_size)
-        if fused_rht:
-            cluster_k = (
-                2
-                if (is_stochastic_qdata_rounding or M * K <= 4096 * 4096)
-                and grid_k % 2 == 0
-                else 1
-            )
-        elif is_stochastic_qdata_rounding and M * K >= 8192 * 8192:
-            cluster_k = 2 if grid_k % 2 == 0 else 1
-        else:
-            cluster_k = (
-                2
-                if has_dim_m_rht and M * K <= 2048 * 2048 and grid_k % 2 == 0
-                else 1
-            )
+        tile_m_size, tile_k_size = (
+            _DIM_M_KM_SMALL_TILE_32_128
+            if M * K <= 2048 * 2048
+            else _DIM_KM_LARGE_TILE_64_128
+        )
+        cluster_k = 1
         needs_boundary_masking = M % 128 != 0 or K % 128 != 0
     elif quant_orientation == "dim_k":
         assert nrb_k is not None

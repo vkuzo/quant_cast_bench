@@ -9,7 +9,7 @@ from quant_cast_bench.quant_cast_cute_hand.blockscale_tma_plan import (
 
 
 @pytest.mark.parametrize(
-    "M,K,input_dtype,orientation,stochastic,square,scale_algo,rht,expected",
+    "M,K,input_dtype,orientation,stochastic,square,scale_algo,expected",
     [
         (
             2048,
@@ -19,7 +19,6 @@ from quant_cast_bench.quant_cast_cute_hand.blockscale_tma_plan import (
             False,
             False,
             ScaleAlgo.RCEIL_E8M0,
-            False,
             BlockscaledTmaPlan(32, 128, 16, False, 64, 16),
         ),
         (
@@ -30,7 +29,6 @@ from quant_cast_bench.quant_cast_cute_hand.blockscale_tma_plan import (
             True,
             False,
             ScaleAlgo.RCEIL_E8M0,
-            False,
             BlockscaledTmaPlan(128, 128, 1, False, 32, 32),
         ),
         (
@@ -41,7 +39,6 @@ from quant_cast_bench.quant_cast_cute_hand.blockscale_tma_plan import (
             False,
             False,
             ScaleAlgo.RCEIL_E8M0,
-            False,
             BlockscaledTmaPlan(64, 256, 1, False, 64, 16),
         ),
         (
@@ -52,7 +49,6 @@ from quant_cast_bench.quant_cast_cute_hand.blockscale_tma_plan import (
             False,
             False,
             ScaleAlgo.RCEIL_E8M0,
-            False,
             BlockscaledTmaPlan(64, 128, 1, False, 64, 32),
         ),
         (
@@ -63,7 +59,6 @@ from quant_cast_bench.quant_cast_cute_hand.blockscale_tma_plan import (
             False,
             False,
             ScaleAlgo.RCEIL_E8M0,
-            False,
             BlockscaledTmaPlan(64, 128, 1, False, 64, 32),
         ),
         (
@@ -74,7 +69,6 @@ from quant_cast_bench.quant_cast_cute_hand.blockscale_tma_plan import (
             False,
             False,
             ScaleAlgo.NVFP4_FP8_E4M3,
-            False,
             BlockscaledTmaPlan(128, 64, 1, False, 24, 48),
         ),
         (
@@ -85,7 +79,6 @@ from quant_cast_bench.quant_cast_cute_hand.blockscale_tma_plan import (
             False,
             False,
             ScaleAlgo.NVFP4_FP8_E4M3,
-            False,
             BlockscaledTmaPlan(128, 64, 1, True, 25, 49),
         ),
         (
@@ -96,7 +89,6 @@ from quant_cast_bench.quant_cast_cute_hand.blockscale_tma_plan import (
             False,
             False,
             ScaleAlgo.NVFP4_FP8_E4M3,
-            False,
             BlockscaledTmaPlan(64, 128, 1, False, 64, 32),
         ),
         (
@@ -104,11 +96,10 @@ from quant_cast_bench.quant_cast_cute_hand.blockscale_tma_plan import (
             8192,
             torch.bfloat16,
             "dim_km",
-            True,
+            False,
             False,
             ScaleAlgo.NVFP4_FP8_E4M3,
-            True,
-            BlockscaledTmaPlan(64, 128, 2, False, 128, 64),
+            BlockscaledTmaPlan(64, 128, 1, False, 128, 64),
         ),
     ],
 )
@@ -120,7 +111,6 @@ def test_select_blockscaled_tma_plan(
     stochastic,
     square,
     scale_algo,
-    rht,
     expected,
 ):
     assert select_blockscaled_tma_plan(
@@ -131,7 +121,6 @@ def test_select_blockscaled_tma_plan(
         is_stochastic_qdata_rounding=stochastic,
         is_square_scaling=square,
         scale_algo=scale_algo,
-        has_dim_m_rht=rht,
     ) == expected
 
 
@@ -145,5 +134,4 @@ def test_select_blockscaled_tma_plan_rejects_invalid_orientation():
             is_stochastic_qdata_rounding=False,
             is_square_scaling=False,
             scale_algo=ScaleAlgo.RCEIL_E8M0,
-            has_dim_m_rht=False,
         )
