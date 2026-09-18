@@ -1,5 +1,7 @@
 """Shared helpers for handwritten CuTe DSL quantization kernels."""
 
+from enum import IntEnum
+
 import cutlass
 import cutlass.cute as cute
 import torch
@@ -15,6 +17,13 @@ from quant_cast_bench.quant_cast_cute.recipes import (
 
 
 COMPILE_CACHE: dict = {}
+
+
+class ScaleAlgo(IntEnum):
+    """Compile-time algorithm used to derive and encode each block scale."""
+
+    RCEIL_E8M0 = 0
+    NVFP4_FP8_E4M3 = 1
 
 
 def _compiled(key, jit_fn, *cute_args):
@@ -369,6 +378,180 @@ def _cvt_rs_satfinite_e2m1x4_f32_x8(
             asm_dialect=llvm.AsmDialect.AD_ATT,
         )
     )
+
+
+@cute.jit
+def _mxfp8_v2_quantize_stochastic_x32(
+    values: cute.TensorSSA,
+    rcp: cutlass.Float32,
+    counter_start: cutlass.Uint64,
+    philox_k0: cutlass.Uint32,
+    philox_k1: cutlass.Uint32,
+) -> cute.TensorSSA:
+    """Quantize one contiguous 32-value output run with two Philox counters."""
+    scaled = values * rcp
+    qwords = cute.make_rmem_tensor(cute.make_layout(8), cutlass.Uint32)
+    for half in cutlass.range_constexpr(2):
+        ctr = counter_start + cutlass.Uint64(half)
+        c0 = cutlass.Uint32(ctr & cutlass.Uint64(0xFFFFFFFF))
+        c1 = cutlass.Uint32(ctr >> 32)
+        zero = cutlass.Uint32(0)
+        r0, r1, r2, r3 = _philox_4x32(
+            c0, c1, zero, zero, philox_k0, philox_k1
+        )
+        value = half * 16
+        word = half * 4
+        qwords[word + 0] = _cvt_rs_satfinite_e4m3x4_f32(
+            scaled[value + 0],
+            scaled[value + 1],
+            scaled[value + 2],
+            scaled[value + 3],
+            r0,
+        )
+        qwords[word + 1] = _cvt_rs_satfinite_e4m3x4_f32(
+            scaled[value + 4],
+            scaled[value + 5],
+            scaled[value + 6],
+            scaled[value + 7],
+            r1,
+        )
+        qwords[word + 2] = _cvt_rs_satfinite_e4m3x4_f32(
+            scaled[value + 8],
+            scaled[value + 9],
+            scaled[value + 10],
+            scaled[value + 11],
+            r2,
+        )
+        qwords[word + 3] = _cvt_rs_satfinite_e4m3x4_f32(
+            scaled[value + 12],
+            scaled[value + 13],
+            scaled[value + 14],
+            scaled[value + 15],
+            r3,
+        )
+    return cute.recast_tensor(qwords, dtype=cutlass.Float8E4M3FN).load()
+
+
+@cute.jit
+def _quantize_fp4_rtne(
+    values: cute.TensorSSA,
+    rcp: cutlass.Float32,
+    value_count: cutlass.Constexpr,
+) -> cute.TensorSSA:
+    """Quantize an x16 or x32 FP32 group into packed E2M1 bytes with RTNE."""
+    scaled = values * rcp
+    qwords = cute.make_rmem_tensor(
+        cute.make_layout(value_count // 8), cutlass.Uint32
+    )
+    for chunk in cutlass.range_constexpr(value_count // 8):
+        offset = chunk * 8
+        qwords[chunk] = _cvt_rn_satfinite_e2m1x2_f32_x4(
+            scaled[offset + 0],
+            scaled[offset + 1],
+            scaled[offset + 2],
+            scaled[offset + 3],
+            scaled[offset + 4],
+            scaled[offset + 5],
+            scaled[offset + 6],
+            scaled[offset + 7],
+        )
+    return cute.recast_tensor(qwords, dtype=cutlass.Uint8).load()
+
+
+@cute.jit
+def _quantize_fp4_stochastic_x16(
+    values: cute.TensorSSA,
+    rcp: cutlass.Float32,
+    sr_counter: cutlass.Uint64,
+    philox_k0: cutlass.Uint32,
+    philox_k1: cutlass.Uint32,
+) -> cute.TensorSSA:
+    """Quantize 16 scaled FP32 values with one Philox counter and native E2M1 SR."""
+    c0 = cutlass.Uint32(sr_counter & cutlass.Uint64(0xFFFFFFFF))
+    c1 = cutlass.Uint32(sr_counter >> 32)
+    zero = cutlass.Uint32(0)
+    r0, r1, r2, r3 = _philox_4x32(
+        c0, c1, zero, zero, philox_k0, philox_k1
+    )
+    qwords = cute.make_rmem_tensor(2, cutlass.Uint32)
+    qwords[0] = _cvt_rs_satfinite_e2m1x4_f32_x8(
+        values[0] * rcp,
+        values[1] * rcp,
+        values[2] * rcp,
+        values[3] * rcp,
+        values[4] * rcp,
+        values[5] * rcp,
+        values[6] * rcp,
+        values[7] * rcp,
+        r0,
+        r2,
+    )
+    qwords[1] = _cvt_rs_satfinite_e2m1x4_f32_x8(
+        values[8] * rcp,
+        values[9] * rcp,
+        values[10] * rcp,
+        values[11] * rcp,
+        values[12] * rcp,
+        values[13] * rcp,
+        values[14] * rcp,
+        values[15] * rcp,
+        r1,
+        r3,
+    )
+    return cute.recast_tensor(qwords, dtype=cutlass.Uint8).load()
+
+
+@cute.jit
+def _blockscaled_quantize_group(
+    values: cute.TensorSSA,
+    outer,
+    value_count: cutlass.Constexpr,
+    qdata_dtype: cutlass.Constexpr,
+    scale_algo: cutlass.Constexpr,
+    is_square_scaling: cutlass.Constexpr,
+    is_stochastic_qdata_rounding: cutlass.Constexpr,
+    sr_counter: cutlass.Uint64 | None,
+    philox_k0: cutlass.Uint32 | None,
+    philox_k1: cutlass.Uint32 | None,
+):
+    """Calculate one block scale and quantize the values that share it."""
+    if cutlass.const_expr(is_stochastic_qdata_rounding):
+        assert sr_counter is not None
+        assert philox_k0 is not None
+        assert philox_k1 is not None
+    else:
+        assert sr_counter is None
+        assert philox_k0 is None
+        assert philox_k1 is None
+
+    amax = cute.math.absf(values).reduce(
+        cute.ReductionOp.MAX, cutlass.Float32(0.0), 0
+    )
+    if cutlass.const_expr(is_square_scaling):
+        amax = cute.arch.warp_reduction_max(amax)
+
+    # ScaleAlgo selects only the scale calculation. The surrounding data path is shared.
+    if cutlass.const_expr(scale_algo == ScaleAlgo.NVFP4_FP8_E4M3):
+        scale, reciprocal = _nvfp4_scale_e4m3(amax, outer, outer)
+    elif cutlass.const_expr(qdata_dtype == cutlass.Float4E2M1FN):
+        reciprocal, scale = _e8m0_with_max_pos(amax, 6.0)
+    else:
+        reciprocal, scale = _e8m0(amax)
+
+    if cutlass.const_expr(qdata_dtype == cutlass.Float4E2M1FN):
+        if cutlass.const_expr(is_stochastic_qdata_rounding):
+            qdata = _quantize_fp4_stochastic_x16(
+                values, reciprocal, sr_counter, philox_k0, philox_k1
+            )
+        else:
+            qdata = _quantize_fp4_rtne(values, reciprocal, value_count)
+    elif cutlass.const_expr(is_stochastic_qdata_rounding):
+        qdata = _mxfp8_v2_quantize_stochastic_x32(
+            values, reciprocal, sr_counter, philox_k0, philox_k1
+        )
+    else:
+        qdata = (values * reciprocal).to(cutlass.Float8E4M3FN)
+    return qdata, scale
 
 
 @cute.jit
