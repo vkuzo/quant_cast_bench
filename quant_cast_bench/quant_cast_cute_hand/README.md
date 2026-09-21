@@ -9,6 +9,34 @@ the remaining work and review findings for upstreaming it into PyTorch core.
 The persistent NVFP4 RHT implementation follows the same plan/kernel/host split
 in the `nvfp4_pipelined/` package.
 
+## Support matrix
+
+| Recipe | `kernel_family` | Format | Orientation | Swizzle | `rounding_mode` | RHT | `is_square_scaling` | Input dtypes |
+|---|---|---|---|---|---|---|---|---|
+| `mxfp8` | `blockscaled_tma` | MXFP8 | dim-K | No | `rtne` | No | No | FP32, BF16, FP16 |
+| `mxfp8_swizzle_v2` | `blockscaled_tma` | MXFP8 | dim-K | Yes | `rtne`, `stochastic` | No | No | FP32, BF16, FP16 |
+| `mxfp8_dim_m_swizzle_v2` | `blockscaled_tma` | MXFP8 | dim-M | Yes | `rtne`, `stochastic` | No | No | FP32, BF16, FP16 |
+| `mxfp8_dim_km_swizzle_v2` | `blockscaled_tma` | MXFP8 | dim-KM | Yes | `rtne`, `stochastic` | No | No | FP32, BF16, FP16 |
+| `mxfp8_32x32_swizzle_v2` | `blockscaled_tma` | MXFP8 | dim-K | Yes | `rtne` | No | Yes (32x32) | FP32, BF16, FP16 |
+| `mxfp4` | `blockscaled_tma` | MXFP4 | dim-K | No | `rtne` | No | No | FP32, BF16, FP16 |
+| `mxfp4_swizzle_v2` | `blockscaled_tma` | MXFP4 | dim-K | Yes | `rtne` | No | No | FP32, BF16, FP16 |
+| `mxfp4_dim_m_swizzle_v2` | `blockscaled_tma` | MXFP4 | dim-M | Yes | `rtne` | No | No | FP32, BF16, FP16 |
+| `mxfp4_dim_km_swizzle_v2` | `blockscaled_tma` | MXFP4 | dim-KM | Yes | `rtne` | No | No | FP32, BF16, FP16 |
+| `nvfp4` | `blockscaled_tma` | NVFP4 | dim-K | No | `rtne` | No | No | FP32, BF16, FP16 |
+| `nvfp4_swizzle_tma` | `blockscaled_tma` | NVFP4 | dim-K | Yes | `rtne` | No | No | FP32, BF16, FP16 |
+| `nvfp4_dim_m_swizzle_tma` | `blockscaled_tma` | NVFP4 | dim-M | Yes | `rtne` | No | No | FP32, BF16, FP16 |
+| `nvfp4_dim_km_swizzle_tma` | `blockscaled_tma` | NVFP4 | dim-KM | Yes | `rtne` | No | No | FP32, BF16, FP16 |
+| `nvfp4_swizzle_16x16_tma` | `blockscaled_tma` | NVFP4 | dim-K | Yes | `rtne` | No | Yes (16x16) | FP32, BF16, FP16 |
+| `nvfp4_dim_m_rht_swizzle_pipelined` | `nvfp4_pipelined` | NVFP4 | dim-M | Yes | `rtne` | Yes | No | BF16 |
+| `nvfp4_dim_m_swizzle_rht_sr_pipelined` | `nvfp4_pipelined` | NVFP4 | dim-M | Yes | `stochastic` | Yes | No | BF16 |
+| `nvfp4_swizzle_dim_k_dim_m_rht_pipelined` | `nvfp4_pipelined` | NVFP4 | dim-KM | Yes | `rtne` | Yes | No | BF16 |
+| `nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_pipelined` | `nvfp4_pipelined` | NVFP4 | dim-KM | Yes | `stochastic` | Yes | No | BF16 |
+
+For the dim-KM pipelined recipes, RHT is applied only to the dim-M pass. The
+`nvfp4_pipelined` family is currently BF16-only because its UMMA path is built
+around BF16 operands; the `blockscaled_tma` family supports all three listed
+input dtypes.
+
 ## Block-scaled TMA upstream-readiness review
 
 The kernel supports dim-K, dim-M, and dim-KM quantization, RTNE and stochastic
