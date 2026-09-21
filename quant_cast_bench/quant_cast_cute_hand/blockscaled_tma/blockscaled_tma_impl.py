@@ -33,6 +33,7 @@ from quant_cast_bench.quant_cast_gold.recipes import (
     Mxfp8DimMSwizzleSRGold,
     Mxfp8SwizzleGold,
     Mxfp8SwizzleSRGold,
+    Nvfp4Gs16x16SwizzleGold,
     Nvfp4GsGold,
     Nvfp4GsDimKMSwizzleGold,
     Nvfp4GsDimMSwizzleGold,
@@ -102,8 +103,6 @@ def _blockscaled_tma_impl_on_current_device(
     if is_nvfp4:
         if qdata_dtype != torch.float4_e2m1fn_x2:
             raise ValueError("NVFP4 scaling requires float4_e2m1fn_x2 qdata")
-        if is_square_scaling:
-            raise ValueError("NVFP4 scaling does not support square scaling")
     else:
         if outer_scale_k is not None or outer_scale_m is not None:
             raise ValueError("RCEIL scaling does not use outer scales")
@@ -122,9 +121,9 @@ def _blockscaled_tma_impl_on_current_device(
         raise ValueError("packed FP4 qdata does not support square scaling")
     if is_square_scaling:
         if quant_orientation != "dim_k":
-            raise ValueError("32x32 v2 currently supports only dim-k output")
+            raise ValueError("square scaling currently supports only dim-k output")
         if is_stochastic_qdata_rounding:
-            raise ValueError("32x32 v2 currently supports only RTNE")
+            raise ValueError("square scaling currently supports only RTNE")
     if is_nvfp4:
         if key is not None:
             raise ValueError("RTNE rounding does not use a Philox key")
@@ -151,6 +150,8 @@ def _blockscaled_tma_impl_on_current_device(
         k_multiple = 32 if do_dim_k else 16
         if K % k_multiple != 0:
             raise ValueError(f"nvfp4_swizzle_tma requires K % {k_multiple} == 0")
+        if is_square_scaling and M % 16 != 0:
+            raise ValueError("NVFP4 16x16 scaling requires M % 16 == 0")
         if do_dim_m and M % 32 != 0:
             raise ValueError("nvfp4 dim-M TMA requires M % 32 == 0")
 
@@ -624,6 +625,31 @@ def nvfp4_swizzle_tma(
 
 NVFP4_SWIZZLE_TMA = QuantCastCuteRecipe.from_gold(
     Nvfp4GsSwizzleGold, cute_fn=nvfp4_swizzle_tma
+)
+
+
+def nvfp4_swizzle_16x16_tma(
+    input: torch.Tensor,
+    outer_scale: torch.Tensor,
+    **kwargs: object,
+) -> _TwoTensorOutput:
+    return _blockscaled_tma_impl(
+        input,
+        quant_orientation="dim_k",
+        key=None,
+        rounding_mode="rtne",
+        is_square_scaling=True,
+        is_scale_swizzled=True,
+        qdata_dtype=torch.float4_e2m1fn_x2,
+        scale_algo=ScaleAlgo.NVFP4_FP8_E4M3,
+        outer_scale_k=outer_scale,
+        **kwargs,
+    )
+
+
+NVFP4_SWIZZLE_16X16_TMA = QuantCastCuteRecipe.from_gold(
+    Nvfp4Gs16x16SwizzleGold,
+    cute_fn=nvfp4_swizzle_16x16_tma,
 )
 
 

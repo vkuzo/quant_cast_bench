@@ -42,6 +42,7 @@ from quant_cast_bench.quant_cast_cute_hand.blockscaled_tma.blockscaled_tma_impl 
     NVFP4,
     NVFP4_DIM_KM_SWIZZLE_TMA,
     NVFP4_DIM_M_SWIZZLE_TMA,
+    NVFP4_SWIZZLE_16X16_TMA,
     NVFP4_SWIZZLE_TMA,
     mxfp4,
     mxfp4_dim_km_swizzle_v2,
@@ -51,6 +52,7 @@ from quant_cast_bench.quant_cast_cute_hand.blockscaled_tma.blockscaled_tma_impl 
     nvfp4,
     nvfp4_dim_km_swizzle_tma,
     nvfp4_dim_m_swizzle_tma,
+    nvfp4_swizzle_16x16_tma,
     nvfp4_swizzle_tma,
 )
 from quant_cast_bench.quant_cast_cute_hand.nvfp4_pipelined.nvfp4_pipelined_impl import (
@@ -2601,6 +2603,7 @@ ALL_RECIPES = [
     ("mxfp4_dim_km_swizzle_v2", MXFP4_DIM_KM_SWIZZLE_V2),
     ("nvfp4_swizzle_direct", NVFP4_SWIZZLE_DIRECT),
     ("nvfp4_swizzle_tma", NVFP4_SWIZZLE_TMA),
+    ("nvfp4_swizzle_16x16_tma", NVFP4_SWIZZLE_16X16_TMA),
     ("nvfp4_dim_m_swizzle_tma", NVFP4_DIM_M_SWIZZLE_TMA),
     ("nvfp4_dim_km_swizzle_tma", NVFP4_DIM_KM_SWIZZLE_TMA),
     (

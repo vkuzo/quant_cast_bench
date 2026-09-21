@@ -46,6 +46,7 @@ from quant_cast_bench.quant_cast_cute_hand.blockscaled_tma.blockscaled_tma_impl 
     mxfp8_32x32_swizzle_v2,
     mxfp8_swizzle_v2,
     nvfp4,
+    nvfp4_swizzle_16x16_tma,
 )
 from quant_cast_bench.quant_cast_cute_hand.recipes import (
     add_v0, add_v1, add_v2, fp8_deepseek_1x128, fp8_deepseek_1x128_dim_m,
@@ -63,7 +64,8 @@ from quant_cast_bench.quant_cast_gold.recipes import (
     mxfp8_32x32_swizzle_f, mxfp8_dim_km_swizzle_f, mxfp8_dim_km_swizzle_sr_f,
     mxfp8_dim_m_swizzle_f, mxfp8_dim_m_swizzle_sr_f, mxfp8_f, mxfp8_swizzle_f,
     mxfp8_swizzle_sr_f, hadamard_rht_fp32_f, hadamard_rht_matrix,
-    nvfp4_gs_f, nvfp4_gs_scale, nvfp4_gs_swizzle_dim_km_f, nvfp4_gs_swizzle_dim_m_f,
+    nvfp4_gs_16x16_swizzle_f, nvfp4_gs_f, nvfp4_gs_scale,
+    nvfp4_gs_swizzle_dim_km_f, nvfp4_gs_swizzle_dim_m_f,
     nvfp4_gs_swizzle_f,
     Nvfp4GsDimMSwizzleRHTSRGold, Nvfp4GsSwizzleDimMRHTGold,
     Nvfp4GsSwizzle_DimK_DimMRHT_Gold,
@@ -640,6 +642,16 @@ def _bench_nvfp4_swizzle_tma(M, K, dtype=torch.bfloat16):
     return _bench_nvfp4_swizzle_impl(M, K, nvfp4_swizzle_tma, dtype)
 
 
+def _bench_nvfp4_swizzle_16x16_tma(M, K, dtype=torch.bfloat16):
+    return _bench_nvfp4_swizzle_impl(
+        M,
+        K,
+        nvfp4_swizzle_16x16_tma,
+        dtype,
+        reference_fn=nvfp4_gs_16x16_swizzle_f,
+    )
+
+
 def _bench_nvfp4(M, K, dtype=torch.bfloat16):
     return _bench_nvfp4_swizzle_impl(
         M, K, nvfp4, dtype, reference_fn=nvfp4_gs_f
@@ -840,6 +852,7 @@ _KERNELS = {
     "nvfp4_swizzle_direct": _bench_nvfp4_swizzle_direct,
     "nvfp4": _bench_nvfp4,
     "nvfp4_swizzle_tma": _bench_nvfp4_swizzle_tma,
+    "nvfp4_swizzle_16x16_tma": _bench_nvfp4_swizzle_16x16_tma,
     "nvfp4_dim_m_swizzle_tma": _bench_nvfp4_dim_m_swizzle_tma,
     "nvfp4_dim_km_swizzle_tma": _bench_nvfp4_dim_km_swizzle_tma,
     "nvfp4_dim_m_rht_swizzle_pipelined": _bench_nvfp4_dim_m_rht_swizzle_pipelined,
@@ -865,6 +878,7 @@ _KERNELS_SUPPORTING_FLOAT16_AND_FLOAT32 = frozenset({
     "mxfp4",
     "nvfp4",
     "nvfp4_swizzle_tma",
+    "nvfp4_swizzle_16x16_tma",
     "nvfp4_dim_m_swizzle_tma",
     "nvfp4_dim_km_swizzle_tma",
 })
