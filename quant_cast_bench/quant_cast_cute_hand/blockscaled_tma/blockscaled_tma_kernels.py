@@ -20,6 +20,7 @@ from quant_cast_bench.quant_cast_cute_hand.utils import (
     _blockscaled_quantize_group,
     _ceil_div,
     _load_philox_key_and_counter,
+    _store_unswizzled_scale_groups_as_uint,
     _store_swizzled_scale_groups_as_uint,
 )
 
@@ -63,6 +64,7 @@ class _BlockscaledTma:
         quant_orientation: int,
         is_stochastic_qdata_rounding: bool,
         is_square_scaling: bool,
+        is_scale_swizzled: bool,
         qdata_dtype: type[cutlass.Numeric] = cutlass.Float8E4M3FN,
         scale_algo: ScaleAlgo = ScaleAlgo.RCEIL_E8M0,
     ) -> None:
@@ -74,6 +76,7 @@ class _BlockscaledTma:
         self.quant_orientation = quant_orientation
         self.is_stochastic_qdata_rounding = is_stochastic_qdata_rounding
         self.is_square_scaling = is_square_scaling
+        self.is_scale_swizzled = is_scale_swizzled
         self.qdata_dtype = qdata_dtype
         self.scale_algo = scale_algo
         self.scale_group_size = (
@@ -140,6 +143,7 @@ class _BlockscaledTma:
             self.is_stochastic_qdata_rounding
         )
         is_square_scaling = cutlass.const_expr(self.is_square_scaling)
+        is_scale_swizzled = cutlass.const_expr(self.is_scale_swizzled)
         scale_algo = cutlass.const_expr(self.scale_algo)
         scale_group_size = cutlass.const_expr(self.scale_group_size)
         qdata_dtype = self.qdata_dtype
@@ -162,6 +166,10 @@ class _BlockscaledTma:
         qdata_k_divisor = 2 if cutlass.const_expr(is_packed_fp4_qdata) else 1
         do_dim_k = quant_orientation != _QUANT_ORIENTATION_DIM_M
         do_dim_m = quant_orientation != _QUANT_ORIENTATION_DIM_K
+
+        if cutlass.const_expr(not is_scale_swizzled):
+            assert quant_orientation == _QUANT_ORIENTATION_DIM_K
+            assert not is_square_scaling
 
         if cutlass.const_expr(quant_orientation == _QUANT_ORIENTATION_DIM_K):
             assert output_k_tma_atom is not None
@@ -692,7 +700,29 @@ class _BlockscaledTma:
                     tile_k_idx * groups_per_row_k
                     + (tidx % threads_per_row_k) * iters
                 )
-                if use_full_tile_k:
+                if cutlass.const_expr(not is_scale_swizzled):
+                    compact_scale_cols = K // scale_group_size
+                    if use_full_tile_k and compact_scale_cols % iters == 0:
+                        _store_unswizzled_scale_groups_as_uint(
+                            mScaleKLogical,
+                            rScaleK,
+                            input_row_k,
+                            scale_col_k,
+                            compact_scale_cols,
+                            iters,
+                        )
+                    elif input_row_k < M:
+                        for it in cutlass.range_constexpr(iters):
+                            if scale_col_k + it < compact_scale_cols:
+                                compact_scale_offset = (
+                                    cutlass.Int64(input_row_k)
+                                    * cutlass.Int64(compact_scale_cols)
+                                    + cutlass.Int64(scale_col_k + it)
+                                )
+                                mScaleKLogical[compact_scale_offset] = rScaleK[
+                                    it
+                                ]
+                elif use_full_tile_k:
                     _store_swizzled_scale_groups_as_uint(
                         mScaleKLogical,
                         rScaleK,
@@ -700,7 +730,7 @@ class _BlockscaledTma:
                         scale_col_k,
                         iters,
                     )
-                else:
+                elif cutlass.const_expr(is_scale_swizzled):
                     rScaleKPadded = cute.make_rmem_tensor(iters, cutlass.Uint8)
                     rScaleKPadded.fill(0)
                     if input_row_k < M:
@@ -732,7 +762,9 @@ class _BlockscaledTma:
                             iters,
                         )
 
-                if cutlass.const_expr(needs_boundary_masking):
+                if cutlass.const_expr(
+                    needs_boundary_masking and is_scale_swizzled
+                ):
                     ncb_k = _ceil_div(K, scale_group_size * 4)
                     grid_n = _ceil_div(K, tile_k_size)
                     covered_groups = grid_n * groups_per_row_k
@@ -757,7 +789,18 @@ class _BlockscaledTma:
                     scale_col_k = (
                         tile_k_idx * groups_per_row_k + local_group_k
                     )
-                    if use_full_tile_k:
+                    if cutlass.const_expr(not is_scale_swizzled):
+                        if input_row_k < M:
+                            if scale_col_k < K // scale_group_size:
+                                compact_scale_offset = (
+                                    cutlass.Int64(input_row_k)
+                                    * cutlass.Int64(K // scale_group_size)
+                                    + cutlass.Int64(scale_col_k)
+                                )
+                                mScaleKLogical[compact_scale_offset] = rScaleK[
+                                    it
+                                ]
+                    elif use_full_tile_k:
                         mScaleKLogical[(input_row_k, scale_col_k)] = rScaleK[it]
                     else:
                         scale_k = cutlass.Uint8(0)
@@ -792,6 +835,7 @@ class _BlockscaledTma:
             self.is_stochastic_qdata_rounding
         )
         is_square_scaling = cutlass.const_expr(self.is_square_scaling)
+        is_scale_swizzled = cutlass.const_expr(self.is_scale_swizzled)
         scale_algo = cutlass.const_expr(self.scale_algo)
         scale_group_size = cutlass.const_expr(self.scale_group_size)
         qdata_dtype = self.qdata_dtype
@@ -812,6 +856,10 @@ class _BlockscaledTma:
 
         do_dim_k = quant_orientation != _QUANT_ORIENTATION_DIM_M
         do_dim_m = quant_orientation != _QUANT_ORIENTATION_DIM_K
+
+        if cutlass.const_expr(not is_scale_swizzled):
+            assert quant_orientation == _QUANT_ORIENTATION_DIM_K
+            assert not is_square_scaling
 
         if cutlass.const_expr(quant_orientation == _QUANT_ORIENTATION_DIM_K):
             assert mOutputK is not None
@@ -954,14 +1002,22 @@ class _BlockscaledTma:
                 (tile_m_size, tile_k_size // qdata_k_divisor),
             )
 
-            nrb_k = _ceil_div(M, 128)
-            ncb_k = _ceil_div(K, scale_group_size * 4)
-            scale_k_row_block_stride = cutlass.Int64(ncb_k) * 32 * 16
-            scale_k_layout = cute.make_layout(
-                ((32, 4, nrb_k), (4, ncb_k)),
-                stride=((16, 4, scale_k_row_block_stride), (1, 32 * 16)),
-            )
-            mScaleKLogical = cute.make_tensor(mScaleK.iterator, scale_k_layout)
+            if cutlass.const_expr(is_scale_swizzled):
+                nrb_k = _ceil_div(M, 128)
+                ncb_k = _ceil_div(K, scale_group_size * 4)
+                scale_k_row_block_stride = cutlass.Int64(ncb_k) * 32 * 16
+                scale_k_layout = cute.make_layout(
+                    ((32, 4, nrb_k), (4, ncb_k)),
+                    stride=((16, 4, scale_k_row_block_stride), (1, 32 * 16)),
+                )
+                mScaleKLogical = cute.make_tensor(
+                    mScaleK.iterator, scale_k_layout
+                )
+            else:
+                # Compact scale storage is flat. The kernel supplies its row
+                # stride explicitly so dynamic output dimensions do not add a
+                # second dynamic tensor stride to every scale-store address.
+                mScaleKLogical = mScaleK
 
             groups_per_row_k = tile_k_size // scale_group_size
             row_owned_k = scale_group_size == 16 or (
@@ -1162,6 +1218,16 @@ def _make_dynamic_scale_fake() -> cute.Tensor:
     )
 
 
+def _make_dynamic_compact_scale_fake() -> cute.Tensor:
+    """Match the flat allocation backing a compact scale output."""
+    return cute.runtime.make_fake_tensor(
+        cutlass.Uint8,
+        (cute.sym_int(),),
+        stride=(1,),
+        assumed_align=4,
+    )
+
+
 def _make_static_vector_fake(
     dtype: type[cutlass.Numeric], size: int, assumed_align: int
 ) -> cute.Tensor:
@@ -1182,6 +1248,7 @@ def _blockscaled_tma_compile_log_key(
     quant_orientation: int,
     is_stochastic_qdata_rounding: bool,
     is_square_scaling: bool,
+    is_scale_swizzled: bool,
     qdata_dtype: torch.dtype = torch.float8_e4m3fn,
     scale_algo: ScaleAlgo = ScaleAlgo.RCEIL_E8M0,
 ) -> str:
@@ -1189,7 +1256,8 @@ def _blockscaled_tma_compile_log_key(
         f"dtype={input_dtype} orientation={quant_orientation} "
         f"tile={tile_m_size}x{tile_k_size} cluster_k={cluster_k} "
         f"masking={needs_boundary_masking} sr={is_stochastic_qdata_rounding} "
-        f"square={is_square_scaling} qdata_dtype={qdata_dtype} "
+        f"square={is_square_scaling} scale_swizzled={is_scale_swizzled} "
+        f"qdata_dtype={qdata_dtype} "
         f"scale_algo={scale_algo.name}"
     )
 
@@ -1207,6 +1275,7 @@ def _compile_blockscaled_tma(
     quant_orientation: int,
     is_stochastic_qdata_rounding: bool,
     is_square_scaling: bool,
+    is_scale_swizzled: bool,
     qdata_dtype: torch.dtype = torch.float8_e4m3fn,
     scale_algo: ScaleAlgo = ScaleAlgo.RCEIL_E8M0,
 ) -> Callable[..., None]:
@@ -1219,6 +1288,11 @@ def _compile_blockscaled_tma(
             raise ValueError("NVFP4 scaling requires float4_e2m1fn_x2 qdata")
         if is_square_scaling:
             raise ValueError("NVFP4 scaling does not support square scaling")
+    if not is_scale_swizzled:
+        if quant_orientation != _QUANT_ORIENTATION_DIM_K:
+            raise ValueError("compact scales currently support only dim-k output")
+        if is_square_scaling:
+            raise ValueError("compact scales do not support square scaling")
     do_dim_k = quant_orientation != _QUANT_ORIENTATION_DIM_M
     do_dim_m = quant_orientation != _QUANT_ORIENTATION_DIM_K
 
@@ -1231,6 +1305,7 @@ def _compile_blockscaled_tma(
         quant_orientation,
         is_stochastic_qdata_rounding,
         is_square_scaling,
+        is_scale_swizzled,
         qdata_element_type,
         scale_algo,
     )
@@ -1244,7 +1319,15 @@ def _compile_blockscaled_tma(
     mOutputK = (
         _make_dynamic_matrix_fake(qdata_storage_element_type) if do_dim_k else None
     )
-    mScaleK = _make_dynamic_scale_fake() if do_dim_k else None
+    mScaleK = (
+        (
+            _make_dynamic_scale_fake()
+            if is_scale_swizzled
+            else _make_dynamic_compact_scale_fake()
+        )
+        if do_dim_k
+        else None
+    )
     is_nvfp4 = scale_algo == ScaleAlgo.NVFP4_FP8_E4M3
     mOuterScaleK = (
         _make_static_vector_fake(cutlass.Float32, 1, assumed_align=4)

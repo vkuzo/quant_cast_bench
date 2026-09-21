@@ -39,8 +39,11 @@ HAS_CUTEDSL = _cutedsl_version is not None and _cutedsl_version >= _MIN_CUTEDSL
 if HAS_CUTEDSL:
     from cutedsl_test_utils import run_i32_ceil_div
     from quant_cast_bench.quant_cast_cute_hand.blockscaled_tma.blockscaled_tma_impl import (
+        mxfp4,
         mxfp4_swizzle_v2,
+        mxfp8,
         mxfp8_swizzle_v2,
+        nvfp4,
         nvfp4_swizzle_tma,
     )
     from quant_cast_bench.quant_cast_cute_hand.blockscaled_tma.blockscaled_tma_kernels import (
@@ -78,6 +81,7 @@ torch.manual_seed(0)
 # rejects it below sm_100, so gate those recipes to cuda capability 10.0. Mirrors the
 # _REQUIRES_SM100 set in test_quant_cast_cute.py.
 _REQUIRES_SM100 = frozenset({
+    "mxfp8",
     "mxfp8_swizzle",
     "mxfp8_swizzle_v2",
     "mxfp8_swizzle_sr_v2",
@@ -93,6 +97,8 @@ _REQUIRES_SM100 = frozenset({
     "mxfp4_swizzle_v2",
     "mxfp4_dim_m_swizzle_v2",
     "mxfp4_dim_km_swizzle_v2",
+    "mxfp4",
+    "nvfp4",
     "nvfp4_swizzle_direct",
     "nvfp4_swizzle_tma",
     "nvfp4_dim_m_swizzle_tma",
@@ -104,6 +110,7 @@ _REQUIRES_SM100 = frozenset({
 })
 
 _MX_V2_RECIPES = frozenset({
+    "mxfp8",
     "mxfp8_swizzle_v2",
     "mxfp8_swizzle_sr_v2",
     "mxfp8_32x32_swizzle_v2",
@@ -114,8 +121,10 @@ _MX_V2_RECIPES = frozenset({
     "mxfp4_swizzle_v2",
     "mxfp4_dim_m_swizzle_v2",
     "mxfp4_dim_km_swizzle_v2",
+    "mxfp4",
 })
 _BLOCKSCALED_TMA_RECIPES = _MX_V2_RECIPES | {
+    "nvfp4",
     "nvfp4_swizzle_tma",
     "nvfp4_dim_m_swizzle_tma",
     "nvfp4_dim_km_swizzle_tma",
@@ -539,6 +548,28 @@ def test_mxfp4_swizzle_v2_quant_orientation(
     assert len(outputs) == len(ref_outputs)
     for output, ref_output in zip(outputs, ref_outputs):
         assert qdata_and_scale_equal(output, ref_output)
+
+
+@pytest.mark.parametrize(
+    "name,kernel,M,K,scale_shape",
+    [
+        ("mxfp8", mxfp8, 129, 160, (129, 5)),
+        ("mxfp4", mxfp4, 129, 160, (129, 5)),
+        ("nvfp4", nvfp4, 129, 160, (129, 10)),
+    ],
+)
+def test_blockscaled_tma_compact_scale(name, kernel, M, K, scale_shape):
+    if torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip(f"{name} emits Blackwell-only PTX; requires cuda capability 10.0")
+    recipe = _get_recipe(name)
+    inputs = recipe.example_input_fn(M, K, torch.bfloat16)
+
+    outputs = kernel(*inputs)
+    reference = recipe.pt_ref_fn(*inputs)
+
+    assert outputs[1].shape == scale_shape
+    for output, expected in zip(outputs, reference):
+        assert qdata_and_scale_equal(output, expected)
 
 
 @pytest.mark.parametrize(

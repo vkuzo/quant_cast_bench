@@ -21,16 +21,19 @@ from quant_cast_bench.quant_cast_cute_hand.blockscaled_tma.blockscaled_tma_kerne
 )
 from quant_cast_bench.quant_cast_cute_hand.utils import _ceil_div
 from quant_cast_bench.quant_cast_gold.recipes import (
+    Mxfp4Gold,
     Mxfp4DimKMSwizzleGold,
     Mxfp4DimMSwizzleGold,
     Mxfp4SwizzleGold,
     Mxfp832x32SwizzleGold,
+    Mxfp8Gold,
     Mxfp8DimKmSwizzleGold,
     Mxfp8DimKmSwizzleSRGold,
     Mxfp8DimMSwizzleGold,
     Mxfp8DimMSwizzleSRGold,
     Mxfp8SwizzleGold,
     Mxfp8SwizzleSRGold,
+    Nvfp4GsGold,
     Nvfp4GsDimKMSwizzleGold,
     Nvfp4GsDimMSwizzleGold,
     Nvfp4GsSwizzleGold,
@@ -63,6 +66,7 @@ def _blockscaled_tma_impl_on_current_device(
     key: torch.Tensor | None,
     rounding_mode: str,
     is_square_scaling: bool,
+    is_scale_swizzled: bool,
     qdata_dtype: torch.dtype = torch.float8_e4m3fn,
     scale_algo: ScaleAlgo = ScaleAlgo.RCEIL_E8M0,
     outer_scale_k: torch.Tensor | None = None,
@@ -73,6 +77,12 @@ def _blockscaled_tma_impl_on_current_device(
     do_dim_k = quant_orientation != "dim_m"
     do_dim_m = quant_orientation != "dim_k"
     is_nvfp4 = scale_algo == ScaleAlgo.NVFP4_FP8_E4M3
+
+    if not is_scale_swizzled:
+        if quant_orientation != "dim_k":
+            raise ValueError("compact scales currently support only dim-k output")
+        if is_square_scaling:
+            raise ValueError("compact scales do not support square scaling")
 
     if input.dim() != 2:
         raise ValueError(
@@ -207,9 +217,17 @@ def _blockscaled_tma_impl_on_current_device(
                 dtype=qdata_storage_dtype,
                 device=input.device,
             )
-            scale_k = torch.empty(
-                nrb_k, ncb_k, 32, 16, dtype=torch.uint8, device=input.device
-            ).view(scale_dtype)
+            if is_scale_swizzled:
+                scale_k = torch.empty(
+                    nrb_k, ncb_k, 32, 16, dtype=torch.uint8, device=input.device
+                ).view(scale_dtype)
+            else:
+                scale_k = torch.empty(
+                    M,
+                    K // scale_group_size,
+                    dtype=torch.uint8,
+                    device=input.device,
+                ).view(scale_dtype)
 
         output_m = scale_m = None
         if do_dim_m:
@@ -280,11 +298,18 @@ def _blockscaled_tma_impl_on_current_device(
         )
         # Every slot is written by the kernel, so zero-initialization would launch a redundant
         # memset.
-        scale_k = torch.empty(
-            nrb_k * ncb_k * 32 * 16,
-            dtype=torch.uint8,
-            device=input.device,
-        )
+        if is_scale_swizzled:
+            scale_k = torch.empty(
+                nrb_k * ncb_k * 32 * 16,
+                dtype=torch.uint8,
+                device=input.device,
+            )
+        else:
+            scale_k = torch.empty(
+                M * (K // scale_group_size),
+                dtype=torch.uint8,
+                device=input.device,
+            )
     seed = key.reshape(-1).view(torch.int64) if key is not None else None
     outer_scale_k_arg = outer_scale_k.reshape(1) if outer_scale_k is not None else None
     outer_scale_m_arg = outer_scale_m.reshape(1) if outer_scale_m is not None else None
@@ -298,6 +323,7 @@ def _blockscaled_tma_impl_on_current_device(
         quant_orientation_id,
         is_stochastic_qdata_rounding,
         is_square_scaling,
+        is_scale_swizzled,
         qdata_dtype,
         scale_algo,
     )
@@ -319,7 +345,11 @@ def _blockscaled_tma_impl_on_current_device(
     if do_dim_m:
         scale_m = scale_m.view(nrb_m, ncb_m, 32, 16).view(scale_dtype)
     if do_dim_k:
-        scale_k = scale_k.view(nrb_k, ncb_k, 32, 16).view(scale_dtype)
+        if is_scale_swizzled:
+            scale_k = scale_k.view(nrb_k, ncb_k, 32, 16)
+        else:
+            scale_k = scale_k.view(M, K // scale_group_size)
+        scale_k = scale_k.view(scale_dtype)
     if is_packed_fp4_qdata:
         if do_dim_k:
             output_k = output_k.view(torch.float4_e2m1fn_x2)
@@ -339,6 +369,7 @@ def _blockscaled_tma_impl(
     key: torch.Tensor | None,
     rounding_mode: str,
     is_square_scaling: bool,
+    is_scale_swizzled: bool,
     qdata_dtype: torch.dtype = torch.float8_e4m3fn,
     scale_algo: ScaleAlgo = ScaleAlgo.RCEIL_E8M0,
     outer_scale_k: torch.Tensor | None = None,
@@ -368,6 +399,7 @@ def _blockscaled_tma_impl(
             key=key,
             rounding_mode=rounding_mode,
             is_square_scaling=is_square_scaling,
+            is_scale_swizzled=is_scale_swizzled,
             qdata_dtype=qdata_dtype,
             scale_algo=scale_algo,
             outer_scale_k=outer_scale_k,
@@ -393,6 +425,7 @@ def mxfp8_swizzle_v2(
         key=key,
         rounding_mode=rounding_mode,
         is_square_scaling=False,
+        is_scale_swizzled=True,
         **kwargs,
     )
 
@@ -400,6 +433,21 @@ def mxfp8_swizzle_v2(
 MXFP8_SWIZZLE_V2 = QuantCastCuteRecipe.from_gold(
     Mxfp8SwizzleGold, cute_fn=mxfp8_swizzle_v2
 )
+
+
+def mxfp8(input: torch.Tensor, **kwargs: object) -> _TwoTensorOutput:
+    return _blockscaled_tma_impl(
+        input,
+        quant_orientation="dim_k",
+        key=None,
+        rounding_mode="rtne",
+        is_square_scaling=False,
+        is_scale_swizzled=False,
+        **kwargs,
+    )
+
+
+MXFP8 = QuantCastCuteRecipe.from_gold(Mxfp8Gold, cute_fn=mxfp8)
 
 
 def mxfp8_32x32_swizzle_v2(
@@ -411,6 +459,7 @@ def mxfp8_32x32_swizzle_v2(
         key=None,
         rounding_mode="rtne",
         is_square_scaling=True,
+        is_scale_swizzled=True,
         **kwargs,
     )
 
@@ -486,6 +535,7 @@ def mxfp4_swizzle_v2(
         key=None,
         rounding_mode="rtne",
         is_square_scaling=False,
+        is_scale_swizzled=True,
         qdata_dtype=torch.float4_e2m1fn_x2,
         **kwargs,
     )
@@ -495,6 +545,22 @@ MXFP4_SWIZZLE_V2 = QuantCastCuteRecipe.from_gold(
     Mxfp4SwizzleGold,
     cute_fn=mxfp4_swizzle_v2,
 )
+
+
+def mxfp4(input: torch.Tensor, **kwargs: object) -> _TwoTensorOutput:
+    return _blockscaled_tma_impl(
+        input,
+        quant_orientation="dim_k",
+        key=None,
+        rounding_mode="rtne",
+        is_square_scaling=False,
+        is_scale_swizzled=False,
+        qdata_dtype=torch.float4_e2m1fn_x2,
+        **kwargs,
+    )
+
+
+MXFP4 = QuantCastCuteRecipe.from_gold(Mxfp4Gold, cute_fn=mxfp4)
 
 
 def mxfp4_dim_m_swizzle_v2(
@@ -548,6 +614,7 @@ def nvfp4_swizzle_tma(
         key=None,
         rounding_mode="rtne",
         is_square_scaling=False,
+        is_scale_swizzled=True,
         qdata_dtype=torch.float4_e2m1fn_x2,
         scale_algo=ScaleAlgo.NVFP4_FP8_E4M3,
         outer_scale_k=outer_scale_k_arg,
@@ -558,6 +625,28 @@ def nvfp4_swizzle_tma(
 NVFP4_SWIZZLE_TMA = QuantCastCuteRecipe.from_gold(
     Nvfp4GsSwizzleGold, cute_fn=nvfp4_swizzle_tma
 )
+
+
+def nvfp4(
+    input: torch.Tensor,
+    outer_scale: torch.Tensor,
+    **kwargs: object,
+) -> _TwoTensorOutput:
+    return _blockscaled_tma_impl(
+        input,
+        quant_orientation="dim_k",
+        key=None,
+        rounding_mode="rtne",
+        is_square_scaling=False,
+        is_scale_swizzled=False,
+        qdata_dtype=torch.float4_e2m1fn_x2,
+        scale_algo=ScaleAlgo.NVFP4_FP8_E4M3,
+        outer_scale_k=outer_scale,
+        **kwargs,
+    )
+
+
+NVFP4 = QuantCastCuteRecipe.from_gold(Nvfp4GsGold, cute_fn=nvfp4)
 
 
 def nvfp4_dim_m_swizzle_tma(

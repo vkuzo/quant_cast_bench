@@ -38,11 +38,14 @@ from torch._inductor.utils import do_bench_using_profiling
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 from quant_cast_bench.quant_cast_cute_hand.blockscaled_tma.blockscaled_tma_impl import (
+    mxfp4,
     mxfp4_dim_km_swizzle_v2,
     mxfp4_dim_m_swizzle_v2,
     mxfp4_swizzle_v2,
+    mxfp8,
     mxfp8_32x32_swizzle_v2,
     mxfp8_swizzle_v2,
+    nvfp4,
 )
 from quant_cast_bench.quant_cast_cute_hand.recipes import (
     add_v0, add_v1, add_v2, fp8_deepseek_1x128, fp8_deepseek_1x128_dim_m,
@@ -56,11 +59,11 @@ from quant_cast_bench.quant_cast_cute_hand.recipes import (
     transpose_v0, transpose_v1,
 )
 from quant_cast_bench.quant_cast_gold.recipes import (
-    mxfp4_dim_km_swizzle_f, mxfp4_dim_m_swizzle_f, mxfp4_swizzle_f,
+    mxfp4_dim_km_swizzle_f, mxfp4_dim_m_swizzle_f, mxfp4_f, mxfp4_swizzle_f,
     mxfp8_32x32_swizzle_f, mxfp8_dim_km_swizzle_f, mxfp8_dim_km_swizzle_sr_f,
-    mxfp8_dim_m_swizzle_f, mxfp8_dim_m_swizzle_sr_f, mxfp8_swizzle_f,
+    mxfp8_dim_m_swizzle_f, mxfp8_dim_m_swizzle_sr_f, mxfp8_f, mxfp8_swizzle_f,
     mxfp8_swizzle_sr_f, hadamard_rht_fp32_f, hadamard_rht_matrix,
-    nvfp4_gs_scale, nvfp4_gs_swizzle_dim_km_f, nvfp4_gs_swizzle_dim_m_f,
+    nvfp4_gs_f, nvfp4_gs_scale, nvfp4_gs_swizzle_dim_km_f, nvfp4_gs_swizzle_dim_m_f,
     nvfp4_gs_swizzle_f,
     Nvfp4GsDimMSwizzleRHTSRGold, Nvfp4GsSwizzleDimMRHTGold,
     Nvfp4GsSwizzle_DimK_DimMRHT_Gold,
@@ -289,6 +292,30 @@ def _bench_mxfp8_swizzle_v2(M, K, dtype):
         x.numel() * x.element_size()   # 16-bit input read
         + q.numel() * q.element_size() # fp8 qdata write
         + s.numel() * s.element_size() # e8m0 (1-byte) scale write
+    )
+    return run, bytes_per_iter
+
+
+def _bench_mxfp8(M, K, dtype):
+    torch.manual_seed(0)
+    x = torch.randn(M, K, dtype=dtype, device="cuda")
+
+    def run():
+        return mxfp8(x)
+
+    qdata, scale = run()
+    torch.cuda.synchronize()
+    qdata_ref, scale_ref = mxfp8_f(x)
+    assert torch.equal(
+        qdata.view(torch.uint8), qdata_ref.view(torch.uint8)
+    ), "qdata mismatch vs reference"
+    assert torch.equal(
+        scale.view(torch.uint8), scale_ref.view(torch.uint8)
+    ), "scale mismatch vs reference"
+    bytes_per_iter = (
+        x.numel() * x.element_size()
+        + qdata.numel() * qdata.element_size()
+        + scale.numel() * scale.element_size()
     )
     return run, bytes_per_iter
 
@@ -535,6 +562,10 @@ def _bench_mxfp4_swizzle_v2(M, K, dtype):
     )
 
 
+def _bench_mxfp4(M, K, dtype):
+    return _bench_mxfp4_swizzle_impl(M, K, dtype, mxfp4, mxfp4_f)
+
+
 def _bench_mxfp4_dim_m_swizzle_v2(M, K, dtype):
     return _bench_mxfp4_swizzle_impl(
         M, K, dtype, mxfp4_dim_m_swizzle_v2, mxfp4_dim_m_swizzle_f
@@ -570,7 +601,13 @@ def _bench_mxfp8_dim_km_swizzle_sr_v2(M, K, dtype):
     return run, bytes_per_iter
 
 
-def _bench_nvfp4_swizzle_impl(M, K, kernel_fn, dtype=torch.bfloat16):
+def _bench_nvfp4_swizzle_impl(
+    M,
+    K,
+    kernel_fn,
+    dtype=torch.bfloat16,
+    reference_fn=nvfp4_gs_swizzle_f,
+):
     torch.manual_seed(0)
     x = torch.randn(M, K, dtype=dtype, device="cuda")
     outer_scale = nvfp4_gs_scale(x).reciprocal()
@@ -580,7 +617,7 @@ def _bench_nvfp4_swizzle_impl(M, K, kernel_fn, dtype=torch.bfloat16):
 
     qdata, scale = run()
     torch.cuda.synchronize()
-    qdata_ref, scale_ref = nvfp4_gs_swizzle_f(x, outer_scale)
+    qdata_ref, scale_ref = reference_fn(x, outer_scale)
     assert torch.equal(
         qdata.view(torch.uint8), qdata_ref.view(torch.uint8)
     ), "qdata mismatch vs reference"
@@ -601,6 +638,12 @@ def _bench_nvfp4_swizzle_direct(M, K):
 
 def _bench_nvfp4_swizzle_tma(M, K, dtype=torch.bfloat16):
     return _bench_nvfp4_swizzle_impl(M, K, nvfp4_swizzle_tma, dtype)
+
+
+def _bench_nvfp4(M, K, dtype=torch.bfloat16):
+    return _bench_nvfp4_swizzle_impl(
+        M, K, nvfp4, dtype, reference_fn=nvfp4_gs_f
+    )
 
 
 def _bench_nvfp4_dim_m_swizzle_tma(M, K, dtype=torch.bfloat16):
@@ -778,6 +821,7 @@ _KERNELS = {
     "fp8_deepseek_1x128_dim_m": _bench_fp8_deepseek_1x128_dim_m,
     "fp8_deepseek_1x128_dim_m_v2": _bench_fp8_deepseek_1x128_dim_m_v2,
     "mxfp8_swizzle": _bench_mxfp8_swizzle,
+    "mxfp8": _bench_mxfp8,
     "mxfp8_swizzle_v2": _bench_mxfp8_swizzle_v2,
     "mxfp8_swizzle_sr_v2": _bench_mxfp8_swizzle_sr_v2,
     "mxfp8_32x32_swizzle_v2": _bench_mxfp8_32x32_swizzle_v2,
@@ -790,9 +834,11 @@ _KERNELS = {
     "mxfp8_dim_km_swizzle_v2": _bench_mxfp8_dim_km_swizzle_v2,
     "mxfp8_dim_km_swizzle_sr_v2": _bench_mxfp8_dim_km_swizzle_sr_v2,
     "mxfp4_swizzle_v2": _bench_mxfp4_swizzle_v2,
+    "mxfp4": _bench_mxfp4,
     "mxfp4_dim_m_swizzle_v2": _bench_mxfp4_dim_m_swizzle_v2,
     "mxfp4_dim_km_swizzle_v2": _bench_mxfp4_dim_km_swizzle_v2,
     "nvfp4_swizzle_direct": _bench_nvfp4_swizzle_direct,
+    "nvfp4": _bench_nvfp4,
     "nvfp4_swizzle_tma": _bench_nvfp4_swizzle_tma,
     "nvfp4_dim_m_swizzle_tma": _bench_nvfp4_dim_m_swizzle_tma,
     "nvfp4_dim_km_swizzle_tma": _bench_nvfp4_dim_km_swizzle_tma,
@@ -805,6 +851,7 @@ _KERNELS = {
 }
 
 _KERNELS_SUPPORTING_FLOAT16_AND_FLOAT32 = frozenset({
+    "mxfp8",
     "mxfp8_swizzle_v2",
     "mxfp8_swizzle_sr_v2",
     "mxfp8_32x32_swizzle_v2",
@@ -815,6 +862,8 @@ _KERNELS_SUPPORTING_FLOAT16_AND_FLOAT32 = frozenset({
     "mxfp4_swizzle_v2",
     "mxfp4_dim_m_swizzle_v2",
     "mxfp4_dim_km_swizzle_v2",
+    "mxfp4",
+    "nvfp4",
     "nvfp4_swizzle_tma",
     "nvfp4_dim_m_swizzle_tma",
     "nvfp4_dim_km_swizzle_tma",
