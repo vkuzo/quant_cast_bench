@@ -26,6 +26,8 @@ def _is_true(value: str) -> bool:
 
 
 def _implementation(kernel: str, family: str) -> str:
+    if kernel in ("mxfp8", "mxfp4", "nvfp4"):
+        return "unswizzled_tma"
     if family in ("mxfp8", "mxfp4"):
         implementation = kernel.rsplit("_", 1)[-1]
         if family == "mxfp8" and "32x32" in kernel:

@@ -337,6 +337,48 @@ def _store_scale_bytes_as_uint(
         mScalePacked[flat // 4] = rScalePacked[0]
 
 
+@cute.jit
+def _store_unswizzled_scale_groups_as_uint(
+    mScale: cute.Tensor,
+    rScale: cute.Tensor,
+    row: cutlass.Int32,
+    scale_col: cutlass.Int32,
+    row_stride: cutlass.Int32,
+    group_count: cutlass.Constexpr,
+) -> None:
+    """Store adjacent bytes into a compact row-major scale tensor.
+
+    The explicit flat offset keeps address calculation independent of the
+    tensor's dynamic 2-D layout while retaining 16- or 32-bit global stores.
+    Callers must ensure each destination is naturally aligned.
+    """
+    flat = cutlass.Int64(row) * cutlass.Int64(row_stride) + cutlass.Int64(
+        scale_col
+    )
+    mScaleFlat = mScale
+    if cutlass.const_expr(group_count == 1):
+        mScaleFlat[flat] = rScale[0]
+    elif cutlass.const_expr(group_count == 2):
+        mScalePacked = cute.make_tensor(
+            cute.recast_ptr(mScaleFlat.iterator, dtype=cutlass.Uint16),
+            cute.make_layout(cute.size(mScaleFlat) // 2),
+        )
+        rScalePacked = cute.recast_tensor(rScale, dtype=cutlass.Uint16)
+        mScalePacked[flat // 2] = rScalePacked[0]
+    else:
+        assert group_count % 4 == 0
+        mScalePacked = cute.make_tensor(
+            cute.recast_ptr(mScaleFlat.iterator, dtype=cutlass.Uint32),
+            cute.make_layout(cute.size(mScaleFlat) // 4),
+        )
+        rScalePacks = cute.tiled_divide(rScale, (4,))
+        for pack_idx in cutlass.range_constexpr(group_count // 4):
+            rScalePacked = cute.recast_tensor(
+                rScalePacks[(None, pack_idx)], dtype=cutlass.Uint32
+            )
+            mScalePacked[flat // 4 + pack_idx] = rScalePacked[0]
+
+
 _NVFP4_GROUP = 16
 _NVFP4_DIRECT_QVPT = 8
 _NVFP4_DIRECT_HALF = 8

@@ -26,11 +26,14 @@ from torch._inductor.utils import _do_bench_using_profiling
 from transformer_engine.pytorch import MXFP8Quantizer, NVFP4Quantizer
 
 from quant_cast_bench.quant_cast_cute_hand.blockscaled_tma.blockscaled_tma_impl import (
+    mxfp4,
     mxfp4_dim_km_swizzle_v2,
     mxfp4_dim_m_swizzle_v2,
     mxfp4_swizzle_v2,
+    mxfp8,
     mxfp8_32x32_swizzle_v2,
     mxfp8_swizzle_v2,
+    nvfp4,
 )
 from quant_cast_bench.quant_cast_cute_hand.recipes import (
     mxfp8_swizzle,
@@ -62,13 +65,26 @@ def _ceil_div(x: int, y: int) -> int:
     return (x + y - 1) // y
 
 
-def _scale_bytes(M: int, K: int, group: int, dim_m: bool) -> int:
+def _scale_bytes(
+    M: int,
+    K: int,
+    group: int,
+    dim_m: bool,
+    scale_swizzled: bool,
+) -> int:
     rows, groups = (K, _ceil_div(M, group)) if dim_m else (M, _ceil_div(K, group))
+    if not scale_swizzled:
+        return rows * groups
     return _ceil_div(rows, 128) * _ceil_div(groups, 4) * 32 * 16
 
 
 def _logical_bytes(
-    M: int, K: int, family: str, mode: str, input_element_size: int
+    M: int,
+    K: int,
+    family: str,
+    mode: str,
+    input_element_size: int,
+    scale_swizzled: bool,
 ) -> int:
     numel = M * K
     if family == "mxfp8":
@@ -81,9 +97,13 @@ def _logical_bytes(
         raise ValueError(f"unsupported quantization family: {family}")
     total = input_element_size * numel
     if mode in ("dim_k", "dim_km"):
-        total += qbytes + _scale_bytes(M, K, group, dim_m=False)
+        total += qbytes + _scale_bytes(
+            M, K, group, dim_m=False, scale_swizzled=scale_swizzled
+        )
     if mode in ("dim_m", "dim_km"):
-        total += qbytes + _scale_bytes(M, K, group, dim_m=True)
+        total += qbytes + _scale_bytes(
+            M, K, group, dim_m=True, scale_swizzled=scale_swizzled
+        )
     return total
 
 
@@ -103,6 +123,8 @@ def _make_ours(name: str, x: torch.Tensor):
     sign = torch.tensor([1, -1] * 8, dtype=torch.bfloat16, device=x.device)
     key = prng.key(0, device=x.device)
 
+    if name == "mxfp8":
+        return lambda: mxfp8(x)
     if name == "mxfp8_swizzle":
         return lambda: mxfp8_swizzle(x)
     if name == "mxfp8_swizzle_v2":
@@ -131,12 +153,16 @@ def _make_ours(name: str, x: torch.Tensor):
         return lambda: mxfp8_swizzle_v2(
             x, quant_orientation="dim_km", key=key, rounding_mode="stochastic"
         )
+    if name == "mxfp4":
+        return lambda: mxfp4(x)
     if name == "mxfp4_swizzle_v2":
         return lambda: mxfp4_swizzle_v2(x)
     if name == "mxfp4_dim_m_swizzle_v2":
         return lambda: mxfp4_dim_m_swizzle_v2(x)
     if name == "mxfp4_dim_km_swizzle_v2":
         return lambda: mxfp4_dim_km_swizzle_v2(x)
+    if name == "nvfp4":
+        return lambda: nvfp4(x, outer)
     if name == "nvfp4_swizzle_direct":
         return lambda: nvfp4_swizzle_direct(x, outer)
     if name == "nvfp4_swizzle_tma":
@@ -170,6 +196,7 @@ def _make_te(
     x: torch.Tensor,
     *,
     square_scaling: bool = False,
+    scale_swizzled: bool = True,
 ):
     rowwise = mode in ("dim_k", "dim_km")
     columnwise = mode in ("dim_m", "dim_km")
@@ -180,7 +207,7 @@ def _make_te(
             columnwise=columnwise,
             with_2d_quantization=square_scaling,
         )
-        quantizer.optimize_for_gemm = True
+        quantizer.optimize_for_gemm = scale_swizzled
         output = quantizer.make_empty(x.shape, dtype=x.dtype, device=x.device)
         return lambda: quantizer.update_quantized(x, output)
 
@@ -199,7 +226,7 @@ def _make_te(
         stochastic_rounding=stochastic,
         with_random_sign_mask=True,
     )
-    quantizer.optimize_for_gemm = True
+    quantizer.optimize_for_gemm = scale_swizzled
     row_amax = torch.ones(1, dtype=torch.float32, device=x.device)
     col_amax = torch.ones(1, dtype=torch.float32, device=x.device)
     return lambda: tex.nvfp4_quantize_with_amax(
@@ -209,10 +236,12 @@ def _make_te(
 
 # name, family, mode, RHT, stochastic rounding
 CASES = (
+    ("mxfp8", "mxfp8", "dim_k", False, False),
     ("mxfp8_swizzle_v2", "mxfp8", "dim_k", False, False),
     ("mxfp8_32x32_swizzle_v2", "mxfp8", "dim_k", False, False),
     ("mxfp8_dim_m_swizzle_v2", "mxfp8", "dim_m", False, False),
     ("mxfp8_dim_km_swizzle_v2", "mxfp8", "dim_km", False, False),
+    ("nvfp4", "nvfp4", "dim_k", False, False),
     ("nvfp4_swizzle_tma", "nvfp4", "dim_k", False, False),
     ("nvfp4_dim_m_swizzle_tma", "nvfp4", "dim_m", False, False),
     ("nvfp4_dim_km_swizzle_tma", "nvfp4", "dim_km", False, False),
@@ -246,6 +275,7 @@ NO_TE_CASES = (
     ("mxfp8_swizzle_sr_v2", "mxfp8", "dim_k", False, True),
     ("mxfp8_dim_m_swizzle_sr_v2", "mxfp8", "dim_m", False, True),
     ("mxfp8_dim_km_swizzle_sr_v2", "mxfp8", "dim_km", False, True),
+    ("mxfp4", "mxfp4", "dim_k", False, False),
     ("mxfp4_swizzle_v2", "mxfp4", "dim_k", False, False),
     ("mxfp4_dim_m_swizzle_v2", "mxfp4", "dim_m", False, False),
     ("mxfp4_dim_km_swizzle_v2", "mxfp4", "dim_km", False, False),
@@ -254,6 +284,7 @@ NO_TE_CASES = (
 ALL_CASES = CASES + NO_TE_CASES
 
 KERNELS_SUPPORTING_FLOAT16_AND_FLOAT32 = frozenset({
+    "mxfp8",
     "mxfp8_swizzle_v2",
     "mxfp8_swizzle_sr_v2",
     "mxfp8_32x32_swizzle_v2",
@@ -261,9 +292,11 @@ KERNELS_SUPPORTING_FLOAT16_AND_FLOAT32 = frozenset({
     "mxfp8_dim_m_swizzle_sr_v2",
     "mxfp8_dim_km_swizzle_v2",
     "mxfp8_dim_km_swizzle_sr_v2",
+    "mxfp4",
     "mxfp4_swizzle_v2",
     "mxfp4_dim_m_swizzle_v2",
     "mxfp4_dim_km_swizzle_v2",
+    "nvfp4",
     "nvfp4_swizzle_tma",
     "nvfp4_dim_m_swizzle_tma",
     "nvfp4_dim_km_swizzle_tma",
@@ -432,12 +465,14 @@ def main(
                 te_tb_s = None
                 if name in te_case_names:
                     square_scaling = name == "mxfp8_32x32_swizzle_v2"
+                    scale_swizzled = name not in ("mxfp8", "nvfp4")
                     key = (
                         family,
                         mode,
                         rht,
                         stochastic,
                         square_scaling,
+                        scale_swizzled,
                         dtype_name,
                         M,
                         K,
@@ -450,13 +485,20 @@ def main(
                             stochastic,
                             x,
                             square_scaling=square_scaling,
+                            scale_swizzled=scale_swizzled,
                         )
                         te_cache[key] = _time(te_run)
                     te_ms = te_cache[key]
 
                 ours_ms = _time(_make_ours(name, x))
+                scale_swizzled = name not in ("mxfp8", "mxfp4", "nvfp4")
                 byte_count = _logical_bytes(
-                    M, K, family, mode, x.element_size()
+                    M,
+                    K,
+                    family,
+                    mode,
+                    x.element_size(),
+                    scale_swizzled,
                 )
                 ours_tb_s = byte_count / (ours_ms * 1e-3) / 1e12
                 if te_ms is not None:

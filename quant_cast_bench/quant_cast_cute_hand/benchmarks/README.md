@@ -13,7 +13,10 @@ include both the conventional 1x32 scale blocks and the 32x32 scale blocks used 
 measurements; the installed TransformerEngine has no comparable optimized MXFP4 quantizer,
 so those panels explicitly mark the TE result as unavailable. Panels are grouped into
 MXFP8, MXFP4, and NVFP4 sections. RHT recipes use the pipelined kernel family; the NVFP4
-section includes shared RTNE/SR panels for its dim-M and dim-KM variants.
+section includes shared RTNE/SR panels for its dim-M and dim-KM variants. The dim-K
+sections also include the compact, unswizzled-scale `mxfp8`, `mxfp4`, and `nvfp4`
+recipes; TransformerEngine is configured without GEMM scale swizzling for the matching
+MXFP8 and NVFP4 measurements.
 
 ![CuTe-hand versus TransformerEngine throughput](transformer_engine_comparison.png)
 
