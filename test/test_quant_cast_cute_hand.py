@@ -44,6 +44,7 @@ if HAS_CUTEDSL:
         mxfp8,
         mxfp8_swizzle_v2,
         nvfp4,
+        nvfp4_swizzle_16x16_tma,
         nvfp4_swizzle_tma,
     )
     from quant_cast_bench.quant_cast_cute_hand.blockscaled_tma.blockscaled_tma_kernels import (
@@ -101,6 +102,7 @@ _REQUIRES_SM100 = frozenset({
     "nvfp4",
     "nvfp4_swizzle_direct",
     "nvfp4_swizzle_tma",
+    "nvfp4_swizzle_16x16_tma",
     "nvfp4_dim_m_swizzle_tma",
     "nvfp4_dim_km_swizzle_tma",
     "nvfp4_dim_m_rht_swizzle_pipelined",
@@ -126,6 +128,7 @@ _MX_V2_RECIPES = frozenset({
 _BLOCKSCALED_TMA_RECIPES = _MX_V2_RECIPES | {
     "nvfp4",
     "nvfp4_swizzle_tma",
+    "nvfp4_swizzle_16x16_tma",
     "nvfp4_dim_m_swizzle_tma",
     "nvfp4_dim_km_swizzle_tma",
 }
@@ -419,6 +422,47 @@ def test_mxfp8_32x32_swizzle_v2_empty(M, K, expected_shapes):
     assert tuple(output.dtype for output in outputs) == (
         torch.float8_e4m3fn,
         torch.float8_e8m0fnu,
+    )
+
+
+@pytest.mark.parametrize("M,K", [(16, 32), (32, 128), (96, 160), (128, 256)])
+def test_nvfp4_swizzle_16x16_tma(M, K):
+    recipe = _get_recipe("nvfp4_swizzle_16x16_tma")
+    inputs = recipe.example_input_fn(M, K, torch.bfloat16)
+
+    outputs = nvfp4_swizzle_16x16_tma(*inputs)
+    reference = recipe.pt_ref_fn(*inputs)
+
+    for output, expected in zip(outputs, reference):
+        assert qdata_and_scale_equal(output, expected)
+
+
+@pytest.mark.parametrize("M,K", [(15, 32), (16, 16)])
+def test_nvfp4_swizzle_16x16_tma_rejects_invalid_shapes(M, K):
+    recipe = _get_recipe("nvfp4_swizzle_16x16_tma")
+    inputs = recipe.example_input_fn(M, K, torch.bfloat16)
+    with pytest.raises(ValueError):
+        nvfp4_swizzle_16x16_tma(*inputs)
+
+
+@pytest.mark.parametrize(
+    "M,K,expected_shapes",
+    [
+        (0, 32, ((0, 16), (0, 1, 32, 16))),
+        (16, 0, ((16, 0), (1, 0, 32, 16))),
+    ],
+)
+def test_nvfp4_swizzle_16x16_tma_empty(M, K, expected_shapes):
+    x = torch.empty(M, K, dtype=torch.bfloat16, device="cuda")
+    outer_scale = torch.ones(1, dtype=torch.float32, device=x.device)
+
+    outputs = nvfp4_swizzle_16x16_tma(x, outer_scale)
+
+    assert tuple(output.shape for output in outputs) == expected_shapes
+    assert all(output.numel() == 0 for output in outputs)
+    assert tuple(output.dtype for output in outputs) == (
+        torch.float4_e2m1fn_x2,
+        torch.float8_e4m3fn,
     )
 
 

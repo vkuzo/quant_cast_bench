@@ -1604,6 +1604,81 @@ Nvfp4GsSwizzleGold = QuantCastSingleKernelGold(
 
 
 # ---------------------------------------------------------------------------
+# Golden recipe: nvfp4 with one inner E4M3 scale per 16x16 square block.
+#
+# The block scale is shared by all 16 rows, expanded back to the standard
+# (M, N//16) scale grid, and then stored in NVIDIA's blocked/swizzled layout.
+# ---------------------------------------------------------------------------
+def nvfp4_gs_16x16_swizzle_f(x, outer_scale, **kwargs):
+    """NVFP4 with one E4M3 inner scale per 16x16 block."""
+    *lead, rows, cols = x.shape
+    row_blocks, col_blocks = rows // 16, cols // 16
+    x_blocks = (
+        x.reshape(*lead, row_blocks, 16, col_blocks, 16)
+        .transpose(-3, -2)
+        .contiguous()
+        .reshape(*lead, row_blocks, col_blocks, 16 * 16)
+    )
+    local_amax = x_blocks.abs().amax(dim=-1, keepdim=True)
+    inner = torch.clamp(
+        (local_amax.to(torch.float32) / F4_E2M1_MAX) * outer_scale,
+        min=E4M3_EPS,
+        max=F8E4M3_MAX,
+    ).to(torch.float8_e4m3fn)
+    reciprocal = outer_scale / inner.to(torch.float32)
+    data_scaled = torch.clamp(
+        x_blocks.to(torch.float32) * reciprocal,
+        -F4_E2M1_MAX,
+        F4_E2M1_MAX,
+    )
+    qdata_blocks = _f32_to_packed_fp4(data_scaled).view(
+        torch.float4_e2m1fn_x2
+    )
+    qdata = (
+        qdata_blocks.reshape(*lead, row_blocks, col_blocks, 16, 8)
+        .transpose(-3, -2)
+        .contiguous()
+        .reshape(*lead, rows, cols // 2)
+    )
+    inner_expanded = inner.squeeze(-1).repeat_interleave(16, dim=-2)
+    return qdata, _to_blocked_4d(inner_expanded)
+
+
+def nvfp4_gs_16x16_swizzle_dq_f(
+    q: torch.Tensor,
+    inner_swizzled: torch.Tensor,
+    outer_scale: torch.Tensor,
+) -> torch.Tensor:
+    """Dequantize the expanded-scale output of ``nvfp4_gs_16x16_swizzle_f``."""
+    return nvfp4_gs_swizzle_dq_f(q, inner_swizzled, outer_scale)
+
+
+def _nvfp4_gs_16x16_swizzle_correctness(
+    inputs: Tuple[torch.Tensor, torch.Tensor],
+    outputs: Tuple[torch.Tensor, torch.Tensor],
+) -> None:
+    x, outer_scale = inputs
+    qdata, inner_swizzled = outputs
+    x_hat = nvfp4_gs_16x16_swizzle_dq_f(
+        qdata, inner_swizzled, outer_scale
+    )
+    sqnr = _compute_error(x.float(), x_hat.float())
+    threshold = 12.0
+    assert sqnr > threshold, (
+        f"nvfp4_gs_16x16_swizzle: sqnr={sqnr.item():.2f} dB below "
+        f"{threshold} dB"
+    )
+
+
+Nvfp4Gs16x16SwizzleGold = QuantCastSingleKernelGold(
+    pt_ref_fn=nvfp4_gs_16x16_swizzle_f,
+    correctness_fn=_nvfp4_gs_16x16_swizzle_correctness,
+    example_input_fn=_nvfp4_gs_swizzle_inputs,
+    perf_description="(16,16) block, fp4 qdata, swizzle",
+)
+
+
+# ---------------------------------------------------------------------------
 # Golden recipe: nvfp4 (swizzled) reduced across M instead of K -- the dim-m (colwise) twin of
 # Nvfp4GsSwizzleGold, mirroring mxfp8_dim_m_swizzle_f vs mxfp8_swizzle_f. Quantize x.t() along the
 # original M in 1x16 blocks (no RHT) and emit in the transposed (N, M//2) frame; the e4m3 inner
@@ -2639,9 +2714,10 @@ ALL_RECIPES = [
     # 8-bit rowwise/colwise
     ("fp8_rowwise", RowwiseFp8Gold),
     ("fp8_colwise", ColwiseFp8Gold),
-    # 4 bit 1D
+    # 4 bit
     ("nvfp4", Nvfp4GsGold),
     ("nvfp4_swizzle", Nvfp4GsSwizzleGold),
+    ("nvfp4_swizzle_16x16", Nvfp4Gs16x16SwizzleGold),
     ("nvfp4_dim_m_swizzle", Nvfp4GsDimMSwizzleGold),
     ("nvfp4_dim_km_swizzle", Nvfp4GsDimKMSwizzleGold),
     ("nvfp4_dim_m_rht_swizzle", Nvfp4GsSwizzleDimMRHTGold),

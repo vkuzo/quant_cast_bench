@@ -565,7 +565,9 @@ def _blockscaled_quantize_group(
         cute.ReductionOp.MAX, cutlass.Float32(0.0), 0
     )
     if cutlass.const_expr(is_square_scaling):
-        amax = cute.arch.warp_reduction_max(amax)
+        amax = cute.arch.warp_reduction_max(
+            amax, threads_in_group=value_count
+        )
 
     # ScaleAlgo selects only the scale calculation. The surrounding data path is shared.
     if cutlass.const_expr(scale_algo == ScaleAlgo.NVFP4_FP8_E4M3):

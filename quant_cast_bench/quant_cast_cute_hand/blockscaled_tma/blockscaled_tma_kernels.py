@@ -235,7 +235,6 @@ class _BlockscaledTma:
             assert not is_square_scaling
         if cutlass.const_expr(scale_algo == ScaleAlgo.NVFP4_FP8_E4M3):
             assert is_packed_fp4_qdata
-            assert not is_square_scaling
 
         # bookkeeping
         tidx, _, _ = cute.arch.thread_idx()
@@ -391,10 +390,16 @@ class _BlockscaledTma:
         smem_load_atom = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(), input_element_type, num_bits_per_copy=128
         )
+        smem_store_bits = (
+            64
+            if cutlass.const_expr(is_square_scaling and is_packed_fp4_qdata)
+            else 128
+        )
+        smem_store_elements = smem_store_bits // qdata_storage_element_type.width
         smem_store_atom = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(),
             qdata_storage_element_type,
-            num_bits_per_copy=128,
+            num_bits_per_copy=smem_store_bits,
         )
 
         if cutlass.const_expr(do_dim_m):
@@ -478,19 +483,24 @@ class _BlockscaledTma:
                         row_block * groups_per_row_block + group
                     ] = scale_m.to(cutlass.Uint8)
 
-                rQM16 = cute.tiled_divide(rQM, (16,))
-                sQM16 = cute.tiled_divide(sOutputM[(tidx, None)], (16,))
+                rQMVector = cute.tiled_divide(rQM, (smem_store_elements,))
+                sQMVector = cute.tiled_divide(
+                    sOutputM[(tidx, None)], (smem_store_elements,)
+                )
                 for vec in cutlass.range_constexpr(
-                    qdata_storage_elements_per_32 // 16
+                    qdata_storage_elements_per_32 // smem_store_elements
                 ):
                     cute.copy(
                         smem_store_atom,
-                        rQM16[(None, vec)],
-                        sQM16[
+                        rQMVector[(None, vec)],
+                        sQMVector[
                             (
                                 None,
                                 row_block
-                                * (qdata_storage_elements_per_32 // 16)
+                                * (
+                                    qdata_storage_elements_per_32
+                                    // smem_store_elements
+                                )
                                 + vec,
                             )
                         ],
@@ -547,14 +557,16 @@ class _BlockscaledTma:
             # * keep scale to registers
             # * store qdata in smem, overwriting the first half of input data (to save smem)
             groups_per_row_k = tile_k_size // scale_group_size
-            row_owned_k = scale_group_size == 16 or (
-                tile_m_size == _DIM_K_TILE_M_SIZE_128
+            row_owned_k = tile_m_size == _DIM_K_TILE_M_SIZE_128 or (
+                scale_group_size == 16 and not is_square_scaling
             )
             if cutlass.const_expr(row_owned_k):
                 threads_per_row_k = _MIN_CTA_THREADS_128 // tile_m_size
                 iters = groups_per_row_k // threads_per_row_k
             else:
-                iters = tile_m_size // 32
+                iters = tile_m_size // (
+                    scale_group_size if is_square_scaling else 32
+                )
             tidfrgInputK = cute.composition(sInput, data_k_tv_layout)
             tidfrgOutputK = cute.composition(sOutputK, output_k_tv_layout)
             thrInputGroupsK = tidfrgInputK[(tidx, None)]
@@ -651,15 +663,19 @@ class _BlockscaledTma:
 
             # All input reads must finish before the aliased qK view overwrites the input tile.
             cute.arch.sync_threads()
-            rQK16 = cute.tiled_divide(rQK, (16,))
-            sGroupK16 = cute.tiled_divide(thrOutputGroupsK, (16,))
+            rQKVector = cute.tiled_divide(rQK, (smem_store_elements,))
+            sGroupKVector = cute.tiled_divide(
+                thrOutputGroupsK, (smem_store_elements,)
+            )
             for vec in cutlass.range_constexpr(
-                qdata_storage_elements_per_group * iters // 16
+                qdata_storage_elements_per_group
+                * iters
+                // smem_store_elements
             ):
                 cute.copy(
                     smem_store_atom,
-                    rQK16[(None, vec)],
-                    sGroupK16[(None, vec)],
+                    rQKVector[(None, vec)],
+                    sGroupKVector[(None, vec)],
                 )
 
         # Publish all enabled qdata writes before launching their TMA transfers.
@@ -779,13 +795,19 @@ class _BlockscaledTma:
                 # is group-major; square scaling is warp/block-major. Both need individual scale stores
                 # because their slots are strided across rows.
                 if cutlass.const_expr(is_square_scaling):
-                    local_group_k = tidx // 32
-                    local_row_k = tidx % 32
+                    local_group_k = tidx // scale_group_size
+                    local_row_k = tidx % scale_group_size
+                    row_step_k = scale_group_size
                 else:
                     local_group_k = tidx % groups_per_row_k
                     local_row_k = tidx // groups_per_row_k
+                    row_step_k = 32
                 for it in cutlass.range_constexpr(iters):
-                    input_row_k = tile_m_idx * tile_m_size + local_row_k + it * 32
+                    input_row_k = (
+                        tile_m_idx * tile_m_size
+                        + local_row_k
+                        + it * row_step_k
+                    )
                     scale_col_k = (
                         tile_k_idx * groups_per_row_k + local_group_k
                     )
@@ -1020,8 +1042,8 @@ class _BlockscaledTma:
                 mScaleKLogical = mScaleK
 
             groups_per_row_k = tile_k_size // scale_group_size
-            row_owned_k = scale_group_size == 16 or (
-                tile_m_size == _DIM_K_TILE_M_SIZE_128
+            row_owned_k = tile_m_size == _DIM_K_TILE_M_SIZE_128 or (
+                scale_group_size == 16 and not is_square_scaling
             )
             if cutlass.const_expr(row_owned_k):
                 threads_per_row_k = _MIN_CTA_THREADS_128 // tile_m_size
@@ -1065,11 +1087,33 @@ class _BlockscaledTma:
                     ),
                 )
             elif cutlass.const_expr(is_square_scaling):
+                square_row_blocks = tile_m_size // scale_group_size
                 data_k_tv_layout = cute.make_layout(
-                    ((32, groups_per_row_k), (32, 1)),
-                    stride=((1, tile_m_size * 32), (tile_m_size, tile_m_size * tile_k_size)),
+                    (
+                        (scale_group_size, groups_per_row_k),
+                        (scale_group_size, square_row_blocks),
+                    ),
+                    stride=(
+                        (1, tile_m_size * scale_group_size),
+                        (tile_m_size, scale_group_size),
+                    ),
                 )
-                output_k_tv_layout = data_k_tv_layout
+                output_k_tv_layout = cute.make_layout(
+                    (
+                        (scale_group_size, groups_per_row_k),
+                        (
+                            qdata_storage_elements_per_group,
+                            square_row_blocks,
+                        ),
+                    ),
+                    stride=(
+                        (
+                            1,
+                            tile_m_size * qdata_storage_elements_per_group,
+                        ),
+                        (tile_m_size, scale_group_size),
+                    ),
+                )
             else:
                 rows_per_stage = _MIN_CTA_THREADS_128 // groups_per_row_k
                 row_blocks = tile_m_size // rows_per_stage
@@ -1286,8 +1330,6 @@ def _compile_blockscaled_tma(
     if scale_algo == ScaleAlgo.NVFP4_FP8_E4M3:
         if qdata_dtype != torch.float4_e2m1fn_x2:
             raise ValueError("NVFP4 scaling requires float4_e2m1fn_x2 qdata")
-        if is_square_scaling:
-            raise ValueError("NVFP4 scaling does not support square scaling")
     if not is_scale_swizzled:
         if quant_orientation != _QUANT_ORIENTATION_DIM_K:
             raise ValueError("compact scales currently support only dim-k output")

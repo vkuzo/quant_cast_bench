@@ -16,7 +16,9 @@ MXFP8, MXFP4, and NVFP4 sections. RHT recipes use the pipelined kernel family; t
 section includes shared RTNE/SR panels for its dim-M and dim-KM variants. The dim-K
 sections also include the compact, unswizzled-scale `mxfp8`, `mxfp4`, and `nvfp4`
 recipes; TransformerEngine is configured without GEMM scale swizzling for the matching
-MXFP8 and NVFP4 measurements.
+MXFP8 and NVFP4 measurements. The NVFP4 section additionally includes the square
+16x16-scale `nvfp4_swizzle_16x16_tma` recipe, compared with TransformerEngine's
+`with_2d_quantization=True` path.
 
 ![CuTe-hand versus TransformerEngine throughput](transformer_engine_comparison.png)
 

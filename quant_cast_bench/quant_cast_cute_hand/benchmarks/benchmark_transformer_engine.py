@@ -34,6 +34,7 @@ from quant_cast_bench.quant_cast_cute_hand.blockscaled_tma.blockscaled_tma_impl 
     mxfp8_32x32_swizzle_v2,
     mxfp8_swizzle_v2,
     nvfp4,
+    nvfp4_swizzle_16x16_tma,
 )
 from quant_cast_bench.quant_cast_cute_hand.recipes import (
     mxfp8_swizzle,
@@ -163,6 +164,8 @@ def _make_ours(name: str, x: torch.Tensor):
         return lambda: mxfp4_dim_km_swizzle_v2(x)
     if name == "nvfp4":
         return lambda: nvfp4(x, outer)
+    if name == "nvfp4_swizzle_16x16_tma":
+        return lambda: nvfp4_swizzle_16x16_tma(x, outer)
     if name == "nvfp4_swizzle_direct":
         return lambda: nvfp4_swizzle_direct(x, outer)
     if name == "nvfp4_swizzle_tma":
@@ -223,6 +226,7 @@ def _make_te(
         with_amax_reduction=False,
         with_rht=rht,
         with_post_rht_amax=rht,
+        with_2d_quantization=square_scaling,
         stochastic_rounding=stochastic,
         with_random_sign_mask=True,
     )
@@ -243,6 +247,7 @@ CASES = (
     ("mxfp8_dim_km_swizzle_v2", "mxfp8", "dim_km", False, False),
     ("nvfp4", "nvfp4", "dim_k", False, False),
     ("nvfp4_swizzle_tma", "nvfp4", "dim_k", False, False),
+    ("nvfp4_swizzle_16x16_tma", "nvfp4", "dim_k", False, False),
     ("nvfp4_dim_m_swizzle_tma", "nvfp4", "dim_m", False, False),
     ("nvfp4_dim_km_swizzle_tma", "nvfp4", "dim_km", False, False),
     ("nvfp4_dim_m_rht_swizzle_pipelined", "nvfp4", "dim_m", True, False),
@@ -298,6 +303,7 @@ KERNELS_SUPPORTING_FLOAT16_AND_FLOAT32 = frozenset({
     "mxfp4_dim_km_swizzle_v2",
     "nvfp4",
     "nvfp4_swizzle_tma",
+    "nvfp4_swizzle_16x16_tma",
     "nvfp4_dim_m_swizzle_tma",
     "nvfp4_dim_km_swizzle_tma",
 })
@@ -464,7 +470,10 @@ def main(
                 te_ms = None
                 te_tb_s = None
                 if name in te_case_names:
-                    square_scaling = name == "mxfp8_32x32_swizzle_v2"
+                    square_scaling = name in (
+                        "mxfp8_32x32_swizzle_v2",
+                        "nvfp4_swizzle_16x16_tma",
+                    )
                     scale_swizzled = name not in ("mxfp8", "nvfp4")
                     key = (
                         family,
