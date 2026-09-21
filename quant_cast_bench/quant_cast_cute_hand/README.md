@@ -37,23 +37,7 @@ For the dim-KM pipelined recipes, RHT is applied only to the dim-M pass. The
 around BF16 operands; the `blockscaled_tma` family supports all three listed
 input dtypes.
 
-## Block-scaled TMA upstream-readiness review
-
-The kernel supports dim-K, dim-M, and dim-KM quantization, RTNE and stochastic
-rounding, BF16/FP16/FP32 inputs, padded scale outputs.
-Its synchronization sequence appears coherent for currently supported shapes:
-
-1. Initialize the input TMA barrier.
-2. Issue and await the input TMA transfer.
-3. Complete the dim-M input reads and output writes, when enabled.
-4. Synchronize before dim-K overwrites the aliased input shared-memory buffer.
-5. Fence and synchronize the qdata shared-memory writes.
-6. Issue the enabled qdata TMA stores.
-7. Overlap the dim-K global scale stores with the qdata TMA store.
-
-The following remaining issues should be addressed before upstreaming.
-
-### For later
+## For later
 
 #### Define the stochastic-rounding RNG contract
 
