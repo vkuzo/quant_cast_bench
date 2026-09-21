@@ -2662,6 +2662,7 @@ ALL_RECIPES = [
         Nvfp4GsSwizzle_DimKSR_DimMRHTSR_Gold,
     ),
     ("nvfp4_blocked_outer", Nvfp4BlockedOuterGold),
+    ("mxfp4", Mxfp4Gold),
     ("mxfp4_swizzle", Mxfp4SwizzleGold),
     ("mxfp4_dim_m_swizzle", Mxfp4DimMSwizzleGold),
     ("mxfp4_dim_km_swizzle", Mxfp4DimKMSwizzleGold),
