@@ -14,7 +14,13 @@ from typing import Callable, Tuple
 import torch
 import torch.func._random as prng
 
-from .utils import f32_to_f4_unpacked, f4_unpacked_to_f32, pack_uint4, unpack_uint4
+from .utils import (
+    _philox4x32_10_stateful_words,
+    f32_to_f4_unpacked,
+    f4_unpacked_to_f32,
+    pack_uint4,
+    unpack_uint4,
+)
 
 # Optional hardware fp4 encode: PyTorch core exposes an `inline_asm_elementwise` higher-order op
 # (torch >= 2.12) that can emit `cvt.rn.satfinite.e2m1x2.f32` on Blackwell (SM100+). It only works
@@ -1045,24 +1051,13 @@ def mxfp8_swizzle_f(x, **kwargs):
     return qdata, _to_blocked_4d(scale_e8m0)
 
 
-def _f32_to_fp8_nvidia_sr(x, key):
-    """Eager emulation of Blackwell ``cvt.rs.satfinite.e4m3x4.f32``.
-
-    One Philox word supplies four 16-bit random operands in the same lane and bit order as the
-    hardware instruction. The exponent-dependent discarded-bit width handles both normal and
-    subnormal E4M3 values; the bottom bin rounds directly between zero and 2**-9. NaNs use the
-    instruction's canonical positive E4M3 NaN encoding instead of entering the finite bit
-    arithmetic below.
-    """
+def _f32_to_fp8_nvidia_sr_with_words(x, word):
+    """Emulate Blackwell FP8 SR using one supplied random word per four values."""
     flat = x.contiguous().reshape(-1)
     assert flat.numel() % 4 == 0, "NVIDIA fp8 SR requires numel divisible by 4"
     groups = flat.numel() // 4
-    n_words = ((groups + 3) // 4) * 4
-    bits = prng.bits(key, n_words, dtype=torch.uint32).to(torch.int64)
-
-    # v4 gives each thread 16 contiguous values and computes one Philox counter for them. Its four
-    # result words feed the four consecutive e4m3x4 groups directly, so group g consumes bits[g].
-    word = bits[:groups]
+    assert word.numel() == groups
+    word = word.reshape(-1).to(torch.int64)
 
     # cvt.rs.e4m3x4 reuses each half-word for two lanes; the second lane reads its bits reversed.
     low = word & 0xFFFF
@@ -1108,6 +1103,26 @@ def _f32_to_fp8_nvidia_sr(x, key):
         is_nan, torch.full_like(rounded, float("nan")), rounded
     )
     return rounded.to(torch.float8_e4m3fn).reshape(x.shape)
+
+
+def _f32_to_fp8_nvidia_sr(x, key):
+    """Eager emulation of Blackwell ``cvt.rs.satfinite.e4m3x4.f32``.
+
+    One Philox word supplies four 16-bit random operands in the same lane and bit order as the
+    hardware instruction. The exponent-dependent discarded-bit width handles both normal and
+    subnormal E4M3 values; the bottom bin rounds directly between zero and 2**-9. NaNs use the
+    instruction's canonical positive E4M3 NaN encoding instead of entering the finite bit
+    arithmetic below.
+    """
+    flat = x.contiguous().reshape(-1)
+    assert flat.numel() % 4 == 0, "NVIDIA fp8 SR requires numel divisible by 4"
+    groups = flat.numel() // 4
+    n_words = ((groups + 3) // 4) * 4
+    bits = prng.bits(key, n_words, dtype=torch.uint32).to(torch.int64)
+
+    # v4 gives each thread 16 contiguous values and computes one Philox counter for them. Its four
+    # result words feed the four consecutive e4m3x4 groups directly, so group g consumes bits[g].
+    return _f32_to_fp8_nvidia_sr_with_words(x, bits[:groups])
 
 
 # TODO(future): audit the other SR gold conversions and give each one explicit non-finite handling
@@ -1179,6 +1194,46 @@ Mxfp8SwizzleSRGold = QuantCastSingleKernelGold(
     correctness_fn=_mxfp8_swizzle_sr_correctness,
     example_input_fn=_mxfp8_swizzle_sr_inputs,
     perf_description="(1,32) block, fp8 qdata (NVIDIA cvt.rs SR numerics), swizzle",
+)
+
+
+def mxfp8_swizzle_stateful_sr_f(x, generator, **kwargs):
+    """MXFP8 SR backed by a stateful CUDA generator and tile-invariant element positions.
+
+    Each invocation reserves four words from the generator. That selects one Philox counter block
+    for the operation; consecutive groups of 16 logical output elements use consecutive 64-bit
+    subsequences, making the result independent of the implementation's thread and tile mapping.
+    """
+    assert x.is_cuda, "stateful stochastic rounding requires a CUDA tensor"
+    generator_device = torch.device(generator.device)
+    assert generator_device.type == "cuda" and generator_device.index in (
+        None,
+        x.device.index,
+    ), "input and generator must be on the same device"
+    *lead, last = x.shape
+    x_b = x.reshape(*lead, last // 32, 32)
+    amax = x_b.abs().amax(dim=-1, keepdim=True)
+    scale_e8m0 = _amax_to_e8m0_rceil(amax)
+    scaled = x_b.to(torch.float32) * _e8m0_scale_to_reciprocal_fp32(scale_e8m0)
+    word_count = scaled.numel() // 4
+    words = _philox4x32_10_stateful_words(generator, word_count, x.device)
+    qdata = _f32_to_fp8_nvidia_sr_with_words(scaled, words).reshape(*lead, last)
+    return qdata, _to_blocked_4d(scale_e8m0.squeeze(-1))
+
+
+def _mxfp8_swizzle_stateful_sr_inputs(M, K, dtype):
+    x = torch.randn(M, K, dtype=dtype, device="cuda")
+    generator = torch.Generator(device=x.device).manual_seed(0)
+    return x, generator
+
+
+Mxfp8SwizzleStatefulSRGold = QuantCastSingleKernelGold(
+    pt_ref_fn=mxfp8_swizzle_stateful_sr_f,
+    correctness_fn=_mxfp8_swizzle_sr_correctness,
+    example_input_fn=_mxfp8_swizzle_stateful_sr_inputs,
+    perf_description=(
+        "(1,32) block, fp8 qdata (stateful NVIDIA cvt.rs SR numerics), swizzle"
+    ),
 )
 
 
@@ -2690,6 +2745,7 @@ ALL_RECIPES = [
     ("mxfp8", Mxfp8Gold),
     ("mxfp8_swizzle", Mxfp8SwizzleGold),
     ("mxfp8_swizzle_sr", Mxfp8SwizzleSRGold),
+    ("mxfp8_swizzle_stateful_sr", Mxfp8SwizzleStatefulSRGold),
     ("fp8_deepseek_1x128", Deepseek1x128Gold),
     # 8-bit 1D, dim-m reduction
     ("mxfp8_dim_m", Mxfp8DimMGold),

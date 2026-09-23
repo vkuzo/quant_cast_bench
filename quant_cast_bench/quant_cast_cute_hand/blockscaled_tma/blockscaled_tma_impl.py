@@ -1,5 +1,6 @@
 """PyTorch-facing implementation for TMA-based block-scaled quantization."""
 
+from dataclasses import dataclass
 from functools import cache, partial
 from typing import TypeAlias
 
@@ -7,6 +8,7 @@ import torch
 
 from quant_cast_bench.quant_cast_cute.recipes import QuantCastCuteRecipe
 from quant_cast_bench.quant_cast_cute_hand.blockscaled_tma.blockscaled_tma_config import (
+    RoundingVariant,
     ScaleAlgo,
 )
 from quant_cast_bench.quant_cast_cute_hand.blockscaled_tma.blockscaled_tma_plan import (
@@ -33,6 +35,7 @@ from quant_cast_bench.quant_cast_gold.recipes import (
     Mxfp8DimMSwizzleSRGold,
     Mxfp8SwizzleGold,
     Mxfp8SwizzleSRGold,
+    Mxfp8SwizzleStatefulSRGold,
     Nvfp4Gs16x16SwizzleGold,
     Nvfp4GsGold,
     Nvfp4GsDimKMSwizzleGold,
@@ -56,6 +59,109 @@ _FourTensorOutput: TypeAlias = tuple[
 _BlockscaledTmaOutput: TypeAlias = _TwoTensorOutput | _FourTensorOutput
 
 
+@dataclass(frozen=True)
+class _PhiloxLaunch:
+    """Flattened Philox arguments for one compiled-kernel invocation.
+
+    RTNE uses none of the fields and leaves every field as ``None``.
+
+    Attributes:
+        seed: The two-word user key for ``STATELESS_SR``, or the graph-managed
+            device seed tensor for ``STATEFUL_SR_CAPTURE``.
+        offset: The graph-managed device offset tensor for
+            ``STATEFUL_SR_CAPTURE``.
+        seed_scalar: The host generator seed for ``STATEFUL_SR_EAGER``.
+        offset_words_scalar: The host generator's word-unit offset for
+            ``STATEFUL_SR_EAGER``.
+        intragraph_offset_words: The per-launch word-unit offset within a
+            captured graph for ``STATEFUL_SR_CAPTURE``.
+    """
+
+    seed: torch.Tensor | None = None
+    offset: torch.Tensor | None = None
+    seed_scalar: int | None = None
+    offset_words_scalar: int | None = None
+    intragraph_offset_words: int | None = None
+
+
+def _select_rounding_variant(
+    input: torch.Tensor,
+    rounding_mode: str,
+    key: torch.Tensor | None,
+    generator: torch.Generator | None,
+) -> RoundingVariant:
+    """Validate the public rounding inputs and select one compile-time variant."""
+    if rounding_mode == "rtne":
+        if key is not None:
+            raise ValueError("RTNE rounding does not use a Philox key")
+        if generator is not None:
+            raise ValueError("RTNE rounding does not use a generator")
+        return RoundingVariant.RTNE
+
+    if key is None and generator is None:
+        raise ValueError("stochastic rounding requires a Philox key or generator")
+    if key is not None and generator is not None:
+        raise ValueError("stochastic rounding accepts only one of key or generator")
+    if key is not None:
+        if not isinstance(key, torch.Tensor):
+            raise ValueError("Philox key must be a torch.Tensor")
+        if key.device != input.device:
+            raise ValueError("input and Philox key must be on the same device")
+        if key.dtype != torch.uint64 or key.numel() != 2:
+            raise ValueError("Philox key must be uint64[2]")
+        return RoundingVariant.STATELESS_SR
+
+    if not isinstance(generator, torch.Generator):
+        raise ValueError("generator must be a torch.Generator")
+    generator_device = torch.device(generator.device)
+    if generator_device.type != "cuda" or generator_device.index not in (
+        None,
+        input.device.index,
+    ):
+        raise ValueError("input and generator must be on the same device")
+    return (
+        RoundingVariant.STATEFUL_SR_CAPTURE
+        if torch.cuda.is_current_stream_capturing()
+        else RoundingVariant.STATEFUL_SR_EAGER
+    )
+
+
+def _prepare_philox_launch(
+    rounding_variant: RoundingVariant,
+    key: torch.Tensor | None,
+    generator: torch.Generator | None,
+) -> _PhiloxLaunch:
+    """Reserve generator state, if needed, immediately before the kernel launch."""
+    if rounding_variant == RoundingVariant.RTNE:
+        return _PhiloxLaunch()
+    if rounding_variant == RoundingVariant.STATELESS_SR:
+        assert key is not None
+        return _PhiloxLaunch(seed=key.reshape(-1).view(torch.int64))
+
+    assert rounding_variant.is_stateful
+    assert generator is not None
+    seed_state, offset_state, intragraph_offset_state = generator.philox_state(4)
+    if rounding_variant == RoundingVariant.STATEFUL_SR_CAPTURE:
+        if not seed_state.is_cuda or not offset_state.is_cuda:
+            raise RuntimeError("CUDA graph capture requires device-resident Philox state")
+        # These alias graph-managed state that is refreshed before every replay.
+        return _PhiloxLaunch(
+            seed=seed_state,
+            offset=offset_state,
+            intragraph_offset_words=int(intragraph_offset_state.item()),
+        )
+
+    assert rounding_variant == RoundingVariant.STATEFUL_SR_EAGER
+    if seed_state.is_cuda or offset_state.is_cuda:
+        raise RuntimeError("eager execution requires host-resident Philox state")
+    # Eager generator state lives on the host. Ordinary CUDA scalar launch arguments avoid
+    # tiny CPU-to-GPU tensor copies.
+    return _PhiloxLaunch(
+        seed_scalar=int(seed_state.item()),
+        offset_words_scalar=int(offset_state.item()),
+    )
+
+
 @cache
 def _cuda_capability(device: int) -> tuple[int, int]:
     return torch.cuda.get_device_capability(device)
@@ -68,6 +174,7 @@ def _blockscaled_tma_impl_on_current_device(
     rounding_mode: str,
     is_square_scaling: bool,
     is_scale_swizzled: bool,
+    generator: torch.Generator | None = None,
     qdata_dtype: torch.dtype = torch.float8_e4m3fn,
     scale_algo: ScaleAlgo = ScaleAlgo.RCEIL_E8M0,
     outer_scale_k: torch.Tensor | None = None,
@@ -112,7 +219,10 @@ def _blockscaled_tma_impl_on_current_device(
             raise ValueError("NVFP4 TMA supports only RTNE")
     elif rounding_mode not in ("rtne", "stochastic"):
         raise ValueError(f"unsupported rounding_mode: {rounding_mode}")
-    is_stochastic_qdata_rounding = rounding_mode == "stochastic"
+    rounding_variant = _select_rounding_variant(
+        input, rounding_mode, key, generator
+    )
+    is_stochastic_qdata_rounding = rounding_variant.is_stochastic
     is_packed_fp4_qdata = qdata_dtype == torch.float4_e2m1fn_x2
 
     if not is_nvfp4 and is_packed_fp4_qdata and is_stochastic_qdata_rounding:
@@ -124,22 +234,6 @@ def _blockscaled_tma_impl_on_current_device(
             raise ValueError("square scaling currently supports only dim-k output")
         if is_stochastic_qdata_rounding:
             raise ValueError("square scaling currently supports only RTNE")
-    if is_nvfp4:
-        if key is not None:
-            raise ValueError("RTNE rounding does not use a Philox key")
-    else:
-        if is_stochastic_qdata_rounding:
-            if key is None:
-                raise ValueError("stochastic rounding requires a Philox key")
-            if not isinstance(key, torch.Tensor):
-                raise ValueError("Philox key must be a torch.Tensor")
-            if key.device != input.device:
-                raise ValueError("input and Philox key must be on the same device")
-            if key.dtype != torch.uint64 or key.numel() != 2:
-                raise ValueError("Philox key must be uint64[2]")
-        elif key is not None:
-            raise ValueError("RTNE rounding does not use a Philox key")
-
     M, K = input.shape
     if M > _INT32_MAX or K > _INT32_MAX:
         raise ValueError(
@@ -311,7 +405,6 @@ def _blockscaled_tma_impl_on_current_device(
                 dtype=torch.uint8,
                 device=input.device,
             )
-    seed = key.reshape(-1).view(torch.int64) if key is not None else None
     outer_scale_k_arg = outer_scale_k.reshape(1) if outer_scale_k is not None else None
     outer_scale_m_arg = outer_scale_m.reshape(1) if outer_scale_m is not None else None
 
@@ -322,12 +415,14 @@ def _blockscaled_tma_impl_on_current_device(
         plan.cluster_k,
         plan.needs_boundary_masking,
         quant_orientation_id,
-        is_stochastic_qdata_rounding,
+        rounding_variant,
         is_square_scaling,
         is_scale_swizzled,
         qdata_dtype,
         scale_algo,
     )
+    # Reserve state only after validation and compilation have succeeded, immediately before launch.
+    philox = _prepare_philox_launch(rounding_variant, key, generator)
     fn(
         input,
         output_k,
@@ -336,7 +431,11 @@ def _blockscaled_tma_impl_on_current_device(
         output_m,
         scale_m,
         outer_scale_m_arg,
-        seed,
+        philox.seed,
+        philox.offset,
+        philox.seed_scalar,
+        philox.offset_words_scalar,
+        philox.intragraph_offset_words,
         M,
         K,
         plan.grid_m,
@@ -371,6 +470,7 @@ def _blockscaled_tma_impl(
     rounding_mode: str,
     is_square_scaling: bool,
     is_scale_swizzled: bool,
+    generator: torch.Generator | None = None,
     qdata_dtype: torch.dtype = torch.float8_e4m3fn,
     scale_algo: ScaleAlgo = ScaleAlgo.RCEIL_E8M0,
     outer_scale_k: torch.Tensor | None = None,
@@ -401,6 +501,7 @@ def _blockscaled_tma_impl(
             rounding_mode=rounding_mode,
             is_square_scaling=is_square_scaling,
             is_scale_swizzled=is_scale_swizzled,
+            generator=generator,
             qdata_dtype=qdata_dtype,
             scale_algo=scale_algo,
             outer_scale_k=outer_scale_k,
@@ -482,6 +583,29 @@ def _mxfp8_swizzle_sr_v2(
 
 MXFP8_SWIZZLE_SR_V2 = QuantCastCuteRecipe.from_gold(
     Mxfp8SwizzleSRGold, cute_fn=_mxfp8_swizzle_sr_v2
+)
+
+
+def mxfp8_swizzle_stateful_sr_v2(
+    input: torch.Tensor,
+    generator: torch.Generator,
+    **kwargs: object,
+) -> _TwoTensorOutput:
+    return _blockscaled_tma_impl(
+        input,
+        quant_orientation="dim_k",
+        key=None,
+        rounding_mode="stochastic",
+        is_square_scaling=False,
+        is_scale_swizzled=True,
+        generator=generator,
+        **kwargs,
+    )
+
+
+MXFP8_SWIZZLE_STATEFUL_SR_V2 = QuantCastCuteRecipe.from_gold(
+    Mxfp8SwizzleStatefulSRGold,
+    cute_fn=mxfp8_swizzle_stateful_sr_v2,
 )
 
 

@@ -11,6 +11,80 @@ _EBITS_F32, _MBITS_F32 = 8, 23
 _F32_EXP_BIAS = (1 << (_EBITS_F32 - 1)) - 1
 _EBITS_F4, _MBITS_F4 = 2, 1
 
+_PHILOX_M0 = 0xD2511F53
+_PHILOX_M1 = 0xCD9E8D57
+_PHILOX_W0 = 0x9E3779B9
+_PHILOX_W1 = 0xBB67AE85
+_UINT16_MASK = (1 << 16) - 1
+_UINT32_MASK = (1 << 32) - 1
+_UINT62_MASK = (1 << 62) - 1
+
+
+def _mulhilo_uint32(x, multiplier):
+    """Return the high and low halves of a uint32 product using safe int64 operations."""
+    x_lo = x & _UINT16_MASK
+    x_hi = x >> 16
+    multiplier_lo = multiplier & _UINT16_MASK
+    multiplier_hi = multiplier >> 16
+    product_lo = x_lo * multiplier_lo
+    product_cross_0 = x_lo * multiplier_hi
+    product_cross_1 = x_hi * multiplier_lo
+    product_hi = x_hi * multiplier_hi
+    carry = (
+        (product_lo >> 16)
+        + (product_cross_0 & _UINT16_MASK)
+        + (product_cross_1 & _UINT16_MASK)
+    )
+    lo = (product_lo & _UINT16_MASK) | ((carry & _UINT16_MASK) << 16)
+    hi = (
+        product_hi
+        + (product_cross_0 >> 16)
+        + (product_cross_1 >> 16)
+        + (carry >> 16)
+    ) & _UINT32_MASK
+    return hi, lo
+
+
+def _philox4x32_10_stateful_words(generator, word_count, device):
+    """Draw words using one generator block and tile-invariant logical subsequences."""
+    seed, offset_words, intragraph_offset_words = generator.philox_state(4)
+    assert int(intragraph_offset_words.item()) % 4 == 0
+
+    # Generator offsets are word-based signed-int64 bit containers. Convert them to a block index
+    # without signed overflow: both terms are multiples of four, and the block sum wraps at 2**62.
+    offset_words = offset_words.to(device=device)
+    offset_blocks = (offset_words >> 2) & _UINT62_MASK
+    intragraph_blocks = (
+        int(intragraph_offset_words.item()) & ((1 << 64) - 1)
+    ) >> 2
+    block = (offset_blocks + intragraph_blocks) & _UINT62_MASK
+
+    subsequence_count = (word_count + 3) // 4
+    subsequence = torch.arange(
+        subsequence_count, dtype=torch.int64, device=device
+    )
+    c0 = (block & _UINT32_MASK).expand_as(subsequence)
+    c1 = ((block >> 32) & _UINT32_MASK).expand_as(subsequence)
+    c2 = subsequence & _UINT32_MASK
+    c3 = (subsequence >> 32) & _UINT32_MASK
+
+    seed = seed.to(device=device)
+    k0 = (seed & _UINT32_MASK).expand_as(subsequence)
+    k1 = ((seed >> 32) & _UINT32_MASK).expand_as(subsequence)
+    for _ in range(10):
+        hi0, lo0 = _mulhilo_uint32(c0, _PHILOX_M0)
+        hi1, lo1 = _mulhilo_uint32(c2, _PHILOX_M1)
+        c0, c1, c2, c3 = (
+            (hi1 ^ c1 ^ k0) & _UINT32_MASK,
+            lo1,
+            (hi0 ^ c3 ^ k1) & _UINT32_MASK,
+            lo0,
+        )
+        k0 = (k0 + _PHILOX_W0) & _UINT32_MASK
+        k1 = (k1 + _PHILOX_W1) & _UINT32_MASK
+
+    return torch.stack((c0, c1, c2, c3), dim=1).reshape(-1)[:word_count]
+
 
 def f32_to_f4_unpacked(x):
     """FP32 -> fp4 e2m1, RNE, saturating. uint8 with bits 4-7 holding the code."""

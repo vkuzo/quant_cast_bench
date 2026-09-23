@@ -13,6 +13,7 @@ from quant_cast_bench.quant_cast_cute.recipes import (
     _philox_4x32,
 )
 from quant_cast_bench.quant_cast_cute_hand.blockscaled_tma.blockscaled_tma_config import (
+    RoundingVariant,
     ScaleAlgo,
 )
 
@@ -418,23 +419,51 @@ def _cvt_rs_satfinite_e2m1x4_f32_x8(
 
 
 @cute.jit
+def _philox_counter_words(
+    rounding_variant: cutlass.Constexpr,
+    operation_block: cutlass.Uint64,
+    logical_block: cutlass.Uint64,
+) -> tuple[cutlass.Uint32, cutlass.Uint32, cutlass.Uint32, cutlass.Uint32]:
+    """Map an operation and logical block to Philox counter/subsequence words."""
+    if cutlass.const_expr(rounding_variant == RoundingVariant.STATELESS_SR):
+        counter = operation_block + logical_block
+        subsequence = cutlass.Uint64(0)
+    else:
+        assert rounding_variant in (
+            RoundingVariant.STATEFUL_SR_EAGER,
+            RoundingVariant.STATEFUL_SR_CAPTURE,
+        )
+        counter = operation_block
+        subsequence = logical_block
+    return (
+        cutlass.Uint32(counter & cutlass.Uint64(0xFFFFFFFF)),
+        cutlass.Uint32(counter >> 32),
+        cutlass.Uint32(subsequence & cutlass.Uint64(0xFFFFFFFF)),
+        cutlass.Uint32(subsequence >> 32),
+    )
+
+
+@cute.jit
 def _mxfp8_v2_quantize_stochastic_x32(
     values: cute.TensorSSA,
     rcp: cutlass.Float32,
-    counter_start: cutlass.Uint64,
+    operation_block: cutlass.Uint64,
+    logical_block_start: cutlass.Uint64,
     philox_k0: cutlass.Uint32,
     philox_k1: cutlass.Uint32,
+    rounding_variant: cutlass.Constexpr,
 ) -> cute.TensorSSA:
     """Quantize one contiguous 32-value output run with two Philox counters."""
     scaled = values * rcp
     qwords = cute.make_rmem_tensor(cute.make_layout(8), cutlass.Uint32)
     for half in cutlass.range_constexpr(2):
-        ctr = counter_start + cutlass.Uint64(half)
-        c0 = cutlass.Uint32(ctr & cutlass.Uint64(0xFFFFFFFF))
-        c1 = cutlass.Uint32(ctr >> 32)
-        zero = cutlass.Uint32(0)
+        c0, c1, c2, c3 = _philox_counter_words(
+            rounding_variant,
+            operation_block,
+            logical_block_start + cutlass.Uint64(half),
+        )
         r0, r1, r2, r3 = _philox_4x32(
-            c0, c1, zero, zero, philox_k0, philox_k1
+            c0, c1, c2, c3, philox_k0, philox_k1
         )
         value = half * 16
         word = half * 4
@@ -546,18 +575,25 @@ def _blockscaled_quantize_group(
     qdata_dtype: cutlass.Constexpr,
     scale_algo: cutlass.Constexpr,
     is_square_scaling: cutlass.Constexpr,
-    is_stochastic_qdata_rounding: cutlass.Constexpr,
-    sr_counter: cutlass.Uint64 | None,
+    rounding_variant: cutlass.Constexpr,
+    sr_operation_block: cutlass.Uint64 | None,
+    sr_logical_block: cutlass.Uint64 | None,
     philox_k0: cutlass.Uint32 | None,
     philox_k1: cutlass.Uint32 | None,
 ):
     """Calculate one block scale and quantize the values that share it."""
+    is_stochastic_qdata_rounding = cutlass.const_expr(
+        rounding_variant != RoundingVariant.RTNE
+    )
     if cutlass.const_expr(is_stochastic_qdata_rounding):
-        assert sr_counter is not None
+        assert sr_operation_block is not None
+        assert sr_logical_block is not None
         assert philox_k0 is not None
         assert philox_k1 is not None
     else:
-        assert sr_counter is None
+        assert rounding_variant == RoundingVariant.RTNE
+        assert sr_operation_block is None
+        assert sr_logical_block is None
         assert philox_k0 is None
         assert philox_k1 is None
 
@@ -579,14 +615,25 @@ def _blockscaled_quantize_group(
 
     if cutlass.const_expr(qdata_dtype == cutlass.Float4E2M1FN):
         if cutlass.const_expr(is_stochastic_qdata_rounding):
+            assert rounding_variant == RoundingVariant.STATELESS_SR
             qdata = _quantize_fp4_stochastic_x16(
-                values, reciprocal, sr_counter, philox_k0, philox_k1
+                values,
+                reciprocal,
+                sr_operation_block + sr_logical_block,
+                philox_k0,
+                philox_k1,
             )
         else:
             qdata = _quantize_fp4_rtne(values, reciprocal, value_count)
     elif cutlass.const_expr(is_stochastic_qdata_rounding):
         qdata = _mxfp8_v2_quantize_stochastic_x32(
-            values, reciprocal, sr_counter, philox_k0, philox_k1
+            values,
+            reciprocal,
+            sr_operation_block,
+            sr_logical_block,
+            philox_k0,
+            philox_k1,
+            rounding_variant,
         )
     else:
         qdata = (values * reciprocal).to(cutlass.Float8E4M3FN)
@@ -830,6 +877,90 @@ def _load_philox_key_and_counter(
         cutlass.Uint32(key64[0] & cutlass.Uint64(0xFFFFFFFF)),
         cutlass.Uint32(key64[0] >> 32),
         key64[1],
+    )
+
+
+@cute.jit
+def _stateful_philox_seed_and_counter(
+    seed64: cutlass.Uint64,
+    offset_words64: cutlass.Uint64,
+) -> tuple[cutlass.Uint32, cutlass.Uint32, cutlass.Uint64]:
+    """Split a generator seed and convert its word offset to a Philox block."""
+    return (
+        cutlass.Uint32(seed64 & cutlass.Uint64(0xFFFFFFFF)),
+        cutlass.Uint32(seed64 >> 32),
+        offset_words64 >> 2,
+    )
+
+
+@cute.jit
+def _load_stateful_philox_device_state(
+    mSeed: cute.Tensor,
+    mOffset: cute.Tensor,
+    intragraph_offset_words: cutlass.Int64,
+) -> tuple[cutlass.Uint32, cutlass.Uint32, cutlass.Uint64]:
+    """Load graph-safe generator state and return its key plus Philox block."""
+    frgSeed = cute.make_rmem_tensor(cute.make_layout(1), mSeed.element_type)
+    frgOffset = cute.make_rmem_tensor(cute.make_layout(1), mOffset.element_type)
+    cute.copy(
+        cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), mSeed.element_type),
+        mSeed,
+        frgSeed,
+    )
+    cute.copy(
+        cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), mOffset.element_type),
+        mOffset,
+        frgOffset,
+    )
+    seed64 = cute.recast_tensor(frgSeed, dtype=cutlass.Uint64)[0]
+    offset_words64 = cute.recast_tensor(frgOffset, dtype=cutlass.Uint64)[0]
+    intragraph_offset_words64 = view_as(
+        intragraph_offset_words, cutlass.Uint64
+    )
+    return _stateful_philox_seed_and_counter(
+        seed64,
+        offset_words64 + intragraph_offset_words64,
+    )
+
+
+@cute.jit
+def _resolve_philox_state(
+    rounding_variant: cutlass.Constexpr,
+    mSeed: cute.Tensor | None,
+    mOffset: cute.Tensor | None,
+    seed_scalar: cutlass.Int64 | None,
+    offset_words_scalar: cutlass.Int64 | None,
+    intragraph_offset_words: cutlass.Int64 | None,
+) -> tuple[cutlass.Uint32, cutlass.Uint32, cutlass.Uint64]:
+    """Resolve a Philox state-passing convention into key words and operation block."""
+    if cutlass.const_expr(rounding_variant == RoundingVariant.STATELESS_SR):
+        assert mSeed is not None
+        assert mOffset is None
+        assert seed_scalar is None
+        assert offset_words_scalar is None
+        assert intragraph_offset_words is None
+        return _load_philox_key_and_counter(mSeed)
+    if cutlass.const_expr(
+        rounding_variant == RoundingVariant.STATEFUL_SR_CAPTURE
+    ):
+        assert mSeed is not None
+        assert mOffset is not None
+        assert seed_scalar is None
+        assert offset_words_scalar is None
+        assert intragraph_offset_words is not None
+        return _load_stateful_philox_device_state(
+            mSeed, mOffset, intragraph_offset_words
+        )
+
+    assert rounding_variant == RoundingVariant.STATEFUL_SR_EAGER
+    assert mSeed is None
+    assert mOffset is None
+    assert seed_scalar is not None
+    assert offset_words_scalar is not None
+    assert intragraph_offset_words is None
+    return _stateful_philox_seed_and_counter(
+        view_as(seed_scalar, cutlass.Uint64),
+        view_as(offset_words_scalar, cutlass.Uint64),
     )
 
 

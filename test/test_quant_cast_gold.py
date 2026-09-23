@@ -34,6 +34,7 @@ from quant_cast_bench.quant_cast_gold.recipes import (
     mxfp8_dim_m_swizzle_sr_f,
     mxfp8_swizzle_f,
     mxfp8_swizzle_sr_f,
+    mxfp8_swizzle_stateful_sr_f,
     nvfp4_gs_scale,
     nvfp4_gs_swizzle_dim_k_dim_m_rht_f,
     nvfp4_gs_swizzle_dim_k_dim_m_rht_nvidia_sr_f,
@@ -83,6 +84,25 @@ def test_mxfp8_swizzle_sr_reproducible_and_preserves_scale():
     assert torch.equal(scale0.view(torch.uint8), scale1.view(torch.uint8))
     assert torch.equal(scale0.view(torch.uint8), scale_rtne.view(torch.uint8))
     assert not torch.equal(q0.view(torch.uint8), q_rtne.view(torch.uint8))
+
+
+def test_mxfp8_swizzle_stateful_sr_advances_one_philox_block():
+    x = torch.randn(129, 160, dtype=torch.bfloat16, device="cuda")
+    generator0 = torch.Generator(device=x.device).manual_seed(7)
+    generator1 = torch.Generator(device=x.device).manual_seed(7)
+
+    q0, scale0 = mxfp8_swizzle_stateful_sr_f(x, generator0)
+    q1, scale1 = mxfp8_swizzle_stateful_sr_f(x, generator1)
+    q2, scale2 = mxfp8_swizzle_stateful_sr_f(x, generator0)
+    _, scale_rtne = mxfp8_swizzle_f(x)
+
+    assert generator0.get_offset() == 8
+    assert generator1.get_offset() == 4
+    assert torch.equal(q0.view(torch.uint8), q1.view(torch.uint8))
+    assert not torch.equal(q0.view(torch.uint8), q2.view(torch.uint8))
+    assert torch.equal(scale0, scale1)
+    assert torch.equal(scale0, scale2)
+    assert torch.equal(scale0, scale_rtne)
 
 
 @pytest.mark.parametrize("M,K", [(128, 128), (129, 160)])
