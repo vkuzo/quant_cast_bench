@@ -463,7 +463,7 @@ def _mxfp8_v2_quantize_stochastic_x32(
             logical_block_start + cutlass.Uint64(half),
         )
         r0, r1, r2, r3 = _philox_4x32(
-            c0, c1, c2, c3, philox_k0, philox_k1
+            c0, c1, c2, c3, philox_k0, philox_k1, 7
         )
         value = half * 16
         word = half * 4
@@ -537,7 +537,7 @@ def _quantize_fp4_stochastic_x16(
     c1 = cutlass.Uint32(sr_counter >> 32)
     zero = cutlass.Uint32(0)
     r0, r1, r2, r3 = _philox_4x32(
-        c0, c1, zero, zero, philox_k0, philox_k1
+        c0, c1, zero, zero, philox_k0, philox_k1, 7
     )
     qwords = cute.make_rmem_tensor(2, cutlass.Uint32)
     qwords[0] = _cvt_rs_satfinite_e2m1x4_f32_x8(
@@ -673,9 +673,9 @@ def _nvfp4_quantize_stochastic_x16(values, outer, sr_counter, k0, k1):
     c0 = cutlass.Uint32(sr_counter & cutlass.Uint64(0xFFFFFFFF))
     c1 = cutlass.Uint32(sr_counter >> 32)
     zero = cutlass.Uint32(0)
-    r0, r1, r2, r3 = _philox_4x32(c0, c1, zero, zero, k0, k1)
-    # prng.bits exposes each Philox counter in [r0, r2, r1, r3] order. Feed one word to each
-    # consecutive group of four values so this specialization bit-matches the eager gold.
+    r0, r1, r2, r3 = _philox_4x32(c0, c1, zero, zero, k0, k1, 7)
+    # Feed the counter words to consecutive groups of four values in the native conversion's
+    # [r0, r2, r1, r3] order; the eager gold mirrors this permutation.
     qwords = cute.make_rmem_tensor(cute.make_layout(2), cutlass.Uint32)
     qwords[0] = _cvt_rs_satfinite_e2m1x4_f32_x8(
         values[0] * reciprocal,
@@ -818,7 +818,9 @@ def _nvfp4_quantize_fast_groups(
             c0 = cutlass.Uint32(sr_counter & cutlass.Uint64(0xFFFFFFFF))
             c1 = cutlass.Uint32(sr_counter >> 32)
             zero = cutlass.Uint32(0)
-            r0, r1, r2, r3 = _philox_4x32(c0, c1, zero, zero, k0, k1)
+            r0, r1, r2, r3 = _philox_4x32(
+                c0, c1, zero, zero, k0, k1, 7
+            )
             qwords[0] = _cvt_rs_satfinite_e2m1x4_f32_x8(
                 values[0] * reciprocal,
                 values[1] * reciprocal,

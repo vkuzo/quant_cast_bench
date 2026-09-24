@@ -1416,7 +1416,7 @@ def _nvfp4_kernel(x_ptr, outer_ptr, q_ptr, s_ptr, seed_ptr, sxm, sxn, ssm, ssn, 
         # pid_n*64 is a multiple of 16, so gf//4 == (row_base>>4) + (grp>>2) and gf%4 == grp%4 -- i.e.
         # the 16 row-local groups split cleanly into 4 Philox counters starting at key[1] + row_base>>4.
         grp_ctr = base + (((offs_m * N + pid_n * 64) >> 4) + tl.arange(0, 4)[None, :]).to(tl.int64)  # (128, 4)
-        r0, r1, r2, r3 = tl.randint4x(seed, grp_ctr)  # 4 words per counter, each (128, 4)
+        r0, r1, r2, r3 = tl.randint4x(seed, grp_ctr, 7)  # 4 words per counter, each (128, 4)
         rbits = tl.interleave(tl.interleave(r0, r1), tl.interleave(r2, r3))  # (128, 16) one word/group
         # Split the 64 cols into the 4 lanes of each group: reshape (128,4,16)->(128,16,2,2) so
         # [row, grp, hi, lo] is col 4*grp + 2*hi + lo, then nested splits peel cols {0,1,2,3} per group.
@@ -1447,14 +1447,14 @@ def _nvfp4_kernel(x_ptr, outer_ptr, q_ptr, s_ptr, seed_ptr, sxm, sxn, ssm, ssn, 
             x_blocks = tl.minimum(tl.maximum(x_blocks, -6.0), 6.0)
             seed, base = tl.split(tl.load(seed_ptr + tl.arange(0, 2)))  # full key: key[0] seed, key[1] base
             # Key the dither on each element's GLOBAL row-major flat index f = offs_m*N + col, matching
-            # the gold's `prng.bits(key, data_scaled.shape)` fill order (data_scaled is a contiguous
+            # the gold's Philox4x32-7 fill order (data_scaled is a contiguous
             # reshape of x). N%64==0 so row_base = offs_m*N + pid_n*64 is a multiple of 4, hence f>>2 ==
-            # (row_base>>2) + (col>>2) and f&3 == col&3. prng.bits honors key[1] as a base counter
+            # (row_base>>2) + (col>>2) and f&3 == col&3. The gold honors key[1] as a base counter
             # offset, so the counter is key[1] + f>>2. randint4x on the per-4-element group counter,
             # straight (r0,r1,r2,r3) lane order (same interleave idiom as _sr_bf16_global_kernel), gives
             # rand[row, 4g+lane] == philox(seed, key[1]+f>>2)[f&3] -- bit-for-bit the gold's per-element draw.
             grp_counter = base + (((offs_m * N + pid_n * 64) >> 2) + tl.arange(0, 16)[None, :]).to(tl.int64)  # (128, 16)
-            r0, r1, r2, r3 = tl.randint4x(seed, grp_counter)  # 4 streams, each (128, 16)
+            r0, r1, r2, r3 = tl.randint4x(seed, grp_counter, 7)  # 4 streams, each (128, 16)
             rand = tl.interleave(tl.interleave(r0, r2), tl.interleave(r1, r3))  # (128,64) -> (r0,r1,r2,r3)
             dither = (rand & 0x3FFFFF).to(tl.int32).reshape(128, 4, 16)  # uniform low-22-bit dither
             xi = (x_blocks.to(tl.int32, bitcast=True) + dither) & -4194304  # add, truncate low 22 bits
@@ -1642,18 +1642,18 @@ BF16_RHT = QuantCastTritonRecipe.from_gold(HadamardRht, triton_fn=rht_triton)
 def _sr_bf16_global_kernel(x_ptr, y_ptr, seed_ptr, n_elements, BLOCK: tl.constexpr):
     # Consume the WHOLE Philox key (the int64 [key[0], key[1]] at seed_ptr): `seed` is the full 64-bit
     # key[0] (Triton splits it into the two 32-bit Philox key words k0/k1) and `base` is key[1], the
-    # base counter offset (in 4-word Philox blocks) that prng.bits adds to every block index.
+    # base counter offset (in 4-word Philox blocks) that the gold adds to every block index.
     # tl.randint4x lays a 64-bit offset into the low two counter words (c0,c1), matching torch's
-    # philox4x32-10 counter, so an advanced key (fold_in / split, which set both words to full 64-bit
+    # Philox4x32-7 counter, so an advanced key (fold_in / split, which set both words to full 64-bit
     # values) reproduces the gold bit-for-bit.
     seed, base = tl.split(tl.load(seed_ptr + tl.arange(0, 2)))  # int64 key[0] (seed), key[1] (base)
     pid = tl.program_id(0)
     grp = base + (pid * BLOCK + tl.arange(0, BLOCK)).to(tl.int64)  # (BLOCK,) counter = key[1] + f>>2
-    r0, r1, r2, r3 = tl.randint4x(seed, grp)  # 4 streams; the group's 4 elements each take one
+    r0, r1, r2, r3 = tl.randint4x(seed, grp, 7)  # 4 streams; the group's 4 elements each take one
     # interleave the 4 streams back to the contiguous 4*BLOCK element span -> coalesced ld/st. Element
     # at flat index f gets counter f>>2 (independent of BLOCK) and stream f&3 -- a pure function of f,
     # so the dither is invariant to the launch tiling. Lane order is the STRAIGHT (r0,r1,r2,r3) so
-    # element 4c+lane == randint4x(seed,c)[lane], matching prng.bits(key, n) flat (the gold path);
+    # element 4c+lane == randint4x(seed,c,7)[lane], matching the gold path;
     # the nesting is a free choice (identical PTX -- 4 words are register-local, contiguous stores).
     rand = tl.interleave(tl.interleave(r0, r2), tl.interleave(r1, r3))  # (4*BLOCK,) -> (r0,r1,r2,r3)
     offs = pid * (4 * BLOCK) + tl.arange(0, 4 * BLOCK)  # contiguous global flat indices
