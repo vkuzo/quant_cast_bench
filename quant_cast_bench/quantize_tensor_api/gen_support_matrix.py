@@ -33,7 +33,6 @@ from quant_cast_bench.quantize_tensor_api.api import (
     quantize_tensor_grouped_dual,
 )
 from quant_cast_bench.quant_cast_gold.recipes import (
-    hadamard_rht_matrix,
     nvfp4_gs_per_token_scale,
     nvfp4_gs_scale,
 )
@@ -178,7 +177,7 @@ def _build_inputs():
         "scalar": nvfp4_gs_scale(x).reciprocal(),
         "per_token": nvfp4_gs_per_token_scale(x).reciprocal(),
     }
-    rht = {"none": None, "rht": hadamard_rht_matrix(sign, x.device, x.dtype)}
+    rht = {"none": None, "rht": sign}
     key = prng.key(0, device=dev)
     return x, outer, rht, key
 

@@ -34,6 +34,7 @@ from quant_cast_bench.quant_cast_gold.recipes import (
     Deepseek128x128Gold,
     Float8TensorwiseGold,
     HadamardRht,
+    hadamard_rht_matrix,
     Mxfp832x32ExpandGold,
     Mxfp8DimKmGold,
     Mxfp8DimKmSwizzleGold,
@@ -2410,7 +2411,8 @@ NVFP4_BLOCKED_OUTER = QuantCastCuteRecipe.from_gold(
 
 
 # ---------------------------------------------------------------------------
-# 16x16 randomized Hadamard transform (bf16 in, bf16 out, no scale). Mirrors hadamard_rht_f:
+# 16x16 randomized Hadamard transform (bf16 in, bf16 out, no scale). The recipe accepts the
+# length-16 sign vector and materializes the matrix before launching. Mirrors hadamard_rht_f:
 # reshape the last dim into groups of 16 and right-multiply each group by the 16x16 RHT matrix
 # (`out = x.reshape(..., 16) @ rht`). Memory-bound (4 bytes/element moved), but the per-group 16x16
 # matmul must NOT be run on the fp32 CUDA cores: a scalar dot-product kernel is compute-bound at ~36%
@@ -2526,12 +2528,13 @@ def _rht_jit(mX, mY, mR, ntiles: cutlass.Constexpr):
         grid=[nblocks, 1, 1], block=[_RHT_THREADS, 1, 1])
 
 
-def rht_cute(x, rht, **kwargs):
+def rht_cute(x, rht_sign, **kwargs):
     assert x.is_contiguous() and x.dim() == 2
     M, N = x.shape
     assert N % 16 == 0, f"rht cute kernel needs N % 16 == 0, got {N}"
     assert (M * N) % 256 == 0, "rht cute kernel needs numel % 256 == 0 (whole 16-group MMA tiles)"
     y = torch.empty(M, N, dtype=torch.bfloat16, device=x.device)
+    rht = hadamard_rht_matrix(rht_sign, x.device, x.dtype)
     ntiles = (M * N) // 256  # number of 16-group x 16 MMA tiles
     # assumed_align=16 enables the 128-bit vectorized copies (torch allocations are >=256B aligned).
     mX = from_dlpack(x.reshape(-1), assumed_align=16).mark_layout_dynamic()  # flatten (per-16-group)

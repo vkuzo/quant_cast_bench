@@ -194,10 +194,10 @@ MXFP8_BIAS = RecipeV2.from_gold(
 )
 
 
-# RHT (non-quant): apply the 16x16 orthogonal transform along the last dim. The RHT matrix
-# (built by HadamardRht.example_input_fn from a fixed +/-1 sign vector) is passed as a REPLICATE
-# aux; a column tile must keep 16-groups intact (a[1] % 16 == 0), else it would sever a transform
-# block. Correctness is the roundtrip check (HadamardRht.correctness_fn: x recovered via rht.t()).
+# RHT (non-quant): apply the 16x16 orthogonal transform along the last dim. The length-16 sign
+# vector defining the RHT is passed as a REPLICATE aux; a column tile must keep 16-groups intact
+# (a[1] % 16 == 0), else it would sever a transform block. Correctness reconstructs the matrix and
+# uses its transpose for the roundtrip check.
 HADAMARD_RHT = RecipeV2.from_gold(
     HadamardRht,
     valid_tile_size_fn=lambda ts, a, p: a[1] % 16 == 0,
@@ -235,5 +235,4 @@ RECIPES_V2 = [
     ("fp32_to_bf16_sr_global_offsets", SR_BF16_GLOBAL),
     ("debug_relu", DEBUG_RELU),
 ]
-
 

@@ -44,7 +44,7 @@ def quantize_tensor(
 | `rounding_mode` | `RTNE` or `STOCHASTIC`. SR is wired only for the per-tensor swizzled nvfp4 casts (NATURAL, and TRANSPOSED which then needs `rht_tensor`); everything else is RTNE-only. |
 | `random_key` | SR entropy — a `torch.func._random` Philox key. Required **iff** `rounding_mode=STOCHASTIC`. |
 | `outer_scale` | precomputed fp32 outer scale, required for nvfp4 (must be `None` otherwise). A per-tensor scalar → per-tensor nvfp4 (swizzled kernel); an `(M, 1)` scale → per-token nvfp4 (gold reference). |
-| `rht_tensor` | optional 16×16 Random Hadamard Transform. Only the per-tensor dim-m (TRANSPOSED) swizzled nvfp4 cast uses it (applies RHT to `input.t()` — the wgrad-operand cast of nvfp4 training). |
+| `rht_tensor` | optional length-16 sign vector defining the Random Hadamard Transform. Only the per-tensor dim-m (TRANSPOSED) swizzled nvfp4 cast uses it (applies RHT to `input.t()` — the wgrad-operand cast of nvfp4 training). |
 | `scaling_type_square_block_and_expand` | mxfp8 only. Compute one scale per 32×32 square block and expand it into the `BlockWise1x32` layout the GEMM consumes (keeps the public enum GEMM-centric). Only the dim-k (contiguous input) `NO_SWIZZLE` cast is wired. |
 
 Returns `(qdata, scale)`. For the fused both-orientation cast use `quantize_tensor_dual`;
@@ -164,4 +164,3 @@ pair then the transposed (dim-M) pair. Abbreviations as in the `quantize_tensor`
 | mxfp8 | 1x32 | 32_4_4 | no | RTNE | 🟡 reference | `mxfp8_f` |
 
 <!-- END GENERATED: support-matrix-grouped-dual -->
-

@@ -407,7 +407,7 @@ def _manual_tile(
 
     # 1. infer output shapes/dtypes by running `f` on a full-shape fake input.
     # allow_non_fake_inputs=True is needed because aux_inputs are real cuda tensors (nvfp4
-    # outer_scale, RHT matrix); meta inputs don't work (device mismatch / no RNG). The probe is
+    # outer_scale, RHT sign vector); meta inputs don't work (device mismatch / no RNG). The probe is
     # whole-tensor, so aux is presented whole (REPLICATE) here regardless of kind.
     with FakeTensorMode(allow_non_fake_inputs=True):
         fake_in = torch.empty(input.shape, dtype=input.dtype, device=input.device)
