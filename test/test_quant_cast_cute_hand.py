@@ -42,6 +42,7 @@ if HAS_CUTEDSL:
         mxfp4,
         mxfp4_swizzle_v2,
         mxfp8,
+        mxfp8_swizzle_stateful_sr_v2,
         mxfp8_swizzle_v2,
         nvfp4,
         nvfp4_swizzle_16x16_tma,
@@ -86,6 +87,7 @@ _REQUIRES_SM100 = frozenset({
     "mxfp8_swizzle",
     "mxfp8_swizzle_v2",
     "mxfp8_swizzle_sr_v2",
+    "mxfp8_swizzle_stateful_sr_v2",
     "mxfp8_32x32_swizzle_v2",
     "mxfp8_swizzle_v3",
     "mxfp8_swizzle_v4",
@@ -115,6 +117,7 @@ _MX_V2_RECIPES = frozenset({
     "mxfp8",
     "mxfp8_swizzle_v2",
     "mxfp8_swizzle_sr_v2",
+    "mxfp8_swizzle_stateful_sr_v2",
     "mxfp8_32x32_swizzle_v2",
     "mxfp8_dim_m_swizzle_v2",
     "mxfp8_dim_m_swizzle_sr_v2",
@@ -482,6 +485,50 @@ def test_mxfp8_swizzle_sr_v2_folded_key_and_padding():
     ref_outputs = recipe.pt_ref_fn(x, key)
     assert qdata_and_scale_equal(outputs[0], ref_outputs[0])
     assert qdata_and_scale_equal(outputs[1], ref_outputs[1])
+
+
+def test_mxfp8_swizzle_stateful_sr_v2_generator_mapping_and_padding():
+    if torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip("v2 stochastic rounding emits Blackwell-only PTX; requires cuda capability 10.0")
+    recipe = _get_recipe("mxfp8_swizzle_stateful_sr_v2")
+    x, _ = recipe.example_input_fn(129, 160, torch.bfloat16)
+    generator_ref = torch.Generator(device=x.device).manual_seed((1 << 64) - 3)
+    generator_ref.set_offset(20)
+    generator_actual = generator_ref.clone_state()
+
+    ref_outputs = recipe.pt_ref_fn(x, generator_ref)
+    outputs = mxfp8_swizzle_stateful_sr_v2(x, generator_actual)
+
+    assert generator_ref.get_offset() == 24
+    assert generator_actual.get_offset() == 24
+    assert qdata_and_scale_equal(outputs[0], ref_outputs[0])
+    assert qdata_and_scale_equal(outputs[1], ref_outputs[1])
+
+
+def test_mxfp8_swizzle_stateful_sr_v2_cuda_graph():
+    if torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip("v2 stochastic rounding emits Blackwell-only PTX; requires cuda capability 10.0")
+    x = torch.randn(129, 160, device="cuda", dtype=torch.bfloat16)
+    seed = (1 << 64) - 3
+
+    eager_generator = torch.Generator(device=x.device).manual_seed(seed)
+    eager_outputs_0 = mxfp8_swizzle_stateful_sr_v2(x, eager_generator)
+    eager_outputs_1 = mxfp8_swizzle_stateful_sr_v2(x, eager_generator)
+
+    graph_generator = torch.Generator(device=x.device).manual_seed(seed)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_outputs_0 = mxfp8_swizzle_stateful_sr_v2(x, graph_generator)
+        graph_outputs_1 = mxfp8_swizzle_stateful_sr_v2(x, graph_generator)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    for actual_outputs, expected_outputs in (
+        (graph_outputs_0, eager_outputs_0),
+        (graph_outputs_1, eager_outputs_1),
+    ):
+        for actual, expected in zip(actual_outputs, expected_outputs):
+            assert qdata_and_scale_equal(actual, expected)
 
 
 def test_mxfp8_swizzle_sr_v2_mixed_width_indexing():
@@ -1304,7 +1351,13 @@ def test_cute_hand_matches_reference(name, recipe, dtype):
             stochastic="swizzle_rht_sr" in name,
         )
     else:
-        cute_inputs = gold_inputs = recipe.example_input_fn(512, 512, dtype)
+        gold_inputs = recipe.example_input_fn(512, 512, dtype)
+        cute_inputs = tuple(
+            value.clone_state()
+            if isinstance(value, torch.Generator)
+            else value
+            for value in gold_inputs
+        )
 
     tile_kwargs = {
         "global_row": 0,
