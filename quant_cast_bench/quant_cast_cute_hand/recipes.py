@@ -1692,7 +1692,7 @@ def _mxfp8_v4_quantize(thrInput, rcp, mSeed: cute.Tensor, flat_start, stochastic
         c0 = cutlass.Uint32(ctr & cutlass.Uint64(0xFFFFFFFF))
         c1 = cutlass.Uint32(ctr >> 32)
         zero = cutlass.Uint32(0)
-        r0, r1, r2, r3 = _philox_4x32(c0, c1, zero, zero, k0, k1)
+        r0, r1, r2, r3 = _philox_4x32(c0, c1, zero, zero, k0, k1, 7)
 
         qwords = cute.make_rmem_tensor(cute.make_layout(_MXS3_VPT // 4), cutlass.Uint32)
         qwords[0] = _cvt_rs_satfinite_e4m3x4_f32(

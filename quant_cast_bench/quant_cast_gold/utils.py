@@ -18,6 +18,7 @@ _PHILOX_W1 = 0xBB67AE85
 _UINT16_MASK = (1 << 16) - 1
 _UINT32_MASK = (1 << 32) - 1
 _UINT62_MASK = (1 << 62) - 1
+_PHILOX_ROUNDS = 7
 
 
 def _mulhilo_uint32(x, multiplier):
@@ -45,7 +46,44 @@ def _mulhilo_uint32(x, multiplier):
     return hi, lo
 
 
-def _philox4x32_10_stateful_words(generator, word_count, device):
+def _philox4x32_words(c0, c1, c2, c3, seed, word_count):
+    """Run Philox4x32-7 and flatten its four output words per counter."""
+    k0 = (seed & _UINT32_MASK).expand_as(c0)
+    k1 = ((seed >> 32) & _UINT32_MASK).expand_as(c0)
+    for _ in range(_PHILOX_ROUNDS):
+        hi0, lo0 = _mulhilo_uint32(c0, _PHILOX_M0)
+        hi1, lo1 = _mulhilo_uint32(c2, _PHILOX_M1)
+        c0, c1, c2, c3 = (
+            (hi1 ^ c1 ^ k0) & _UINT32_MASK,
+            lo1,
+            (hi0 ^ c3 ^ k1) & _UINT32_MASK,
+            lo0,
+        )
+        k0 = (k0 + _PHILOX_W0) & _UINT32_MASK
+        k1 = (k1 + _PHILOX_W1) & _UINT32_MASK
+
+    return torch.stack((c0, c1, c2, c3), dim=1).reshape(-1)[:word_count]
+
+
+def _philox4x32_7_stateless_words(key, word_count):
+    """Draw words from a user-managed seed/counter key using Philox4x32-7."""
+    key = key.reshape(-1).view(torch.int64)
+    counter_count = (word_count + 3) // 4
+    counter = key[1] + torch.arange(
+        counter_count, dtype=torch.int64, device=key.device
+    )
+    zeros = torch.zeros_like(counter)
+    return _philox4x32_words(
+        counter & _UINT32_MASK,
+        (counter >> 32) & _UINT32_MASK,
+        zeros,
+        zeros,
+        key[0],
+        word_count,
+    )
+
+
+def _philox4x32_7_stateful_words(generator, word_count, device):
     """Draw words using one generator block and tile-invariant logical subsequences."""
     seed, offset_words, intragraph_offset_words = generator.philox_state(4)
     assert int(intragraph_offset_words.item()) % 4 == 0
@@ -63,27 +101,14 @@ def _philox4x32_10_stateful_words(generator, word_count, device):
     subsequence = torch.arange(
         subsequence_count, dtype=torch.int64, device=device
     )
-    c0 = (block & _UINT32_MASK).expand_as(subsequence)
-    c1 = ((block >> 32) & _UINT32_MASK).expand_as(subsequence)
-    c2 = subsequence & _UINT32_MASK
-    c3 = (subsequence >> 32) & _UINT32_MASK
-
-    seed = seed.to(device=device)
-    k0 = (seed & _UINT32_MASK).expand_as(subsequence)
-    k1 = ((seed >> 32) & _UINT32_MASK).expand_as(subsequence)
-    for _ in range(10):
-        hi0, lo0 = _mulhilo_uint32(c0, _PHILOX_M0)
-        hi1, lo1 = _mulhilo_uint32(c2, _PHILOX_M1)
-        c0, c1, c2, c3 = (
-            (hi1 ^ c1 ^ k0) & _UINT32_MASK,
-            lo1,
-            (hi0 ^ c3 ^ k1) & _UINT32_MASK,
-            lo0,
-        )
-        k0 = (k0 + _PHILOX_W0) & _UINT32_MASK
-        k1 = (k1 + _PHILOX_W1) & _UINT32_MASK
-
-    return torch.stack((c0, c1, c2, c3), dim=1).reshape(-1)[:word_count]
+    return _philox4x32_words(
+        (block & _UINT32_MASK).expand_as(subsequence),
+        ((block >> 32) & _UINT32_MASK).expand_as(subsequence),
+        subsequence & _UINT32_MASK,
+        (subsequence >> 32) & _UINT32_MASK,
+        seed.to(device=device),
+        word_count,
+    )
 
 
 def f32_to_f4_unpacked(x):
