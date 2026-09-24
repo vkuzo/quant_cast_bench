@@ -24,6 +24,7 @@ from quant_cast_bench.quant_cast_gold.recipes import (
     Deepseek128x128Gold,
     Float8TensorwiseGold,
     HadamardRht,
+    hadamard_rht_matrix,
     Mxfp832x32DimKMSwizzleGold,
     Mxfp832x32DimMSwizzleGold,
     Mxfp832x32ExpandGold,
@@ -1583,8 +1584,8 @@ NVFP4_BLOCKED_OUTER = QuantCastTritonRecipe.from_gold(
 # ---------------------------------------------------------------------------
 # 16x16 randomized Hadamard transform (bf16 in, bf16 out, no scale). Mirrors hadamard_rht_f:
 # reshape the last dim into groups of 16 and right-multiply each group by the 16x16 RHT matrix
-# (`out = x.reshape(..., 16) @ rht`). The RHT matrix is an explicit input (built once on the host);
-# the kernel just reads it. We flatten x to (n_groups, 16) -- every 16 contiguous elements along the
+# (`out = x.reshape(..., 16) @ rht`). The recipe input is the length-16 sign vector; the wrapper
+# materializes the matrix that the kernel reads. We flatten x to (n_groups, 16) -- every 16 contiguous elements along the
 # last dim form one group -- and give each program a BLOCK_G x 16 tile, so the whole thing is a batch
 # of (BLOCK_G, 16) @ (16, 16) matmuls via tl.dot with fp32 accumulation (matching torch's bf16 matmul,
 # which accumulates in fp32 on tensor cores), cast back to bf16 on store. Memory-bound: 4 bytes moved
@@ -1603,13 +1604,13 @@ def _rht_kernel(x_ptr, rht_ptr, y_ptr, n_groups, BLOCK_G: tl.constexpr):
     tl.store(y_ptr + xoff, out, mask=gmask[:, None])
 
 
-def rht_triton(x, rht, **kwargs):
-    """16x16 randomized Hadamard transform along the last dim (mirrors `hadamard_rht_f`). `rht` is the
-    precomputed 16x16 RHT matrix (an explicit input). Returns a 1-tuple `(out,)` -- no scale."""
+def rht_triton(x, rht_sign, **kwargs):
+    """16x16 randomized Hadamard transform along the last dim (mirrors `hadamard_rht_f`)."""
     assert x.dtype == torch.bfloat16, f"RHT expects bf16 input, got {x.dtype}"
     assert x.is_contiguous()
     assert x.shape[-1] % 16 == 0, f"last dim {x.shape[-1]} not divisible by 16"
     out = torch.empty_like(x)
+    rht = hadamard_rht_matrix(rht_sign, x.device, x.dtype)
     n_groups = x.numel() // 16
     BLOCK_G = 512  # rows per program; big tiles amortize the tiny K=16 dot (swept best on B200)
     def grid(meta):

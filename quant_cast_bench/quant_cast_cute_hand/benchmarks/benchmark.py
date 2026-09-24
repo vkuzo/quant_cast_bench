@@ -63,7 +63,7 @@ from quant_cast_bench.quant_cast_gold.recipes import (
     mxfp4_dim_km_swizzle_f, mxfp4_dim_m_swizzle_f, mxfp4_f, mxfp4_swizzle_f,
     mxfp8_32x32_swizzle_f, mxfp8_dim_km_swizzle_f, mxfp8_dim_km_swizzle_sr_f,
     mxfp8_dim_m_swizzle_f, mxfp8_dim_m_swizzle_sr_f, mxfp8_f, mxfp8_swizzle_f,
-    mxfp8_swizzle_sr_f, hadamard_rht_fp32_f, hadamard_rht_matrix,
+    mxfp8_swizzle_sr_f, hadamard_rht_fp32_f,
     nvfp4_gs_16x16_swizzle_f, nvfp4_gs_f, nvfp4_gs_scale,
     nvfp4_gs_swizzle_dim_km_f, nvfp4_gs_swizzle_dim_m_f,
     nvfp4_gs_swizzle_f,
@@ -700,8 +700,7 @@ def _bench_nvfp4_dim_m_rht(M, K, *, stochastic):
     torch.manual_seed(0)
     x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
     rht_sign = torch.tensor([1, -1] * 8, device=x.device, dtype=x.dtype)
-    rht = hadamard_rht_matrix(rht_sign, x.device, x.dtype)
-    (x_t_rht,) = hadamard_rht_fp32_f(x.t().contiguous(), rht)
+    (x_t_rht,) = hadamard_rht_fp32_f(x.t().contiguous(), rht_sign)
     outer_scale = nvfp4_gs_scale(x_t_rht).reciprocal()
 
     if stochastic:
@@ -713,7 +712,7 @@ def _bench_nvfp4_dim_m_rht(M, K, *, stochastic):
             )
 
         gold = Nvfp4GsDimMSwizzleRHTSRGold
-        gold_inputs = (x, outer_scale, rht, key)
+        gold_inputs = (x, outer_scale, rht_sign, key)
     else:
 
         def run():
@@ -722,7 +721,7 @@ def _bench_nvfp4_dim_m_rht(M, K, *, stochastic):
             )
 
         gold = Nvfp4GsSwizzleDimMRHTGold
-        gold_inputs = (x, outer_scale, rht)
+        gold_inputs = (x, outer_scale, rht_sign)
 
     outputs = run()
     torch.cuda.synchronize()
@@ -745,8 +744,7 @@ def _bench_nvfp4_dim_km_rht_pipelined(M, K, *, stochastic):
     torch.manual_seed(0)
     x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
     rht_sign = torch.tensor([1, -1] * 8, device=x.device, dtype=x.dtype)
-    rht = hadamard_rht_matrix(rht_sign, x.device, x.dtype)
-    (x_t_rht,) = hadamard_rht_fp32_f(x.t().contiguous(), rht)
+    (x_t_rht,) = hadamard_rht_fp32_f(x.t().contiguous(), rht_sign)
     outer_scale_k = nvfp4_gs_scale(x).reciprocal()
     outer_scale_m = nvfp4_gs_scale(x_t_rht).reciprocal()
     if stochastic:
@@ -758,7 +756,7 @@ def _bench_nvfp4_dim_km_rht_pipelined(M, K, *, stochastic):
             )
 
         gold = Nvfp4GsSwizzle_DimKSR_DimMRHTSR_Gold
-        gold_inputs = (x, outer_scale_k, outer_scale_m, rht, key)
+        gold_inputs = (x, outer_scale_k, outer_scale_m, rht_sign, key)
     else:
 
         def run():
@@ -767,7 +765,7 @@ def _bench_nvfp4_dim_km_rht_pipelined(M, K, *, stochastic):
             )
 
         gold = Nvfp4GsSwizzle_DimK_DimMRHT_Gold
-        gold_inputs = (x, outer_scale_k, outer_scale_m, rht)
+        gold_inputs = (x, outer_scale_k, outer_scale_m, rht_sign)
 
     outputs = run()
     torch.cuda.synchronize()

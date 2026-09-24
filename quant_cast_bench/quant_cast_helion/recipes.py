@@ -23,6 +23,7 @@ from quant_cast_bench.quant_cast_gold.recipes import (
     Deepseek128x128Gold,
     Float8TensorwiseGold,
     HadamardRht,
+    hadamard_rht_matrix,
     Mxfp832x32ExpandGold,
     Mxfp8DimKmGold,
     Mxfp8DimKmSwizzleGold,
@@ -904,8 +905,9 @@ NVFP4_SWIZZLE = QuantCastHelionRecipe.from_gold(
 
 # ---------------------------------------------------------------------------
 # bf16 16x16 randomized Hadamard transform (RHT): bf16 in, bf16 out, NO scale (a 1-tuple output).
-# Mirrors hadamard_rht_f -- out = (x.reshape(..., 16) @ rht).reshape(...). The RHT matrix is a (16,16)
-# bf16 aux input (built on the host). Like the triton kernel, flatten the whole tensor to (n_groups,
+# Mirrors hadamard_rht_f -- out = (x.reshape(..., 16) @ rht).reshape(...). The recipe input is the
+# length-16 sign vector; the wrapper materializes the (16,16) bf16 matrix for the kernel. Like the
+# triton kernel, flatten the whole tensor to (n_groups,
 # 16) groups of 16 and give each program a (BLOCK_G, 16) tile -> a batch of (BLOCK_G, 16) @ (16, 16)
 # matmuls. Compute in fp32 (upcasting the bf16 inputs is exact, so an fp32 matmul reproduces torch's
 # bf16 gemm with fp32 accumulation) then cast back to bf16. It's a bandwidth-bound elementwise-shaped
@@ -937,15 +939,16 @@ def _rht_kernel(
         out[tile_g, :] = torch.matmul(x_blk, r).to(torch.bfloat16)  # (bg, 16), fp32 accum -> bf16
 
 
-def rht_helion(x, rht, **kwargs):
+def rht_helion(x, rht_sign, **kwargs):
     """16x16 randomized Hadamard transform along the last dim in Helion (mirrors `hadamard_rht_f`):
-    bf16 in, bf16 out, no scale. `rht` is the (16,16) RHT matrix (host-built aux). Returns a 1-tuple
+    bf16 in, bf16 out, no scale. `rht_sign` is the length-16 sign-vector aux. Returns a 1-tuple
     `(out,)`. `**kwargs` are accepted and ignored (the kernel owns its tiling)."""
     assert x.is_contiguous() and x.dim() == 2
     M, N = x.shape
     assert N % 16 == 0, f"bf16_rht requires N divisible by 16, got N={N}"
     n_groups = (M * N) // 16
     out = torch.empty_like(x)
+    rht = hadamard_rht_matrix(rht_sign, x.device, x.dtype)
     _rht_kernel(x.view(n_groups, 16), rht.contiguous(), out.view(n_groups, 16))
     return (out,)
 

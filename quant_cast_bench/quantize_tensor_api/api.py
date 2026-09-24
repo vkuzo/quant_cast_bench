@@ -69,9 +69,7 @@ def quantize_tensor(
     qdata_rounding_mode: RoundingMode = RoundingMode.RTNE,
     random_key: Tensor | None = None,
     outer_quant_scale: Tensor | None = None,
-    # TODO(future PR): more design on RHT, specifically:
-    # 1. generalize size (today hardcodes 16x16)
-    # 2. think through whether the input should be the sign vector or the RHT
+    # TODO(future PR): generalize the RHT size (today it hardcodes a length-16 sign vector).
     rht_tensor: Tensor | None = None,
     scaling_type_square_block_and_expand: bool = False,
 ) -> tuple[Tensor, Tensor]:
@@ -109,7 +107,7 @@ def quantize_tensor(
         before passing. Required for nvfp4 (float4_e2m1fn_x2) two-level scaling; must be None
         otherwise. A per-tensor scalar selects per-tensor nvfp4 (swizzled kernel); a per-token (M, 1)
         scale selects per-token nvfp4 (mapped to the gold reference, no swizzle).
-      rht_tensor: optional 16x16 Random Hadamard Transform matrix. Only used by the per-tensor
+      rht_tensor: optional length-16 sign vector defining the Random Hadamard Transform. Only used by the per-tensor
         dim-m swizzled nvfp4 cast (selected by passing a transposed view), where it applies the RHT
         to the un-transposed input before quantizing (the wgrad-operand cast of nvfp4 training); must
         be None for every other path.
@@ -331,7 +329,7 @@ def quantize_tensor_dual(
         row-major. mxfp8 only, and only with scaling_type_square_block_and_expand=True +
         swizzle_type=SWIZZLE_32_4_4 (the 32x32 square-block cast).
       qdata_rounding_mode: RTNE or STOCHASTIC. STOCHASTIC is supported only by the RHT nvfp4 cast
-        (rht_tensor=(None, rht)) -- the grad_output cast of nvfp4 training; mxfp8 and the plain
+        (rht_tensor=(None, rht_sign)) -- the grad_output cast of nvfp4 training; mxfp8 and the plain
         no-RHT nvfp4 cast are RTNE only.
       random_key: Philox key for stochastic rounding (required when qdata_rounding_mode=STOCHASTIC, must
         be None otherwise). Split internally into one substream per orientation.
@@ -342,7 +340,7 @@ def quantize_tensor_dual(
         explicit -- there is no single-value form. Without an RHT the two are the same value
         (|input.t()| == |input|), so pass (os, os). With an RHT they differ (|input| for dim-k,
         |RHT(input.t())| for dim-m), so pass (dim_k, dim_m).
-      rht_tensor: optional (dim_k, dim_m) tuple carrying a 16x16 Random Hadamard Transform matrix
+      rht_tensor: optional (dim_k, dim_m) tuple carrying a length-16 sign vector defining the RHT
         applied to the transposed (dim-m) cast (the wgrad-operand cast of nvfp4 training); dim-k never
         applies one. None for mxfp8 and for the plain (no-RHT) nvfp4 dim-km cast. Because the RHT is
         dim-m (second-operand) only, pass it as (None, rht) -- rht in the dim-k slot is rejected.
@@ -387,7 +385,7 @@ def quantize_tensor_dual(
     )
     assert rht_tensor is None or isinstance(rht_tensor, tuple), (
         "rht_tensor must be a (dim_k, dim_m) tuple (or None); pass both orientations explicitly, "
-        "e.g. rht_tensor=(None, rht)"
+        "e.g. rht_tensor=(None, rht_sign)"
     )
     outer_quant_scale_k, outer_quant_scale_m = outer_quant_scale if outer_quant_scale is not None else (None, None)
     rht_tensor_k, rht_tensor_m = rht_tensor if rht_tensor is not None else (None, None)
@@ -429,18 +427,19 @@ def quantize_tensor_dual(
             # SR only exists for the RHT (grad_output) cast of nvfp4 training; the plain no-RHT
             # dim-km cast (activation/weight) is RTNE.
             assert qdata_rounding_mode == RoundingMode.RTNE, (
-                "stochastic rounding is only supported by the RHT nvfp4 cast (rht_tensor=(None, rht))"
+                "stochastic rounding is only supported by the RHT nvfp4 cast "
+                "(rht_tensor=(None, rht_sign))"
             )
             return nvfp4_gs_swizzle_dim_km_f(input, outer_quant_scale_k, outer_quant_scale_m)
         # WITH RHT (Nvfp4GsSwizzle_DimK_DimMRHT_Gold's nvfp4_gs_swizzle_dim_k_dim_m_rht_f): dim-m
         # applies the RHT to input.t() before quantizing (the wgrad-operand cast of nvfp4 training).
         # The two orientations now need DIFFERENT outer scales (|input| vs |RHT(input.t())|), so pass
         # outer_quant_scale=(dim_k, dim_m). The RHT is dim-m (second-operand) ONLY, so it must be passed as
-        # the (None, rht) tuple form -- a bare rht_tensor=rht (which would apply to both operands) is
+        # the (None, rht_sign) tuple form -- a bare sign vector (which would apply to both operands) is
         # rejected.
         assert rht_tensor_k is None and rht_tensor_m is not None, (
             "nvfp4 quantize_tensor_dual applies the RHT to the dim-m (second) operand only; "
-            "pass rht_tensor=(None, rht), not a bare rht_tensor=rht"
+            "pass rht_tensor=(None, rht_sign), not a bare sign vector"
         )
         assert outer_quant_scale_k is not None and outer_quant_scale_m is not None, (
             "RHT nvfp4 quantize_tensor_dual requires an outer_quant_scale per orientation "

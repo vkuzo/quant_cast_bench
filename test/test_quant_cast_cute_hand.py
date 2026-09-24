@@ -15,12 +15,8 @@ import torch.func._random as prng
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from qdata_utils import mismatch_fraction, qdata_and_scale_equal
 from quant_cast_bench.quant_cast_gold.recipes import (
-    Nvfp4GsSwizzleDimMRHTGold,
     _from_blocked_4d,
-    hadamard_rht_fp32_f,
-    hadamard_rht_matrix,
     mxfp8_swizzle_sr_f,
-    nvfp4_gs_scale,
 )
 
 # The CuTeDSL kernels import `_maybe_recast_from_f4_f6` (the fp4/fp6 register-packing helper) from
@@ -141,38 +137,6 @@ def _get_recipe(recipe_name):
     _recipe_name, recipe = [x for x in ALL_RECIPES if x[0] == recipe_name][0]
     return recipe
 
-
-def _nvfp4_dim_m_rht_test_inputs(M, K, *, stochastic=False):
-    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
-    rht_sign = torch.tensor([1, -1] * 8, device=x.device, dtype=x.dtype)
-    rht = hadamard_rht_matrix(rht_sign, x.device, x.dtype)
-    (x_t_rht,) = hadamard_rht_fp32_f(x.t().contiguous(), rht)
-    outer_scale = nvfp4_gs_scale(x_t_rht).reciprocal()
-    if stochastic:
-        key = prng.key(0, device=x.device)
-        return (x, outer_scale, rht_sign, key), (x, outer_scale, rht, key)
-    return (x, outer_scale, rht_sign), (x, outer_scale, rht)
-
-
-def _nvfp4_dim_km_rht_test_inputs(M, K, *, stochastic=False):
-    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
-    rht_sign = torch.tensor([1, -1] * 8, device=x.device, dtype=x.dtype)
-    rht = hadamard_rht_matrix(rht_sign, x.device, x.dtype)
-    (x_t_rht,) = hadamard_rht_fp32_f(x.t().contiguous(), rht)
-    outer_scale_k = nvfp4_gs_scale(x).reciprocal()
-    outer_scale_m = nvfp4_gs_scale(x_t_rht).reciprocal()
-    if stochastic:
-        key = prng.fold_in(prng.key(7, device=x.device), 12345)
-        return (
-            x, outer_scale_k, outer_scale_m, rht_sign, key
-        ), (
-            x, outer_scale_k, outer_scale_m, rht, key
-        )
-    return (
-        x, outer_scale_k, outer_scale_m, rht_sign
-    ), (
-        x, outer_scale_k, outer_scale_m, rht
-    )
 
 def test_add_v0():
     M, K = 2, 64
@@ -911,17 +875,13 @@ def test_nvfp4_dim_m_rht_pipelined(kernel, M, K):
     if torch.cuda.get_device_capability() != (10, 0):
         pytest.skip(f"{kernel} emits Blackwell-only PTX; requires cuda capability 10.0")
     recipe = _get_recipe(kernel)
-    cute_inputs, gold_inputs = _nvfp4_dim_m_rht_test_inputs(
-        M,
-        K,
-        stochastic="swizzle_rht_sr" in kernel,
-    )
-    outputs = recipe.cute_fn(*cute_inputs)
+    inputs = recipe.example_input_fn(M, K, torch.bfloat16)
+    outputs = recipe.cute_fn(*inputs)
     assert tuple(output.shape for output in outputs) == (
         (K, M // 2),
         (K // 128, M // 64, 32, 16),
     )
-    recipe.correctness_fn(gold_inputs, outputs)
+    recipe.correctness_fn(inputs, outputs)
 
 
 @pytest.mark.parametrize(
@@ -1174,18 +1134,7 @@ def test_nvfp4_rht_pipelined_requires_full_tiles(kernel, M, K):
     if torch.cuda.get_device_capability() != (10, 0):
         pytest.skip(f"{kernel} emits Blackwell-only PTX; requires cuda capability 10.0")
     recipe = _get_recipe(kernel)
-    if "dim_k" in kernel:
-        cute_inputs, _ = _nvfp4_dim_km_rht_test_inputs(
-            M,
-            K,
-            stochastic="_sr_dim_m_" in kernel,
-        )
-    else:
-        cute_inputs, _ = _nvfp4_dim_m_rht_test_inputs(
-            M,
-            K,
-            stochastic="_sr_pipelined" in kernel,
-        )
+    cute_inputs = recipe.example_input_fn(M, K, torch.bfloat16)
     with pytest.raises(AssertionError, match="M % 128.*K % 128"):
         recipe.cute_fn(*cute_inputs)
 
@@ -1332,32 +1281,13 @@ def test_cute_hand_matches_reference(name, recipe, dtype):
     if dtype != torch.bfloat16 and name not in _SUPPORTS_NON_BFLOAT16:
         pytest.skip(f"{name} does not support {dtype} input")
     torch.manual_seed(0)
-    if name in (
-        "nvfp4_swizzle_dim_k_dim_m_rht_pipelined",
-        "nvfp4_swizzle_dim_k_sr_dim_m_rht_sr_pipelined",
-    ):
-        cute_inputs, gold_inputs = _nvfp4_dim_km_rht_test_inputs(
-            512,
-            512,
-            stochastic="_sr_dim_m_" in name,
-        )
-    elif name in (
-        "nvfp4_dim_m_rht_swizzle_pipelined",
-        "nvfp4_dim_m_swizzle_rht_sr_pipelined",
-    ):
-        cute_inputs, gold_inputs = _nvfp4_dim_m_rht_test_inputs(
-            512,
-            512,
-            stochastic="swizzle_rht_sr" in name,
-        )
-    else:
-        gold_inputs = recipe.example_input_fn(512, 512, dtype)
-        cute_inputs = tuple(
-            value.clone_state()
-            if isinstance(value, torch.Generator)
-            else value
-            for value in gold_inputs
-        )
+    gold_inputs = recipe.example_input_fn(512, 512, dtype)
+    cute_inputs = tuple(
+        value.clone_state()
+        if isinstance(value, torch.Generator)
+        else value
+        for value in gold_inputs
+    )
 
     tile_kwargs = {
         "global_row": 0,

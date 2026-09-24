@@ -84,7 +84,7 @@ class QuantCastSingleKernelGold:
     `example_input_fn(M, K, dtype) -> (x, *aux)` builds one representative set of
       positional inputs for `pt_ref_fn` at the given (rows, cols) and input dtype: the
       tensor `x` plus any extra args the recipe takes (a precalculated scale, a bias, an
-      RHT matrix, a PRNG key).
+      RHT sign vector, a PRNG key).
 
     `perf_description` is a free-form note about the recipe's performance characteristics
       (filled in manually per recipe); surfaced in the benchmark results.
@@ -1838,12 +1838,13 @@ Nvfp4GsDimKMSwizzleGold = QuantCastSingleKernelGold(
 # intentionally retain the existing BF16 transform until their implementations and numerical
 # contracts move together.
 # ---------------------------------------------------------------------------
-def nvfp4_gs_swizzle_dim_m_rht_f(x, outer_scale, rht, **kwargs):
+def nvfp4_gs_swizzle_dim_m_rht_f(x, outer_scale, rht_sign, **kwargs):
     """dim-m (colwise) nvfp4-swizzle WITH RHT: RHT along the original M (x.t() is (N, M), RHT hits
     its last dim), then nvfp4 along M, output in the transposed (N, M//2) frame. `outer_scale` is
-    the per-tensor scalar over |RHT(x.t())| (aux input, REPLICATE); `rht` is the 16x16 RHT matrix
-    (aux input). The RHT is evaluated in FP32 and remains FP32 through quantization."""
-    (x_t_rht,) = hadamard_rht_fp32_f(x.t().contiguous(), rht)
+    the per-tensor scalar over |RHT(x.t())| (aux input, REPLICATE); `rht_sign` is the length-16
+    random sign vector defining RHT = diag(rht_sign) @ H. The RHT is evaluated in FP32 and remains
+    FP32 through quantization."""
+    (x_t_rht,) = hadamard_rht_fp32_f(x.t().contiguous(), rht_sign)
     return nvfp4_gs_swizzle_f(x_t_rht, outer_scale)
 
 
@@ -1853,7 +1854,8 @@ def _nvfp4_gs_swizzle_dim_m_rht_correctness(
 ) -> None:
     """dequant recovers RHT(x.t()); invert the RHT (orthogonal -> rht.t()) and transpose back before
     comparing to x. nvfp4 is 4-bit, so a low (12 dB) floor -- RHT tends to raise the dim-m SQNR."""
-    x, outer_scale, rht = inputs
+    x, outer_scale, rht_sign = inputs
+    rht = hadamard_rht_matrix(rht_sign, x.device, x.dtype)
     qm, sm = outputs
     x_t_rht_hat = nvfp4_gs_swizzle_dq_f(qm, sm, outer_scale)  # (N, M) ~ RHT(x.t())
     N_, M_ = x_t_rht_hat.shape
@@ -1865,13 +1867,12 @@ def _nvfp4_gs_swizzle_dim_m_rht_correctness(
 
 def _nvfp4_gs_swizzle_dim_m_rht_inputs(M, K, dtype):
     x = torch.randn(M, K, dtype=dtype, device="cuda")
-    # fixed +/-1 sign vector (deterministic), same as the dim_k_dim_m_rht inputs helper.
-    sign = torch.tensor([1, -1] * 8, device=x.device, dtype=x.dtype)
-    rht = hadamard_rht_matrix(sign, x.device, x.dtype)
+    # Fixed +/-1 sign vector (deterministic), shared with the dim-km RHT inputs helper.
+    rht_sign = torch.tensor([1, -1] * 8, device=x.device, dtype=x.dtype)
     # Outer scale is over the same FP32 RHT output re-derived by pt_ref_fn (col_global_amax).
-    (x_t_rht,) = hadamard_rht_fp32_f(x.t().contiguous(), rht)
+    (x_t_rht,) = hadamard_rht_fp32_f(x.t().contiguous(), rht_sign)
     outer_scale = x_t_rht.abs().amax() / (F8E4M3_MAX * F4_E2M1_MAX)
-    return (x, outer_scale.reciprocal(), rht)  # recipes take 1/S
+    return (x, outer_scale.reciprocal(), rht_sign)  # recipes take 1/S
 
 
 Nvfp4GsSwizzleDimMRHTGold = QuantCastSingleKernelGold(
@@ -1895,14 +1896,16 @@ Nvfp4GsSwizzleDimMRHTGold = QuantCastSingleKernelGold(
 # amaxes are the kernel's `row_global_amax` / `col_global_amax` inputs. RHT = diag(sign) @ H (via the
 # HadamardRht helpers below), orthogonal, so correctness inverts the dim-m path with rht.t().
 # ---------------------------------------------------------------------------
-def nvfp4_gs_swizzle_dim_k_dim_m_rht_f(x, outer_scale_k, outer_scale_m, rht, **kwargs):
+def nvfp4_gs_swizzle_dim_k_dim_m_rht_f(
+    x, outer_scale_k, outer_scale_m, rht_sign, **kwargs
+):
     """Tile-invariant `f`: nvfp4-swizzle x both ways in one read. dim-k is plain nvfp4 (no RHT);
     dim-m applies the FP32 RHT to x.t() then nvfp4s along M. Returns (qk (M,N//2), sk swizzled,
     qm (N,M//2), sm swizzled). `outer_scale_k`/`outer_scale_m` are per-tensor scalars (aux inputs);
-    `rht` is the 16x16 RHT matrix (aux input)."""
+    `rht_sign` is the length-16 random sign vector defining the RHT (aux input)."""
     qk, sk = nvfp4_gs_swizzle_f(x, outer_scale_k)  # dim-k: 1x16 along K, no RHT
     # dim-m: RHT along the original M (x.t() is (N, M), RHT hits its last dim), then nvfp4 along M.
-    (x_t_rht,) = hadamard_rht_fp32_f(x.t().contiguous(), rht)
+    (x_t_rht,) = hadamard_rht_fp32_f(x.t().contiguous(), rht_sign)
     qm, sm = nvfp4_gs_swizzle_f(x_t_rht, outer_scale_m)  # transposed (N, M//2) frame
     return qk, sk, qm, sm
 
@@ -1914,7 +1917,8 @@ def _nvfp4_gs_swizzle_dim_k_dim_m_rht_correctness(
     """Dequant each orientation and assert SQNR above threshold. The dim-m pair recovers the RHT
     domain (RHT(x.t())), so invert the RHT (orthogonal -> rht.t()) and transpose back before
     comparing to x. nvfp4 is 4-bit, so a low (12 dB) floor -- RHT tends to raise the dim-m SQNR."""
-    x, outer_scale_k, outer_scale_m, rht = inputs
+    x, outer_scale_k, outer_scale_m, rht_sign = inputs
+    rht = hadamard_rht_matrix(rht_sign, x.device, x.dtype)
     qk, sk, qm, sm = outputs
     x_hat_k = nvfp4_gs_swizzle_dq_f(qk, sk, outer_scale_k)  # (M, N) ~ x
     x_t_rht_hat = nvfp4_gs_swizzle_dq_f(qm, sm, outer_scale_m)  # (N, M) ~ RHT(x.t())
@@ -1929,14 +1933,13 @@ def _nvfp4_gs_swizzle_dim_k_dim_m_rht_correctness(
 
 def _nvfp4_gs_swizzle_dim_k_dim_m_rht_inputs(M, K, dtype):
     x = torch.randn(M, K, dtype=dtype, device="cuda")
-    # fixed +/-1 sign vector (deterministic), same as _hadamard_rht_inputs; build the 16x16 RHT matrix.
-    sign = torch.tensor([1, -1] * 8, device=x.device, dtype=x.dtype)
-    rht = hadamard_rht_matrix(sign, x.device, x.dtype)
+    # Fixed +/-1 sign vector (deterministic), same as _hadamard_rht_inputs.
+    rht_sign = torch.tensor([1, -1] * 8, device=x.device, dtype=x.dtype)
     outer_scale_k = nvfp4_gs_scale(x)  # global amax over |x|
     # Dim-M uses the same FP32 RHT output that pt_ref_fn quantizes.
-    (x_t_rht,) = hadamard_rht_fp32_f(x.t().contiguous(), rht)
+    (x_t_rht,) = hadamard_rht_fp32_f(x.t().contiguous(), rht_sign)
     outer_scale_m = x_t_rht.abs().amax() / (F8E4M3_MAX * F4_E2M1_MAX)
-    return (x, outer_scale_k.reciprocal(), outer_scale_m.reciprocal(), rht)  # recipes take 1/S
+    return (x, outer_scale_k.reciprocal(), outer_scale_m.reciprocal(), rht_sign)  # recipes take 1/S
 
 
 Nvfp4GsSwizzle_DimK_DimMRHT_Gold = QuantCastSingleKernelGold(
@@ -2127,13 +2130,13 @@ Nvfp4GsSwizzleSRGold = QuantCastSingleKernelGold(
 
 
 def nvfp4_gs_swizzle_dim_k_dim_m_rht_sr_f(
-    x, outer_scale_k, outer_scale_m, rht, key_k, key_m, **kwargs
+    x, outer_scale_k, outer_scale_m, rht_sign, key_k, key_m, **kwargs
 ):
     """`nvfp4_gs_swizzle_dim_k_dim_m_rht_f` with stochastic rounding on both fp4 casts. dim-k is
     plain SR nvfp4 (no RHT); dim-m applies the RHT to x.t() then SR-nvfp4s along M. `key_k`/`key_m`
     are independent Philox keys (one per direction, so the two casts draw uncorrelated dither)."""
     qk, sk = nvfp4_gs_swizzle_sr_f(x, outer_scale_k, key_k)  # dim-k: 1x16 along K, no RHT, SR
-    (x_t_rht,) = hadamard_rht_f(x.t().contiguous(), rht)
+    (x_t_rht,) = hadamard_rht_f(x.t().contiguous(), rht_sign)
     qm, sm = nvfp4_gs_swizzle_sr_f(x_t_rht, outer_scale_m, key_m)  # transposed (N, M//2) frame, SR
     return qk, sk, qm, sm
 
@@ -2145,7 +2148,8 @@ def _nvfp4_gs_swizzle_dim_k_dim_m_rht_sr_correctness(
     """Same SQNR check as the RNE gold: dequant each orientation (inverting the dim-m RHT with
     rht.t()) and assert SQNR above the 12 dB fp4 floor. SR adds a little more quantization noise than
     RNE but is unbiased, so the floor is unchanged."""
-    x, outer_scale_k, outer_scale_m, rht, *_keys = inputs
+    x, outer_scale_k, outer_scale_m, rht_sign, *_keys = inputs
+    rht = hadamard_rht_matrix(rht_sign, x.device, x.dtype)
     qk, sk, qm, sm = outputs
     x_hat_k = nvfp4_gs_swizzle_dq_f(qk, sk, outer_scale_k)  # (M, N) ~ x
     x_t_rht_hat = nvfp4_gs_swizzle_dq_f(qm, sm, outer_scale_m)  # (N, M) ~ RHT(x.t())
@@ -2160,15 +2164,21 @@ def _nvfp4_gs_swizzle_dim_k_dim_m_rht_sr_correctness(
 
 def _nvfp4_gs_swizzle_dim_k_dim_m_rht_sr_inputs(M, K, dtype):
     x = torch.randn(M, K, dtype=dtype, device="cuda")
-    sign = torch.tensor([1, -1] * 8, device=x.device, dtype=x.dtype)
-    rht = hadamard_rht_matrix(sign, x.device, x.dtype)
+    rht_sign = torch.tensor([1, -1] * 8, device=x.device, dtype=x.dtype)
     outer_scale_k = nvfp4_gs_scale(x)  # global amax over |x|
-    (x_t_rht,) = hadamard_rht_f(x.t().contiguous(), rht)
+    (x_t_rht,) = hadamard_rht_f(x.t().contiguous(), rht_sign)
     outer_scale_m = x_t_rht.abs().to(torch.float32).amax() / (F8E4M3_MAX * F4_E2M1_MAX)
     # independent Philox keys for the two SR casts (dim-k over x, dim-m over RHT(x.t())).
     key_k = prng.key(0, device=x.device)
     key_m = prng.key(1, device=x.device)
-    return (x, outer_scale_k.reciprocal(), outer_scale_m.reciprocal(), rht, key_k, key_m)  # recipes take 1/S
+    return (
+        x,
+        outer_scale_k.reciprocal(),
+        outer_scale_m.reciprocal(),
+        rht_sign,
+        key_k,
+        key_m,
+    )  # recipes take 1/S
 
 
 Nvfp4GsSwizzle_DimKPortableSR_DimMRHTPortableSR_Gold = QuantCastSingleKernelGold(
@@ -2191,13 +2201,13 @@ Nvfp4GsSwizzle_DimKPortableSR_DimMRHTPortableSR_Gold = QuantCastSingleKernelGold
 # grad_output wgrad-operand cast of nvfp4 training (RHT + SR), without the dim-k output. The
 # per-tensor outer scale is over |RHT(x.t())| (torchao's col_global_amax). Reference only (no kernel).
 # ---------------------------------------------------------------------------
-def nvfp4_gs_swizzle_dim_m_rht_sr_f(x, outer_scale, rht, key, **kwargs):
+def nvfp4_gs_swizzle_dim_m_rht_sr_f(x, outer_scale, rht_sign, key, **kwargs):
     """dim-m (colwise) SR nvfp4-swizzle WITH RHT: RHT along the original M then stochastic-round
     nvfp4 along M, output in the transposed (N, M//2) frame. Unlike the FP32 RNE recipe, this
     future-migration path still rounds the RHT to BF16 before the FP4 cast. `outer_scale` is the
-    per-tensor scalar over |RHT(x.t())| (aux input, REPLICATE); `rht` is the 16x16 RHT matrix;
-    `key` is a torch.func._random Philox key (all aux inputs)."""
-    (x_t_rht,) = hadamard_rht_f(x.t().contiguous(), rht)
+    per-tensor scalar over |RHT(x.t())| (aux input, REPLICATE); `rht_sign` is the length-16 random
+    sign vector defining the RHT; `key` is a torch.func._random Philox key (all aux inputs)."""
+    (x_t_rht,) = hadamard_rht_f(x.t().contiguous(), rht_sign)
     return nvfp4_gs_swizzle_sr_f(x_t_rht, outer_scale, key)
 
 
@@ -2208,7 +2218,8 @@ def _nvfp4_gs_swizzle_dim_m_rht_sr_correctness(
     """dequant recovers RHT(x.t()); invert the RHT (orthogonal -> rht.t()) and transpose back before
     comparing to x. Same 12 dB fp4 floor as the RNE dim-m gold -- SR is unbiased, so the round-trip
     SQNR is unchanged."""
-    x, outer_scale, rht, _key = inputs
+    x, outer_scale, rht_sign, _key = inputs
+    rht = hadamard_rht_matrix(rht_sign, x.device, x.dtype)
     qm, sm = outputs
     x_t_rht_hat = nvfp4_gs_swizzle_dq_f(qm, sm, outer_scale)  # (N, M) ~ RHT(x.t())
     N_, M_ = x_t_rht_hat.shape
@@ -2220,11 +2231,10 @@ def _nvfp4_gs_swizzle_dim_m_rht_sr_correctness(
 
 def _nvfp4_gs_swizzle_dim_m_rht_sr_inputs(M, K, dtype):
     x = torch.randn(M, K, dtype=dtype, device="cuda")
-    sign = torch.tensor([1, -1] * 8, device=x.device, dtype=x.dtype)
-    rht = hadamard_rht_matrix(sign, x.device, x.dtype)
-    (x_t_rht,) = hadamard_rht_f(x.t().contiguous(), rht)
+    rht_sign = torch.tensor([1, -1] * 8, device=x.device, dtype=x.dtype)
+    (x_t_rht,) = hadamard_rht_f(x.t().contiguous(), rht_sign)
     outer_scale = x_t_rht.abs().to(torch.float32).amax() / (F8E4M3_MAX * F4_E2M1_MAX)
-    return (x, outer_scale.reciprocal(), rht, prng.key(0, device=x.device))  # 1/S; fixed Philox key -> reproducible SR
+    return (x, outer_scale.reciprocal(), rht_sign, prng.key(0, device=x.device))  # 1/S; fixed Philox key -> reproducible SR
 
 
 Nvfp4GsDimMSwizzleRHTPortableSRGold = QuantCastSingleKernelGold(
@@ -2236,23 +2246,22 @@ Nvfp4GsDimMSwizzleRHTPortableSRGold = QuantCastSingleKernelGold(
 
 
 def nvfp4_gs_swizzle_dim_m_rht_nvidia_sr_f(
-    x, outer_scale, rht, key, **kwargs
+    x, outer_scale, rht_sign, key, **kwargs
 ):
     """FP32 dim-M RHT NVFP4 using NVIDIA ``cvt.rs.e2m1x4`` stochastic rounding."""
-    (x_t_rht,) = hadamard_rht_fp32_f(x.t().contiguous(), rht)
+    (x_t_rht,) = hadamard_rht_fp32_f(x.t().contiguous(), rht_sign)
     return nvfp4_gs_swizzle_nvidia_sr_f(x_t_rht, outer_scale, key)
 
 
 def _nvfp4_gs_swizzle_dim_m_rht_nvidia_sr_inputs(M, K, dtype):
     x = torch.randn(M, K, dtype=dtype, device="cuda")
-    sign = torch.tensor([1, -1] * 8, device=x.device, dtype=x.dtype)
-    rht = hadamard_rht_matrix(sign, x.device, x.dtype)
-    (x_t_rht,) = hadamard_rht_fp32_f(x.t().contiguous(), rht)
+    rht_sign = torch.tensor([1, -1] * 8, device=x.device, dtype=x.dtype)
+    (x_t_rht,) = hadamard_rht_fp32_f(x.t().contiguous(), rht_sign)
     outer_scale = x_t_rht.abs().amax() / (F8E4M3_MAX * F4_E2M1_MAX)
     return (
         x,
         outer_scale.reciprocal(),
-        rht,
+        rht_sign,
         prng.key(0, device=x.device),
     )
 
@@ -2269,12 +2278,12 @@ Nvfp4GsDimMSwizzleRHTSRGold = QuantCastSingleKernelGold(
 
 
 def nvfp4_gs_swizzle_dim_k_dim_m_rht_nvidia_sr_f(
-    x, outer_scale_k, outer_scale_m, rht, key, **kwargs
+    x, outer_scale_k, outer_scale_m, rht_sign, key, **kwargs
 ):
     """Dim-K and FP32 dim-M RHT NVFP4 using disjoint ranges of one ``cvt.rs`` SR stream."""
     M, K = x.shape
     qk, sk = nvfp4_gs_swizzle_nvidia_sr_f(x, outer_scale_k, key)
-    (x_t_rht,) = hadamard_rht_fp32_f(x.t().contiguous(), rht)
+    (x_t_rht,) = hadamard_rht_fp32_f(x.t().contiguous(), rht_sign)
     # One Philox counter supplies the four random words consumed by 16 FP4 output values.
     key_m = _advance_philox_key_by_counters(key, M * K // 16)
     qm, sm = nvfp4_gs_swizzle_nvidia_sr_f(x_t_rht, outer_scale_m, key_m)
@@ -2283,16 +2292,15 @@ def nvfp4_gs_swizzle_dim_k_dim_m_rht_nvidia_sr_f(
 
 def _nvfp4_gs_swizzle_dim_k_dim_m_rht_nvidia_sr_inputs(M, K, dtype):
     x = torch.randn(M, K, dtype=dtype, device="cuda")
-    sign = torch.tensor([1, -1] * 8, device=x.device, dtype=x.dtype)
-    rht = hadamard_rht_matrix(sign, x.device, x.dtype)
+    rht_sign = torch.tensor([1, -1] * 8, device=x.device, dtype=x.dtype)
     outer_scale_k = nvfp4_gs_scale(x)
-    (x_t_rht,) = hadamard_rht_fp32_f(x.t().contiguous(), rht)
+    (x_t_rht,) = hadamard_rht_fp32_f(x.t().contiguous(), rht_sign)
     outer_scale_m = x_t_rht.abs().amax() / (F8E4M3_MAX * F4_E2M1_MAX)
     return (
         x,
         outer_scale_k.reciprocal(),
         outer_scale_m.reciprocal(),
-        rht,
+        rht_sign,
         prng.key(0, device=x.device),
     )
 
@@ -2574,8 +2582,9 @@ DebugReluGold = QuantCastSingleKernelGold(
 # in, bf16 out, NO scale/aux output -- pt_ref_fn returns a 1-tuple `(out,)`. Building block
 # for torchao's RHT-fused nvfp4 kernels. RHT = diag(sign) @ H, where H is the 16x16
 # Sylvester-Walsh matrix / sqrt(16); mirrors torchao get_rht_matrix. RHT is orthogonal (its
-# inverse is its transpose) but, with a sign vector, not an involution. The RHT matrix is
-# passed to pt_ref_fn as an explicit input (a REPLICATE aux under flex_tile_map).
+# inverse is its transpose) but, with a sign vector, not an involution. The length-16 sign vector is
+# passed to pt_ref_fn as an explicit input (a REPLICATE aux under flex_tile_map); the reference
+# materializes the fixed 16x16 matrix internally.
 # ---------------------------------------------------------------------------
 # 16x16 Sylvester-Walsh Hadamard values (torchao hadamard_utils.py get_hadamard_matrix).
 _HADAMARD_16 = [
@@ -2609,17 +2618,19 @@ def hadamard_rht_matrix(sign_vector, device, dtype):
     return torch.diag(sign_vector.to(device=device, dtype=dtype)) @ H
 
 
-def hadamard_rht_f(x, rht, **kwargs):
-    """Apply the 16x16 RHT along the last dim. `rht` is the RHT matrix (built via
-    `hadamard_rht_matrix`), an explicit input. Returns a 1-tuple `(out,)` -- no scale."""
+def hadamard_rht_f(x, rht_sign, **kwargs):
+    """Apply the 16x16 RHT along the last dim. `rht_sign` is the length-16 random sign vector
+    defining RHT = diag(rht_sign) @ H. Returns a 1-tuple `(out,)` -- no scale."""
     *lead, last = x.shape
+    rht = hadamard_rht_matrix(rht_sign, x.device, x.dtype)
     out = (x.reshape(*lead, last // 16, 16) @ rht).reshape(*lead, last)
     return (out,)
 
 
-def hadamard_rht_fp32_f(x, rht, **kwargs):
-    """Apply the 16x16 RHT in FP32 and return an FP32 result."""
+def hadamard_rht_fp32_f(x, rht_sign, **kwargs):
+    """Apply the sign-defined 16x16 RHT in FP32 and return an FP32 result."""
     *lead, last = x.shape
+    rht = hadamard_rht_matrix(rht_sign, x.device, x.dtype)
     out = (
         x.reshape(*lead, last // 16, 16).float() @ rht.float()
     ).reshape(*lead, last)
@@ -2631,7 +2642,8 @@ def _hadamard_rht_correctness(
 ) -> None:
     """RHT is orthogonal, so its transpose inverts it: recover `x` from the transformed output
     (NOT by applying RHT twice) and assert high SQNR. There's no scale to dequant here."""
-    x, rht = inputs
+    x, rht_sign = inputs
+    rht = hadamard_rht_matrix(rht_sign, x.device, x.dtype)
     (y,) = outputs
     M, N = x.shape
     x_rec = (y.reshape(M, N // 16, 16) @ rht.t()).reshape(M, N)
@@ -2642,9 +2654,9 @@ def _hadamard_rht_correctness(
 
 def _hadamard_rht_inputs(M, K, dtype):
     x = torch.randn(M, K, dtype=dtype, device="cuda")
-    # fixed +/-1 sign vector (deterministic); build the 16x16 RHT matrix pt_ref_fn transforms with.
-    sign = torch.tensor([1, -1] * 8, device=x.device, dtype=x.dtype)
-    return (x, hadamard_rht_matrix(sign, x.device, x.dtype))
+    # Fixed +/-1 sign vector (deterministic); pt_ref_fn materializes its 16x16 RHT matrix.
+    rht_sign = torch.tensor([1, -1] * 8, device=x.device, dtype=x.dtype)
+    return (x, rht_sign)
 
 
 HadamardRht = QuantCastSingleKernelGold(

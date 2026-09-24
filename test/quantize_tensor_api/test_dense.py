@@ -23,7 +23,6 @@ from quant_cast_bench.quant_cast_gold.recipes import (
     _compute_error,
     hadamard_rht_f,
     hadamard_rht_fp32_f,
-    hadamard_rht_matrix,
     mxfp8_32x32_expand_f,
     mxfp8_32x32_qdata_dim_k_scale_dim_km_swizzle_f,
     mxfp8_dim_km_f,
@@ -326,10 +325,9 @@ def test_nvfp4_dim_m_rht_matches_gold_bitwise(M, N, dtype):
     # wgrad-operand cast of nvfp4 training. No Triton kernel yet, so the API maps straight to the gold
     # -> byte-identical by construction; runs eager on any CUDA device (bit-math fp4 path).
     sign = torch.tensor([1, -1] * 8, device=x.device, dtype=x.dtype)  # fixed +/-1 RHT sign vector
-    rht = hadamard_rht_matrix(sign, x.device, x.dtype)
     # Two-level outer scale is over the FP32 |RHT(x.t())| (the RHT-domain amax), not |x|. API and
     # gold consume 1/S.
-    (x_t_rht,) = hadamard_rht_fp32_f(x.t().contiguous(), rht)
+    (x_t_rht,) = hadamard_rht_fp32_f(x.t().contiguous(), sign)
     outer_quant_scale = (x_t_rht.abs().to(torch.float32).amax() / (F8E4M3_MAX * F4_E2M1_MAX)).reciprocal()
     q, s = quantize_tensor(
         x.t(),  # dim-m: pass a transposed view; the API un-transposes and uses the dim-m kernel
@@ -338,9 +336,9 @@ def test_nvfp4_dim_m_rht_matches_gold_bitwise(M, N, dtype):
         scaling_type=[ScalingType.BlockWise1x16, ScalingType.TensorWise],
         swizzle_type=SwizzleType.SWIZZLE_32_4_4,
         outer_quant_scale=outer_quant_scale,
-        rht_tensor=rht,
+        rht_tensor=sign,
     )
-    q_ref, s_ref = nvfp4_gs_swizzle_dim_m_rht_f(x, outer_quant_scale, rht)
+    q_ref, s_ref = nvfp4_gs_swizzle_dim_m_rht_f(x, outer_quant_scale, sign)
     assert torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8)), "qdata differs from gold"
     assert torch.equal(s.view(torch.uint8), s_ref.view(torch.uint8)), "scale differs from gold"
     assert q.dtype == torch.float4_e2m1fn_x2
@@ -481,10 +479,10 @@ requires_sm100 = pytest.mark.skipif(
 )
 
 
-def _rht_outer_scale(x, rht):
+def _rht_outer_scale(x, rht_sign):
     """Per-tensor fp32 outer scale over |RHT(x.T)| (the RHT-path amax basis), same formula as the
     dim_k_dim_m_rht gold's own inputs helper."""
-    (x_rht,) = hadamard_rht_f(x.t().contiguous(), rht)
+    (x_rht,) = hadamard_rht_f(x.t().contiguous(), rht_sign)
     return x_rht.abs().to(torch.float32).amax() / (F8E4M3_MAX * F4_E2M1_MAX)
 
 
@@ -621,7 +619,7 @@ class _Nvfp4LinearSingleDirection(torch.autograd.Function):
     See the module comment above for the per-GEMM cast/orientation/RHT breakdown."""
 
     @staticmethod
-    def forward(ctx, input, weight, rht, key):
+    def forward(ctx, input, weight, rht_sign, key):
         # input: x, shape [M, K]
         # weight: w, shape [N, K]
         # grad_output: go, shape [M, K]
@@ -629,7 +627,7 @@ class _Nvfp4LinearSingleDirection(torch.autograd.Function):
 
         # Activation: row cast (no RHT) feeds fwd; col cast (RHT on input.T) is saved for wgrad.
         x_gs_k = nvfp4_gs_scale(input)  # outer scale over |input|
-        x_rht_g_s_m = _rht_outer_scale(input, rht)  # outer scale over |RHT(input.T)|
+        x_rht_g_s_m = _rht_outer_scale(input, rht_sign)  # outer scale over |RHT(input.T)|
         # Activation casts through the quantize_tensor API (splitting the fused
         # nvfp4_gs_swizzle_dim_k_dim_m_rht_f into its two orientations). dim-k is plain nvfp4 (no RHT,
         # contiguous input) over |input|; dim-m applies the RHT to input.t() then nvfp4s along M
@@ -649,7 +647,7 @@ class _Nvfp4LinearSingleDirection(torch.autograd.Function):
             scaling_type=[ScalingType.BlockWise1x16, ScalingType.TensorWise],
             swizzle_type=SwizzleType.SWIZZLE_32_4_4,
             outer_quant_scale=x_rht_g_s_m.reciprocal(),
-            rht_tensor=rht,
+            rht_tensor=rht_sign,
         )
         # Weight: row cast (blk K) feeds fwd; transposed row cast (blk N) is the dgrad col operand.
         w_gs = nvfp4_gs_scale(weight)  # |W| == |W.T|, so one outer scale serves both
@@ -684,12 +682,14 @@ class _Nvfp4LinearSingleDirection(torch.autograd.Function):
             swizzle_b=[F.SwizzleType.SWIZZLE_32_4_4, F.SwizzleType.NO_SWIZZLE],
             output_dtype=torch.bfloat16,
         )
-        ctx.save_for_backward(x_rht_q_m, x_rht_s_m, x_rht_g_s_m, w_q_n, w_s_n, w_gs, rht, key)
+        ctx.save_for_backward(
+            x_rht_q_m, x_rht_s_m, x_rht_g_s_m, w_q_n, w_s_n, w_gs, rht_sign, key
+        )
         return out
 
     @staticmethod
     def backward(ctx, grad_output):
-        x_rht_q_m, x_rht_s_m, x_rht_g_s_m, w_q_n, w_s_n, w_gs, rht, key = ctx.saved_tensors
+        x_rht_q_m, x_rht_s_m, x_rht_g_s_m, w_q_n, w_s_n, w_gs, rht_sign, key = ctx.saved_tensors
         grad_output = grad_output.contiguous()
         # grad_output: row cast (no RHT) feeds dgrad; col cast (RHT on dy.T) feeds wgrad. Both use
         # STOCHASTIC ROUNDING -- torchao applies SR to exactly these two grad_output casts (the
@@ -700,7 +700,7 @@ class _Nvfp4LinearSingleDirection(torch.autograd.Function):
         # by choosing what key it passes to forward -- e.g. prng.fold_in(base_key, step); this Function
         # just splits whatever it is handed.
         go_gs_k = nvfp4_gs_scale(grad_output)  # over |grad_output|
-        go_rht_g_s_m = _rht_outer_scale(grad_output, rht)  # over |RHT(grad_output.T)|
+        go_rht_g_s_m = _rht_outer_scale(grad_output, rht_sign)  # over |RHT(grad_output.T)|
         key_k, key_m = prng.split(key, 2)
         # grad_output casts through the quantize_tensor API with STOCHASTIC rounding (splitting the
         # fused nvfp4_gs_swizzle_dim_k_dim_m_rht_sr_f into its two orientations, one Philox key each).
@@ -723,7 +723,7 @@ class _Nvfp4LinearSingleDirection(torch.autograd.Function):
             scaling_type=[ScalingType.BlockWise1x16, ScalingType.TensorWise],
             swizzle_type=SwizzleType.SWIZZLE_32_4_4,
             outer_quant_scale=go_rht_g_s_m.reciprocal(),
-            rht_tensor=rht,
+            rht_tensor=rht_sign,
             qdata_rounding_mode=RoundingMode.STOCHASTIC,
             random_key=key_m,
         )
@@ -747,7 +747,7 @@ class _Nvfp4LinearSingleDirection(torch.autograd.Function):
             swizzle_b=[F.SwizzleType.SWIZZLE_32_4_4, F.SwizzleType.NO_SWIZZLE],
             output_dtype=torch.bfloat16,
         )
-        return grad_input, grad_weight, None, None  # extra None: rht, key
+        return grad_input, grad_weight, None, None  # extra None: rht_sign, key
 
 
 class _Nvfp4LinearBiDirection(torch.autograd.Function):
@@ -756,7 +756,7 @@ class _Nvfp4LinearBiDirection(torch.autograd.Function):
     See the module comment above for the per-GEMM cast/orientation/RHT breakdown."""
 
     @staticmethod
-    def forward(ctx, input, weight, rht, key):
+    def forward(ctx, input, weight, rht_sign, key):
         # input: x, shape [M, K]
         # weight: w, shape [N, K]
         # grad_output: go, shape [M, K]
@@ -764,12 +764,12 @@ class _Nvfp4LinearBiDirection(torch.autograd.Function):
 
         # Activation: row cast (no RHT) feeds fwd; col cast (RHT on input.T) is saved for wgrad.
         x_gs_k = nvfp4_gs_scale(input)  # outer scale over |input|
-        x_rht_g_s_m = _rht_outer_scale(input, rht)  # outer scale over |RHT(input.T)|
+        x_rht_g_s_m = _rht_outer_scale(input, rht_sign)  # outer scale over |RHT(input.T)|
         # Activation cast through the fused dual-orientation quantize_tensor_dual API. dim-k
         # is plain nvfp4 (no RHT, NATURAL) over |input|; dim-m applies the RHT to input.t() then
         # nvfp4s along M, scaled by |RHT(input.t())|. The two orientations use different outer scales
         # (passed as the (dim_k, dim_m) tuple); the RHT is dim-m (second-operand) only, so it goes in
-        # as the (None, rht) tuple.
+        # as the (None, rht_sign) tuple.
         x_q_k, xs_k, x_rht_q_m, x_rht_s_m = quantize_tensor_dual(
             input,
             qdata_dtype=torch.float4_e2m1fn_x2,
@@ -777,7 +777,7 @@ class _Nvfp4LinearBiDirection(torch.autograd.Function):
             scaling_type=[ScalingType.BlockWise1x16, ScalingType.TensorWise],
             swizzle_type=SwizzleType.SWIZZLE_32_4_4,
             outer_quant_scale=(x_gs_k.reciprocal(), x_rht_g_s_m.reciprocal()),  # API consumes 1/S per orientation
-            rht_tensor=(None, rht),
+            rht_tensor=(None, rht_sign),
         )
         # Weight: row cast (blk K) feeds fwd; transposed row cast (blk N) is the dgrad col operand.
         w_gs = nvfp4_gs_scale(weight)  # |W| == |W.T|, so one outer scale serves both
@@ -804,12 +804,14 @@ class _Nvfp4LinearBiDirection(torch.autograd.Function):
             swizzle_b=[F.SwizzleType.SWIZZLE_32_4_4, F.SwizzleType.NO_SWIZZLE],
             output_dtype=torch.bfloat16,
         )
-        ctx.save_for_backward(x_rht_q_m, x_rht_s_m, x_rht_g_s_m, w_q_n, w_s_n, w_gs, rht, key)
+        ctx.save_for_backward(
+            x_rht_q_m, x_rht_s_m, x_rht_g_s_m, w_q_n, w_s_n, w_gs, rht_sign, key
+        )
         return out
 
     @staticmethod
     def backward(ctx, grad_output):
-        x_rht_q_m, x_rht_s_m, x_rht_g_s_m, w_q_n, w_s_n, w_gs, rht, key = ctx.saved_tensors
+        x_rht_q_m, x_rht_s_m, x_rht_g_s_m, w_q_n, w_s_n, w_gs, rht_sign, key = ctx.saved_tensors
         grad_output = grad_output.contiguous()
         # grad_output: row cast (no RHT) feeds dgrad; col cast (RHT on dy.T) feeds wgrad. Both use
         # STOCHASTIC ROUNDING -- torchao applies SR to exactly these two grad_output casts (the
@@ -820,11 +822,11 @@ class _Nvfp4LinearBiDirection(torch.autograd.Function):
         # by choosing what key it passes to forward -- e.g. prng.fold_in(base_key, step); this Function
         # just splits whatever it is handed.
         go_gs_k = nvfp4_gs_scale(grad_output)  # over |grad_output|
-        go_rht_g_s_m = _rht_outer_scale(grad_output, rht)  # over |RHT(grad_output.T)|
+        go_rht_g_s_m = _rht_outer_scale(grad_output, rht_sign)  # over |RHT(grad_output.T)|
         # Both grad_output casts in one fused dual SR cast (nvfp4_gs_swizzle_dim_k_dim_m_rht_sr_f):
         # dim-k is plain SR nvfp4 (no RHT) over |grad_output|; dim-m applies the RHT to grad_output.t()
         # then SR-nvfp4s along M, scaled by |RHT(dy.t())|. Per-orientation outer_quant_scale=(dim_k, dim_m);
-        # the RHT is dim-m (second-operand) only, so rht_tensor=(None, rht). We hand it the single key --
+        # the RHT is dim-m (second-operand) only, so rht_tensor=(None, rht_sign). We hand it the single key --
         # the API splits it into one Philox substream per orientation (== prng.split(key, 2) here).
         go_sr_q_k, gos_k, go_sr_q_m, go_s_m = quantize_tensor_dual(
             grad_output,
@@ -833,7 +835,7 @@ class _Nvfp4LinearBiDirection(torch.autograd.Function):
             scaling_type=[ScalingType.BlockWise1x16, ScalingType.TensorWise],
             swizzle_type=SwizzleType.SWIZZLE_32_4_4,
             outer_quant_scale=(go_gs_k.reciprocal(), go_rht_g_s_m.reciprocal()),  # API consumes 1/S per orientation
-            rht_tensor=(None, rht),
+            rht_tensor=(None, rht_sign),
             qdata_rounding_mode=RoundingMode.STOCHASTIC,
             random_key=key,
         )
@@ -857,7 +859,7 @@ class _Nvfp4LinearBiDirection(torch.autograd.Function):
             swizzle_b=[F.SwizzleType.SWIZZLE_32_4_4, F.SwizzleType.NO_SWIZZLE],
             output_dtype=torch.bfloat16,
         )
-        return grad_input, grad_weight, None, None  # extra None: rht, key
+        return grad_input, grad_weight, None, None  # extra None: rht_sign, key
 
 
 @requires_sm100
@@ -871,7 +873,6 @@ def test_nvfp4_linear_fwd_bwd_sqnr(linear_fn):
     w = torch.randn(N, K, dtype=torch.bfloat16, device="cuda")
     grad_out = torch.randn(M, N, dtype=torch.bfloat16, device="cuda")  # fixed upstream grad
     sign = torch.tensor([1, -1] * 8, device=x.device, dtype=x.dtype)  # fixed RHT sign vector
-    rht = hadamard_rht_matrix(sign, x.device, x.dtype)
     key = prng.key(0, device=x.device)  # caller-supplied SR key; backward splits it into two streams
 
     # bf16 reference: out = x @ w.T, then backward with the same upstream grad.
@@ -882,10 +883,10 @@ def test_nvfp4_linear_fwd_bwd_sqnr(linear_fn):
     # nvfp4 path through the reference autograd Function.
     xq = x.clone().requires_grad_(True)
     wq = w.clone().requires_grad_(True)
-    linear_fn.apply(xq, wq, rht, key).backward(grad_out)
+    linear_fn.apply(xq, wq, sign, key).backward(grad_out)
 
     out_ref = xr @ wr.t()
-    out_q = _Nvfp4LinearSingleDirection.apply(x, w, rht, key)
+    out_q = _Nvfp4LinearSingleDirection.apply(x, w, sign, key)
     sqnr_out = _compute_error(out_ref.float(), out_q.float())
     sqnr_gx = _compute_error(xr.grad.float(), xq.grad.float())
     sqnr_gw = _compute_error(wr.grad.float(), wq.grad.float())
@@ -901,7 +902,7 @@ def test_nvfp4_linear_fwd_bwd_sqnr(linear_fn):
     assert sqnr_gw > 13.0, f"grad_weight sqnr={sqnr_gw.item():.2f} dB below 13 dB"
 
     # Cross-check against the original all-gold reference (test_quant_cast_gold._Nvfp4Linear), which
-    # uses the fully-gold casts instead of the quantize_tensor API. Same rht/key/inputs, so the only
+    # uses the fully-gold casts instead of the quantize_tensor API. Same sign/key/inputs, so the only
     # differences are the API casts that hit a Triton kernel: the weight row/col casts and the
     # activation dim-k (NATURAL) cast use hardware cvt.e2m1x2, which picks different RNE ties than the
     # gold fp32 path on <1% of fp4 codes. The grad_output casts are also API-routed here, but their SR
@@ -912,7 +913,7 @@ def test_nvfp4_linear_fwd_bwd_sqnr(linear_fn):
     # Triton-cast operands, so they match at high SQNR (~38 dB) rather than bitwise.
     xg = x.clone().requires_grad_(True)
     wg = w.clone().requires_grad_(True)
-    out_gold = _Nvfp4LinearRef.apply(xg, wg, rht, key)
+    out_gold = _Nvfp4LinearRef.apply(xg, wg, sign, key)
     out_gold.backward(grad_out)
     assert torch.equal(wq.grad, wg.grad), "grad_weight differs from the all-gold reference"
     sqnr_out_vs_gold = _compute_error(out_gold.float(), out_q.float())
