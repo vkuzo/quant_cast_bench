@@ -172,6 +172,15 @@ def plot(csv_path: Path, output_path: Path) -> None:
         for name in section_order
     }
     sections = {name: values for name, values in sections.items() if values}
+    if "MXFP8" in sections:
+        # Keep the compact, unswizzled-scale baseline after the swizzled MXFP8 charts.
+        sections["MXFP8"].sort(
+            key=lambda variants: any(
+                row["kernel"] == "mxfp8"
+                for rows in variants.values()
+                for row in rows
+            )
+        )
 
     height_ratios = []
     for variants in sections.values():
