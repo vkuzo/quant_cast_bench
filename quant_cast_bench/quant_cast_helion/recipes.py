@@ -992,7 +992,7 @@ def _sr_bf16_kernel(
     x: torch.Tensor,  # (n,) fp32 input, flattened (n divisible by 4)
     out: torch.Tensor,  # (n,) bf16 output, mutated in place
     seed: int,  # Philox seed = key[0] (full 64 bits; tl.randint4x splits it into two 32-bit words)
-    base: int,  # base counter offset = key[1] (gold keys draws on key[1] + f>>2)
+    base: int,  # base counter offset = key[1] (prng.bits keys draws on key[1] + f>>2)
 ) -> None:
     n, = x.shape
     nq = n // 4  # groups of 4 elements: one Philox round (4 draws) per group
@@ -1007,7 +1007,7 @@ def _sr_bf16_kernel(
         # bitcast each to int32 to match output_like / the downstream int32 math.
         r0, r1, r2, r3 = hl.inline_triton(
             """
-            a, b, c, d = tl.randint4x({seed}, {offs}, 7)
+            a, b, c, d = tl.randint4x({seed}, {offs})
             (a.to(tl.int32, bitcast=True), b.to(tl.int32, bitcast=True),
              c.to(tl.int32, bitcast=True), d.to(tl.int32, bitcast=True))
             """,
@@ -1030,7 +1030,7 @@ def _sr_bf16_kernel(
 def sr_bf16_helion(x, key, **kwargs):
     """Tiling-invariant fp32 -> bf16 stochastic rounding in Helion (mirrors `sr_bf16_global_f`). `key`
     is a torch Philox key tensor `[key[0], key[1]]`: key[0] is the 64-bit Philox seed and key[1] is a
-    base counter offset (in Philox-block units) -- gold keys draw f on `key[1] + f>>2`,
+    base counter offset (in Philox-block units) -- gold's `prng.bits` keys draw f on `key[1] + f>>2`,
     so we consume BOTH words to bit-match it for any (incl. fold_in/split-advanced) key. SR is unbiased
     -- a value between two bf16 grid points rounds up with probability (x-lo)/(hi-lo). Returns a
     1-tuple `(out,)`. `**kwargs` accepted and ignored (the kernel owns its tiling)."""

@@ -15,8 +15,7 @@ import torch
 import torch.func._random as prng
 
 from .utils import (
-    _philox4x32_7_stateful_words,
-    _philox4x32_7_stateless_words,
+    _philox4x32_10_stateful_words,
     f32_to_f4_unpacked,
     f4_unpacked_to_f32,
     pack_uint4,
@@ -1109,8 +1108,6 @@ def _f32_to_fp8_nvidia_sr_with_words(x, word):
 def _f32_to_fp8_nvidia_sr(x, key):
     """Eager emulation of Blackwell ``cvt.rs.satfinite.e4m3x4.f32``.
 
-    Random words come from reduced-round Philox4x32-7.
-
     One Philox word supplies four 16-bit random operands in the same lane and bit order as the
     hardware instruction. The exponent-dependent discarded-bit width handles both normal and
     subnormal E4M3 values; the bottom bin rounds directly between zero and 2**-9. NaNs use the
@@ -1120,11 +1117,12 @@ def _f32_to_fp8_nvidia_sr(x, key):
     flat = x.contiguous().reshape(-1)
     assert flat.numel() % 4 == 0, "NVIDIA fp8 SR requires numel divisible by 4"
     groups = flat.numel() // 4
-    bits = _philox4x32_7_stateless_words(key, groups)
+    n_words = ((groups + 3) // 4) * 4
+    bits = prng.bits(key, n_words, dtype=torch.uint32).to(torch.int64)
 
     # v4 gives each thread 16 contiguous values and computes one Philox counter for them. Its four
     # result words feed the four consecutive e4m3x4 groups directly, so group g consumes bits[g].
-    return _f32_to_fp8_nvidia_sr_with_words(x, bits)
+    return _f32_to_fp8_nvidia_sr_with_words(x, bits[:groups])
 
 
 # TODO(future): audit the other SR gold conversions and give each one explicit non-finite handling
@@ -1205,7 +1203,6 @@ def mxfp8_swizzle_stateful_sr_f(x, generator, **kwargs):
     Each invocation reserves four words from the generator. That selects one Philox counter block
     for the operation; consecutive groups of 16 logical output elements use consecutive 64-bit
     subsequences, making the result independent of the implementation's thread and tile mapping.
-    Random words use reduced-round Philox4x32-7.
     """
     assert x.is_cuda, "stateful stochastic rounding requires a CUDA tensor"
     generator_device = torch.device(generator.device)
@@ -1219,7 +1216,7 @@ def mxfp8_swizzle_stateful_sr_f(x, generator, **kwargs):
     scale_e8m0 = _amax_to_e8m0_rceil(amax)
     scaled = x_b.to(torch.float32) * _e8m0_scale_to_reciprocal_fp32(scale_e8m0)
     word_count = scaled.numel() // 4
-    words = _philox4x32_7_stateful_words(generator, word_count, x.device)
+    words = _philox4x32_10_stateful_words(generator, word_count, x.device)
     qdata = _f32_to_fp8_nvidia_sr_with_words(scaled, words).reshape(*lead, last)
     return qdata, _to_blocked_4d(scale_e8m0.squeeze(-1))
 
@@ -1960,8 +1957,8 @@ Nvfp4GsSwizzle_DimK_DimMRHT_Gold = QuantCastSingleKernelGold(
 # (Rounding.STOCHASTIC's `_reference_impl`, NOT the NVIDIA cvt.rs hardware intrinsics): add a uniform
 # dither into the fp32 mantissa bits the target format discards, then truncate. fp4 (e2m1) keeps one
 # mantissa bit, so it drops 23 - 1 = 22 bits (vs that reference's 16 for bf16 / 20 for e4m3). The
-# dither is the low 22 bits of a Philox4x32-7 draw, matching the repo's other SR golds
-# (sr_bf16_global_f). SR is unbiased (E[SR(v)] = v), so the round-trip SQNR stays above the same 12 dB floor
+# dither is the low 22 bits of a raw `prng.bits` draw -- exactly as the reference does, and matching
+# the repo's other SR golds (sr_bf16_global_f). SR is unbiased (E[SR(v)] = v), so the round-trip SQNR stays above the same 12 dB floor
 # as the RNE gold; the point of SR here is an unbiased grad cast, which the RNE gold cannot give.
 # ---------------------------------------------------------------------------
 def _f32_to_packed_fp4_sr(data_scaled, key):
@@ -1969,15 +1966,13 @@ def _f32_to_packed_fp4_sr(data_scaled, key):
     `_f32_to_packed_fp4`) with STOCHASTIC rounding to the fp4 grid instead of RNE. Adds a uniform
     22-bit dither into the discarded fp32 mantissa field, then truncates (the software-SR trick from
     stochastic_rounding_api's STOCHASTIC `_reference_impl`, drop = 23 - 1 fp4 mantissa bit = 22). The
-    dither is the low 22 bits of a Philox4x32-7 draw (same as sr_bf16_global_f). After the
+    dither is the low 22 bits of a raw `prng.bits(key, ...)` draw (same as sr_bf16_global_f). After the
     add-and-truncate the value already sits on the fp4 normal grid, so the
     f32_to_f4_unpacked RNE below is a no-op for normals (subnormals, |scaled| < 1, double-round -- the
     same approximation the e4m3 SR reference tolerates)."""
     drop = 22  # 23 fp32 mantissa bits - 1 fp4 (e2m1) mantissa bit
-    bits = _philox4x32_7_stateless_words(key, data_scaled.numel()).reshape(
-        data_scaled.shape
-    )
-    rand = (bits & ((1 << drop) - 1)).to(torch.int32)
+    bits = prng.bits(key, tuple(data_scaled.shape))  # full 32-bit uniform draw per element
+    rand = bits & ((1 << drop) - 1)  # keep only the low `drop` bits -> uniform int in [0, 2**22)
     xi = (data_scaled.contiguous().view(torch.int32) + rand) & -(1 << drop)
     x_sr = xi.view(torch.float32)
     return pack_uint4(f32_to_f4_unpacked(x_sr))
@@ -2052,15 +2047,14 @@ def _f32_to_packed_fp4_nvidia_sr(data_scaled, key):
     `cvt.rs.satfinite.e2m1x4.f32` intrinsic numerics, rather than the software add-dither-truncate of
     `_f32_to_packed_fp4_sr`. Bit-exact eager emulation (no PTX): one Philox word per group of 4
     elements, a byte-interleaved 16-bit random slice per element, then an exponent-dependent .rs carry
-    round on the e2m1 grid. Random words use Philox4x32-7. Packs two e2m1 codes per byte like
-    `_f32_to_packed_fp4_sr`."""
+    round on the e2m1 grid. Packs two e2m1 codes per byte like `_f32_to_packed_fp4_sr`."""
     flat = data_scaled.contiguous().reshape(-1)
     groups = flat.numel() // 4  # the x4 intrinsic converts 4 elements per 32-bit random word
     n_words = ((groups + 3) // 4) * 4  # round up to whole Philox counters (4 words each)
-    bits = _philox4x32_7_stateless_words(key, n_words)
-    # word layout reproduces the triton kernel's tl.randint4x(seed, ctr, 7) +
+    bits = prng.bits(key, n_words, dtype=torch.uint32).to(torch.int64)
+    # word layout reproduces the triton kernel's tl.randint4x(seed, ctr) +
     # interleave(interleave(r0,r1),interleave(r2,r3)): 4 consecutive groups take one counter's 4 words
-    # in perm order [0,2,1,3].
+    # in perm order [0,2,1,3], which prng.bits lays as bits[4c + lane].
     g = torch.arange(groups, device=flat.device)
     perm = torch.tensor([0, 2, 1, 3], device=flat.device)
     W = bits[4 * (g // 4) + perm[g % 4]]  # (groups,) one random word per group
@@ -2717,12 +2711,12 @@ def sr_bf16_global_f(x, key, **kwargs):
 
     The framework supplies the tile's global origin and row stride via kwargs, read here as
     `global_row`, `global_col`, `num_col`. Each element's global flat index is
-    `(global_row + i) * num_col + (global_col + j)`. We draw from a SINGLE-seed Philox4x32-7
-    counter stream (`bits[f] == philox7(seed, f>>2)[f&3]`) and gather each element's word at its
-    global flat position. Because the position is global, element (i, j) gets
+    `(global_row + i) * num_col + (global_col + j)`. We draw from the SINGLE-seed Philox counter
+    stream `prng.bits` exposes (`bits(key, n)[f] == philox(seed, f>>2)[f&3]`) and gather each
+    element's word at its global flat position. Because the position is global, element (i, j) gets
     the same draw regardless of which tile it lands in, so INDUCTOR == MANUAL_TILE bit-for-bit.
     Keying by global counter (not by a per-element key) is also what lets the Triton kernel
-    reproduce this bit-for-bit via `tl.randint4x(seed, gidx>>2, 7)[gidx&3]`. Returns `(out,)`.
+    reproduce this bit-for-bit via `tl.randint4x(seed, gidx>>2)[gidx&3]`. Returns `(out,)`.
     """
     assert x.dtype == torch.float32, f"SR bf16 expects fp32 input, got {x.dtype}"
     global_row = kwargs["global_row"]
@@ -2735,11 +2729,11 @@ def sr_bf16_global_f(x, key, **kwargs):
     j = (global_col + torch.arange(N, device=x.device)).view(1, -1)
     gidx = (i * num_col + j).reshape(-1).to(torch.int64)
     # draw the contiguous single-seed stream up to this tile's highest global index, then gather
-    # each element's word at its global position. bits[f] == philox7(seed, f>>2)[f&3], so the gather
-    # picks out exactly what the kernel's tl.randint4x(seed, gidx>>2, 7)[gidx&3] produces. n_flat is a
+    # each element's word at its global position. bits[f] == philox(seed, f>>2)[f&3], so the gather
+    # picks out exactly what the kernel's tl.randint4x(seed, gidx>>2)[gidx&3] produces. n_flat is a
     # Python int (origin/stride are eager ints), so this stays traceable / no host sync.
     n_flat = (global_row + M - 1) * num_col + (global_col + N - 1) + 1
-    bits = _philox4x32_7_stateless_words(key, n_flat).to(torch.uint32).view(torch.int32)[gidx]
+    bits = prng.bits(key, n_flat, dtype=torch.uint32).view(torch.int32)[gidx]  # full 32-bit words
     rand16 = (bits & ((1 << 16) - 1)).reshape(M, N)  # keep only the low 16 bits -> uniform int in [0, 2**16)
     return (_sr_bf16_dither(x, rand16),)
 

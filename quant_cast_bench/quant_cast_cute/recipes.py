@@ -2555,14 +2555,14 @@ BF16_RHT = QuantCastCuteRecipe.from_gold(HadamardRht, cute_fn=rht_cute)
 # the simplest SR target -- no exponent rebias, no packing, no scale.
 #
 # RNG: CuTeDSL exposes no counter-based PRNG intrinsic (unlike Triton's `tl.randint4x`), so we
-# implement Philox-4x32 by hand (`_philox_4x32`) out of the integer ops the DSL does have -- the
+# implement Philox-4x32-10 by hand (`_philox_4x32`) out of the integer ops the DSL does have -- the
 # same generator Triton/PyTorch use. It's a stateless pure function `(counter, key) -> 4 uniform
 # uint32`, so every thread computes its own draws with no shared state. We key it like Triton's global
 # SR kernel: counter = (flat index // 4), and the four outputs feed the four consecutive elements of
 # that group in straight order (element 4c+lane <- philox(seed, c)[lane]), each dithered by its LOW 16
-# bits. That is bit-identical to the gold `sr_bf16_global_f` Philox4x32-7 stream and the Triton
-# global kernel, so the `fp32_to_bf16_sr_global_offsets` recipe bit-matches the gold.
-# One Philox call per 4 elements amortizes the 7-round mix. E[SR(x)] = x holds (mean error ~1e-5 vs
+# bits. That is bit-identical to the gold `sr_bf16_global_f` (`prng.bits(key, n)[gidx] & 0xFFFF`) and
+# the Triton global kernel, so the `fp32_to_bf16_sr_global_offsets` recipe bit-matches the gold.
+# One Philox call per 4 elements amortizes the 10-round mix. E[SR(x)] = x holds (mean error ~1e-5 vs
 # the 1e-3 tolerance on the 512x512 constant-input test).
 #
 # It's a pure elementwise streaming cast (read fp32, write bf16, no reduction), so it wants the same
@@ -2578,18 +2578,18 @@ _SR_LD_BITS = min(128, _SR_VPT * 32)    # fp32 input  -> 128-bit vectorized load
 _SR_ST_BITS = min(128, _SR_VPT * 16)    # bf16 output -> 128-bit vectorized store
 
 # Philox-4x32 round constants (Salmon et al., "Parallel Random Numbers: As Easy as 1, 2, 3"); the
-# same values Random123 / Triton's tl.randint4x / PyTorch's _philox_uniform use.
+# same values Random123 / Triton's tl.randint4x / PyTorch's _philox_uniform use. 10 rounds.
 _PHILOX_M0 = 0xD2511F53
 _PHILOX_M1 = 0xCD9E8D57
 _PHILOX_W0 = 0x9E3779B9                 # Weyl key bump, word 0
 _PHILOX_W1 = 0xBB67AE85                 # Weyl key bump, word 1
+_PHILOX_ROUNDS = 10
 
 
 @cute.jit
-def _philox_4x32(c0, c1, c2, c3, k0, k1, rounds: cutlass.Constexpr):
-    """Philox-4x32 with a compile-time round count.
-
-    Maps a 128-bit counter (c0..c3) and 64-bit key (k0,k1) to four uint32 outputs.
+def _philox_4x32(c0, c1, c2, c3, k0, k1):
+    """Philox-4x32-10: a stateless counter-based PRNG mapping a 128-bit counter (c0..c3) + 64-bit key
+    (k0,k1) to four uniform uint32 outputs.
 
     We implement it by hand because CuTeDSL ships NO random-number generator -- there is no
     counter-based (or any) PRNG intrinsic in the device API (unlike Triton's `tl.randint4x` or
@@ -2599,9 +2599,9 @@ def _philox_4x32(c0, c1, c2, c3, k0, k1, rounds: cutlass.Constexpr):
 
     Each round multiplies two counter words by the M constants, keeps the hi/lo halves of the 64-bit
     products (mulhilo via the Uint64 widen), and mixes them with the other two counter words and the
-    key; the key is bumped by the Weyl constants between rounds. Ten rounds reproduce the standard
-    Philox4x32 mapping bit-for-bit (verified against Random123); fewer select a reduced-round form."""
-    for _ in cutlass.range_constexpr(rounds):
+    key; the key is bumped by the Weyl constants between rounds. Bit-for-bit the standard Philox4x32
+    (verified against the Random123 reference)."""
+    for _ in cutlass.range_constexpr(_PHILOX_ROUNDS):
         p0 = cutlass.Uint64(c0) * cutlass.Uint64(_PHILOX_M0)
         p1 = cutlass.Uint64(c2) * cutlass.Uint64(_PHILOX_M1)
         hi0 = cutlass.Uint32(p0 >> 32)
@@ -2644,16 +2644,14 @@ def _sr_bf16_kernel(gX: cute.Tensor, gY: cute.Tensor, gSeed: cute.Tensor, cX: cu
         frgXi = cute.recast_tensor(frgX, dtype=cutlass.Int32)  # reinterpret the f32 bits in place
         zero = cutlass.Uint32(0)
         # p0 is a multiple of VPT (hence of 4), so the thread's run splits into VPT//4 aligned groups
-        # of 4 global-consecutive elements; one Philox call dithers each group. The gold's Philox7
+        # of 4 global-consecutive elements; one Philox call dithers each group. The gold's prng.bits
         # keys group f>>2 on `key[1] + f>>2`, a 64-bit counter split into Philox words c0 (low) / c1
         # (high) exactly as tl.randint4x does, so this bit-matches the gold for any key.
         for g in cutlass.range_constexpr(_SR_VPT // 4):
             ctr = base + cutlass.Uint64(p0 // 4) + cutlass.Uint64(g)
             c0 = cutlass.Uint32(ctr & cutlass.Uint64(0xFFFFFFFF))
             c1 = cutlass.Uint32(ctr >> 32)
-            r0, r1, r2, r3 = _philox_4x32(
-                c0, c1, zero, zero, k0, k1, 7
-            )
+            r0, r1, r2, r3 = _philox_4x32(c0, c1, zero, zero, k0, k1)
             b = g * 4
             # add the low-16-bit dither, then truncate the low 16 mantissa bits (-65536 == 0xFFFF0000).
             # LOW (not top) 16 bits so the dither is bit-identical to the gold/Triton path, which take
@@ -2685,7 +2683,7 @@ def sr_bf16_global_cute(x, key, **kwargs):
     `p0 = thrC[0][0]` and `ctr = base + p0//4 + g`), so it's tile-invariant AND bit-matches the gold.
     `key` is a Philox key tensor `[key[0], key[1]]`: key[0] is the 64-bit seed, key[1] a base counter
     offset -- the kernel loads both words on-device (no host sync) and consumes them exactly like the
-    gold's reduced-round stream, so it matches for any (incl. fold_in/split-advanced) key.
+    gold's `prng.bits`, so it matches for any (incl. fold_in/split-advanced) key.
     `global_row`/`global_col`/`num_col` are flex_tile_map artifacts a standalone kernel that owns its
     own tiling doesn't need. Returns `(out,)`."""
     assert x.dtype == torch.float32, f"SR bf16 expects fp32 input, got {x.dtype}"
