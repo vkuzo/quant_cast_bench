@@ -20,6 +20,7 @@ LABEL_FONT_SIZE = 13
 TICK_FONT_SIZE = 11
 LEGEND_FONT_SIZE = 10
 ANNOTATION_FONT_SIZE = 10
+PANEL_M_VALUES = (4096, 8192, 16384)
 
 def _is_true(value: str) -> bool:
     return value.lower() == "true"
@@ -40,28 +41,32 @@ def _implementation(kernel: str, family: str) -> str:
 
 def _read_results(
     path: Path,
-) -> dict[tuple[str, str, bool, str], dict[bool, list[dict[str, str]]]]:
+) -> dict[tuple[str, str, bool, str, int], dict[bool, list[dict[str, str]]]]:
     charts: dict[
-        tuple[str, str, bool, str], dict[bool, list[dict[str, str]]]
+        tuple[str, str, bool, str, int], dict[bool, list[dict[str, str]]]
     ] = {}
     with path.open(newline="") as csv_file:
         for row in csv.DictReader(csv_file):
-            if int(row["M"]) != int(row["K"]):
+            M = int(row["M"])
+            if M not in PANEL_M_VALUES:
                 continue
             key = (
                 row["family"],
                 row["mode"],
                 _is_true(row["rht"]),
                 _implementation(row["kernel"], row["family"]),
+                M,
             )
             stochastic = _is_true(row["stochastic"])
             charts.setdefault(key, {}).setdefault(stochastic, []).append(row)
 
     if not charts:
-        raise ValueError(f"{path} contains no square-shape benchmark rows")
+        raise ValueError(
+            f"{path} contains no benchmark rows for M in {PANEL_M_VALUES}"
+        )
     for variants in charts.values():
         for rows in variants.values():
-            rows.sort(key=lambda row: int(row["M"]))
+            rows.sort(key=lambda row: int(row["K"]))
     return charts
 
 
@@ -77,10 +82,14 @@ def _section_name(variants: dict[bool, list[dict[str, str]]]) -> str:
 def _plot_chart(
     axis: plt.Axes, variants: dict[bool, list[dict[str, str]]]
 ) -> None:
-    shapes = sorted(
-        {int(row["M"]) for rows in variants.values() for row in rows}
+    m_values = {int(row["M"]) for rows in variants.values() for row in rows}
+    if len(m_values) != 1:
+        raise ValueError(f"each chart requires one fixed M value, got {m_values}")
+    M = next(iter(m_values))
+    k_values = sorted(
+        {int(row["K"]) for rows in variants.values() for row in rows}
     )
-    shape_to_x = {shape: index for index, shape in enumerate(shapes)}
+    k_to_x = {K: index for index, K in enumerate(k_values)}
     titles = []
     missing_te_rounding = []
     input_dtypes = {
@@ -100,7 +109,7 @@ def _plot_chart(
         rounding = "SR" if stochastic else "RTNE"
         linestyle = "--" if stochastic else "-"
         titles.append(rows[0]["kernel"])
-        x = [shape_to_x[int(row["M"])] for row in rows]
+        x = [k_to_x[int(row["K"])] for row in rows]
         axis.plot(
             x,
             [float(row["ours_tb_s"]) for row in rows],
@@ -115,7 +124,7 @@ def _plot_chart(
         te_rows = [row for row in rows if row["te_tb_s"]]
         if te_rows:
             axis.plot(
-                [shape_to_x[int(row["M"])] for row in te_rows],
+                [k_to_x[int(row["K"])] for row in te_rows],
                 [float(row["te_tb_s"]) for row in te_rows],
                 color=TE_COLOR,
                 linestyle=linestyle,
@@ -139,10 +148,11 @@ def _plot_chart(
         )
 
     axis.set_title(
-        "\n".join((*titles, "Input dtype: BF16")), fontsize=TITLE_FONT_SIZE
+        "\n".join((*titles, f"M = {M}, input dtype: BF16")),
+        fontsize=TITLE_FONT_SIZE,
     )
-    axis.set_xticks(range(len(shapes)), [str(shape) for shape in shapes])
-    axis.set_xlabel("M == K", fontsize=LABEL_FONT_SIZE)
+    axis.set_xticks(range(len(k_values)), [str(K) for K in k_values])
+    axis.set_xlabel("K", fontsize=LABEL_FONT_SIZE)
     axis.set_ylabel("TB/s", fontsize=LABEL_FONT_SIZE)
     axis.tick_params(axis="both", labelsize=TICK_FONT_SIZE)
     axis.set_ylim(0, 8)
@@ -161,7 +171,7 @@ def _plot_chart(
 
 def plot(csv_path: Path, output_path: Path) -> None:
     charts = _read_results(csv_path)
-    column_count = 2
+    column_count = 3
     section_order = ("MXFP8", "MXFP4", "NVFP4")
     sections = {
         name: [
