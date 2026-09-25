@@ -18,6 +18,7 @@ TITLE_FONT_SIZE = 12
 LABEL_FONT_SIZE = 13
 TICK_FONT_SIZE = 11
 LEGEND_FONT_SIZE = 10
+PANEL_M_VALUES = (4096, 8192, 16384)
 
 
 def _plot_chart(axis: plt.Axes, rows: list[dict[str, str]]) -> None:
@@ -27,7 +28,11 @@ def _plot_chart(axis: plt.Axes, rows: list[dict[str, str]]) -> None:
             f"README charts require BF16 inputs, got {sorted(input_dtypes)}"
         )
 
-    rows.sort(key=lambda row: int(row["M"]))
+    m_values = {int(row["M"]) for row in rows}
+    if len(m_values) != 1:
+        raise ValueError(f"each chart requires one fixed M value, got {m_values}")
+    M = next(iter(m_values))
+    rows.sort(key=lambda row: int(row["K"]))
     x = list(range(len(rows)))
     axis.plot(
         x,
@@ -49,10 +54,11 @@ def _plot_chart(axis: plt.Axes, rows: list[dict[str, str]]) -> None:
     )
 
     axis.set_title(
-        f"{rows[0]['kernel']}\nInput dtype: BF16", fontsize=TITLE_FONT_SIZE
+        f"{rows[0]['kernel']}\nM = {M}, input dtype: BF16",
+        fontsize=TITLE_FONT_SIZE,
     )
-    axis.set_xticks(x, [row["M"] for row in rows])
-    axis.set_xlabel("M == K", fontsize=LABEL_FONT_SIZE)
+    axis.set_xticks(x, [row["K"] for row in rows])
+    axis.set_xlabel("K", fontsize=LABEL_FONT_SIZE)
     axis.set_ylabel("TB/s", fontsize=LABEL_FONT_SIZE)
     axis.tick_params(axis="both", labelsize=TICK_FONT_SIZE)
     axis.set_ylim(0, 8)
@@ -74,21 +80,23 @@ def plot(csv_path: Path, output_path: Path) -> None:
         rows = [
             row
             for row in csv.DictReader(csv_file)
-            if int(row["M"]) == int(row["K"])
+            if int(row["M"]) in PANEL_M_VALUES
         ]
     if not rows:
-        raise ValueError(f"{csv_path} contains no square-shape benchmark rows")
+        raise ValueError(
+            f"{csv_path} contains no benchmark rows for M in {PANEL_M_VALUES}"
+        )
 
-    grouped_rows: dict[str, list[dict[str, str]]] = {}
+    grouped_rows: dict[tuple[str, int], list[dict[str, str]]] = {}
     for row in rows:
-        grouped_rows.setdefault(row["kernel"], []).append(row)
+        grouped_rows.setdefault((row["kernel"], int(row["M"])), []).append(row)
     family_order = {"mxfp4": 0, "nvfp4": 1}
     charts = sorted(
         grouped_rows.values(),
         key=lambda values: family_order.get(values[0]["family"], 2),
     )
 
-    column_count = 2
+    column_count = 3
     row_count = math.ceil(len(charts) / column_count)
     figure, axes_array = plt.subplots(
         row_count,
