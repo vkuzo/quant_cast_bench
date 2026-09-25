@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 from functools import cache, partial
-from typing import TypeAlias
+from typing import NamedTuple, TypeAlias
 
 import torch
 
@@ -12,6 +12,7 @@ from quant_cast_bench.quant_cast_cute_hand.blockscaled_tma.blockscaled_tma_confi
     ScaleAlgo,
 )
 from quant_cast_bench.quant_cast_cute_hand.blockscaled_tma.blockscaled_tma_plan import (
+    BlockscaledTmaPlan,
     select_blockscaled_tma_plan,
 )
 from quant_cast_bench.quant_cast_cute_hand.blockscaled_tma.blockscaled_tma_kernels import (
@@ -82,6 +83,44 @@ class _PhiloxLaunch:
     seed_scalar: int | None = None
     offset_words_scalar: int | None = None
     intragraph_offset_words: int | None = None
+
+
+class _BlockscaledTmaSpec(NamedTuple):
+    """Validated, normalized host-side description of one quantization request."""
+
+    M: int
+    K: int
+    quant_orientation: str
+    quant_orientation_id: int
+    do_dim_k: bool
+    do_dim_m: bool
+    rounding_variant: RoundingVariant
+    is_stochastic_qdata_rounding: bool
+    is_packed_fp4_qdata: bool
+    is_square_scaling: bool
+    is_scale_swizzled: bool
+    qdata_dtype: torch.dtype
+    scale_algo: ScaleAlgo
+    scale_group_size: int
+    qdata_k_divisor: int
+    qdata_storage_dtype: torch.dtype
+    scale_dtype: torch.dtype
+    nrb_k: int | None
+    ncb_k: int | None
+    nrb_m: int | None
+    ncb_m: int | None
+
+
+class _PreparedBlockscaledTmaLaunch(NamedTuple):
+    """Host-side launch plan, allocated outputs, and normalized optional operands."""
+
+    plan: BlockscaledTmaPlan | None
+    output_k: torch.Tensor | None
+    scale_k: torch.Tensor | None
+    outer_scale_k: torch.Tensor | None
+    output_m: torch.Tensor | None
+    scale_m: torch.Tensor | None
+    outer_scale_m: torch.Tensor | None
 
 
 def _select_rounding_variant(
@@ -167,8 +206,24 @@ def _cuda_capability(device: int) -> tuple[int, int]:
     return torch.cuda.get_device_capability(device)
 
 
-def _blockscaled_tma_impl_on_current_device(
+def _validate_outer_scale(
     input: torch.Tensor,
+    outer_scale: torch.Tensor | None,
+    name: str,
+) -> None:
+    if outer_scale is None:
+        raise ValueError(f"{name} outer scale is required")
+    if not isinstance(outer_scale, torch.Tensor):
+        raise TypeError(f"{name} outer scale must be a torch.Tensor")
+    if outer_scale.device != input.device:
+        raise ValueError(f"input and {name} outer scale must be on the same device")
+    if outer_scale.dtype != torch.float32 or outer_scale.numel() != 1:
+        raise ValueError(f"{name} outer scale must be a float32 scalar")
+
+
+def _validate_and_normalize_blockscaled_tma(
+    input: torch.Tensor,
+    *,
     quant_orientation: str,
     key: torch.Tensor | None,
     rounding_mode: str,
@@ -179,7 +234,9 @@ def _blockscaled_tma_impl_on_current_device(
     scale_algo: ScaleAlgo = ScaleAlgo.RCEIL_E8M0,
     outer_scale_k: torch.Tensor | None = None,
     outer_scale_m: torch.Tensor | None = None,
-) -> _BlockscaledTmaOutput:
+) -> _BlockscaledTmaSpec:
+    """Validate public arguments and return their canonical host-side form."""
+
     if quant_orientation not in ("dim_k", "dim_m", "dim_km"):
         raise ValueError(f"unsupported quant_orientation: {quant_orientation}")
     do_dim_k = quant_orientation != "dim_m"
@@ -249,27 +306,13 @@ def _blockscaled_tma_impl_on_current_device(
         if do_dim_m and M % 32 != 0:
             raise ValueError("nvfp4 dim-M TMA requires M % 32 == 0")
 
-        def validate_outer_scale(
-            outer_scale: torch.Tensor | None, name: str
-        ) -> None:
-            if outer_scale is None:
-                raise ValueError(f"{name} outer scale is required")
-            if not isinstance(outer_scale, torch.Tensor):
-                raise TypeError(f"{name} outer scale must be a torch.Tensor")
-            if outer_scale.device != input.device:
-                raise ValueError(
-                    f"input and {name} outer scale must be on the same device"
-                )
-            if outer_scale.dtype != torch.float32 or outer_scale.numel() != 1:
-                raise ValueError(f"{name} outer scale must be a float32 scalar")
-
         if do_dim_k:
-            validate_outer_scale(outer_scale_k, "dim-K")
+            _validate_outer_scale(input, outer_scale_k, "dim-K")
         else:
             if outer_scale_k is not None:
                 raise ValueError("dim-M does not use a dim-K outer scale")
         if do_dim_m:
-            validate_outer_scale(outer_scale_m, "dim-M")
+            _validate_outer_scale(input, outer_scale_m, "dim-M")
         else:
             if outer_scale_m is not None:
                 raise ValueError("dim-K does not use a dim-M outer scale")
@@ -301,68 +344,60 @@ def _blockscaled_tma_impl_on_current_device(
         nrb_m = _ceil_div(K, 128)
         ncb_m = _ceil_div(M // scale_group_size, 4)
 
-    # CUDA cannot launch a zero-sized grid. Return the correctly oriented empty
-    # tensors directly, preserving the padded scale layout in every mode.
-    if M == 0 or K == 0:
-        output_k = scale_k = None
-        if do_dim_k:
-            output_k = torch.empty(
-                M,
-                K // qdata_k_divisor,
-                dtype=qdata_storage_dtype,
-                device=input.device,
-            )
-            if is_scale_swizzled:
-                scale_k = torch.empty(
-                    nrb_k, ncb_k, 32, 16, dtype=torch.uint8, device=input.device
-                ).view(scale_dtype)
-            else:
-                scale_k = torch.empty(
-                    M,
-                    K // scale_group_size,
-                    dtype=torch.uint8,
-                    device=input.device,
-                ).view(scale_dtype)
-
-        output_m = scale_m = None
-        if do_dim_m:
-            output_m = torch.empty(
-                K,
-                M // qdata_k_divisor,
-                dtype=qdata_storage_dtype,
-                device=input.device,
-            )
-            scale_m = torch.empty(
-                nrb_m, ncb_m, 32, 16, dtype=torch.uint8, device=input.device
-            ).view(scale_dtype)
-
-        if is_packed_fp4_qdata:
-            if do_dim_k:
-                output_k = output_k.view(torch.float4_e2m1fn_x2)
-            if do_dim_m:
-                output_m = output_m.view(torch.float4_e2m1fn_x2)
-        if quant_orientation == "dim_k":
-            return output_k, scale_k
-        if quant_orientation == "dim_m":
-            return output_m, scale_m
-        return output_k, scale_k, output_m, scale_m
-
     quant_orientation_id = {
         "dim_k": _QUANT_ORIENTATION_DIM_K,
         "dim_m": _QUANT_ORIENTATION_DIM_M,
         "dim_km": _QUANT_ORIENTATION_DIM_KM,
     }[quant_orientation]
 
-    plan = select_blockscaled_tma_plan(
-        M,
-        K,
-        input_dtype=input.dtype,
+    return _BlockscaledTmaSpec(
+        M=M,
+        K=K,
         quant_orientation=quant_orientation,
+        quant_orientation_id=quant_orientation_id,
+        do_dim_k=do_dim_k,
+        do_dim_m=do_dim_m,
+        rounding_variant=rounding_variant,
         is_stochastic_qdata_rounding=is_stochastic_qdata_rounding,
+        is_packed_fp4_qdata=is_packed_fp4_qdata,
         is_square_scaling=is_square_scaling,
+        is_scale_swizzled=is_scale_swizzled,
+        qdata_dtype=qdata_dtype,
         scale_algo=scale_algo,
+        scale_group_size=scale_group_size,
+        qdata_k_divisor=qdata_k_divisor,
+        qdata_storage_dtype=qdata_storage_dtype,
+        scale_dtype=scale_dtype,
+        nrb_k=nrb_k,
+        ncb_k=ncb_k,
+        nrb_m=nrb_m,
+        ncb_m=ncb_m,
     )
-    if plan.grid_k > _CUDA_GRID_X_MAX or plan.grid_m > _CUDA_GRID_Y_MAX:
+
+
+def _prepare_blockscaled_tma_launch(
+    input: torch.Tensor,
+    spec: _BlockscaledTmaSpec,
+    *,
+    outer_scale_k: torch.Tensor | None,
+    outer_scale_m: torch.Tensor | None,
+) -> _PreparedBlockscaledTmaLaunch:
+    """Select the launch plan and allocate its output storage."""
+
+    plan = None
+    if spec.M != 0 and spec.K != 0:
+        plan = select_blockscaled_tma_plan(
+            spec.M,
+            spec.K,
+            input_dtype=input.dtype,
+            quant_orientation=spec.quant_orientation,
+            is_stochastic_qdata_rounding=spec.is_stochastic_qdata_rounding,
+            is_square_scaling=spec.is_square_scaling,
+            scale_algo=spec.scale_algo,
+        )
+    if plan is not None and (
+        plan.grid_k > _CUDA_GRID_X_MAX or plan.grid_m > _CUDA_GRID_Y_MAX
+    ):
         raise ValueError(
             "blockscaled TMA launch grid exceeds CUDA limits: "
             f"grid=({plan.grid_k}, {plan.grid_m}, 1), "
@@ -370,97 +405,175 @@ def _blockscaled_tma_impl_on_current_device(
         )
 
     output_m = scale_m = None
-    if do_dim_m:
+    if spec.do_dim_m:
+        assert spec.nrb_m is not None
+        assert spec.ncb_m is not None
         output_m = torch.empty(
-            K,
-            M // qdata_k_divisor,
-            dtype=qdata_storage_dtype,
+            spec.K,
+            spec.M // spec.qdata_k_divisor,
+            dtype=spec.qdata_storage_dtype,
             device=input.device,
         )
         scale_m = torch.empty(
-            nrb_m * ncb_m * 32 * 16,
+            spec.nrb_m * spec.ncb_m * 32 * 16,
             dtype=torch.uint8,
             device=input.device,
         )
 
     output_k = scale_k = None
-    if do_dim_k:
+    if spec.do_dim_k:
+        assert spec.nrb_k is not None
+        assert spec.ncb_k is not None
         output_k = torch.empty(
-            M,
-            K // qdata_k_divisor,
-            dtype=qdata_storage_dtype,
+            spec.M,
+            spec.K // spec.qdata_k_divisor,
+            dtype=spec.qdata_storage_dtype,
             device=input.device,
         )
         # Every slot is written by the kernel, so zero-initialization would launch a redundant
         # memset.
-        if is_scale_swizzled:
+        if spec.is_scale_swizzled:
             scale_k = torch.empty(
-                nrb_k * ncb_k * 32 * 16,
+                spec.nrb_k * spec.ncb_k * 32 * 16,
                 dtype=torch.uint8,
                 device=input.device,
             )
         else:
             scale_k = torch.empty(
-                M * (K // scale_group_size),
+                spec.M * (spec.K // spec.scale_group_size),
                 dtype=torch.uint8,
                 device=input.device,
             )
-    outer_scale_k_arg = outer_scale_k.reshape(1) if outer_scale_k is not None else None
-    outer_scale_m_arg = outer_scale_m.reshape(1) if outer_scale_m is not None else None
+
+    return _PreparedBlockscaledTmaLaunch(
+        plan=plan,
+        output_k=output_k,
+        scale_k=scale_k,
+        outer_scale_k=(outer_scale_k.reshape(1) if outer_scale_k is not None else None),
+        output_m=output_m,
+        scale_m=scale_m,
+        outer_scale_m=(outer_scale_m.reshape(1) if outer_scale_m is not None else None),
+    )
+
+
+def _format_blockscaled_tma_output(
+    spec: _BlockscaledTmaSpec,
+    launch: _PreparedBlockscaledTmaLaunch,
+) -> _BlockscaledTmaOutput:
+    """Apply public dtypes and shapes to the allocated output storage."""
+
+    output_k, scale_k = launch.output_k, launch.scale_k
+    output_m, scale_m = launch.output_m, launch.scale_m
+
+    if spec.do_dim_m:
+        assert output_m is not None
+        assert scale_m is not None
+        assert spec.nrb_m is not None
+        assert spec.ncb_m is not None
+        scale_m = scale_m.view(spec.nrb_m, spec.ncb_m, 32, 16).view(
+            spec.scale_dtype
+        )
+    if spec.do_dim_k:
+        assert output_k is not None
+        assert scale_k is not None
+        assert spec.nrb_k is not None
+        assert spec.ncb_k is not None
+        if spec.is_scale_swizzled:
+            scale_k = scale_k.view(spec.nrb_k, spec.ncb_k, 32, 16)
+        else:
+            scale_k = scale_k.view(spec.M, spec.K // spec.scale_group_size)
+        scale_k = scale_k.view(spec.scale_dtype)
+    if spec.is_packed_fp4_qdata:
+        if spec.do_dim_k:
+            assert output_k is not None
+            output_k = output_k.view(torch.float4_e2m1fn_x2)
+        if spec.do_dim_m:
+            assert output_m is not None
+            output_m = output_m.view(torch.float4_e2m1fn_x2)
+
+    if spec.quant_orientation == "dim_k":
+        assert output_k is not None and scale_k is not None
+        return output_k, scale_k
+    if spec.quant_orientation == "dim_m":
+        assert output_m is not None and scale_m is not None
+        return output_m, scale_m
+    assert output_k is not None and scale_k is not None
+    assert output_m is not None and scale_m is not None
+    return output_k, scale_k, output_m, scale_m
+
+
+def _blockscaled_tma_impl_on_current_device(
+    input: torch.Tensor,
+    quant_orientation: str,
+    key: torch.Tensor | None,
+    rounding_mode: str,
+    is_square_scaling: bool,
+    is_scale_swizzled: bool,
+    generator: torch.Generator | None = None,
+    qdata_dtype: torch.dtype = torch.float8_e4m3fn,
+    scale_algo: ScaleAlgo = ScaleAlgo.RCEIL_E8M0,
+    outer_scale_k: torch.Tensor | None = None,
+    outer_scale_m: torch.Tensor | None = None,
+) -> _BlockscaledTmaOutput:
+    spec = _validate_and_normalize_blockscaled_tma(
+        input,
+        quant_orientation=quant_orientation,
+        key=key,
+        rounding_mode=rounding_mode,
+        is_square_scaling=is_square_scaling,
+        is_scale_swizzled=is_scale_swizzled,
+        generator=generator,
+        qdata_dtype=qdata_dtype,
+        scale_algo=scale_algo,
+        outer_scale_k=outer_scale_k,
+        outer_scale_m=outer_scale_m,
+    )
+    launch = _prepare_blockscaled_tma_launch(
+        input,
+        spec,
+        outer_scale_k=outer_scale_k,
+        outer_scale_m=outer_scale_m,
+    )
+
+    # CUDA cannot launch a zero-sized grid. The preparation step still allocates
+    # correctly shaped empty outputs so result formatting remains shared.
+    if launch.plan is None:
+        return _format_blockscaled_tma_output(spec, launch)
 
     fn = _compile_blockscaled_tma(
         input.dtype,
-        plan.tile_m_size,
-        plan.tile_k_size,
-        plan.cluster_k,
-        plan.needs_boundary_masking,
-        quant_orientation_id,
-        rounding_variant,
-        is_square_scaling,
-        is_scale_swizzled,
-        qdata_dtype,
-        scale_algo,
+        launch.plan.tile_m_size,
+        launch.plan.tile_k_size,
+        launch.plan.cluster_k,
+        launch.plan.needs_boundary_masking,
+        spec.quant_orientation_id,
+        spec.rounding_variant,
+        spec.is_square_scaling,
+        spec.is_scale_swizzled,
+        spec.qdata_dtype,
+        spec.scale_algo,
     )
     # Reserve state only after validation and compilation have succeeded, immediately before launch.
-    philox = _prepare_philox_launch(rounding_variant, key, generator)
+    philox = _prepare_philox_launch(spec.rounding_variant, key, generator)
     fn(
         input,
-        output_k,
-        scale_k,
-        outer_scale_k_arg,
-        output_m,
-        scale_m,
-        outer_scale_m_arg,
+        launch.output_k,
+        launch.scale_k,
+        launch.outer_scale_k,
+        launch.output_m,
+        launch.scale_m,
+        launch.outer_scale_m,
         philox.seed,
         philox.offset,
         philox.seed_scalar,
         philox.offset_words_scalar,
         philox.intragraph_offset_words,
-        M,
-        K,
-        plan.grid_m,
-        plan.grid_k,
+        spec.M,
+        spec.K,
+        launch.plan.grid_m,
+        launch.plan.grid_k,
     )
-
-    if do_dim_m:
-        scale_m = scale_m.view(nrb_m, ncb_m, 32, 16).view(scale_dtype)
-    if do_dim_k:
-        if is_scale_swizzled:
-            scale_k = scale_k.view(nrb_k, ncb_k, 32, 16)
-        else:
-            scale_k = scale_k.view(M, K // scale_group_size)
-        scale_k = scale_k.view(scale_dtype)
-    if is_packed_fp4_qdata:
-        if do_dim_k:
-            output_k = output_k.view(torch.float4_e2m1fn_x2)
-        if do_dim_m:
-            output_m = output_m.view(torch.float4_e2m1fn_x2)
-
-    if quant_orientation == "dim_k":
-        return output_k, scale_k
-    if quant_orientation == "dim_m":
-        return output_m, scale_m
-    return output_k, scale_k, output_m, scale_m
+    return _format_blockscaled_tma_output(spec, launch)
 
 
 def _blockscaled_tma_impl(
