@@ -133,9 +133,9 @@ class _BlockscaledTma:
              - syncthreads for dim-k smem input reads
              - store qdata to smem scratchpad from 0b
           5. synchronize/publish dim-m and dim-k shared-memory output writes
-          6. if do_dim_k, launch the dim-k TMA qdata store
-          7. if do_dim_m, launch the dim-m TMA qdata store
-          8. if do_dim_k, store scales from registers to global memory
+          6. launch and commit each enabled TMA qdata store
+          7. if do_dim_k, store scales from registers to global memory
+          8. wait for each issuing warp's TMA reads from shared memory to complete
 
         """
 
@@ -730,6 +730,7 @@ class _BlockscaledTma:
                     tOutputsK,
                     tOutputgK[(None, tile_m_idx, tile_k_idx)],
                 )
+                cute.arch.cp_async_bulk_commit_group()
         if cutlass.const_expr(do_dim_m):
             # The fused SR specialization issues its independent output transfers from separate warps.
             output_m_warp = (
@@ -743,6 +744,7 @@ class _BlockscaledTma:
                     tOutputsM,
                     tOutputgM[(None, tile_k_idx, tile_m_idx)],
                 )
+                cute.arch.cp_async_bulk_commit_group()
 
         if cutlass.const_expr(do_dim_k):
             # do the dim-k scale write (overlaps with qdata TMA store)
@@ -871,6 +873,15 @@ class _BlockscaledTma:
                             if scale_col_k < K // scale_group_size:
                                 scale_k = rScaleK[it]
                         mScaleKLogical[(input_row_k, scale_col_k)] = scale_k
+
+        # TMA store groups are thread-local. Drain each issuing warp before the CTA's shared-memory
+        # source buffers go out of scope; the read-only wait need not wait for global writes.
+        if cutlass.const_expr(do_dim_k):
+            if warp == 0:
+                cute.arch.cp_async_bulk_wait_group(0, read=True)
+        if cutlass.const_expr(do_dim_m):
+            if warp == output_m_warp:
+                cute.arch.cp_async_bulk_wait_group(0, read=True)
 
     @cute.jit
     def __call__(
