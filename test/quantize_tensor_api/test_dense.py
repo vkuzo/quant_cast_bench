@@ -20,22 +20,30 @@ from quant_cast_bench.quantize_tensor_api.api import (
 from quant_cast_bench.quant_cast_gold.recipes import (
     F4_E2M1_MAX,
     F8E4M3_MAX,
+    Nvfp4GsSwizzleDimMRHTGold,
     _compute_error,
     hadamard_rht_f,
     hadamard_rht_fp32_f,
     mxfp8_32x32_expand_f,
     mxfp8_32x32_qdata_dim_k_scale_dim_km_swizzle_f,
+    mxfp8_32x32_swizzle_f,
     mxfp8_dim_km_f,
     mxfp8_dim_km_swizzle_f,
+    mxfp8_dim_km_swizzle_sr_f,
+    mxfp4_dim_km_swizzle_f,
+    mxfp4_dim_m_swizzle_f,
     mxfp4_f,
+    mxfp4_swizzle_f,
     mxfp8_dim_m_f,
     mxfp8_dim_m_swizzle_f,
+    mxfp8_dim_m_swizzle_sr_f,
     mxfp8_f,
     mxfp8_swizzle_f,
+    mxfp8_swizzle_sr_f,
+    nvfp4_gs_16x16_swizzle_f,
     nvfp4_gs_f,
     nvfp4_gs_per_token_scale,
     nvfp4_gs_scale,
-    nvfp4_gs_swizzle_dim_m_rht_f,
     nvfp4_gs_swizzle_f,
 )
 
@@ -63,7 +71,7 @@ def test_rowwise_matches_gold_bitwise(M, N, dtype):
         swizzle_type=SwizzleType.NO_SWIZZLE,
     )
     q_ref, s_ref = mxfp8_f(x)
-    # both paths pick the e8m0 scale by floor(log2(amax)) and divide, so the API (Triton) output is
+    # Both paths pick the same e8m0 scale and divide, so the CuTe-hand fast path (or Triton fallback) is
     # byte-identical to the eager golden reference -- exact, not merely within tolerance.
     assert torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8)), "qdata differs from gold"
     assert torch.equal(s.view(torch.uint8), s_ref.view(torch.uint8)), "scale differs from gold"
@@ -78,8 +86,7 @@ def test_rowwise_matches_gold_bitwise(M, N, dtype):
 def test_mxfp4_matches_gold_bitwise(M, N, dtype):
     x = torch.randn(M, N, dtype=dtype, device="cuda")
     # mxfp4: fp4 (e2m1) qdata + e8m0 rceil 1x32 block scale (RCEIL_E8M0 tells it apart from nvfp4,
-    # which shares the float4_e2m1fn_x2 qdata dtype). No Triton kernel yet, so the API dispatches to
-    # the gold reference -> byte-identical by construction; the test pins the wiring/shape/dtype.
+    # which shares the float4_e2m1fn_x2 qdata dtype). Eligible inputs dispatch to CuTe-hand.
     q, s = quantize_tensor(
         x,
         qdata_dtype=torch.float4_e2m1fn_x2,
@@ -164,6 +171,66 @@ def test_32x32_matches_gold_bitwise(M, N, dtype):
     assert q.shape == (M, N) and s.shape == (M, N // 32)
 
 
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and torch.cuda.get_device_capability() >= (10, 0)),
+    reason="CuTe-hand blockscaled TMA requires Blackwell",
+)
+def test_32x32_swizzle_matches_gold_bitwise():
+    x = torch.randn(256, 512, dtype=torch.bfloat16, device="cuda")
+    outputs = quantize_tensor(
+        x,
+        qdata_dtype=torch.float8_e4m3fn,
+        inner_scale_calc=InnerScaleCalc.RCEIL_E8M0,
+        scaling_type=ScalingType.BlockWise1x32,
+        swizzle_type=SwizzleType.SWIZZLE_32_4_4,
+        scaling_type_square_block_and_expand=True,
+    )
+    references = mxfp8_32x32_swizzle_f(x)
+    for output, reference in zip(outputs, references):
+        assert torch.equal(output.view(torch.uint8), reference.view(torch.uint8))
+
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and torch.cuda.get_device_capability() >= (10, 0)),
+    reason="CuTe-hand blockscaled TMA requires Blackwell",
+)
+@pytest.mark.parametrize(
+    "orientation,gold_fn",
+    [("dim_k", mxfp4_swizzle_f), ("dim_m", mxfp4_dim_m_swizzle_f)],
+)
+def test_mxfp4_swizzle_matches_gold_bitwise(orientation, gold_fn):
+    x = torch.randn(256, 512, dtype=torch.bfloat16, device="cuda")
+    api_input = x if orientation == "dim_k" else x.t()
+    outputs = quantize_tensor(
+        api_input,
+        qdata_dtype=torch.float4_e2m1fn_x2,
+        inner_scale_calc=InnerScaleCalc.RCEIL_E8M0,
+        scaling_type=ScalingType.BlockWise1x32,
+        swizzle_type=SwizzleType.SWIZZLE_32_4_4,
+    )
+    references = gold_fn(x)
+    for output, reference in zip(outputs, references):
+        assert torch.equal(output.view(torch.uint8), reference.view(torch.uint8))
+
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and torch.cuda.get_device_capability() >= (10, 0)),
+    reason="CuTe-hand blockscaled TMA requires Blackwell",
+)
+def test_mxfp4_dual_swizzle_matches_gold_bitwise():
+    x = torch.randn(256, 512, dtype=torch.bfloat16, device="cuda")
+    outputs = quantize_tensor_dual(
+        x,
+        qdata_dtype=torch.float4_e2m1fn_x2,
+        inner_scale_calc=InnerScaleCalc.RCEIL_E8M0,
+        scaling_type=ScalingType.BlockWise1x32,
+        swizzle_type=SwizzleType.SWIZZLE_32_4_4,
+    )
+    references = mxfp4_dim_km_swizzle_f(x)
+    for output, reference in zip(outputs, references):
+        assert torch.equal(output.view(torch.uint8), reference.view(torch.uint8))
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("M,N", SHAPES)
@@ -230,6 +297,56 @@ def test_both_swizzle_matches_gold_bitwise(M, N, dtype):
     assert qm.shape == (N, M)  # transposed qdata
 
 
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and torch.cuda.get_device_capability() >= (10, 0)),
+    reason="CuTe-hand blockscaled TMA requires Blackwell",
+)
+@pytest.mark.parametrize(
+    "orientation,gold_fn",
+    [
+        ("dim_k", mxfp8_swizzle_sr_f),
+        ("dim_m", mxfp8_dim_m_swizzle_sr_f),
+    ],
+)
+def test_mxfp8_swizzle_sr_matches_gold_bitwise(orientation, gold_fn):
+    x = torch.randn(256, 512, dtype=torch.bfloat16, device="cuda")
+    key = prng.fold_in(prng.key(7, device=x.device), 12345)
+    api_input = x if orientation == "dim_k" else x.t()
+    outputs = quantize_tensor(
+        api_input,
+        qdata_dtype=torch.float8_e4m3fn,
+        inner_scale_calc=InnerScaleCalc.RCEIL_E8M0,
+        scaling_type=ScalingType.BlockWise1x32,
+        swizzle_type=SwizzleType.SWIZZLE_32_4_4,
+        qdata_rounding_mode=RoundingMode.STOCHASTIC,
+        random_key=key,
+    )
+    references = gold_fn(x, key)
+    for output, reference in zip(outputs, references):
+        assert torch.equal(output.view(torch.uint8), reference.view(torch.uint8))
+
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and torch.cuda.get_device_capability() >= (10, 0)),
+    reason="CuTe-hand blockscaled TMA requires Blackwell",
+)
+def test_mxfp8_dual_swizzle_sr_matches_gold_bitwise():
+    x = torch.randn(256, 512, dtype=torch.bfloat16, device="cuda")
+    key = prng.fold_in(prng.key(7, device=x.device), 12345)
+    outputs = quantize_tensor_dual(
+        x,
+        qdata_dtype=torch.float8_e4m3fn,
+        inner_scale_calc=InnerScaleCalc.RCEIL_E8M0,
+        scaling_type=ScalingType.BlockWise1x32,
+        swizzle_type=SwizzleType.SWIZZLE_32_4_4,
+        qdata_rounding_mode=RoundingMode.STOCHASTIC,
+        random_key=key,
+    )
+    references = mxfp8_dim_km_swizzle_sr_f(x, key)
+    for output, reference in zip(outputs, references):
+        assert torch.equal(output.view(torch.uint8), reference.view(torch.uint8))
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("M,N", SHAPES)  # every SHAPES entry is a multiple of 32 in both dims
@@ -286,6 +403,36 @@ def test_nvfp4_matches_gold(M, N, dtype):
     assert qdata_mismatch < 0.01, f"qdata differs from gold in {qdata_mismatch:.3%} of bytes (RNE ties)"
 
 
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and torch.cuda.get_device_capability() >= (10, 0)),
+    reason="CuTe-hand blockscaled TMA requires Blackwell",
+)
+@pytest.mark.parametrize("square_scaling", [False, True])
+def test_nvfp4_additional_cute_hand_recipes_match_gold(square_scaling):
+    x = torch.randn(256, 512, dtype=torch.bfloat16, device="cuda")
+    outer_quant_scale = nvfp4_gs_scale(x).reciprocal()
+    outputs = quantize_tensor(
+        x,
+        qdata_dtype=torch.float4_e2m1fn_x2,
+        inner_scale_calc=InnerScaleCalc.NVFP4_E4M3,
+        scaling_type=[ScalingType.BlockWise1x16, ScalingType.TensorWise],
+        swizzle_type=(
+            SwizzleType.SWIZZLE_32_4_4
+            if square_scaling
+            else SwizzleType.NO_SWIZZLE
+        ),
+        outer_quant_scale=outer_quant_scale,
+        scaling_type_square_block_and_expand=square_scaling,
+    )
+    references = (
+        nvfp4_gs_16x16_swizzle_f(x, outer_quant_scale)
+        if square_scaling
+        else nvfp4_gs_f(x, outer_quant_scale)
+    )
+    for output, reference in zip(outputs, references):
+        assert torch.equal(output.view(torch.uint8), reference.view(torch.uint8))
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("M,N", SHAPES)
@@ -317,13 +464,13 @@ def test_nvfp4_per_token_matches_gold_bitwise(M, N, dtype):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("M,N", SHAPES)
-def test_nvfp4_dim_m_rht_matches_gold_bitwise(M, N, dtype):
+def test_nvfp4_dim_m_rht_matches_gold(M, N, dtype):
     torch.manual_seed(0)
     x = torch.randn(M, N, dtype=dtype, device="cuda")
     # dim-m (TRANSPOSED) swizzled nvfp4 WITH RHT: passing rht_tensor routes to the gold
     # nvfp4_gs_swizzle_dim_m_rht_f (RHT x.t() then nvfp4 along M, transposed (N, M//2) frame) -- the
-    # wgrad-operand cast of nvfp4 training. No Triton kernel yet, so the API maps straight to the gold
-    # -> byte-identical by construction; runs eager on any CUDA device (bit-math fp4 path).
+    # wgrad-operand cast of nvfp4 training. Full-tile BF16 inputs on Blackwell use the CuTe-hand
+    # pipelined kernel; other inputs retain the eager gold fallback.
     sign = torch.tensor([1, -1] * 8, device=x.device, dtype=x.dtype)  # fixed +/-1 RHT sign vector
     # Two-level outer scale is over the FP32 |RHT(x.t())| (the RHT-domain amax), not |x|. API and
     # gold consume 1/S.
@@ -338,9 +485,9 @@ def test_nvfp4_dim_m_rht_matches_gold_bitwise(M, N, dtype):
         outer_quant_scale=outer_quant_scale,
         rht_tensor=sign,
     )
-    q_ref, s_ref = nvfp4_gs_swizzle_dim_m_rht_f(x, outer_quant_scale, sign)
-    assert torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8)), "qdata differs from gold"
-    assert torch.equal(s.view(torch.uint8), s_ref.view(torch.uint8)), "scale differs from gold"
+    Nvfp4GsSwizzleDimMRHTGold.correctness_fn(
+        (x, outer_quant_scale, sign), (q, s)
+    )
     assert q.dtype == torch.float4_e2m1fn_x2
     assert s.dtype == torch.float8_e4m3fn  # nvfp4 inner scale is e4m3 (not e8m0)
     assert q.shape == (N, M // 2)  # transposed (N, M//2) frame, two fp4 codes per byte
@@ -380,15 +527,6 @@ def test_unsupported_combo_raises():
             inner_scale_calc=InnerScaleCalc.RCEIL_E8M0,
             scaling_type=ScalingType.RowWise,
             )
-    with pytest.raises(ValueError):  # 32x32 has no swizzle kernel
-        quantize_tensor(
-            x,
-            qdata_dtype=torch.float8_e4m3fn,
-            inner_scale_calc=InnerScaleCalc.RCEIL_E8M0,
-            scaling_type=ScalingType.BlockWise1x32,
-            swizzle_type=SwizzleType.SWIZZLE_32_4_4,
-            scaling_type_square_block_and_expand=True,
-        )
     with pytest.raises(ValueError):  # skip_transposed_qdata needs the 32x32 square-block flag
         quantize_tensor_dual(
             x,
@@ -909,17 +1047,18 @@ def test_nvfp4_linear_fwd_bwd_sqnr(linear_fn):
     # specs map to gold references (nvfp4_gs_swizzle_sr_f / nvfp4_gs_swizzle_dim_m_rht_sr_f), so they
     # add no divergence. wgrad (grad_weight = grad_output_col @ input_col) touches neither the weight
     # cast nor the dim-k activation cast -- only the dim-m activation and grad_output casts, both
-    # gold-backed in the API -- so grad_weight stays BIT-IDENTICAL. out and grad_input use the
-    # Triton-cast operands, so they match at high SQNR (~38 dB) rather than bitwise.
+    # use CuTe-hand where eligible, so compare every result at high SQNR rather than requiring the
+    # pipelined BF16-UMMA path to be bit-identical to the FP32-RHT gold.
     xg = x.clone().requires_grad_(True)
     wg = w.clone().requires_grad_(True)
     out_gold = _Nvfp4LinearRef.apply(xg, wg, sign, key)
     out_gold.backward(grad_out)
-    assert torch.equal(wq.grad, wg.grad), "grad_weight differs from the all-gold reference"
     sqnr_out_vs_gold = _compute_error(out_gold.float(), out_q.float())
     sqnr_gx_vs_gold = _compute_error(xg.grad.float(), xq.grad.float())
+    sqnr_gw_vs_gold = _compute_error(wg.grad.float(), wq.grad.float())
     assert sqnr_out_vs_gold > 30.0, f"output vs gold sqnr={sqnr_out_vs_gold.item():.2f} dB below 30 dB"
     assert sqnr_gx_vs_gold > 30.0, f"grad_input vs gold sqnr={sqnr_gx_vs_gold.item():.2f} dB below 30 dB"
+    assert sqnr_gw_vs_gold > 30.0, f"grad_weight vs gold sqnr={sqnr_gw_vs_gold.item():.2f} dB below 30 dB"
 
 
 @requires_sm100

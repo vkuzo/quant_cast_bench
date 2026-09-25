@@ -5,6 +5,24 @@ import torch.func._random as prng
 from torch import Tensor
 from torch.nn.functional import SwizzleType  # core enum: NO_SWIZZLE=0, SWIZZLE_32_4_4=1
 
+from quant_cast_bench.quant_cast_cute_hand.blockscaled_tma.blockscaled_tma_impl import (
+    mxfp4,
+    mxfp4_dim_km_swizzle_v2,
+    mxfp4_dim_m_swizzle_v2,
+    mxfp4_swizzle_v2,
+    mxfp8,
+    mxfp8_32x32_swizzle_v2,
+    mxfp8_swizzle_v2,
+    nvfp4,
+    nvfp4_dim_km_swizzle_tma,
+    nvfp4_dim_m_swizzle_tma,
+    nvfp4_swizzle_16x16_tma,
+    nvfp4_swizzle_tma,
+)
+from quant_cast_bench.quant_cast_cute_hand.nvfp4_pipelined.nvfp4_pipelined_impl import (
+    nvfp4_dim_m_rht_swizzle_pipelined,
+    nvfp4_swizzle_dim_k_dim_m_rht_pipelined,
+)
 from quant_cast_bench.quantize_tensor_api.moe_utils import (
     BLOCK_SIZE,
     _to_blocked_2d_k_groups,
@@ -12,7 +30,14 @@ from quant_cast_bench.quantize_tensor_api.moe_utils import (
     quantize_2d_act,
 )
 from quant_cast_bench.quant_cast_gold.recipes import (
+    mxfp4_dim_km_swizzle_f,
+    mxfp4_dim_m_swizzle_f,
     mxfp4_f,
+    mxfp4_swizzle_f,
+    mxfp8_dim_km_swizzle_sr_f,
+    mxfp8_dim_m_swizzle_sr_f,
+    mxfp8_swizzle_sr_f,
+    nvfp4_gs_16x16_swizzle_f,
     nvfp4_gs_f,
     nvfp4_gs_swizzle_dim_k_dim_m_rht_f,
     nvfp4_gs_swizzle_dim_k_dim_m_rht_sr_f,
@@ -59,6 +84,49 @@ class InnerScaleCalc(StrEnum):
     NVFP4_E4M3 = "nvfp4_e4m3"
 
 
+def _can_use_blockscaled_tma(input: Tensor, quant_orientation: str) -> bool:
+    """Whether the input satisfies the common CuTe-hand blockscaled TMA launch contract."""
+    if (
+        input.device.type != "cuda"
+        or torch.cuda.get_device_capability(input.device) < (10, 0)
+        or input.dtype not in (torch.bfloat16, torch.float16, torch.float32)
+        or not input.is_contiguous()
+        or input.data_ptr() % 16 != 0
+    ):
+        return False
+    M, K = input.shape
+    if M > 2**31 - 1 or K > 2**31 - 1:
+        return False
+    if quant_orientation == "dim_k":
+        return K % 32 == 0
+    if quant_orientation == "dim_m":
+        return M % 32 == 0 and K % 16 == 0
+    if quant_orientation == "dim_km":
+        return M % 32 == 0 and K % 32 == 0
+    raise ValueError(f"unsupported quant_orientation: {quant_orientation}")
+
+
+def _can_use_nvfp4_rht_pipelined(input: Tensor, rht_sign: Tensor) -> bool:
+    """Whether the input satisfies the BF16, full-tile CuTe-hand RHT launch contract."""
+    M, K = input.shape
+    return (
+        input.device.type == "cuda"
+        and torch.cuda.get_device_capability(input.device) >= (10, 0)
+        and input.dtype == torch.bfloat16
+        and input.is_contiguous()
+        and input.data_ptr() % 16 == 0
+        and M > 0
+        and K > 0
+        and M % 128 == 0
+        and K % 128 == 0
+        and isinstance(rht_sign, torch.Tensor)
+        and rht_sign.shape == (16,)
+        and rht_sign.dtype == torch.bfloat16
+        and rht_sign.device == input.device
+        and rht_sign.is_contiguous()
+    )
+
+
 def quantize_tensor(
     input: Tensor,
     *,
@@ -96,9 +164,8 @@ def quantize_tensor(
         the transpose, un-transposes it, and routes to the specialized dim-m cast; the outputs are
         written transposed-contiguous.
       swizzle_type: NO_SWIZZLE or SWIZZLE_32_4_4.
-      qdata_rounding_mode: RTNE or STOCHASTIC. STOCHASTIC is supported only by the per-tensor swizzled
-        nvfp4 casts -- NATURAL (dim-k) and TRANSPOSED (dim-m, which then requires an rht_tensor) --
-        and requires random_key; every other path is RTNE-only.
+      qdata_rounding_mode: RTNE or STOCHASTIC. STOCHASTIC is supported by swizzled mxfp8 and by
+        per-tensor swizzled nvfp4. The nvfp4 TRANSPOSED path also requires an rht_tensor.
       random_key: SR entropy, a torch.func._random Philox key. Required when (and only when)
         qdata_rounding_mode is STOCHASTIC.
       outer_quant_scale: precomputed fp32 outer QUANT scale, i.e. low = high * outer_quant_scale.
@@ -111,9 +178,9 @@ def quantize_tensor(
         dim-m swizzled nvfp4 cast (selected by passing a transposed view), where it applies the RHT
         to the un-transposed input before quantizing (the wgrad-operand cast of nvfp4 training); must
         be None for every other path.
-      scaling_type_square_block_and_expand: mxfp8 only. When True, compute one scale per 32x32
-        square block and expand it into the 1x32 layout the gemm consumes (requires
-        scaling_type=BlockWise1x32). Only the dim-k (contiguous input) NO_SWIZZLE cast is wired.
+      scaling_type_square_block_and_expand: compute one scale per square block and expand it into
+        the row-blocked layout the GEMM consumes: 32x32 -> 1x32 for mxfp8, or 16x16 -> 1x16 for
+        nvfp4. Only dim-k is supported.
 
     Returns:
         2 tensors (qdata, scale)
@@ -130,24 +197,26 @@ def quantize_tensor(
     else:
         inner_scaling_type, outer_scaling_type = scaling_type, None
     # scaling_type_square_block_and_expand computes the scale over 32x32 square blocks and expands it
-    # into the 1x32 layout the gemm consumes, so the scaling_type must be the 1x32 it expands into.
+    # into the row-blocked layout the GEMM consumes: 1x32 for MXFP8, or 1x16 for NVFP4.
     if scaling_type_square_block_and_expand:
-        assert inner_scaling_type == ScalingType.BlockWise1x32, (
-            "scaling_type_square_block_and_expand requires scaling_type=BlockWise1x32, got "
+        expanded_scaling_type = (
+            ScalingType.BlockWise1x16
+            if inner_scale_calc == InnerScaleCalc.NVFP4_E4M3
+            else ScalingType.BlockWise1x32
+        )
+        assert inner_scaling_type == expanded_scaling_type, (
+            "scaling_type_square_block_and_expand requires scaling_type="
+            f"{expanded_scaling_type!r}, got "
             f"{inner_scaling_type!r}"
         )
-    # SR is implemented only for the two nvfp4 swizzle casts below; every other path asserts RTNE
-    # where it dispatches. random_key IS the SR entropy (a torch.func._random Philox key), so it and
-    # STOCHASTIC must come together.
+    # random_key is the SR entropy (a torch.func._random Philox key), so it and STOCHASTIC must come
+    # together. Individual recipe branches below reject SR when they do not implement it.
     if qdata_rounding_mode == RoundingMode.STOCHASTIC:
         assert random_key is not None, "qdata_rounding_mode=STOCHASTIC requires random_key (the SR Philox key)"
     elif random_key is not None:
         raise ValueError("random_key is only used with qdata_rounding_mode=STOCHASTIC")
 
     if qdata_dtype == torch.float4_e2m1fn_x2:
-        assert not scaling_type_square_block_and_expand, (
-            "scaling_type_square_block_and_expand is only supported for mxfp8 (float8_e4m3fn)"
-        )
         # dim-k (contiguous input, scale along the last dim) vs dim-m (a transposed view, scale along
         # the first dim): un-transpose the view and route to the specialized dim-m cast.
         if input.is_contiguous():
@@ -159,17 +228,39 @@ def quantize_tensor(
             )
             is_dim_m = True
         if inner_scale_calc == InnerScaleCalc.RCEIL_E8M0:
-            assert not is_dim_m, "mxfp4 supports only the dim-k (contiguous input) cast"
+            assert not scaling_type_square_block_and_expand, (
+                "scaling_type_square_block_and_expand is not supported for mxfp4"
+            )
             assert outer_scaling_type is None, "mxfp4 (RCEIL_E8M0) is single-level; pass a bare ScalingType"
             assert outer_quant_scale is None, "mxfp4 (RCEIL_E8M0) is single-level; outer_quant_scale must be None"
             assert rht_tensor is None, "rht_tensor is only supported by the dim-m nvfp4 cast"
             assert qdata_rounding_mode == RoundingMode.RTNE, "stochastic rounding is not supported for mxfp4"
-            if (inner_scaling_type, swizzle_type) == (ScalingType.BlockWise1x32, SwizzleType.NO_SWIZZLE):
-                assert x.shape[1] % 32 == 0, f"last dim must be a multiple of 32, got {x.shape[1]}"
-                return mxfp4_f(x)
+            spec = (inner_scaling_type, swizzle_type)
+            if not is_dim_m and spec == (
+                ScalingType.BlockWise1x32,
+                SwizzleType.NO_SWIZZLE,
+            ):
+                assert x.shape[1] % 32 == 0, (
+                    f"last dim must be a multiple of 32, got {x.shape[1]}"
+                )
+                return mxfp4(x) if _can_use_blockscaled_tma(x, "dim_k") else mxfp4_f(x)
+            if spec == (
+                ScalingType.BlockWise1x32,
+                SwizzleType.SWIZZLE_32_4_4,
+            ):
+                quant_orientation = "dim_m" if is_dim_m else "dim_k"
+                if _can_use_blockscaled_tma(x, quant_orientation):
+                    if is_dim_m:
+                        return mxfp4_dim_m_swizzle_v2(x)
+                    return mxfp4_swizzle_v2(x)
+                if is_dim_m:
+                    return mxfp4_dim_m_swizzle_f(x)
+                return mxfp4_swizzle_f(x)
             raise ValueError(
                 f"unsupported (scaling_type, swizzle_type)=({scaling_type!r}, {swizzle_type!r}) for "
-                "mxfp4 (float4_e2m1fn_x2, RCEIL_E8M0); supported: (BlockWise1x32, NO_SWIZZLE)"
+                "mxfp4 (float4_e2m1fn_x2, RCEIL_E8M0); supported: dim-k "
+                "(BlockWise1x32, NO_SWIZZLE|SWIZZLE_32_4_4), dim-m "
+                "(BlockWise1x32, SWIZZLE_32_4_4)"
             )
         assert inner_scale_calc == InnerScaleCalc.NVFP4_E4M3, (
             f"float4_e2m1fn_x2 qdata requires inner_scale_calc=NVFP4_E4M3 (nvfp4) or "
@@ -189,6 +280,9 @@ def quantize_tensor(
             # Per-token: no Triton kernel yet, so map to the gold reference (`nvfp4_gs_f`, plain
             # row-major inner scale, no swizzle). dim-k only.
             assert not is_dim_m, "per-token (RowWise) nvfp4 supports only the dim-k (contiguous input) cast"
+            assert not scaling_type_square_block_and_expand, (
+                "square-block scaling is not supported for per-token nvfp4"
+            )
             assert outer_quant_scale.shape == (x.shape[0], 1), (
                 f"per-token (RowWise) nvfp4 outer_quant_scale must be (M, 1)=({x.shape[0]}, 1), got "
                 f"{tuple(outer_quant_scale.shape)}"
@@ -203,8 +297,43 @@ def quantize_tensor(
                 "(BlockWise1x16, NO_SWIZZLE)"
             )
         if outer_scaling_type == ScalingType.TensorWise:
+            if scaling_type_square_block_and_expand:
+                assert not is_dim_m, "16x16 nvfp4 supports only the dim-k cast"
+                assert rht_tensor is None, "16x16 nvfp4 does not support RHT"
+                assert qdata_rounding_mode == RoundingMode.RTNE, (
+                    "16x16 nvfp4 supports only RTNE"
+                )
+                if (inner_scaling_type, swizzle_type) == (
+                    ScalingType.BlockWise1x16,
+                    SwizzleType.SWIZZLE_32_4_4,
+                ):
+                    assert x.shape[0] % 16 == 0, (
+                        f"first dim must be a multiple of 16, got {x.shape[0]}"
+                    )
+                    assert x.shape[1] % 32 == 0, (
+                        f"last dim must be a multiple of 32, got {x.shape[1]}"
+                    )
+                    if _can_use_blockscaled_tma(x, "dim_k"):
+                        return nvfp4_swizzle_16x16_tma(x, outer_quant_scale)
+                    return nvfp4_gs_16x16_swizzle_f(x, outer_quant_scale)
+                raise ValueError(
+                    "16x16 nvfp4 requires (BlockWise1x16, SWIZZLE_32_4_4)"
+                )
             if not is_dim_m:
-                # dim-k (natural) swizzled per-tensor nvfp4.
+                # dim-k (natural) per-tensor nvfp4.
+                if (inner_scaling_type, swizzle_type) == (
+                    ScalingType.BlockWise1x16,
+                    SwizzleType.NO_SWIZZLE,
+                ):
+                    assert rht_tensor is None, (
+                        "rht_tensor is only supported by the dim-m nvfp4 cast"
+                    )
+                    assert qdata_rounding_mode == RoundingMode.RTNE, (
+                        "unswizzled nvfp4 supports only RTNE"
+                    )
+                    if _can_use_blockscaled_tma(x, "dim_k"):
+                        return nvfp4(x, outer_quant_scale)
+                    return nvfp4_gs_f(x, outer_quant_scale)
                 if (inner_scaling_type, swizzle_type) == (ScalingType.BlockWise1x16, SwizzleType.SWIZZLE_32_4_4):
                     assert rht_tensor is None, "rht_tensor is only supported by the dim-m nvfp4 cast"
                     if qdata_rounding_mode == RoundingMode.STOCHASTIC:
@@ -212,26 +341,31 @@ def quantize_tensor(
                         # reference, no
                         # Triton kernel; random_key is its Philox key.
                         return nvfp4_gs_swizzle_sr_f(x, outer_quant_scale, random_key)
+                    if _can_use_blockscaled_tma(x, "dim_k"):
+                        return nvfp4_swizzle_tma(x, outer_quant_scale)
                     return nvfp4_triton(x, outer_quant_scale, swizzle=True)
                 raise ValueError(
                     f"unsupported (scaling_type, swizzle_type)=({scaling_type!r}, {swizzle_type!r}) for "
-                    "dim-k per-tensor nvfp4 (float4_e2m1fn_x2); supported: (BlockWise1x16, SWIZZLE_32_4_4)"
+                    "dim-k per-tensor nvfp4 (float4_e2m1fn_x2); supported: "
+                    "(BlockWise1x16, NO_SWIZZLE|SWIZZLE_32_4_4)"
                 )
-            # dim-m per-tensor nvfp4 has no Triton kernel yet, so map it to the gold reference. RTNE
-            # without an RHT is Nvfp4GsDimMSwizzleGold's nvfp4_gs_swizzle_dim_m_f (quantize x in 1x16
-            # blocks along M, transposed (N, M//2) frame, swizzled e4m3 scale); RTNE with an RHT is
-            # Nvfp4GsSwizzleDimMRHTGold's nvfp4_gs_swizzle_dim_m_rht_f (same, but RHT x.t() first -- the
-            # wgrad-operand cast of nvfp4 training); STOCHASTIC is the SR twin of the latter
-            # (Nvfp4GsDimMSwizzleRHTPortableSRGold's nvfp4_gs_swizzle_dim_m_rht_sr_f) -- the only
-            # dim-m SR gold
-            # is the RHT one, so SR requires an rht_tensor. The outer_quant_scale must match: |x.t()| for the
-            # no-RHT path, |RHT(x.t())| for the RHT paths (caller-set).
+            # Dim-m per-tensor NVFP4 uses CuTe-hand TMA for plain RTNE and the pipelined kernel for
+            # eligible full-tile BF16 RHT RTNE inputs. Other architectures/shapes retain the gold
+            # fallback. STOCHASTIC names the portable-SR gold, which is numerically distinct from
+            # the pipelined kernel's NVIDIA cvt.rs recipe, so it deliberately remains a reference.
+            # The outer_quant_scale must match |x.t()| without RHT or |RHT(x.t())| with RHT.
             if (inner_scaling_type, swizzle_type) == (ScalingType.BlockWise1x16, SwizzleType.SWIZZLE_32_4_4):
                 if qdata_rounding_mode == RoundingMode.STOCHASTIC:
                     assert rht_tensor is not None, "stochastic dim-m nvfp4 requires an rht_tensor"
                     return nvfp4_gs_swizzle_dim_m_rht_sr_f(x, outer_quant_scale, rht_tensor, random_key)
                 if rht_tensor is None:
+                    if _can_use_blockscaled_tma(x, "dim_m"):
+                        return nvfp4_dim_m_swizzle_tma(x, outer_quant_scale)
                     return nvfp4_gs_swizzle_dim_m_f(x, outer_quant_scale)
+                if _can_use_nvfp4_rht_pipelined(x, rht_tensor):
+                    return nvfp4_dim_m_rht_swizzle_pipelined(
+                        x, outer_quant_scale, rht_tensor
+                    )
                 return nvfp4_gs_swizzle_dim_m_rht_f(x, outer_quant_scale, rht_tensor)
             raise ValueError(
                 f"unsupported (scaling_type, swizzle_type)=({scaling_type!r}, {swizzle_type!r}) for "
@@ -251,18 +385,28 @@ def quantize_tensor(
     assert outer_scaling_type is None, "mxfp8 is single-level; pass a bare ScalingType"
     assert outer_quant_scale is None, "outer_quant_scale is only used by nvfp4 (float4_e2m1fn_x2) quantization"
     assert rht_tensor is None, "rht_tensor is only used by nvfp4 (float4_e2m1fn_x2) quantization"
-    assert qdata_rounding_mode == RoundingMode.RTNE, "stochastic rounding is not supported for mxfp8"
 
     if scaling_type_square_block_and_expand:
         # 32x32 square-block mxfp8: one scale per 32x32 tile, expanded into the 1x32 layout the gemm
-        # consumes. Only the dim-k (contiguous input), NO_SWIZZLE cast has a kernel.
-        if input.is_contiguous() and swizzle_type == SwizzleType.NO_SWIZZLE:
+        # consumes. Only the dim-k (contiguous input) cast is supported.
+        assert qdata_rounding_mode == RoundingMode.RTNE, "32x32 mxfp8 supports only RTNE"
+        if input.is_contiguous() and swizzle_type in (
+            SwizzleType.NO_SWIZZLE,
+            SwizzleType.SWIZZLE_32_4_4,
+        ):
             assert input.shape[0] % 32 == 0, f"first dim must be a multiple of 32, got {input.shape[0]}"
             assert input.shape[1] % 32 == 0, f"last dim must be a multiple of 32, got {input.shape[1]}"
-            return mxfp8_32x32_triton(input, swizzle=False)
+            if (
+                swizzle_type == SwizzleType.SWIZZLE_32_4_4
+                and _can_use_blockscaled_tma(input, "dim_k")
+            ):
+                return mxfp8_32x32_swizzle_v2(input)
+            return mxfp8_32x32_triton(
+                input, swizzle=swizzle_type == SwizzleType.SWIZZLE_32_4_4
+            )
         raise ValueError(
             "scaling_type_square_block_and_expand (32x32 mxfp8) supports only the dim-k "
-            "(contiguous input) NO_SWIZZLE cast"
+            "(contiguous input) cast"
         )
 
     # 2D: dim-k (contiguous input, scale along the last dim) vs dim-m (a transposed view, scale along
@@ -271,10 +415,23 @@ def quantize_tensor(
     spec = (inner_scaling_type, swizzle_type)
     if input.is_contiguous():
         if spec == (ScalingType.BlockWise1x32, SwizzleType.NO_SWIZZLE):
+            assert qdata_rounding_mode == RoundingMode.RTNE, (
+                "unswizzled mxfp8 supports only RTNE"
+            )
             assert input.shape[1] % 32 == 0, f"last dim must be a multiple of 32, got {input.shape[1]}"
+            if _can_use_blockscaled_tma(input, "dim_k"):
+                return mxfp8(input)
             return mxfp8_triton(input, swizzle=False)
         if spec == (ScalingType.BlockWise1x32, SwizzleType.SWIZZLE_32_4_4):
             assert input.shape[1] % 32 == 0, f"last dim must be a multiple of 32, got {input.shape[1]}"
+            if _can_use_blockscaled_tma(input, "dim_k"):
+                return mxfp8_swizzle_v2(
+                    input,
+                    key=random_key,
+                    rounding_mode=qdata_rounding_mode,
+                )
+            if qdata_rounding_mode == RoundingMode.STOCHASTIC:
+                return mxfp8_swizzle_sr_f(input, random_key)
             return mxfp8_triton(input, swizzle=True)
         raise ValueError(
             f"unsupported (scaling_type, swizzle_type)={spec!r} for the dim-k (contiguous input) "
@@ -288,8 +445,20 @@ def quantize_tensor(
         "input must be contiguous (dim-k), or a transpose of a contiguous tensor (dim-m)"
     )
     if spec == (ScalingType.BlockWise1x32, SwizzleType.NO_SWIZZLE):
+        assert qdata_rounding_mode == RoundingMode.RTNE, (
+            "unswizzled dim-m mxfp8 supports only RTNE"
+        )
         return mxfp8_dim_m_triton(x, swizzle=False)
     if spec == (ScalingType.BlockWise1x32, SwizzleType.SWIZZLE_32_4_4):
+        if _can_use_blockscaled_tma(x, "dim_m"):
+            return mxfp8_swizzle_v2(
+                x,
+                quant_orientation="dim_m",
+                key=random_key,
+                rounding_mode=qdata_rounding_mode,
+            )
+        if qdata_rounding_mode == RoundingMode.STOCHASTIC:
+            return mxfp8_dim_m_swizzle_sr_f(x, random_key)
         return mxfp8_dim_m_triton(x, swizzle=True)
     raise ValueError(
         f"unsupported (scaling_type, swizzle_type)={spec!r} for the dim-m (transposed input) mxfp8 "
@@ -328,9 +497,8 @@ def quantize_tensor_dual(
         Needed on hardware (such as Blackwell) where the second argument of a scaled gemm can be
         row-major. mxfp8 only, and only with scaling_type_square_block_and_expand=True +
         swizzle_type=SWIZZLE_32_4_4 (the 32x32 square-block cast).
-      qdata_rounding_mode: RTNE or STOCHASTIC. STOCHASTIC is supported only by the RHT nvfp4 cast
-        (rht_tensor=(None, rht_sign)) -- the grad_output cast of nvfp4 training; mxfp8 and the plain
-        no-RHT nvfp4 cast are RTNE only.
+      qdata_rounding_mode: RTNE or STOCHASTIC. STOCHASTIC is supported by swizzled mxfp8 and the RHT
+        nvfp4 cast (rht_tensor=(None, rht_sign)); plain no-RHT nvfp4 is RTNE-only.
       random_key: Philox key for stochastic rounding (required when qdata_rounding_mode=STOCHASTIC, must
         be None otherwise). Split internally into one substream per orientation.
       outer_quant_scale: nvfp4 per-tensor outer QUANT scale, i.e. low = high * outer_quant_scale.
@@ -363,11 +531,17 @@ def quantize_tensor_dual(
         inner_scaling_type, outer_scaling_type = scaling_type
     else:
         inner_scaling_type, outer_scaling_type = scaling_type, None
-    # scaling_type_square_block_and_expand computes the scale over 32x32 square blocks and expands it
-    # into the 1x32 layout the gemm consumes, so the scaling_type must be the 1x32 it expands into.
+    # scaling_type_square_block_and_expand computes a square-block scale and expands it into the
+    # row-blocked layout the GEMM consumes: 1x32 for MXFP8, or 1x16 for NVFP4.
     if scaling_type_square_block_and_expand:
-        assert inner_scaling_type == ScalingType.BlockWise1x32, (
-            "scaling_type_square_block_and_expand requires scaling_type=BlockWise1x32, got "
+        expanded_scaling_type = (
+            ScalingType.BlockWise1x16
+            if inner_scale_calc == InnerScaleCalc.NVFP4_E4M3
+            else ScalingType.BlockWise1x32
+        )
+        assert inner_scaling_type == expanded_scaling_type, (
+            "scaling_type_square_block_and_expand requires scaling_type="
+            f"{expanded_scaling_type!r}, got "
             f"{inner_scaling_type!r}"
         )
     # stochastic rounding and its entropy source are coupled: STOCHASTIC needs a random_key, and a
@@ -391,15 +565,48 @@ def quantize_tensor_dual(
     rht_tensor_k, rht_tensor_m = rht_tensor if rht_tensor is not None else (None, None)
 
     if qdata_dtype == torch.float4_e2m1fn_x2:
-        # Fused dual nvfp4 cast: dim-k is plain nvfp4 over |input|; dim-m nvfp4s input.t()
-        # along the original M. No Triton kernel yet, so both map to gold references.
         assert input.is_contiguous(), "input must be contiguous"
+        if inner_scale_calc == InnerScaleCalc.RCEIL_E8M0:
+            assert outer_scaling_type is None, (
+                "mxfp4 is single-level; pass a bare ScalingType"
+            )
+            assert outer_quant_scale_k is None and outer_quant_scale_m is None, (
+                "mxfp4 does not use outer_quant_scale"
+            )
+            assert rht_tensor_k is None and rht_tensor_m is None, (
+                "mxfp4 does not support RHT"
+            )
+            assert not skip_transposed_qdata, (
+                "skip_transposed_qdata is not supported for mxfp4"
+            )
+            assert not scaling_type_square_block_and_expand, (
+                "square-block scaling is not supported for mxfp4"
+            )
+            assert qdata_rounding_mode == RoundingMode.RTNE, (
+                "mxfp4 supports only RTNE"
+            )
+            spec = (inner_scaling_type, swizzle_type)
+            if spec == (
+                ScalingType.BlockWise1x32,
+                SwizzleType.SWIZZLE_32_4_4,
+            ):
+                if _can_use_blockscaled_tma(input, "dim_km"):
+                    return mxfp4_dim_km_swizzle_v2(input)
+                return mxfp4_dim_km_swizzle_f(input)
+            raise ValueError(
+                f"unsupported (scaling_type, swizzle_type)={spec!r} for dual mxfp4; "
+                "supported: (BlockWise1x32, SWIZZLE_32_4_4)"
+            )
+
+        # Fused dual NVFP4 cast: dim-k is plain NVFP4 over |input|; dim-m quantizes input.t()
+        # along the original M. Eligible RTNE inputs use CuTe-hand; unsupported shapes/devices and
+        # the numerically distinct portable-SR recipe retain their gold fallbacks.
         assert inner_scale_calc == InnerScaleCalc.NVFP4_E4M3, (
             f"float4_e2m1fn_x2 qdata requires inner_scale_calc=NVFP4_E4M3 (nvfp4), got {inner_scale_calc!r}"
         )
         assert not skip_transposed_qdata, "skip_transposed_qdata is not supported for nvfp4"
         assert not scaling_type_square_block_and_expand, (
-            "scaling_type_square_block_and_expand is only supported for mxfp8 (float8_e4m3fn)"
+            "scaling_type_square_block_and_expand is not supported for dual nvfp4"
         )
         assert outer_scaling_type is not None, (
             "nvfp4 is two-level; pass scaling_type=[BlockWise1x16, TensorWise]"
@@ -430,6 +637,10 @@ def quantize_tensor_dual(
                 "stochastic rounding is only supported by the RHT nvfp4 cast "
                 "(rht_tensor=(None, rht_sign))"
             )
+            if _can_use_blockscaled_tma(input, "dim_km"):
+                return nvfp4_dim_km_swizzle_tma(
+                    input, outer_quant_scale_k, outer_quant_scale_m
+                )
             return nvfp4_gs_swizzle_dim_km_f(input, outer_quant_scale_k, outer_quant_scale_m)
         # WITH RHT (Nvfp4GsSwizzle_DimK_DimMRHT_Gold's nvfp4_gs_swizzle_dim_k_dim_m_rht_f): dim-m
         # applies the RHT to input.t() before quantizing (the wgrad-operand cast of nvfp4 training).
@@ -454,6 +665,13 @@ def quantize_tensor_dual(
             return nvfp4_gs_swizzle_dim_k_dim_m_rht_sr_f(
                 input, outer_quant_scale_k, outer_quant_scale_m, rht_tensor_m, key_k, key_m
             )
+        if _can_use_nvfp4_rht_pipelined(input, rht_tensor_m):
+            return nvfp4_swizzle_dim_k_dim_m_rht_pipelined(
+                input,
+                outer_quant_scale_k,
+                outer_quant_scale_m,
+                rht_tensor_m,
+            )
         return nvfp4_gs_swizzle_dim_k_dim_m_rht_f(input, outer_quant_scale_k, outer_quant_scale_m, rht_tensor_m)
 
     # mxfp8: float8_e4m3fn qdata + e8m0 rceil inner scale; outer_quant_scale / rht_tensor unused.
@@ -470,7 +688,6 @@ def quantize_tensor_dual(
     assert rht_tensor_k is None and rht_tensor_m is None, (
         "rht_tensor is only used by nvfp4 (float4_e2m1fn_x2) quantization"
     )
-    assert qdata_rounding_mode == RoundingMode.RTNE, "stochastic rounding is not supported for mxfp8"
 
     assert input.is_contiguous(), "input must be contiguous"
     spec = (inner_scaling_type, swizzle_type)
@@ -478,6 +695,9 @@ def quantize_tensor_dual(
         # skip_transposed_qdata (natural qdata, both scales) is wired only for the 32x32 square-block
         # cast (expanded into the swizzled 1x32 layout).
         if scaling_type_square_block_and_expand and swizzle_type == SwizzleType.SWIZZLE_32_4_4:
+            assert qdata_rounding_mode == RoundingMode.RTNE, (
+                "32x32 mxfp8 supports only RTNE"
+            )
             assert input.shape[0] % 32 == 0, f"first dim must be a multiple of 32, got {input.shape[0]}"
             assert input.shape[1] % 32 == 0, f"last dim must be a multiple of 32, got {input.shape[1]}"
             return mxfp8_32x32_qdata_dim_k_scale_dim_km_swizzle_triton(input)
@@ -492,8 +712,20 @@ def quantize_tensor_dual(
             "skip_transposed_qdata=True"
         )
     if spec == (ScalingType.BlockWise1x32, SwizzleType.NO_SWIZZLE):
+        assert qdata_rounding_mode == RoundingMode.RTNE, (
+            "unswizzled dual mxfp8 supports only RTNE"
+        )
         return mxfp8_dim_km_triton(input, swizzle=False)
     if spec == (ScalingType.BlockWise1x32, SwizzleType.SWIZZLE_32_4_4):
+        if _can_use_blockscaled_tma(input, "dim_km"):
+            return mxfp8_swizzle_v2(
+                input,
+                quant_orientation="dim_km",
+                key=random_key,
+                rounding_mode=qdata_rounding_mode,
+            )
+        if qdata_rounding_mode == RoundingMode.STOCHASTIC:
+            return mxfp8_dim_km_swizzle_sr_f(input, random_key)
         return mxfp8_dim_km_triton(input, swizzle=True)
     raise ValueError(
         f"unsupported (scaling_type, swizzle_type)={spec!r}; supported: "

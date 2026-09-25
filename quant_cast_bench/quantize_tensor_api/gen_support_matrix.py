@@ -139,7 +139,7 @@ def _install_dispatch_probes():
     for module in (api, moe_utils):
         for name, obj in list(vars(module).items()):
             mod = getattr(obj, "__module__", "") or ""
-            is_kernel = "quant_cast_triton" in mod
+            is_kernel = "quant_cast_triton" in mod or "quant_cast_cute_hand" in mod
             is_ref = "quant_cast_gold" in mod
             if not (callable(obj) and (is_kernel or is_ref)):
                 continue
@@ -250,9 +250,16 @@ def collect_dual() -> list[tuple[str, ...]]:
         ))
         if res is None:
             continue
-        fmt = "mxfp8" if qd == torch.float8_e4m3fn else (
-            "nvfp4 (per-tensor, RHT)" if rhv == "dim_m" else "nvfp4 (per-tensor)"
-        )
+        if qd == torch.float8_e4m3fn:
+            fmt = "mxfp8"
+        elif isc == InnerScaleCalc.RCEIL_E8M0:
+            fmt = "mxfp4"
+        else:
+            fmt = (
+                "nvfp4 (per-tensor, RHT)"
+                if rhv == "dim_m"
+                else "nvfp4 (per-tensor)"
+            )
         scl_tp = SCALING_R[st] if osv == "none" else f"{SCALING_R[st]}+TW"
         rows.add((fmt, scl_tp, SWIZZLE_R[sw], SKIP_R[skip], EXPAND_R[ex], ROUNDING_R[rm], *res))
     return sorted(rows)
