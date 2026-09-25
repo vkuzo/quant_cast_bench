@@ -173,10 +173,6 @@ class _BlockscaledTma:
         do_dim_k = quant_orientation != _QUANT_ORIENTATION_DIM_M
         do_dim_m = quant_orientation != _QUANT_ORIENTATION_DIM_K
 
-        if cutlass.const_expr(not is_scale_swizzled):
-            assert quant_orientation == _QUANT_ORIENTATION_DIM_K
-            assert not is_square_scaling
-
         if cutlass.const_expr(quant_orientation == _QUANT_ORIENTATION_DIM_K):
             assert output_k_tma_atom is not None
             assert output_k_tma_tensor is not None
@@ -186,29 +182,13 @@ class _BlockscaledTma:
             assert output_k_tv_layout is not None
             if cutlass.const_expr(scale_algo == ScaleAlgo.NVFP4_FP8_E4M3):
                 assert mOuterScaleK is not None
-            else:
-                assert mOuterScaleK is None
-            assert output_m_tma_atom is None
-            assert output_m_tma_tensor is None
-            assert mScaleMLogical is None
-            assert mOuterScaleM is None
-            assert output_m_smem_layout is None
         elif cutlass.const_expr(quant_orientation == _QUANT_ORIENTATION_DIM_M):
-            assert output_k_tma_atom is None
-            assert output_k_tma_tensor is None
-            assert mScaleKLogical is None
-            assert output_k_smem_layout is None
-            assert data_k_tv_layout is None
-            assert output_k_tv_layout is None
-            assert mOuterScaleK is None
             assert output_m_tma_atom is not None
             assert output_m_tma_tensor is not None
             assert mScaleMLogical is not None
             assert output_m_smem_layout is not None
             if cutlass.const_expr(scale_algo == ScaleAlgo.NVFP4_FP8_E4M3):
                 assert mOuterScaleM is not None
-            else:
-                assert mOuterScaleM is None
         else:
             assert quant_orientation == _QUANT_ORIENTATION_DIM_KM
             assert output_k_tma_atom is not None
@@ -219,55 +199,28 @@ class _BlockscaledTma:
             assert output_k_tv_layout is not None
             if cutlass.const_expr(scale_algo == ScaleAlgo.NVFP4_FP8_E4M3):
                 assert mOuterScaleK is not None
-            else:
-                assert mOuterScaleK is None
             assert output_m_tma_atom is not None
             assert output_m_tma_tensor is not None
             assert mScaleMLogical is not None
             assert output_m_smem_layout is not None
             if cutlass.const_expr(scale_algo == ScaleAlgo.NVFP4_FP8_E4M3):
                 assert mOuterScaleM is not None
-            else:
-                assert mOuterScaleM is None
 
         if cutlass.const_expr(
             rounding_variant == RoundingVariant.STATEFUL_SR_CAPTURE
         ):
             assert mSeed is not None
             assert mOffset is not None
-            assert rng_seed is None
-            assert rng_offset_words is None
             assert intragraph_offset_words is not None
         elif cutlass.const_expr(
             rounding_variant == RoundingVariant.STATELESS_SR
         ):
             assert mSeed is not None
-            assert mOffset is None
-            assert rng_seed is None
-            assert rng_offset_words is None
-            assert intragraph_offset_words is None
         elif cutlass.const_expr(
             rounding_variant == RoundingVariant.STATEFUL_SR_EAGER
         ):
-            assert mSeed is None
-            assert mOffset is None
             assert rng_seed is not None
             assert rng_offset_words is not None
-            assert intragraph_offset_words is None
-        else:
-            assert rounding_variant == RoundingVariant.RTNE
-            assert mSeed is None
-            assert mOffset is None
-            assert rng_seed is None
-            assert rng_offset_words is None
-            assert intragraph_offset_words is None
-        if cutlass.const_expr(
-            is_packed_fp4_qdata and scale_algo != ScaleAlgo.NVFP4_FP8_E4M3
-        ):
-            assert not is_stochastic_qdata_rounding
-            assert not is_square_scaling
-        if cutlass.const_expr(scale_algo == ScaleAlgo.NVFP4_FP8_E4M3):
-            assert is_packed_fp4_qdata
 
         # bookkeeping
         tidx, _, _ = cute.arch.thread_idx()
@@ -936,81 +889,41 @@ class _BlockscaledTma:
         do_dim_k = quant_orientation != _QUANT_ORIENTATION_DIM_M
         do_dim_m = quant_orientation != _QUANT_ORIENTATION_DIM_K
 
-        if cutlass.const_expr(not is_scale_swizzled):
-            assert quant_orientation == _QUANT_ORIENTATION_DIM_K
-            assert not is_square_scaling
-
         if cutlass.const_expr(quant_orientation == _QUANT_ORIENTATION_DIM_K):
             assert mOutputK is not None
             assert mScaleK is not None
-            assert (mOuterScaleK is not None) == (
-                scale_algo == ScaleAlgo.NVFP4_FP8_E4M3
-            )
-            assert mOutputM is None
-            assert mScaleM is None
-            assert mOuterScaleM is None
+            if cutlass.const_expr(scale_algo == ScaleAlgo.NVFP4_FP8_E4M3):
+                assert mOuterScaleK is not None
         elif cutlass.const_expr(quant_orientation == _QUANT_ORIENTATION_DIM_M):
-            assert mOutputK is None
-            assert mScaleK is None
-            assert mOuterScaleK is None
             assert mOutputM is not None
             assert mScaleM is not None
-            assert (mOuterScaleM is not None) == (
-                scale_algo == ScaleAlgo.NVFP4_FP8_E4M3
-            )
+            if cutlass.const_expr(scale_algo == ScaleAlgo.NVFP4_FP8_E4M3):
+                assert mOuterScaleM is not None
         else:
             assert quant_orientation == _QUANT_ORIENTATION_DIM_KM
             assert mOutputK is not None
             assert mScaleK is not None
-            assert (mOuterScaleK is not None) == (
-                scale_algo == ScaleAlgo.NVFP4_FP8_E4M3
-            )
             assert mOutputM is not None
             assert mScaleM is not None
-            assert (mOuterScaleM is not None) == (
-                scale_algo == ScaleAlgo.NVFP4_FP8_E4M3
-            )
+            if cutlass.const_expr(scale_algo == ScaleAlgo.NVFP4_FP8_E4M3):
+                assert mOuterScaleK is not None
+                assert mOuterScaleM is not None
 
         if cutlass.const_expr(
             rounding_variant == RoundingVariant.STATEFUL_SR_CAPTURE
         ):
             assert mSeed is not None
             assert mOffset is not None
-            assert rng_seed is None
-            assert rng_offset_words is None
             assert intragraph_offset_words is not None
         elif cutlass.const_expr(
             rounding_variant == RoundingVariant.STATELESS_SR
         ):
             assert mSeed is not None
-            assert mOffset is None
-            assert rng_seed is None
-            assert rng_offset_words is None
-            assert intragraph_offset_words is None
         elif cutlass.const_expr(
             rounding_variant == RoundingVariant.STATEFUL_SR_EAGER
         ):
-            assert mSeed is None
-            assert mOffset is None
             assert rng_seed is not None
             assert rng_offset_words is not None
-            assert intragraph_offset_words is None
-        else:
-            assert rounding_variant == RoundingVariant.RTNE
-            assert mSeed is None
-            assert mOffset is None
-            assert rng_seed is None
-            assert rng_offset_words is None
-            assert intragraph_offset_words is None
-        if cutlass.const_expr(is_square_scaling):
-            assert quant_orientation == _QUANT_ORIENTATION_DIM_K
-        if cutlass.const_expr(
-            is_packed_fp4_qdata and scale_algo != ScaleAlgo.NVFP4_FP8_E4M3
-        ):
-            assert not is_stochastic_qdata_rounding
-            assert not is_square_scaling
-        if cutlass.const_expr(scale_algo == ScaleAlgo.NVFP4_FP8_E4M3):
-            assert is_packed_fp4_qdata
 
         if cutlass.const_expr(quant_orientation == _QUANT_ORIENTATION_DIM_M):
             # Keep the kernel argument type uniform while retaining the original unswizzled dim-M
@@ -1411,18 +1324,8 @@ def _compile_blockscaled_tma(
     qdata_dtype: torch.dtype = torch.float8_e4m3fn,
     scale_algo: ScaleAlgo = ScaleAlgo.RCEIL_E8M0,
 ) -> Callable[..., None]:
-    if qdata_dtype not in _TORCH_TO_CUTE_QDATA_DTYPE:
-        raise ValueError(f"unsupported qdata dtype: {qdata_dtype}")
     input_element_type = _TORCH_TO_CUTE_DTYPE[input_dtype]
     qdata_element_type = _TORCH_TO_CUTE_QDATA_DTYPE[qdata_dtype]
-    if scale_algo == ScaleAlgo.NVFP4_FP8_E4M3:
-        if qdata_dtype != torch.float4_e2m1fn_x2:
-            raise ValueError("NVFP4 scaling requires float4_e2m1fn_x2 qdata")
-    if not is_scale_swizzled:
-        if quant_orientation != _QUANT_ORIENTATION_DIM_K:
-            raise ValueError("compact scales currently support only dim-k output")
-        if is_square_scaling:
-            raise ValueError("compact scales do not support square scaling")
     do_dim_k = quant_orientation != _QUANT_ORIENTATION_DIM_M
     do_dim_m = quant_orientation != _QUANT_ORIENTATION_DIM_K
 
